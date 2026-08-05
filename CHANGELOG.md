@@ -2,6 +2,12 @@
 
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow semantic versioning.
 
+## Unreleased
+
+### Added
+
+- Continuous Rust performance tracking with CodSpeed and Divan benchmarks.
+
 ## 1.0.0 - 2026-08-05
 
 ### Added

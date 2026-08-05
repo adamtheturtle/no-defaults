@@ -95,7 +95,7 @@ Like Ruff, `no-defaults` discovers the closest `pyproject.toml` containing `[too
 
 An optimized `1.0.0` development build checked a pinned Typeshed checkout containing 5,368 Python and stub files (12.5 MiB) in a median 0.29 seconds across five warm runs on an Apple Silicon Mac, or roughly 18,000 files per second. It produced 50,974 diagnostics; an earlier full-output measurement used approximately 41 MiB maximum RSS.
 
-The scheduled `Typeshed benchmark` workflow repeats this against a pinned upstream revision and fails on parser errors, unexpected results, or a gross performance regression.
+CodSpeed runs parser-and-rule benchmarks for representative modules on every pull request and every push to `main`, providing stable comparisons against the default-branch baseline. The scheduled `Typeshed benchmark` remains as a real-project correctness and gross-regression check.
 
 ## pre-commit
 

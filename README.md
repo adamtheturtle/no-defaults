@@ -58,8 +58,8 @@ After a successful fix, the command exits with status `0` and prints a Ruff-styl
 The default `full` output includes source excerpts and carets. `concise` emits one diagnostic per line, `json` emits a machine-readable array, and `github` emits workflow commands for GitHub Actions annotations.
 
 The linter detects defaults on positional-only, positional-or-keyword, and keyword-only parameters.
-For classes decorated with `@dataclass` or `@dataclasses.dataclass`, it detects assigned defaults plus `field(default=...)` and `field(default_factory=...)`.
-`ClassVar` assignments are ignored because they are not dataclass fields.
+For classes decorated with `@dataclass` or `@dataclasses.dataclass`, it detects assigned defaults plus `field(default=...)` and `field(default_factory=...)` in the class body.
+`ClassVar` assignments are ignored because they are not dataclass fields, and annotated assignments inside method bodies are ignored because they are locals.
 
 Suppress an individual violation with either a blanket `# noqa` or the rule-specific `# noqa: NOD001` on the line containing the default:
 

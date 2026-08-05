@@ -4,6 +4,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+## 1.0.1 - 2026-08-05
+
+### Fixed
+
+- Annotated assignments inside the methods of a dataclass are no longer reported as dataclass fields. They are locals, and `--fix` removed their values to leave bare annotations that raised `NameError` at runtime.
+
 ### Added
 
 - Continuous Rust performance tracking with CodSpeed and Divan benchmarks.

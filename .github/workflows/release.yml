@@ -84,7 +84,7 @@ jobs:
     needs: [wheels, sdist]
     runs-on: ubuntu-latest
     environment:
-      name: pypi
+      name: release
       url: https://pypi.org/p/no-defaults
     permissions:
       id-token: write

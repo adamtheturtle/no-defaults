@@ -53,7 +53,7 @@ Configuration lives in `pyproject.toml`:
 private_only = true
 ```
 
-Private means a name that starts with one underscore. In private-only mode, the rule applies to private functions and methods, all members of private classes, and private dataclass fields. Dunder names are not considered private.
+Private means a name that starts with one underscore. In private-only mode, the rule applies to private modules and packages, private functions and methods, all members of private classes, and private dataclass fields. For example, all defaults in `_module.py` and `_package/module.py` are checked. Dunder names such as `__init__.py` are not considered private by themselves.
 
 ## pre-commit
 

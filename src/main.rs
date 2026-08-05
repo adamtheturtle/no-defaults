@@ -143,7 +143,7 @@ fn check_file(path: &Path, private_only: bool) -> Result<Vec<Diagnostic>, String
         path,
         source: &source,
         private_only,
-        private_scope: false,
+        private_scope: is_private_module(path),
         dataclass_scope: false,
         diagnostics: Vec::new(),
     };
@@ -258,6 +258,14 @@ impl<'a> Visitor<'a> for Checker<'a> {
 
 fn is_private(name: &str) -> bool {
     name.starts_with('_') && !name.starts_with("__")
+}
+
+fn is_private_module(path: &Path) -> bool {
+    path.components().any(|component| {
+        let component = component.as_os_str().to_string_lossy();
+        let name = component.strip_suffix(".py").unwrap_or(&component);
+        is_private(name)
+    })
 }
 
 fn has_dataclass_decorator(class: &ast::StmtClassDef) -> bool {
@@ -407,5 +415,14 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found[0].contains("function `c`"));
         Ok(())
+    }
+
+    #[test]
+    fn recognizes_private_modules_and_packages() {
+        assert!(is_private_module(Path::new("src/_module.py")));
+        assert!(is_private_module(Path::new("src/_package/module.py")));
+        assert!(is_private_module(Path::new("src/_package/__init__.py")));
+        assert!(!is_private_module(Path::new("src/package/__init__.py")));
+        assert!(!is_private_module(Path::new("src/package/module.py")));
     }
 }

@@ -1,0 +1,6 @@
+[tool.no_defaults]
+private_only = true
+
+[tool.no_defaults.per_file_enforcement]
+"tests/**" = "all"
+"src/**" = "private"

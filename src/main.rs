@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -10,10 +11,15 @@ use ruff_python_ast::visitor::{walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use similar::TextDiff;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Forbid defaults in Python functions and dataclasses")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "clap stores independent command-line switches as booleans"
+)]
 struct Cli {
     /// Python files or directories to check.
     #[arg(default_value = ".")]
@@ -26,6 +32,26 @@ struct Cli {
     /// Remove detected defaults automatically.
     #[arg(long)]
     fix: bool,
+
+    /// Preview fixes as a unified diff without writing files.
+    #[arg(long, conflicts_with = "fix")]
+    diff: bool,
+
+    /// Diagnostic output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Full)]
+    output_format: OutputFormat,
+
+    /// Show the effective settings for each supplied file and exit.
+    #[arg(long)]
+    show_settings: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Full,
+    Concise,
+    Json,
+    Github,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -44,6 +70,7 @@ struct Config {
     per_file_enforcement: BTreeMap<String, Enforcement>,
 }
 
+#[derive(Clone)]
 struct LoadedConfig {
     root: PathBuf,
     config: Config,
@@ -79,19 +106,27 @@ fn main() -> ExitCode {
 
 fn run() -> Result<bool, String> {
     let cli = Cli::parse();
-    let loaded = load_config()?;
-    let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
     let files = collect_files(&cli.paths)?;
+    let settings = settings_for_files(&files, cli.private_only)?;
+    if cli.show_settings {
+        for (path, setting) in files.iter().zip(&settings) {
+            println!("{}", path.display());
+            println!("  project-root = {}", setting.project_root.display());
+            println!(
+                "  enforcement = {}",
+                if setting.private_only {
+                    "private"
+                } else {
+                    "all"
+                }
+            );
+        }
+        return Ok(false);
+    }
     let results: Vec<Result<Vec<Diagnostic>, String>> = files
         .par_iter()
-        .map(|path| {
-            let private_only = if cli.private_only {
-                true
-            } else {
-                private_only_for(path, &loaded, &overrides)
-            };
-            check_file(path, private_only)
-        })
+        .zip(settings.par_iter())
+        .map(|(path, setting)| check_file(path, setting.private_only))
         .collect();
     let mut diagnostics = Vec::new();
     for result in results {
@@ -100,8 +135,13 @@ fn run() -> Result<bool, String> {
     diagnostics.sort_by(|left, right| {
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
-    if cli.fix && !diagnostics.is_empty() {
-        apply_fixes(&diagnostics)?;
+    if (cli.fix || cli.diff) && !diagnostics.is_empty() {
+        let changes = fixed_sources(&diagnostics)?;
+        if cli.diff {
+            print_diffs(&changes);
+            return Ok(true);
+        }
+        write_fixes_atomically(changes)?;
         println!(
             "Found {} error{} ({} fixed, 0 remaining).",
             diagnostics.len(),
@@ -110,14 +150,87 @@ fn run() -> Result<bool, String> {
         );
         return Ok(false);
     }
-    for diagnostic in &diagnostics {
-        println!(
-            "{}:{}:{}: NOD001 {}",
-            diagnostic.path.display(),
-            diagnostic.line,
-            diagnostic.column,
-            diagnostic.message
-        );
+    report_diagnostics(&diagnostics, cli.output_format)?;
+    Ok(!diagnostics.is_empty())
+}
+
+#[derive(Serialize)]
+struct JsonDiagnostic<'a> {
+    path: String,
+    line: usize,
+    column: usize,
+    code: &'static str,
+    message: &'a str,
+}
+
+fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Result<(), String> {
+    match format {
+        OutputFormat::Full => {
+            for diagnostic in diagnostics {
+                println!(
+                    "{}:{}:{}: NOD001 {}",
+                    diagnostic.path.display(),
+                    diagnostic.line,
+                    diagnostic.column,
+                    diagnostic.message
+                );
+                if let Ok(source) = std::fs::read_to_string(&diagnostic.path) {
+                    if let Some(line) = source.lines().nth(diagnostic.line.saturating_sub(1)) {
+                        let width = diagnostic.line.to_string().len();
+                        println!("{space:width$} |", space = "", width = width);
+                        println!("{} | {}", diagnostic.line, line);
+                        println!(
+                            "{space:width$} | {caret:>column$}",
+                            space = "",
+                            caret = "^",
+                            width = width,
+                            column = diagnostic.column
+                        );
+                        println!("{space:width$} |", space = "", width = width);
+                    }
+                }
+            }
+        }
+        OutputFormat::Concise => {
+            for diagnostic in diagnostics {
+                println!(
+                    "{}:{}:{}: NOD001 {}",
+                    diagnostic.path.display(),
+                    diagnostic.line,
+                    diagnostic.column,
+                    diagnostic.message
+                );
+            }
+        }
+        OutputFormat::Json => {
+            let json = diagnostics
+                .iter()
+                .map(|diagnostic| JsonDiagnostic {
+                    path: diagnostic.path.display().to_string(),
+                    line: diagnostic.line,
+                    column: diagnostic.column,
+                    code: "NOD001",
+                    message: &diagnostic.message,
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json).map_err(|error| error.to_string())?
+            );
+            return Ok(());
+        }
+        OutputFormat::Github => {
+            for diagnostic in diagnostics {
+                println!(
+                    "::error file={},line={},col={},title=NOD001::{}",
+                    github_escape_property(&diagnostic.path.display().to_string()),
+                    diagnostic.line,
+                    diagnostic.column,
+                    github_escape_message(&diagnostic.message)
+                );
+            }
+            return Ok(());
+        }
     }
     if !diagnostics.is_empty() {
         println!(
@@ -126,10 +239,124 @@ fn run() -> Result<bool, String> {
             if diagnostics.len() == 1 { "" } else { "s" }
         );
     }
-    Ok(!diagnostics.is_empty())
+    Ok(())
 }
 
-fn apply_fixes(diagnostics: &[Diagnostic]) -> Result<(), String> {
+fn github_escape_message(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+fn github_escape_property(value: &str) -> String {
+    github_escape_message(value)
+        .replace(':', "%3A")
+        .replace(',', "%2C")
+}
+
+struct FileSettings {
+    project_root: PathBuf,
+    private_only: bool,
+}
+
+fn settings_for_files(
+    files: &[PathBuf],
+    cli_private_only: bool,
+) -> Result<Vec<FileSettings>, String> {
+    let fallback_root = std::env::current_dir()
+        .map_err(|error| error.to_string())?
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let mut directory_cache: BTreeMap<PathBuf, Option<PathBuf>> = BTreeMap::new();
+    let mut config_cache: BTreeMap<PathBuf, LoadedConfig> = BTreeMap::new();
+    let mut settings = Vec::with_capacity(files.len());
+    for path in files {
+        let config_path = discover_config_path(path, &mut directory_cache)?;
+        let loaded = if let Some(config_path) = config_path {
+            if !config_cache.contains_key(&config_path) {
+                let loaded = load_config_path(&config_path)?;
+                config_cache.insert(config_path.clone(), loaded);
+            }
+            config_cache
+                .get(&config_path)
+                .cloned()
+                .ok_or_else(|| format!("configuration cache lost {}", config_path.display()))?
+        } else {
+            LoadedConfig {
+                root: fallback_root.clone(),
+                config: Config::default(),
+            }
+        };
+        let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
+        settings.push(FileSettings {
+            project_root: loaded.root.clone(),
+            private_only: cli_private_only || private_only_for(path, &loaded, &overrides),
+        });
+    }
+    Ok(settings)
+}
+
+fn discover_config_path(
+    file: &Path,
+    cache: &mut BTreeMap<PathBuf, Option<PathBuf>>,
+) -> Result<Option<PathBuf>, String> {
+    let absolute = std::fs::canonicalize(file)
+        .map_err(|error| format!("could not resolve {}: {error}", file.display()))?;
+    let mut directory = absolute.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let mut visited = Vec::new();
+    let found = loop {
+        if let Some(cached) = cache.get(&directory) {
+            break cached.clone();
+        }
+        visited.push(directory.clone());
+        let candidate = directory.join("pyproject.toml");
+        if candidate.is_file() && pyproject_has_config(&candidate)? {
+            break Some(candidate);
+        }
+        if !directory.pop() {
+            break None;
+        }
+    };
+    for directory in visited {
+        cache.insert(directory, found.clone());
+    }
+    Ok(found)
+}
+
+fn pyproject_has_config(path: &Path) -> Result<bool, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let value: toml::Value = toml::from_str(&text)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    Ok(value
+        .get("tool")
+        .and_then(|tool| tool.get("no_defaults"))
+        .is_some())
+}
+
+fn load_config_path(path: &Path) -> Result<LoadedConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let value: toml::Value = toml::from_str(&text)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    let table = value
+        .get("tool")
+        .and_then(|tool| tool.get("no_defaults"))
+        .cloned()
+        .ok_or_else(|| format!("{} does not contain [tool.no_defaults]", path.display()))?;
+    let config = table
+        .try_into()
+        .map_err(|error| format!("invalid [tool.no_defaults] in {}: {error}", path.display()))?;
+    Ok(LoadedConfig {
+        root: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+        config,
+    })
+}
+
+fn fixed_sources(
+    diagnostics: &[Diagnostic],
+) -> Result<BTreeMap<PathBuf, (String, String)>, String> {
     let mut by_path: BTreeMap<&Path, Vec<TextRange>> = BTreeMap::new();
     for diagnostic in diagnostics {
         by_path
@@ -137,57 +364,86 @@ fn apply_fixes(diagnostics: &[Diagnostic]) -> Result<(), String> {
             .or_default()
             .push(diagnostic.fix);
     }
-    for (path, mut ranges) in by_path {
-        let mut source = std::fs::read_to_string(path)
-            .map_err(|error| format!("could not read {} for fixing: {error}", path.display()))?;
-        ranges.sort_by_key(|range| std::cmp::Reverse(range.start()));
-        for range in ranges {
-            source.replace_range(range.start().to_usize()..range.end().to_usize(), "");
-        }
-        parse_module(&source).map_err(|error| {
+    by_path
+        .into_iter()
+        .map(|(path, mut ranges)| {
+            let source = std::fs::read_to_string(path).map_err(|error| {
+                format!("could not read {} for fixing: {error}", path.display())
+            })?;
+            let mut fixed = source.clone();
+            ranges.sort_by_key(|range| std::cmp::Reverse(range.start()));
+            for range in ranges {
+                fixed.replace_range(range.start().to_usize()..range.end().to_usize(), "");
+            }
+            parse_module(&fixed).map_err(|error| {
+                format!(
+                    "refusing to write invalid Python to {} after fixing: {error}",
+                    path.display()
+                )
+            })?;
+            Ok((path.to_path_buf(), (source, fixed)))
+        })
+        .collect()
+}
+
+fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Result<(), String> {
+    for (path, (_, fixed)) in changes {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let permissions = std::fs::metadata(&path)
+            .map_err(|error| {
+                format!(
+                    "could not inspect {} before fixing: {error}",
+                    path.display()
+                )
+            })?
+            .permissions();
+        let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
             format!(
-                "refusing to write invalid Python to {} after fixing: {error}",
+                "could not create temporary file beside {}: {error}",
                 path.display()
             )
         })?;
-        std::fs::write(path, source)
-            .map_err(|error| format!("could not write fixes to {}: {error}", path.display()))?;
+        temporary.write_all(fixed.as_bytes()).map_err(|error| {
+            format!(
+                "could not write temporary fix for {}: {error}",
+                path.display()
+            )
+        })?;
+        temporary.as_file().sync_all().map_err(|error| {
+            format!(
+                "could not sync temporary fix for {}: {error}",
+                path.display()
+            )
+        })?;
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .map_err(|error| {
+                format!(
+                    "could not preserve permissions while fixing {}: {error}",
+                    path.display()
+                )
+            })?;
+        temporary.persist(&path).map_err(|error| {
+            format!(
+                "could not atomically replace {}: {}",
+                path.display(),
+                error.error
+            )
+        })?;
     }
     Ok(())
 }
 
-fn load_config() -> Result<LoadedConfig, String> {
-    let mut directory = std::env::current_dir().map_err(|error| error.to_string())?;
-    loop {
-        let path = directory.join("pyproject.toml");
-        if path.is_file() {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-            let value: toml::Value = toml::from_str(&text)
-                .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-            let config = value
-                .get("tool")
-                .and_then(|tool| tool.get("no_defaults"))
-                .cloned()
-                .map_or_else(
-                    || Ok(Config::default()),
-                    |table| {
-                        table.try_into().map_err(|error| {
-                            format!("invalid [tool.no_defaults] in {}: {error}", path.display())
-                        })
-                    },
-                )?;
-            return Ok(LoadedConfig {
-                root: directory,
-                config,
-            });
-        }
-        if !directory.pop() {
-            return Ok(LoadedConfig {
-                root: std::env::current_dir().map_err(|error| error.to_string())?,
-                config: Config::default(),
-            });
-        }
+fn print_diffs(changes: &BTreeMap<PathBuf, (String, String)>) {
+    for (path, (source, fixed)) in changes {
+        print!(
+            "{}",
+            TextDiff::from_lines(source, fixed).unified_diff().header(
+                &format!("a/{}", path.display()),
+                &format!("b/{}", path.display())
+            )
+        );
     }
 }
 
@@ -226,7 +482,8 @@ fn compile_overrides(
 }
 
 fn private_only_for(path: &Path, loaded: &LoadedConfig, overrides: &[PerFileEnforcement]) -> bool {
-    let relative = path.strip_prefix(&loaded.root).unwrap_or(path);
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let relative = resolved.strip_prefix(&loaded.root).unwrap_or(&resolved);
     let filename = relative.file_name().unwrap_or_default();
     let selected = overrides
         .iter()
@@ -285,6 +542,9 @@ fn check_file(path: &Path, private_only: bool) -> Result<Vec<Diagnostic>, String
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let parsed = parse_module(&source)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    if has_file_noqa(&source) {
+        return Ok(Vec::new());
+    }
     let mut checker = Checker {
         path,
         source: &source,
@@ -297,6 +557,23 @@ fn check_file(path: &Path, private_only: bool) -> Result<Vec<Diagnostic>, String
         checker.visit_stmt(statement);
     }
     Ok(checker.diagnostics)
+}
+
+fn has_file_noqa(source: &str) -> bool {
+    source.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        let Some(directive) = line.strip_prefix('#').map(str::trim) else {
+            return false;
+        };
+        let Some(rest) = directive.strip_prefix("ruff: noqa") else {
+            return directive == "flake8: noqa";
+        };
+        let rest = rest.trim();
+        rest.is_empty()
+            || rest
+                .strip_prefix(':')
+                .is_some_and(|codes| codes.split(',').any(|code| code.trim() == "nod001"))
+    })
 }
 
 struct Checker<'a> {
@@ -664,13 +941,63 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let diagnostics = check_file(&path, false)?;
         assert_eq!(diagnostics.len(), 5);
-        apply_fixes(&diagnostics)?;
+        write_fixes_atomically(fixed_sources(&diagnostics)?)?;
         let fixed = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
         assert!(fixed.contains("def f(a: int, *, b): pass"));
         assert!(fixed.contains("a: int"));
         assert!(fixed.contains("b: int = field(repr=False)"));
         assert!(fixed.contains("c: int = field(kw_only=True)"));
         assert!(fixed.contains("not_a_field = 3"));
+        assert!(check_file(&directory.path().join("example.py"), false)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn multiline_fixes_are_idempotent_and_keep_comments() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.py");
+        std::fs::write(
+            &path,
+            "def f(\n    value: int = 1,  # useful comment\n    *,\n    flag=True,\n):\n    pass\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let diagnostics = check_file(&path, false)?;
+        write_fixes_atomically(fixed_sources(&diagnostics)?)?;
+        let fixed = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        assert!(fixed.contains("value: int,  # useful comment"));
+        assert!(fixed.contains("flag,"));
+        assert!(check_file(&path, false)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn file_level_noqa_suppresses_rule() {
+        assert!(has_file_noqa("# ruff: noqa: NOD001\ndef f(x=1): pass\n"));
+        assert!(!has_file_noqa("# ruff: noqa: E501\ndef f(x=1): pass\n"));
+    }
+
+    #[test]
+    fn closest_configuration_wins_for_each_file() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let nested = directory.path().join("package");
+        std::fs::create_dir(&nested).map_err(|error| error.to_string())?;
+        std::fs::write(
+            directory.path().join("pyproject.toml"),
+            "[tool.no_defaults]\nprivate_only = true\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            nested.join("pyproject.toml"),
+            "[tool.no_defaults]\nprivate_only = false\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let root_file = directory.path().join("root.py");
+        let nested_file = nested.join("nested.py");
+        std::fs::write(&root_file, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&nested_file, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
+        let settings = settings_for_files(&[root_file, nested_file], false)?;
+        assert!(settings[0].private_only);
+        assert!(!settings[1].private_only);
         Ok(())
     }
 }

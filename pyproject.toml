@@ -4,17 +4,23 @@ build-backend = "maturin"
 
 [project]
 name = "no-defaults"
-version = "0.2.0"
+version = "1.0.0"
 description = "A fast Python linter that forbids function and dataclass defaults."
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Adam Dangoor", email = "adamdangoor@gmail.com" }]
 requires-python = ">=3.9"
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Programming Language :: Rust",
   "Topic :: Software Development :: Quality Assurance",
 ]
@@ -23,6 +29,7 @@ keywords = ["lint", "defaults", "dataclasses", "pre-commit"]
 [project.urls]
 Source = "https://github.com/adamtheturtle/no-defaults"
 Issues = "https://github.com/adamtheturtle/no-defaults/issues"
+Changelog = "https://github.com/adamtheturtle/no-defaults/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 bindings = "bin"

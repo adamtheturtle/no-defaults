@@ -1,0 +1,22 @@
+name: Bug report
+description: Report incorrect diagnostics, fixes, crashes, or configuration behavior.
+title: "Bug: "
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: Reproduction
+      description: Include minimal Python, pyproject.toml, and the exact command.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: no-defaults version
+      placeholder: no-defaults 1.0.0
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true

@@ -1,3 +1,6 @@
+[![CI](https://github.com/adamtheturtle/no-defaults/actions/workflows/ci.yml/badge.svg)](https://github.com/adamtheturtle/no-defaults/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/no-defaults.svg)](https://pypi.org/project/no-defaults/)
+
 # no-defaults
 
 A fast, standalone Python linter that forbids defaults in function signatures and dataclasses.
@@ -18,17 +21,19 @@ class Job:
 ## Installation
 
 ```console
-uv tool install git+https://github.com/adamtheturtle/no-defaults
+uv tool install no-defaults
 ```
-
-This installs from GitHub; the initial release has not yet been published to PyPI.
 
 ## Usage
 
 ```console
 no-defaults .
 no-defaults --fix .
+no-defaults --diff .
 no-defaults --private-only src tests
+no-defaults --output-format json .
+no-defaults --output-format github .
+no-defaults --show-settings src/package/api.py
 ```
 
 Exit status is `0` when clean, `1` when violations are found, and `2` for an operational error.
@@ -48,7 +53,9 @@ retries: int = field(default=3, kw_only=True)
 retries: int = field(kw_only=True)
 ```
 
-After a successful fix, the command exits with status `0` and prints a Ruff-style summary such as `Found 2 errors (2 fixed, 0 remaining).`
+After a successful fix, the command exits with status `0` and prints a Ruff-style summary such as `Found 2 errors (2 fixed, 0 remaining).` Writes use an atomic same-directory replacement. `--diff` prints a unified diff, writes nothing, and exits with status `1` when changes are available.
+
+The default `full` output includes source excerpts and carets. `concise` emits one diagnostic per line, `json` emits a machine-readable array, and `github` emits workflow commands for GitHub Actions annotations.
 
 The linter detects defaults on positional-only, positional-or-keyword, and keyword-only parameters.
 For classes decorated with `@dataclass` or `@dataclasses.dataclass`, it detects assigned defaults plus `field(default=...)` and `field(default_factory=...)`.
@@ -60,6 +67,8 @@ Suppress an individual violation with either a blanket `# noqa` or the rule-spec
 def compatible(timeout=30):  # noqa: NOD001
     pass
 ```
+
+Suppress the rule for an entire file with `# ruff: noqa` or `# ruff: noqa: NOD001`.
 
 ## Configuration
 
@@ -80,12 +89,20 @@ Private means a name that starts with one underscore. In private-only mode, the 
 
 The `--private-only` CLI flag overrides the configuration for every checked file.
 
+Like Ruff, `no-defaults` discovers the closest `pyproject.toml` containing `[tool.no_defaults]` separately for each file. This supports monorepos with nested configuration; files without a local table continue searching parent directories.
+
+## Performance
+
+An optimized `1.0.0` development build checked a pinned Typeshed checkout containing 5,368 Python and stub files (12.5 MiB) in a median 0.29 seconds across five warm runs on an Apple Silicon Mac, or roughly 18,000 files per second. It produced 50,974 diagnostics; an earlier full-output measurement used approximately 41 MiB maximum RSS.
+
+The scheduled `Typeshed benchmark` workflow repeats this against a pinned upstream revision and fails on parser errors, unexpected results, or a gross performance regression.
+
 ## pre-commit
 
 ```yaml
 repos:
   - repo: https://github.com/adamtheturtle/no-defaults
-    rev: v0.2.0
+    rev: v1.0.0
     hooks:
       - id: no-defaults
 ```
@@ -93,3 +110,5 @@ repos:
 ## License
 
 MIT
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CHANGELOG.md](CHANGELOG.md).

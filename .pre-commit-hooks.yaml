@@ -1,0 +1,7 @@
+- id: no-defaults
+  name: no-defaults
+  description: Forbid function and dataclass defaults.
+  entry: no-defaults
+  language: python
+  types: [python]
+  require_serial: true

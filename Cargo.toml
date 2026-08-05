@@ -1,6 +1,6 @@
 [package]
 name = "no-defaults"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.83"
 description = "A fast Python linter that forbids function and dataclass defaults"
@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+globset = "0.4"
 ignore = "0.4"
 rayon = "1.12"
 ruff_python_ast = { package = "rustpython-ruff_python_ast", version = "0.15.8" }

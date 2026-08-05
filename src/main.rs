@@ -1,13 +1,15 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
+use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use ruff_python_ast::visitor::{walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
-use ruff_text_size::{Ranged, TextSize};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use serde::Deserialize;
 
 #[derive(Debug, Parser)]
@@ -20,12 +22,39 @@ struct Cli {
     /// Only enforce private (underscore-prefixed) functions, classes, and fields.
     #[arg(long)]
     private_only: bool,
+
+    /// Remove detected defaults automatically.
+    #[arg(long)]
+    fix: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Enforcement {
+    All,
+    Private,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 struct Config {
-    #[serde(default)]
+    #[serde(default, alias = "private-only")]
     private_only: bool,
+
+    #[serde(default, alias = "per-file-enforcement")]
+    per_file_enforcement: BTreeMap<String, Enforcement>,
+}
+
+struct LoadedConfig {
+    root: PathBuf,
+    config: Config,
+}
+
+struct PerFileEnforcement {
+    matcher: GlobMatcher,
+    negated: bool,
+    specificity: usize,
+    pattern: String,
+    enforcement: Enforcement,
 }
 
 #[derive(Debug)]
@@ -34,6 +63,7 @@ struct Diagnostic {
     line: usize,
     column: usize,
     message: String,
+    fix: TextRange,
 }
 
 fn main() -> ExitCode {
@@ -49,12 +79,19 @@ fn main() -> ExitCode {
 
 fn run() -> Result<bool, String> {
     let cli = Cli::parse();
-    let config = load_config()?;
-    let private_only = cli.private_only || config.private_only;
+    let loaded = load_config()?;
+    let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
     let files = collect_files(&cli.paths)?;
     let results: Vec<Result<Vec<Diagnostic>, String>> = files
         .par_iter()
-        .map(|path| check_file(path, private_only))
+        .map(|path| {
+            let private_only = if cli.private_only {
+                true
+            } else {
+                private_only_for(path, &loaded, &overrides)
+            };
+            check_file(path, private_only)
+        })
         .collect();
     let mut diagnostics = Vec::new();
     for result in results {
@@ -63,8 +100,18 @@ fn run() -> Result<bool, String> {
     diagnostics.sort_by(|left, right| {
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
+    if cli.fix && !diagnostics.is_empty() {
+        apply_fixes(&diagnostics)?;
+        println!(
+            "Found {} error{} ({} fixed, 0 remaining).",
+            diagnostics.len(),
+            if diagnostics.len() == 1 { "" } else { "s" },
+            diagnostics.len()
+        );
+        return Ok(false);
+    }
     for diagnostic in &diagnostics {
-        eprintln!(
+        println!(
             "{}:{}:{}: NOD001 {}",
             diagnostic.path.display(),
             diagnostic.line,
@@ -72,10 +119,44 @@ fn run() -> Result<bool, String> {
             diagnostic.message
         );
     }
+    if !diagnostics.is_empty() {
+        println!(
+            "Found {} error{}.",
+            diagnostics.len(),
+            if diagnostics.len() == 1 { "" } else { "s" }
+        );
+    }
     Ok(!diagnostics.is_empty())
 }
 
-fn load_config() -> Result<Config, String> {
+fn apply_fixes(diagnostics: &[Diagnostic]) -> Result<(), String> {
+    let mut by_path: BTreeMap<&Path, Vec<TextRange>> = BTreeMap::new();
+    for diagnostic in diagnostics {
+        by_path
+            .entry(&diagnostic.path)
+            .or_default()
+            .push(diagnostic.fix);
+    }
+    for (path, mut ranges) in by_path {
+        let mut source = std::fs::read_to_string(path)
+            .map_err(|error| format!("could not read {} for fixing: {error}", path.display()))?;
+        ranges.sort_by_key(|range| std::cmp::Reverse(range.start()));
+        for range in ranges {
+            source.replace_range(range.start().to_usize()..range.end().to_usize(), "");
+        }
+        parse_module(&source).map_err(|error| {
+            format!(
+                "refusing to write invalid Python to {} after fixing: {error}",
+                path.display()
+            )
+        })?;
+        std::fs::write(path, source)
+            .map_err(|error| format!("could not write fixes to {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn load_config() -> Result<LoadedConfig, String> {
     let mut directory = std::env::current_dir().map_err(|error| error.to_string())?;
     loop {
         let path = directory.join("pyproject.toml");
@@ -84,7 +165,7 @@ fn load_config() -> Result<Config, String> {
                 .map_err(|error| format!("could not read {}: {error}", path.display()))?;
             let value: toml::Value = toml::from_str(&text)
                 .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-            return value
+            let config = value
                 .get("tool")
                 .and_then(|tool| tool.get("no_defaults"))
                 .cloned()
@@ -95,11 +176,76 @@ fn load_config() -> Result<Config, String> {
                             format!("invalid [tool.no_defaults] in {}: {error}", path.display())
                         })
                     },
-                );
+                )?;
+            return Ok(LoadedConfig {
+                root: directory,
+                config,
+            });
         }
         if !directory.pop() {
-            return Ok(Config::default());
+            return Ok(LoadedConfig {
+                root: std::env::current_dir().map_err(|error| error.to_string())?,
+                config: Config::default(),
+            });
         }
+    }
+}
+
+fn compile_overrides(
+    configured: &BTreeMap<String, Enforcement>,
+) -> Result<Vec<PerFileEnforcement>, String> {
+    configured
+        .iter()
+        .map(|(configured_pattern, enforcement)| {
+            let (negated, pattern) = configured_pattern
+                .strip_prefix('!')
+                .map_or((false, configured_pattern.as_str()), |pattern| {
+                    (true, pattern)
+                });
+            if pattern.is_empty() {
+                return Err("per-file enforcement pattern must not be empty".to_owned());
+            }
+            let matcher = Glob::new(pattern)
+                .map_err(|error| {
+                    format!("invalid per-file enforcement pattern `{pattern}`: {error}")
+                })?
+                .compile_matcher();
+            let specificity = pattern
+                .chars()
+                .filter(|character| !matches!(character, '*' | '?' | '[' | ']' | '{' | '}'))
+                .count();
+            Ok(PerFileEnforcement {
+                matcher,
+                negated,
+                specificity,
+                pattern: pattern.to_owned(),
+                enforcement: *enforcement,
+            })
+        })
+        .collect()
+}
+
+fn private_only_for(path: &Path, loaded: &LoadedConfig, overrides: &[PerFileEnforcement]) -> bool {
+    let relative = path.strip_prefix(&loaded.root).unwrap_or(path);
+    let filename = relative.file_name().unwrap_or_default();
+    let selected = overrides
+        .iter()
+        .filter(|entry| {
+            let matched = if entry.pattern.contains('/') {
+                entry.matcher.is_match(relative)
+            } else {
+                entry.matcher.is_match(filename)
+            };
+            matched != entry.negated
+        })
+        .max_by(|left, right| {
+            (left.specificity, &left.pattern).cmp(&(right.specificity, &right.pattern))
+        })
+        .map(|entry| entry.enforcement);
+    match selected {
+        Some(Enforcement::All) => false,
+        Some(Enforcement::Private) => true,
+        None => loaded.config.private_only,
     }
 }
 
@@ -167,7 +313,7 @@ impl Checker<'_> {
         !self.private_only || self.private_scope || is_private(name)
     }
 
-    fn report(&mut self, offset: TextSize, message: String) {
+    fn report(&mut self, offset: TextSize, message: String, fix: TextRange) {
         if is_suppressed(self.source, offset) {
             return;
         }
@@ -177,6 +323,7 @@ impl Checker<'_> {
             line,
             column,
             message,
+            fix,
         });
     }
 
@@ -198,32 +345,29 @@ impl Checker<'_> {
                         "parameter `{}` of function `{}` has a default",
                         parameter.parameter.name, function.name
                     ),
+                    TextRange::new(parameter.parameter.end(), default.end()),
                 );
             }
         }
     }
 
     fn check_dataclass_field(&mut self, statement: &Stmt) {
-        let (name, value) = match statement {
-            Stmt::AnnAssign(assign) => match (&*assign.target, assign.value.as_deref()) {
-                (Expr::Name(name), Some(value)) => (name.id.as_str(), value),
-                _ => return,
-            },
-            Stmt::Assign(assign) if assign.targets.len() == 1 => match &assign.targets[0] {
-                Expr::Name(name) => (name.id.as_str(), &*assign.value),
-                _ => return,
-            },
-            _ => return,
+        let Stmt::AnnAssign(assign) = statement else {
+            return;
         };
-        if !self.enabled(name) || is_class_var(statement) {
+        let (Expr::Name(name), Some(value)) = (&*assign.target, assign.value.as_deref()) else {
+            return;
+        };
+        if !self.enabled(name.id.as_str()) || is_class_var(statement) {
             return;
         }
-        let Some(kind) = field_default_kind(value) else {
+        let Some(default) = field_default(value, assign.annotation.end()) else {
             return;
         };
         self.report(
             value.start(),
-            format!("dataclass field `{name}` has a {kind}"),
+            format!("dataclass field `{}` has a {}", name.id, default.kind),
+            default.fix,
         );
     }
 }
@@ -289,32 +433,84 @@ fn is_class_var(statement: &Stmt) -> bool {
                 || matches!(&*subscript.value, Expr::Attribute(attribute) if attribute.attr.as_str() == "ClassVar"))
 }
 
-fn field_default_kind(value: &Expr) -> Option<&'static str> {
+struct FieldDefault {
+    kind: &'static str,
+    fix: TextRange,
+}
+
+fn field_default(value: &Expr, annotation_end: TextSize) -> Option<FieldDefault> {
     let Expr::Call(call) = value else {
-        return Some("default");
+        return Some(FieldDefault {
+            kind: "default",
+            fix: TextRange::new(annotation_end, value.end()),
+        });
     };
     let is_field = matches!(&*call.func, Expr::Name(name) if name.id.as_str() == "field")
         || matches!(&*call.func, Expr::Attribute(attribute) if attribute.attr.as_str() == "field");
     if !is_field {
-        return Some("default");
+        return Some(FieldDefault {
+            kind: "default",
+            fix: TextRange::new(annotation_end, value.end()),
+        });
     }
-    if call.arguments.keywords.iter().any(|keyword| {
-        keyword
-            .arg
-            .as_ref()
-            .is_some_and(|name| name.as_str() == "default_factory")
-    }) {
-        Some("default factory")
-    } else if call.arguments.keywords.iter().any(|keyword| {
-        keyword
-            .arg
-            .as_ref()
-            .is_some_and(|name| name.as_str() == "default")
-    }) || !call.arguments.args.is_empty()
+    if let Some(first) = call.arguments.args.first() {
+        return Some(FieldDefault {
+            kind: "default",
+            fix: argument_removal_range(
+                first.range(),
+                call.arguments
+                    .args
+                    .get(1)
+                    .map(Ranged::range)
+                    .or_else(|| call.arguments.keywords.first().map(Ranged::range)),
+                None,
+            ),
+        });
+    }
+    let (index, keyword) = call
+        .arguments
+        .keywords
+        .iter()
+        .enumerate()
+        .find(|(_, keyword)| {
+            keyword
+                .arg
+                .as_ref()
+                .is_some_and(|name| matches!(name.as_str(), "default" | "default_factory"))
+        })?;
+    let kind = if keyword
+        .arg
+        .as_ref()
+        .is_some_and(|name| name.as_str() == "default_factory")
     {
-        Some("default")
+        "default factory"
     } else {
-        None
+        "default"
+    };
+    Some(FieldDefault {
+        kind,
+        fix: argument_removal_range(
+            keyword.range(),
+            call.arguments.keywords.get(index + 1).map(Ranged::range),
+            index
+                .checked_sub(1)
+                .and_then(|previous| call.arguments.keywords.get(previous))
+                .map(Ranged::range),
+        ),
+    })
+}
+
+fn argument_removal_range(
+    target: TextRange,
+    next: Option<TextRange>,
+    previous: Option<TextRange>,
+) -> TextRange {
+    if let Some(next) = next {
+        TextRange::new(target.start(), next.start())
+    } else if let Some(previous) = previous {
+        TextRange::new(previous.end(), target.end())
+    } else {
+        target
     }
 }
 
@@ -424,5 +620,57 @@ mod tests {
         assert!(is_private_module(Path::new("src/_package/__init__.py")));
         assert!(!is_private_module(Path::new("src/package/__init__.py")));
         assert!(!is_private_module(Path::new("src/package/module.py")));
+    }
+
+    #[test]
+    fn per_file_enforcement_supports_tests_all_src_private() -> Result<(), String> {
+        let loaded = LoadedConfig {
+            root: PathBuf::from("project"),
+            config: Config {
+                private_only: false,
+                per_file_enforcement: BTreeMap::from([
+                    ("src/**".to_owned(), Enforcement::Private),
+                    ("tests/**".to_owned(), Enforcement::All),
+                ]),
+            },
+        };
+        let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
+        assert!(!private_only_for(
+            Path::new("project/tests/test_api.py"),
+            &loaded,
+            &overrides
+        ));
+        assert!(private_only_for(
+            Path::new("project/src/package/api.py"),
+            &loaded,
+            &overrides
+        ));
+        assert!(!private_only_for(
+            Path::new("project/scripts/release.py"),
+            &loaded,
+            &overrides
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn fixes_function_and_dataclass_defaults_safely() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.py");
+        std::fs::write(
+            &path,
+            "from dataclasses import dataclass, field\n\ndef f(a: int = 1, *, b=2): pass\n\n@dataclass\nclass C:\n    a: int = 1\n    b: int = field(default=2, repr=False)\n    c: int = field(kw_only=True, default_factory=int)\n    not_a_field = 3\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let diagnostics = check_file(&path, false)?;
+        assert_eq!(diagnostics.len(), 5);
+        apply_fixes(&diagnostics)?;
+        let fixed = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        assert!(fixed.contains("def f(a: int, *, b): pass"));
+        assert!(fixed.contains("a: int"));
+        assert!(fixed.contains("b: int = field(repr=False)"));
+        assert!(fixed.contains("c: int = field(kw_only=True)"));
+        assert!(fixed.contains("not_a_field = 3"));
+        Ok(())
     }
 }

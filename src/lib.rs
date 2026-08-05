@@ -676,8 +676,13 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::FunctionDef(function) => {
                 self.check_function(function);
                 let old_private = self.private_scope;
+                let old_dataclass = self.dataclass_scope;
                 self.private_scope = old_private || is_private(function.name.as_str());
+                // Annotated assignments in a method body are locals, not
+                // fields, so field detection stops at the function boundary.
+                self.dataclass_scope = false;
                 walk_stmt(self, statement);
+                self.dataclass_scope = old_dataclass;
                 self.private_scope = old_private;
             }
             Stmt::ClassDef(class) => {
@@ -887,6 +892,46 @@ mod tests {
         )?;
         assert_eq!(found.len(), 2);
         assert!(found[1].contains("default factory"));
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_annotated_locals_in_dataclass_methods() -> Result<(), String> {
+        let found = messages(
+            "@dataclass\nclass C:\n x: int = 1\n def _validate(self) -> None:\n  seen: set[str] = set()\n  def inner() -> None:\n   nested: int = 0\n",
+            false,
+        )?;
+        assert_eq!(found, ["dataclass field `x` has a default"]);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_annotated_locals_in_async_dataclass_methods() -> Result<(), String> {
+        let found = messages(
+            "@dataclass\nclass C:\n async def _fetch(self) -> None:\n  chunks: list[str] = []\n",
+            false,
+        )?;
+        assert!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn detects_fields_of_dataclass_nested_in_a_method() -> Result<(), String> {
+        let found = messages(
+            "@dataclass\nclass C:\n def build(self) -> None:\n  local: int = 0\n  @dataclass\n  class Inner:\n   y: int = 2\n",
+            false,
+        )?;
+        assert_eq!(found, ["dataclass field `y` has a default"]);
+        Ok(())
+    }
+
+    #[test]
+    fn resumes_field_detection_after_a_method() -> Result<(), String> {
+        let found = messages(
+            "@dataclass\nclass C:\n def _validate(self) -> None:\n  local: int = 0\n after: int = 3\n",
+            false,
+        )?;
+        assert_eq!(found, ["dataclass field `after` has a default"]);
         Ok(())
     }
 

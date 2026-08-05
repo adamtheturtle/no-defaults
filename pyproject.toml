@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "no-defaults"
-version = "1.0.0"
+version = "1.0.1"
 description = "A fast Python linter that forbids function and dataclass defaults."
 readme = "README.md"
 license = "MIT"

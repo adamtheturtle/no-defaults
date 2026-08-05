@@ -18,8 +18,10 @@ class Job:
 ## Installation
 
 ```console
-pip install no-defaults
+uv tool install git+https://github.com/adamtheturtle/no-defaults
 ```
+
+This installs from GitHub; the initial release has not yet been published to PyPI.
 
 ## Usage
 

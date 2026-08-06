@@ -151,6 +151,20 @@ fn run() -> Result<bool, String> {
             if diagnostics.len() == 1 { "" } else { "s" },
             diagnostics.len()
         );
+        // Removing a default makes the argument required, but call sites are
+        // never rewritten, so callers that relied on it now fail at runtime.
+        let removed = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "NOD001")
+            .count();
+        if removed > 0 {
+            eprintln!(
+                "warning: {removed} default{} removed; call sites are not updated. \
+                 Callers relying on {} raise `TypeError`. Run your tests.",
+                if removed == 1 { "" } else { "s" },
+                if removed == 1 { "it" } else { "them" },
+            );
+        }
         return Ok(false);
     }
     report_diagnostics(&diagnostics, cli.output_format)?;

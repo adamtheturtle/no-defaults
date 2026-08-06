@@ -7,6 +7,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 ### Added
 
 - `NOD002` reports a `noqa` directive that names `NOD001` without suppressing anything, inline or file-level. `--fix` removes the directive, or just the `NOD001` code when the directive lists others. Blanket directives are never reported because they may belong to another linter, and a blanket `# ruff: noqa` or `# flake8: noqa` still silences the whole file.
+- `--fix` now warns that call sites are not updated when it removes defaults.
+
+### Documentation
+
+- Document that `--fix` rewrites signatures only, so callers that relied on a removed default fail at runtime.
 
 ## 1.0.1 - 2026-08-05
 

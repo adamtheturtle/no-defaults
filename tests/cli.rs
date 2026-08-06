@@ -65,3 +65,29 @@ fn diff_previews_without_writing() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(std::fs::read_to_string(path)?, "def f(value=1): pass\n");
     Ok(())
 }
+
+#[test]
+fn fix_warns_that_call_sites_are_not_updated() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def f(value=1): pass\ndef g(other=2): pass\n")?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("2 defaults removed"), "{stderr:?}");
+    assert!(stderr.contains("call sites are not updated"), "{stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn fix_does_not_warn_when_only_unused_directives_are_removed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def f(value):  # noqa: NOD001\n    pass\n")?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(!stderr.contains("call sites"), "{stderr:?}");
+    Ok(())
+}

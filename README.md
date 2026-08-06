@@ -95,6 +95,18 @@ src/example.py:1:21: NOD002 unused `noqa` directive for `NOD001`
 
 Only directives that name the code are checked. A blanket `# noqa` may exist for another linter, so it is never reported, and a blanket `# ruff: noqa` or `# flake8: noqa` silences every rule in the file, including this one. When `--fix` removes the last code from a directive, it removes the whole comment; otherwise it removes just `NOD001` from the list.
 
+### Using suppressions alongside Ruff
+
+`NOD001` is not a Ruff rule, so Ruff reports every `# noqa: NOD001` as `RUF102 Invalid rule code`.
+That diagnostic is fixable, which means `ruff check --fix` deletes the suppression comment and leaves the violation behind for `no-defaults` to report.
+
+Register the prefix as an external code so Ruff leaves the suppressions alone:
+
+```toml
+[tool.ruff]
+lint.external = [ "NOD" ]
+```
+
 ## Configuration
 
 Configuration lives in `pyproject.toml`:
@@ -109,6 +121,22 @@ private_only = true
 ```
 
 Private means a name that starts with one underscore. In private-only mode, the rule applies to private modules and packages, private functions and methods, all members of private classes, and private dataclass fields. For example, all defaults in `_module.py` and `_package/module.py` are checked. Dunder names such as `__init__.py` are not considered private by themselves.
+
+### Private modules that are re-exported publicly
+
+Privacy is decided from module and symbol names alone. A function defined in `_upload.py` counts as private even when the package's `__init__.py` re-exports it, whether through `__all__` or a plain import. Under `private_only = true` it is still checked, although its defaults are part of the public API, where removing one is a breaking change for callers.
+
+This is deliberate. `no-defaults` checks each file on its own, which is what lets it resolve configuration per file and stay fast when pre-commit passes only the changed files. It never reads `__init__.py` to work out which names a private module re-exports, so it cannot tell an internal helper from a re-exported one.
+
+Suppress the rule on the signatures that are public in practice:
+
+```python
+def upload(
+    *,
+    strategy: Strategy = Strategy.DIFF,  # noqa: NOD001
+) -> None:
+    """Re-exported from the package root, so the default is public API."""
+```
 
 `per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`. Use `"all"` to reject every default in matching files or `"private"` to reject defaults only in private scopes. Patterns without a slash match file names at any depth. An initial `!` negates a pattern. If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
 

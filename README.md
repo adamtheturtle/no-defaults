@@ -53,24 +53,44 @@ retries: int = field(default=3, kw_only=True)
 retries: int = field(kw_only=True)
 ```
 
-After a successful fix, the command exits with status `0` and prints a Ruff-style summary such as `Found 2 errors (2 fixed, 0 remaining).` Writes use an atomic same-directory replacement. `--diff` prints a unified diff, writes nothing, and exits with status `1` when changes are available.
+After a successful fix, the command exits with status `0` and prints a Ruff-style summary such as `Found 2 errors (2 fixed, 0 remaining).` followed by `Updated 3 call sites.` Writes use an atomic same-directory replacement. `--diff` prints a unified diff, writes nothing, and exits with status `1` when changes are available.
 
-### `--fix` does not update call sites
+### `--fix` updates call sites
 
-`--fix` rewrites signatures and nothing else. Removing a default makes that argument required, so every caller that omitted it now raises `TypeError` at runtime:
+Removing a default makes that argument required, so `--fix` also passes the removed default explicitly at every call it can see in the files you asked it to check:
 
 ```python
-def connect(timeout=30):     # becomes  def connect(timeout):
+def connect(host, timeout=30):     # becomes  def connect(host, timeout):
     ...
 
-connect()                    # TypeError: connect() missing 1 required positional argument
+connect("example.com")             # becomes  connect("example.com", timeout=30)
+connect("example.com", 5)          # already supplies it, so it is left alone
 ```
 
-The same applies to dataclass fields, which become required at construction. The fixed code still imports and still lints clean, so a warning is printed after fixing and **your test suite is what confirms the result**.
+The same applies to dataclass fields, which become required at construction: `Job("j")` becomes `Job("j", retries=3)`. A `default_factory` becomes the value it produces, so `field(default_factory=list)` adds `tags=[]` — a fresh list per call, which is what the factory gave you.
 
-Rewriting call sites would mean resolving every call to its definition across the whole project, which this per-file design deliberately avoids. It would not be sufficient either: for a function that is part of your public API, the callers that break are in other people's code.
+Arguments are appended as keywords wherever Python allows it, so the change is stable under later edits to the signature. Positional-only parameters are appended positionally instead.
 
-`--fix` is therefore safest under `private_only = true`, where the symbols it touches have no callers outside the project.
+Calls are resolved through the calling file's own imports, not by matching the bare name. A project with its own `connect` does not get `socket.connect` rewritten, and two modules that each define `helper` are told apart. A method is rewritten when reached through `self`, `cls`, or a class the file can name — `Client`, `api.Client`, or one imported by name — which is as far as the receiver's type can be known without inference. What each method already receives is accounted for, so `instance.fetch(url)` and `Client.fetch(instance, url)` are both filled in correctly, and a `staticmethod` is given nothing extra.
+
+Nothing is guessed. A call is left alone, with a warning naming the file and line, when
+
+- it cannot be tied to the definition that was fixed: an unrelated callable of the same name, a method on a receiver whose type is unknown such as `client.fetch(...)`, or a call through an import this run could not resolve;
+- the call unpacks `*args` or `**kwargs`, so what it already supplies is unknown;
+- the removed default is not a literal (`value=SENTINEL`, `path=Path.cwd()`), because repeating that text at the call site would depend on names the caller may not have imported, or would re-evaluate the expression;
+- a positional-only argument cannot be appended without reordering the call;
+- the dataclass inherits fields, whose order in the constructor the defining file cannot see;
+- the function is named without being called — a bare `@decorator`, or a callback passed as `run(cb)` — because Python calls it somewhere with no argument list to add to.
+
+Fields that `__init__` never accepts are never added to a call: `field(..., init=False)`, a `_: KW_ONLY` marker, and a class whose decorator says `init=False`.
+
+Class names are exempt from the named-without-being-called check, because they appear in annotations and `isinstance` checks constantly and none of those are calls.
+
+Two things `--fix` still cannot reach: **callers outside the files you checked** — for a function that is part of your public API, they are in other people's code — and **calls made dynamically**, through `getattr` or a variable holding the function. A warning after fixing says so, and **your test suite is what confirms the result**.
+
+`--fix` is therefore safest under `private_only = true`, where the symbols it touches have no callers outside the project, and it sees the most when you run it over the whole project at once. Under pre-commit, which passes only the changed files, a call in a file that did not change is not in the run and is not updated — run `no-defaults --fix .` by hand when you are removing a default that is called from elsewhere.
+
+`--diff` shows the call-site edits alongside the signature edits, and reports the same warnings, so you can preview the whole change before writing anything.
 
 The default `full` output includes source excerpts and carets. `concise` emits one diagnostic per line, `json` emits a machine-readable array, and `github` emits workflow commands for GitHub Actions annotations.
 
@@ -166,7 +186,7 @@ def upload(
     """Re-exported from the package root, so the default is public API."""
 ```
 
-`per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`. Use `"all"` to reject every default in matching files, `"private"` to reject defaults only in private scopes, or `"none"` to exempt matching files from the rule. `"none"` also wins over `--private-only`, so an exempt file stays exempt. Patterns without a slash match file names at any depth. An initial `!` negates a pattern. If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
+`per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`. Use `"all"` to reject every default in matching files, `"private"` to reject defaults only in private scopes, or `"none"` to exempt matching files from the rule. `"none"` also wins over `--private-only`, so an exempt file stays exempt. An exempt file keeps its own defaults, but its call sites are still updated when a callable it uses is fixed elsewhere: exemption decides which definitions are checked, not whether the file keeps working. Patterns without a slash match file names at any depth. An initial `!` negates a pattern. If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
 
 The `--private-only` CLI flag overrides the configuration for every checked file.
 

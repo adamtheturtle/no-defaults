@@ -78,7 +78,16 @@ def compatible(  # noqa: NOD001
     pass
 ```
 
-Decorators do not move that line, and the scope stops at the signature: nested functions and dataclass fields keep their own violations. A directive placed elsewhere in the signature, such as on the closing parenthesis, still applies only to its own line.
+A directive on the `class` line does the same for every field of a dataclass:
+
+```python
+@dataclass
+class Job:  # noqa: NOD001
+    retries: int = 3
+    tags: list[str] = field(default_factory=list)
+```
+
+Decorators do not move either line, and the scope stops at the signature or the class body: methods, nested functions, and nested dataclasses keep their own violations and need their own directives. A directive placed elsewhere in the signature, such as on the closing parenthesis, still applies only to its own line.
 
 Suppress the rule for an entire file with `# ruff: noqa` or `# ruff: noqa: NOD001`.
 

@@ -76,7 +76,7 @@ The default `full` output includes source excerpts and carets. `concise` emits o
 
 The linter detects defaults on positional-only, positional-or-keyword, and keyword-only parameters.
 For classes decorated with `@dataclass` or `@dataclasses.dataclass`, it detects assigned defaults plus `field(default=...)` and `field(default_factory=...)` in the class body.
-`ClassVar` assignments are ignored because they are not dataclass fields, and annotated assignments inside method bodies are ignored because they are locals.
+`ClassVar` assignments are ignored because they are not dataclass fields, whether the annotation is bare, qualified, or quoted as in `x: "ClassVar[int]" = 1`. Annotated assignments inside method bodies are ignored because they are locals.
 
 Suppress an individual violation with either a blanket `# noqa` or the rule-specific `# noqa: NOD001` on the line containing the default:
 

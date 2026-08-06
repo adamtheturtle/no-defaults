@@ -191,14 +191,16 @@ The `--respect-reexports` flag turns this on for every checked file, whatever th
 
 #### What counts as a re-export
 
-For each checked file, `no-defaults` reads the `__init__.py` of its directory and of each directory above it, stopping where the package does — at the first directory without an `__init__.py`. Walking back down, it stops again at the first private directory, because a name re-exported by `_internal/__init__.py` is no more reachable from outside than the module it came from.
+For each checked file, `no-defaults` reads the `__init__.py` of its directory and of each directory above it, stopping where the package does — at the first directory without an `__init__.py`. A private package seals what is inside it: a name re-exported by `_internal/__init__.py` is no more reachable from outside than the module it came from, and that holds for a public sub-package inside `_internal` too.
 
-In each of those files, these make a name public:
+In each of the files it reads, these make a name public:
 
 - an import that binds it, including `from . import x`, `from ._mod import x`, `import x.y as z`, and imports inside `try` or `if TYPE_CHECKING` blocks;
 - an entry in `__all__`, when `__all__` is written out as a list or tuple of string literals.
 
 A name treated as public is public wherever it is defined in that package. A public class carries its members with it — `class Client` re-exported from `_upload.py` keeps the defaults of `fetch`, but `_retry` is private by its own name and is still checked. A re-exported dataclass keeps its field defaults.
+
+A module or package re-exported under its own name counts too. `from . import _upload` makes `package._upload` reachable, so everything in `_upload.py` is treated as being in a public module and only names private in their own right are checked. The same applies to `from . import _internal`, which unseals the private package: its `__init__.py` is read after all.
 
 #### Limitations
 
@@ -211,7 +213,11 @@ The check is by name. It never resolves an import back to the module it came fro
 - **Deletions and rebinding are not tracked.** A name imported and then `del`-ed in `__init__.py` still counts as re-exported.
 - **Every `__init__.py` in the chain must parse.** One that does not is an error, the same as a checked file that does not parse.
 
-Reading these files costs one parse per directory containing checked files, done once and shared, and only in private-only mode with the option on.
+Reading these files costs one parse per package, shared by every checked file below it, and only in private-only mode with the option on. On the pinned Typeshed checkout described under [Performance](#performance) — 5,368 files across several thousand stub packages — `--private-only` takes a median 0.19 seconds and `--private-only --respect-reexports` a median 0.28 seconds, while dropping 4,579 diagnostics to 3,209. A package's `__init__.pyi` counts where there is no `__init__.py`, so a stub-only distribution is read the same way.
+
+#### Turning it on
+
+A signature that is now recognised as public no longer needs the `# noqa: NOD001` that was keeping it quiet, so those directives are reported as `NOD002` unused directives. That is the migration path from the workaround below: turn the option on, then run `--fix`, which removes them.
 
 Where a re-export is not detected, or where you want a public default checked anyway, the per-file levers still apply. Exempt the module:
 

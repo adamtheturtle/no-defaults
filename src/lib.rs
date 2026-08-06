@@ -617,7 +617,7 @@ fn settings_for_files(
         .map_err(|error| error.to_string())?;
     let mut directory_cache: BTreeMap<PathBuf, Option<PathBuf>> = BTreeMap::new();
     let mut config_cache: BTreeMap<PathBuf, LoadedConfig> = BTreeMap::new();
-    let mut reexport_cache: BTreeMap<PathBuf, Arc<Reexports>> = BTreeMap::new();
+    let mut reexport_cache: BTreeMap<PathBuf, PackageReexports> = BTreeMap::new();
     let mut settings = Vec::with_capacity(files.len());
     for path in files {
         let config_path = discover_config_path(path, &mut directory_cache)?;
@@ -644,13 +644,8 @@ fn settings_for_files(
         // else pays for reading them.
         let reexports = if respect_reexports && private_only == Some(true) {
             let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-            let directory = resolved.parent().unwrap_or(Path::new(".")).to_path_buf();
-            match reexport_cache.entry(directory.clone()) {
-                Entry::Occupied(entry) => Arc::clone(entry.get()),
-                Entry::Vacant(entry) => {
-                    Arc::clone(entry.insert(Arc::new(package_reexports(&directory)?)))
-                }
-            }
+            let directory = resolved.parent().unwrap_or(Path::new("."));
+            package_reexports(directory, &mut reexport_cache)?.names
         } else {
             Arc::new(Reexports::default())
         };
@@ -664,30 +659,65 @@ fn settings_for_files(
     Ok(settings)
 }
 
+/// What one package publishes, cached so each `__init__.py` is read once
+/// however many directories below it are checked.
+#[derive(Clone, Default)]
+struct PackageReexports {
+    names: Arc<Reexports>,
+    /// Whether a private package stands between this one and the outside. Its
+    /// own `__init__.py` then publishes nothing, and neither does any package
+    /// below it, however public their names are.
+    sealed: bool,
+}
+
 /// The names the `__init__.py` files above a file re-export.
 ///
-/// The walk stops where the package does, at the first directory without an
-/// `__init__.py`, and again on the way down at the first private directory:
-/// a name re-exported by `_internal/__init__.py` is no more reachable from
-/// outside than the module it came from.
-fn package_reexports(directory: &Path) -> Result<Reexports, String> {
-    let mut packages = Vec::new();
-    let mut current = directory.to_path_buf();
-    while current.join("__init__.py").is_file() {
-        packages.push(current.clone());
-        if !current.pop() {
-            break;
-        }
+/// Each directory's answer is its parent's plus its own `__init__.py`, so the
+/// walk stops where the package does: at the first directory without an
+/// `__init__.py`. A private package seals what is below it, because a name
+/// re-exported by `_internal/__init__.py` is no more reachable from outside
+/// than the module it came from — unless the package above re-exports
+/// `_internal` itself, which puts it back within reach.
+fn package_reexports(
+    directory: &Path,
+    cache: &mut BTreeMap<PathBuf, PackageReexports>,
+) -> Result<PackageReexports, String> {
+    let Some(init) = package_init(directory) else {
+        return Ok(PackageReexports::default());
+    };
+    if let Some(cached) = cache.get(directory) {
+        return Ok(cached.clone());
     }
-    let mut reexports = Reexports::default();
-    for package in packages.iter().rev() {
-        let name = package.file_name().unwrap_or_default().to_string_lossy();
-        if is_private(&name) {
-            break;
+    let parent = match directory.parent() {
+        Some(parent) => package_reexports(parent, cache)?,
+        None => PackageReexports::default(),
+    };
+    let name = directory.file_name().unwrap_or_default().to_string_lossy();
+    let sealed = parent.sealed || (is_private(&name) && !parent.names.covers(&name));
+    let package = if sealed {
+        PackageReexports {
+            names: parent.names,
+            sealed,
         }
-        collect_reexports(&package.join("__init__.py"), &mut reexports)?;
-    }
-    Ok(reexports)
+    } else {
+        let mut names = (*parent.names).clone();
+        collect_reexports(&init, &mut names)?;
+        PackageReexports {
+            names: Arc::new(names),
+            sealed,
+        }
+    };
+    cache.insert(directory.to_path_buf(), package.clone());
+    Ok(package)
+}
+
+/// The file that makes a directory a package, which is a stub in a stub-only
+/// distribution.
+fn package_init(directory: &Path) -> Option<PathBuf> {
+    ["__init__.py", "__init__.pyi"]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 fn collect_reexports(path: &Path, reexports: &mut Reexports) -> Result<(), String> {
@@ -1096,7 +1126,7 @@ fn check_source(
         private_only,
         reexports,
         scope: Scope {
-            private: is_private_module(path),
+            private: is_private_module(path, reexports),
             ..Scope::default()
         },
         header: None,
@@ -1574,11 +1604,19 @@ fn is_private(name: &str) -> bool {
     name.starts_with('_') && !name.starts_with("__")
 }
 
-fn is_private_module(path: &Path) -> bool {
+/// Whether the file's own path keeps everything in it out of the public API.
+///
+/// A private module or package that a package above re-exports under its own
+/// name — `from . import _upload` — is reachable as `package._upload`, so what
+/// it holds is public despite the underscore.
+fn is_private_module(path: &Path, reexports: &Reexports) -> bool {
     path.components().any(|component| {
         let component = component.as_os_str().to_string_lossy();
-        let name = component.strip_suffix(".py").unwrap_or(&component);
-        is_private(name)
+        let name = component
+            .strip_suffix(".py")
+            .or_else(|| component.strip_suffix(".pyi"))
+            .unwrap_or(&component);
+        is_private(name) && !reexports.covers(name)
     })
 }
 
@@ -2488,6 +2526,42 @@ mod tests {
     }
 
     #[test]
+    fn a_module_reexported_under_its_own_name_is_public() -> Result<(), String> {
+        // `from . import _upload` makes `package._upload.upload` reachable.
+        let source = "def upload(timeout=30): pass\ndef _helper(x=1): pass\n";
+        let found = private_module_messages(source, &["_upload"])?;
+        assert_eq!(
+            found,
+            ["parameter `x` of function `_helper` has a default"],
+            "a private name in a reachable module is still private"
+        );
+        assert_eq!(private_module_messages(source, &[])?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_directive_on_a_reexported_signature_becomes_unused() -> Result<(), String> {
+        let reexports = Reexports {
+            wildcard: false,
+            names: BTreeSet::from(["upload".to_owned()]),
+        };
+        let found = check_source(
+            Path::new("package/_upload.py"),
+            "def upload(timeout=30): pass  # noqa: NOD001\n",
+            true,
+            &reexports,
+            false,
+        )?;
+        let codes: Vec<&str> = found
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(codes, ["NOD002"]);
+        Ok(())
+    }
+
+    #[test]
     fn a_wildcard_reexport_makes_every_name_public() -> Result<(), String> {
         let reexports = Reexports {
             wildcard: true,
@@ -2520,7 +2594,7 @@ mod tests {
             "from ._upload import buried\n",
         )
         .map_err(|error| error.to_string())?;
-        let reexports = package_reexports(&internal)?;
+        let reexports = package_reexports(&internal, &mut BTreeMap::new())?.names;
         assert!(reexports.covers("send"));
         assert!(reexports.covers("Job"));
         assert!(reexports.covers("os"));
@@ -2539,14 +2613,89 @@ mod tests {
         std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         std::fs::write(root.join("__init__.py"), "from ._upload import *\n")
             .map_err(|error| error.to_string())?;
-        assert!(package_reexports(&root)?.wildcard);
+        assert!(
+            package_reexports(&root, &mut BTreeMap::new())?
+                .names
+                .wildcard
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_reexported_private_package_is_read_after_all() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        let internal = root.join("_internal");
+        let deeper = internal.join("deeper");
+        std::fs::create_dir_all(&deeper).map_err(|error| error.to_string())?;
+        std::fs::write(root.join("__init__.py"), "from . import _internal\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            internal.join("__init__.py"),
+            "from ._upload import reachable\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(deeper.join("__init__.py"), "from ._mod import deep\n")
+            .map_err(|error| error.to_string())?;
+        let mut cache = BTreeMap::new();
+        let reexports = package_reexports(&deeper, &mut cache)?.names;
+        assert!(reexports.covers("reachable"));
+        assert!(reexports.covers("deep"));
+        // Each package in the chain answered once, for the parent as well as
+        // for the directory that asked.
+        assert_eq!(cache.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_private_package_seals_the_public_ones_inside_it() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        let internal = root.join("_internal");
+        let deeper = internal.join("deeper");
+        std::fs::create_dir_all(&deeper).map_err(|error| error.to_string())?;
+        std::fs::write(root.join("__init__.py"), "from ._internal import shown\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(internal.join("__init__.py"), "").map_err(|error| error.to_string())?;
+        std::fs::write(deeper.join("__init__.py"), "from ._mod import buried\n")
+            .map_err(|error| error.to_string())?;
+        let package = package_reexports(&deeper, &mut BTreeMap::new())?;
+        assert!(package.sealed);
+        assert!(package.names.covers("shown"));
+        assert!(
+            !package.names.covers("buried"),
+            "a public package inside a private one is still out of reach"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stub_only_package_is_read_from_its_pyi_initializer() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        std::fs::write(
+            root.join("__init__.pyi"),
+            "from . import _upload\nfrom ._upload import upload\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let reexports = package_reexports(&root, &mut BTreeMap::new())?.names;
+        assert!(reexports.covers("upload"));
+        assert!(
+            !is_private_module(Path::new("package/_upload.pyi"), &reexports),
+            "a stub's extension must not hide the module name"
+        );
+        assert!(is_private_module(
+            Path::new("package/_other.pyi"),
+            &reexports
+        ));
         Ok(())
     }
 
     #[test]
     fn a_file_outside_a_package_has_no_reexports() -> Result<(), String> {
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let reexports = package_reexports(directory.path())?;
+        let reexports = package_reexports(directory.path(), &mut BTreeMap::new())?.names;
         assert!(reexports.names.is_empty());
         assert!(!reexports.wildcard);
         Ok(())
@@ -2565,11 +2714,26 @@ mod tests {
 
     #[test]
     fn recognizes_private_modules_and_packages() {
-        assert!(is_private_module(Path::new("src/_module.py")));
-        assert!(is_private_module(Path::new("src/_package/module.py")));
-        assert!(is_private_module(Path::new("src/_package/__init__.py")));
-        assert!(!is_private_module(Path::new("src/package/__init__.py")));
-        assert!(!is_private_module(Path::new("src/package/module.py")));
+        assert!(is_private_module(
+            Path::new("src/_module.py"),
+            &Reexports::default()
+        ));
+        assert!(is_private_module(
+            Path::new("src/_package/module.py"),
+            &Reexports::default()
+        ));
+        assert!(is_private_module(
+            Path::new("src/_package/__init__.py"),
+            &Reexports::default()
+        ));
+        assert!(!is_private_module(
+            Path::new("src/package/__init__.py"),
+            &Reexports::default()
+        ));
+        assert!(!is_private_module(
+            Path::new("src/package/module.py"),
+            &Reexports::default()
+        ));
     }
 
     #[test]

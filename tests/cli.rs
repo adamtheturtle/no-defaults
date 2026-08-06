@@ -406,3 +406,31 @@ fn show_settings_reports_reexport_handling() -> Result<(), Box<dyn std::error::E
     assert!(stdout.contains("respect-reexports = true"), "{stdout}");
     Ok(())
 }
+
+#[test]
+fn a_module_reexported_whole_keeps_its_public_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("package");
+    std::fs::create_dir_all(&package)?;
+    std::fs::write(
+        directory.path().join("pyproject.toml"),
+        "[tool.no_defaults]\nprivate_only = true\nrespect_reexports = true\n",
+    )?;
+    // The module itself is re-exported, so `package._upload.upload` is reachable.
+    std::fs::write(package.join("__init__.py"), "from . import _upload\n")?;
+    std::fs::write(
+        package.join("_upload.py"),
+        "def upload(timeout=30): pass\n\n\ndef _helper(retries=3): pass\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("function `_helper`"), "{stdout}");
+    assert!(!stdout.contains("function `upload`"), "{stdout}");
+    assert!(stdout.contains("Found 1 error."), "{stdout}");
+    Ok(())
+}

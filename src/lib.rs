@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::{walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
-use ruff_python_parser::parse_module;
+use ruff_python_parser::{parse_expression, parse_module};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
@@ -938,10 +938,32 @@ fn is_class_var(statement: &Stmt) -> bool {
     let Stmt::AnnAssign(assign) = statement else {
         return false;
     };
-    matches!(&*assign.annotation, Expr::Name(name) if name.id.as_str() == "ClassVar")
-        || matches!(&*assign.annotation, Expr::Subscript(subscript)
-            if matches!(&*subscript.value, Expr::Name(name) if name.id.as_str() == "ClassVar")
-                || matches!(&*subscript.value, Expr::Attribute(attribute) if attribute.attr.as_str() == "ClassVar"))
+    annotates_class_var(&assign.annotation)
+}
+
+/// Whether an annotation names `ClassVar`, bare, qualified, or quoted.
+///
+/// `dataclasses` resolves a string annotation textually, so
+/// `x: "ClassVar[int]" = 1` really is a class variable rather than a field.
+fn annotates_class_var(annotation: &Expr) -> bool {
+    match annotation {
+        Expr::Name(name) => name.id.as_str() == "ClassVar",
+        Expr::Attribute(attribute) => attribute.attr.as_str() == "ClassVar",
+        Expr::Subscript(subscript) => annotates_class_var(&subscript.value),
+        // Quoted annotations are only one level deep: the contents of
+        // `"ClassVar[int]"` are an expression, not another string. Surrounding
+        // whitespace is trimmed because `dataclasses` accepts it and the
+        // parser would reject the leading indentation.
+        Expr::StringLiteral(literal) => {
+            parse_expression(literal.value.to_str().trim()).is_ok_and(|parsed| {
+                match parsed.expr() {
+                    Expr::StringLiteral(_) => false,
+                    expression => annotates_class_var(expression),
+                }
+            })
+        }
+        _ => false,
+    }
 }
 
 struct FieldDefault {
@@ -1086,6 +1108,26 @@ mod tests {
         )?;
         assert_eq!(found.len(), 2);
         assert!(found[1].contains("default factory"));
+        Ok(())
+    }
+
+    #[test]
+    fn quoted_class_var_annotations_are_not_fields() -> Result<(), String> {
+        let found = messages(
+            "@dataclass\nclass C:\n a: \"ClassVar[int]\" = 1\n b: \"typing.ClassVar[int]\" = 2\n c: 'ClassVar' = 3\n d: \"  ClassVar[int]  \" = 4\n",
+            false,
+        )?;
+        assert!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn quoted_non_class_var_annotations_are_still_fields() -> Result<(), String> {
+        let found = messages(
+            "@dataclass\nclass C:\n a: \"int\" = 1\n b: \"NotClassVar[int]\" = 2\n c: \"((\" = 3\n",
+            false,
+        )?;
+        assert_eq!(found.len(), 3, "{found:?}");
         Ok(())
     }
 

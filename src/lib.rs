@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 use globset::{Glob, GlobMatcher};
@@ -30,6 +31,10 @@ struct Cli {
     /// Only enforce private (underscore-prefixed) functions, classes, and fields.
     #[arg(long)]
     private_only: bool,
+
+    /// In private-only mode, treat names an `__init__.py` re-exports as public.
+    #[arg(long)]
+    respect_reexports: bool,
 
     /// Remove detected defaults automatically.
     #[arg(long)]
@@ -69,6 +74,9 @@ struct Config {
     #[serde(default, alias = "private-only")]
     private_only: bool,
 
+    #[serde(default, alias = "respect-reexports")]
+    respect_reexports: bool,
+
     #[serde(default, alias = "per-file-enforcement")]
     per_file_enforcement: BTreeMap<String, Enforcement>,
 }
@@ -77,6 +85,26 @@ struct Config {
 struct LoadedConfig {
     root: PathBuf,
     config: Config,
+}
+
+/// The names that a package's `__init__.py` files make part of its public API.
+///
+/// Under `private_only` with `respect_reexports`, a name here is left alone
+/// wherever it is defined: a helper in `_upload.py` that the package root
+/// re-exports is public API, and its defaults are public API with it.
+#[derive(Clone, Debug, Default)]
+struct Reexports {
+    /// Whether a `from ... import *` stood in the way. The names behind it
+    /// cannot be listed without resolving the module, so every name counts as
+    /// re-exported.
+    wildcard: bool,
+    names: BTreeSet<String>,
+}
+
+impl Reexports {
+    fn covers(&self, name: &str) -> bool {
+        self.wildcard || self.names.contains(name)
+    }
 }
 
 struct PerFileEnforcement {
@@ -235,7 +263,7 @@ pub fn main() -> ExitCode {
 fn run() -> Result<bool, String> {
     let cli = Cli::parse();
     let files = collect_files(&cli.paths)?;
-    let settings = settings_for_files(&files, cli.private_only)?;
+    let settings = settings_for_files(&files, cli.private_only, cli.respect_reexports)?;
     if cli.show_settings {
         for (path, setting) in files.iter().zip(&settings) {
             println!("{}", path.display());
@@ -248,6 +276,7 @@ fn run() -> Result<bool, String> {
                     None => "none",
                 }
             );
+            println!("  respect-reexports = {}", setting.respect_reexports);
         }
         return Ok(false);
     }
@@ -262,7 +291,7 @@ fn run() -> Result<bool, String> {
             // about leaving the file broken at runtime.
             setting.private_only.map_or_else(
                 || Ok(Checked::default()),
-                |private_only| check_file(path, private_only, fixing),
+                |private_only| check_file(path, private_only, &setting.reexports, fixing),
             )
         })
         .collect();
@@ -571,11 +600,16 @@ struct FileSettings {
     project_root: PathBuf,
     /// `None` when the file is exempt from the rule entirely.
     private_only: Option<bool>,
+    respect_reexports: bool,
+    /// Empty unless the file is checked in private-only mode with
+    /// `respect_reexports`, which is the only combination that consults it.
+    reexports: Arc<Reexports>,
 }
 
 fn settings_for_files(
     files: &[PathBuf],
     cli_private_only: bool,
+    cli_respect_reexports: bool,
 ) -> Result<Vec<FileSettings>, String> {
     let fallback_root = std::env::current_dir()
         .map_err(|error| error.to_string())?
@@ -583,6 +617,7 @@ fn settings_for_files(
         .map_err(|error| error.to_string())?;
     let mut directory_cache: BTreeMap<PathBuf, Option<PathBuf>> = BTreeMap::new();
     let mut config_cache: BTreeMap<PathBuf, LoadedConfig> = BTreeMap::new();
+    let mut reexport_cache: BTreeMap<PathBuf, PackageReexports> = BTreeMap::new();
     let mut settings = Vec::with_capacity(files.len());
     for path in files {
         let config_path = discover_config_path(path, &mut directory_cache)?;
@@ -602,13 +637,178 @@ fn settings_for_files(
             }
         };
         let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
+        let private_only = private_only_for(path, &loaded, &overrides)
+            .map(|private_only| cli_private_only || private_only);
+        let respect_reexports = cli_respect_reexports || loaded.config.respect_reexports;
+        // Nothing else consults the package's `__init__.py` files, so nothing
+        // else pays for reading them.
+        let reexports = if respect_reexports && private_only == Some(true) {
+            let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            let directory = resolved.parent().unwrap_or(Path::new("."));
+            package_reexports(directory, &loaded.root, &mut reexport_cache)?.names
+        } else {
+            Arc::new(Reexports::default())
+        };
         settings.push(FileSettings {
             project_root: loaded.root.clone(),
-            private_only: private_only_for(path, &loaded, &overrides)
-                .map(|private_only| cli_private_only || private_only),
+            private_only,
+            respect_reexports,
+            reexports,
         });
     }
     Ok(settings)
+}
+
+/// What one package publishes, cached so each `__init__.py` is read once
+/// however many directories below it are checked.
+#[derive(Clone, Default)]
+struct PackageReexports {
+    names: Arc<Reexports>,
+    /// Whether a private package stands between this one and the outside. Its
+    /// own `__init__.py` then publishes nothing, and neither does any package
+    /// below it, however public their names are.
+    sealed: bool,
+}
+
+/// The names the `__init__.py` files above a file re-export.
+///
+/// Each directory's answer is its parent's plus its own `__init__.py`. A
+/// directory without one holds no names of its own but is still a link in the
+/// chain, because a namespace package under a regular one is imported through
+/// it, so the walk climbs to the project root rather than stopping at the
+/// first missing `__init__.py`. Outside the root — a file checked from an
+/// unrelated working directory — it follows the package chain as far as that
+/// reaches instead.
+///
+/// A private package seals what is below it, because a name re-exported by
+/// `_internal/__init__.py` is no more reachable from outside than the module
+/// it came from — unless the package above re-exports `_internal` itself,
+/// which puts it back within reach.
+fn package_reexports(
+    directory: &Path,
+    root: &Path,
+    cache: &mut BTreeMap<PathBuf, PackageReexports>,
+) -> Result<PackageReexports, String> {
+    if let Some(cached) = cache.get(directory) {
+        return Ok(cached.clone());
+    }
+    let init = package_init(directory);
+    let climbs = directory != root && (directory.starts_with(root) || init.is_some());
+    let inherited = match directory.parent().filter(|_| climbs) {
+        Some(parent) => package_reexports(parent, root, cache)?,
+        None => PackageReexports::default(),
+    };
+    let name = directory.file_name().unwrap_or_default().to_string_lossy();
+    // The directory the walk stops at is not reached by an import, so its own
+    // name says nothing about what is inside it.
+    let sealed =
+        inherited.sealed || (climbs && is_private(&name) && !inherited.names.covers(&name));
+    let package = match init {
+        Some(init) if !sealed => {
+            let mut names = (*inherited.names).clone();
+            collect_reexports(&init, &mut names)?;
+            PackageReexports {
+                names: Arc::new(names),
+                sealed,
+            }
+        }
+        _ => PackageReexports {
+            names: inherited.names,
+            sealed,
+        },
+    };
+    cache.insert(directory.to_path_buf(), package.clone());
+    Ok(package)
+}
+
+/// The file that makes a directory a package, which is a stub in a stub-only
+/// distribution.
+fn package_init(directory: &Path) -> Option<PathBuf> {
+    ["__init__.py", "__init__.pyi"]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn collect_reexports(path: &Path, reexports: &mut Reexports) -> Result<(), String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let parsed = parse_module(&source)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    let mut collector = ReexportCollector { reexports };
+    for statement in parsed.suite() {
+        collector.visit_stmt(statement);
+    }
+    Ok(())
+}
+
+/// Gathers what an `__init__.py` binds: imported names, and the strings of a
+/// literal `__all__`.
+struct ReexportCollector<'a> {
+    reexports: &'a mut Reexports,
+}
+
+impl ReexportCollector<'_> {
+    /// Add the entries of an `__all__` that is written out as a list or tuple
+    /// of string literals. One computed from a call or another module's
+    /// `__all__` says nothing this run can read.
+    fn collect_all(&mut self, value: &Expr) {
+        let elements = match value {
+            Expr::List(list) => &list.elts,
+            Expr::Tuple(tuple) => &tuple.elts,
+            _ => return,
+        };
+        for element in elements {
+            if let Expr::StringLiteral(string) = element {
+                self.reexports.names.insert(string.value.to_string());
+            }
+        }
+    }
+}
+
+fn is_dunder_all(target: &Expr) -> bool {
+    matches!(target, Expr::Name(name) if name.id.as_str() == "__all__")
+}
+
+impl<'a> Visitor<'a> for ReexportCollector<'_> {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        match statement {
+            Stmt::ImportFrom(import) => {
+                for alias in &import.names {
+                    if alias.name.as_str() == "*" {
+                        self.reexports.wildcard = true;
+                    } else {
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                        self.reexports.names.insert(bound.to_string());
+                    }
+                }
+            }
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    // `import a.b` binds `a`; `import a.b as c` binds `c`.
+                    let bound = alias.asname.as_ref().map_or_else(
+                        || alias.name.split('.').next().unwrap_or_default().to_owned(),
+                        ToString::to_string,
+                    );
+                    self.reexports.names.insert(bound);
+                }
+            }
+            Stmt::Assign(assign) if assign.targets.iter().any(is_dunder_all) => {
+                self.collect_all(&assign.value);
+            }
+            Stmt::AnnAssign(assign) if is_dunder_all(&assign.target) => {
+                if let Some(value) = assign.value.as_deref() {
+                    self.collect_all(value);
+                }
+            }
+            Stmt::AugAssign(assign) if is_dunder_all(&assign.target) => {
+                self.collect_all(&assign.value);
+            }
+            // Imports guarded by `try` or `if TYPE_CHECKING` re-export just as
+            // much as ones at the top level.
+            _ => walk_stmt(self, statement),
+        }
+    }
 }
 
 fn discover_config_path(
@@ -887,17 +1087,26 @@ fn is_python(path: &Path) -> bool {
 /// This is primarily exposed for performance benchmarks.
 #[doc(hidden)]
 pub fn lint_source(source: &str, private_only: bool) -> Result<usize, String> {
-    Ok(
-        check_source(Path::new("benchmark.py"), source, private_only, false)?
-            .diagnostics
-            .len(),
-    )
+    Ok(check_source(
+        Path::new("benchmark.py"),
+        source,
+        private_only,
+        &Reexports::default(),
+        false,
+    )?
+    .diagnostics
+    .len())
 }
 
-fn check_file(path: &Path, private_only: bool, signatures: bool) -> Result<Checked, String> {
+fn check_file(
+    path: &Path,
+    private_only: bool,
+    reexports: &Reexports,
+    signatures: bool,
+) -> Result<Checked, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    check_source(path, &source, private_only, signatures)
+    check_source(path, &source, private_only, reexports, signatures)
 }
 
 /// Check one file. `signatures` records what each fixed callable looks like so
@@ -907,6 +1116,7 @@ fn check_source(
     path: &Path,
     source: &str,
     private_only: bool,
+    reexports: &Reexports,
     signatures: bool,
 ) -> Result<Checked, String> {
     let parsed = parse_module(source)
@@ -924,8 +1134,9 @@ fn check_source(
         path,
         source,
         private_only,
+        reexports,
         scope: Scope {
-            private: is_private_module(path),
+            private: is_private_module(path, reexports),
             ..Scope::default()
         },
         header: None,
@@ -1083,6 +1294,10 @@ struct Checker<'a> {
     path: &'a Path,
     source: &'a str,
     private_only: bool,
+    /// The names the enclosing package re-exports, which are public API
+    /// whichever module they are defined in. Empty unless `respect_reexports`
+    /// is on.
+    reexports: &'a Reexports,
     scope: Scope,
     /// Start of the `def` or `class` line that owns the violations being
     /// reported, so one directive there can cover every parameter of a
@@ -1124,7 +1339,18 @@ struct ClassCollector {
 
 impl Checker<'_> {
     fn enabled(&self, name: &str) -> bool {
-        !self.private_only || self.scope.private || is_private(name)
+        if !self.private_only {
+            return true;
+        }
+        // A re-exported name is public API however private its module is.
+        !self.reexports.covers(name) && (self.scope.private || is_private(name))
+    }
+
+    /// Whether definitions inside `name` are private, given the scope holding
+    /// it. A re-exported class or function carries everything it contains into
+    /// the public API with it.
+    fn encloses_private(&self, name: &str, outer: Scope) -> bool {
+        !self.reexports.covers(name) && (outer.private || is_private(name))
     }
 
     /// Mark the directives that suppress a violation at `offset`, preferring
@@ -1320,7 +1546,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.check_function(function);
                 let outer = self.scope;
                 self.scope = Scope {
-                    private: outer.private || is_private(function.name.as_str()),
+                    private: self.encloses_private(function.name.as_str(), outer),
                     // Annotated assignments in a method body are locals, not
                     // fields, so field detection stops at the function boundary.
                     dataclass: false,
@@ -1336,7 +1562,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // directive covering every field sits on.
                 self.header = Some(line_start(self.source, class.name.start()));
                 self.scope = Scope {
-                    private: outer.private || is_private(class.name.as_str()),
+                    private: self.encloses_private(class.name.as_str(), outer),
                     dataclass: has_dataclass_decorator(class),
                     class_body: true,
                 };
@@ -1388,11 +1614,19 @@ fn is_private(name: &str) -> bool {
     name.starts_with('_') && !name.starts_with("__")
 }
 
-fn is_private_module(path: &Path) -> bool {
+/// Whether the file's own path keeps everything in it out of the public API.
+///
+/// A private module or package that a package above re-exports under its own
+/// name — `from . import _upload` — is reachable as `package._upload`, so what
+/// it holds is public despite the underscore.
+fn is_private_module(path: &Path, reexports: &Reexports) -> bool {
     path.components().any(|component| {
         let component = component.as_os_str().to_string_lossy();
-        let name = component.strip_suffix(".py").unwrap_or(&component);
-        is_private(name)
+        let name = component
+            .strip_suffix(".py")
+            .or_else(|| component.strip_suffix(".pyi"))
+            .unwrap_or(&component);
+        is_private(name) && !reexports.covers(name)
     })
 }
 
@@ -2082,21 +2316,31 @@ mod tests {
     use super::*;
 
     fn messages(source: &str, private_only: bool) -> Result<Vec<String>, String> {
-        Ok(
-            check_source(Path::new("fixture.py"), source, private_only, false)?
-                .diagnostics
-                .into_iter()
-                .map(|item| item.message)
-                .collect(),
-        )
+        Ok(check_source(
+            Path::new("fixture.py"),
+            source,
+            private_only,
+            &Reexports::default(),
+            false,
+        )?
+        .diagnostics
+        .into_iter()
+        .map(|item| item.message)
+        .collect())
     }
 
     fn codes(source: &str) -> Result<Vec<&'static str>, String> {
-        Ok(check_source(Path::new("fixture.py"), source, false, false)?
-            .diagnostics
-            .into_iter()
-            .map(|item| item.code)
-            .collect())
+        Ok(check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            &Reexports::default(),
+            false,
+        )?
+        .diagnostics
+        .into_iter()
+        .map(|item| item.code)
+        .collect())
     }
 
     /// Fix every file in `directory` the way `--fix` does, and report the calls
@@ -2105,7 +2349,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         let mut signatures = Vec::new();
         for path in files {
-            let checked = check_file(path, false, true)?;
+            let checked = check_file(path, false, &Reexports::default(), true)?;
             diagnostics.extend(checked.diagnostics);
             signatures.extend(checked.signatures);
         }
@@ -2124,7 +2368,9 @@ mod tests {
         write_fixes_atomically(fixed_sources(call_sites.edits, &mut updated)?)?;
         for path in files {
             assert!(
-                check_file(path, false, false)?.diagnostics.is_empty(),
+                check_file(path, false, &Reexports::default(), false)?
+                    .diagnostics
+                    .is_empty(),
                 "{}",
                 path.display()
             );
@@ -2239,6 +2485,269 @@ mod tests {
         Ok(())
     }
 
+    /// The violations found in a private module whose package re-exports the
+    /// given names.
+    fn private_module_messages(source: &str, reexported: &[&str]) -> Result<Vec<String>, String> {
+        let reexports = Reexports {
+            wildcard: false,
+            names: reexported.iter().map(|name| (*name).to_owned()).collect(),
+        };
+        Ok(check_source(
+            Path::new("package/_upload.py"),
+            source,
+            true,
+            &reexports,
+            false,
+        )?
+        .diagnostics
+        .into_iter()
+        .map(|item| item.message)
+        .collect())
+    }
+
+    #[test]
+    fn a_reexported_name_is_public_however_private_its_module_is() -> Result<(), String> {
+        let source = "def upload(timeout=30): pass\ndef helper(x=1): pass\n";
+        let found = private_module_messages(source, &["upload"])?;
+        assert_eq!(found, ["parameter `x` of function `helper` has a default"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_reexported_class_carries_its_members_into_the_public_api() -> Result<(), String> {
+        let source =
+            "class _Client:\n def fetch(self, retries=3): pass\n def _retry(self, x=1): pass\n";
+        let found = private_module_messages(source, &["_Client"])?;
+        assert_eq!(
+            found,
+            ["parameter `x` of function `_retry` has a default"],
+            "a private method of a public class is still private"
+        );
+        assert_eq!(private_module_messages(source, &[])?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_reexported_dataclass_keeps_its_field_defaults() -> Result<(), String> {
+        let source = "@dataclass\nclass Job:\n retries: int = 3\n";
+        assert!(private_module_messages(source, &["Job"])?.is_empty());
+        assert_eq!(private_module_messages(source, &[])?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_module_reexported_under_its_own_name_is_public() -> Result<(), String> {
+        // `from . import _upload` makes `package._upload.upload` reachable.
+        let source = "def upload(timeout=30): pass\ndef _helper(x=1): pass\n";
+        let found = private_module_messages(source, &["_upload"])?;
+        assert_eq!(
+            found,
+            ["parameter `x` of function `_helper` has a default"],
+            "a private name in a reachable module is still private"
+        );
+        assert_eq!(private_module_messages(source, &[])?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_directive_on_a_reexported_signature_becomes_unused() -> Result<(), String> {
+        let reexports = Reexports {
+            wildcard: false,
+            names: BTreeSet::from(["upload".to_owned()]),
+        };
+        let found = check_source(
+            Path::new("package/_upload.py"),
+            "def upload(timeout=30): pass  # noqa: NOD001\n",
+            true,
+            &reexports,
+            false,
+        )?;
+        let codes: Vec<&str> = found
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(codes, ["NOD002"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_wildcard_reexport_makes_every_name_public() -> Result<(), String> {
+        let reexports = Reexports {
+            wildcard: true,
+            names: BTreeSet::new(),
+        };
+        let found = check_source(
+            Path::new("package/_upload.py"),
+            "def _helper(x=1): pass\n",
+            true,
+            &reexports,
+            false,
+        )?;
+        assert!(found.diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn reexports_are_read_from_public_package_initializers() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        let internal = root.join("_internal");
+        std::fs::create_dir_all(&internal).map_err(|error| error.to_string())?;
+        std::fs::write(
+            root.join("__init__.py"),
+            "import os\nfrom ._internal import upload as send\n__all__ = [\"send\", \"Job\"]\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            internal.join("__init__.py"),
+            "from ._upload import buried\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let reexports = package_reexports(&internal, directory.path(), &mut BTreeMap::new())?.names;
+        assert!(reexports.covers("send"));
+        assert!(reexports.covers("Job"));
+        assert!(reexports.covers("os"));
+        assert!(
+            !reexports.covers("buried"),
+            "a private package re-exports nothing to the outside"
+        );
+        assert!(!reexports.wildcard);
+        Ok(())
+    }
+
+    #[test]
+    fn a_star_import_in_an_initializer_sets_the_wildcard() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        std::fs::write(root.join("__init__.py"), "from ._upload import *\n")
+            .map_err(|error| error.to_string())?;
+        assert!(
+            package_reexports(&root, directory.path(), &mut BTreeMap::new())?
+                .names
+                .wildcard
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_reexported_private_package_is_read_after_all() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        let internal = root.join("_internal");
+        let deeper = internal.join("deeper");
+        std::fs::create_dir_all(&deeper).map_err(|error| error.to_string())?;
+        std::fs::write(root.join("__init__.py"), "from . import _internal\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            internal.join("__init__.py"),
+            "from ._upload import reachable\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(deeper.join("__init__.py"), "from ._mod import deep\n")
+            .map_err(|error| error.to_string())?;
+        let mut cache = BTreeMap::new();
+        let reexports = package_reexports(&deeper, directory.path(), &mut cache)?.names;
+        assert!(reexports.covers("reachable"));
+        assert!(reexports.covers("deep"));
+        // Each directory in the chain answered once, for the ancestors as well
+        // as for the directory that asked: the three packages and the root the
+        // walk stopped at.
+        assert_eq!(cache.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_namespace_package_does_not_break_the_chain() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        // `data` has no `__init__.py`, but `package.data._mod` is imported
+        // through it all the same.
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).map_err(|error| error.to_string())?;
+        std::fs::write(root.join("__init__.py"), "from .data._mod import upload\n")
+            .map_err(|error| error.to_string())?;
+        let reexports = package_reexports(&data, directory.path(), &mut BTreeMap::new())?.names;
+        assert!(reexports.covers("upload"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_project_root() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("project");
+        let package = root.join("package");
+        std::fs::create_dir_all(&package).map_err(|error| error.to_string())?;
+        // An `__init__.py` above the root belongs to no package this run knows.
+        std::fs::write(
+            directory.path().join("__init__.py"),
+            "from ._outer import far\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(package.join("__init__.py"), "from ._upload import near\n")
+            .map_err(|error| error.to_string())?;
+        let reexports = package_reexports(&package, &root, &mut BTreeMap::new())?.names;
+        assert!(reexports.covers("near"));
+        assert!(!reexports.covers("far"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_private_package_seals_the_public_ones_inside_it() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        let internal = root.join("_internal");
+        let deeper = internal.join("deeper");
+        std::fs::create_dir_all(&deeper).map_err(|error| error.to_string())?;
+        std::fs::write(root.join("__init__.py"), "from ._internal import shown\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(internal.join("__init__.py"), "").map_err(|error| error.to_string())?;
+        std::fs::write(deeper.join("__init__.py"), "from ._mod import buried\n")
+            .map_err(|error| error.to_string())?;
+        let package = package_reexports(&deeper, directory.path(), &mut BTreeMap::new())?;
+        assert!(package.sealed);
+        assert!(package.names.covers("shown"));
+        assert!(
+            !package.names.covers("buried"),
+            "a public package inside a private one is still out of reach"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stub_only_package_is_read_from_its_pyi_initializer() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        std::fs::write(
+            root.join("__init__.pyi"),
+            "from . import _upload\nfrom ._upload import upload\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let reexports = package_reexports(&root, directory.path(), &mut BTreeMap::new())?.names;
+        assert!(reexports.covers("upload"));
+        assert!(
+            !is_private_module(Path::new("package/_upload.pyi"), &reexports),
+            "a stub's extension must not hide the module name"
+        );
+        assert!(is_private_module(
+            Path::new("package/_other.pyi"),
+            &reexports
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_outside_a_package_has_no_reexports() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let reexports =
+            package_reexports(directory.path(), directory.path(), &mut BTreeMap::new())?.names;
+        assert!(reexports.names.is_empty());
+        assert!(!reexports.wildcard);
+        Ok(())
+    }
+
     #[test]
     fn noqa_suppresses_blanket_and_selected_violations() -> Result<(), String> {
         let found = messages(
@@ -2252,11 +2761,26 @@ mod tests {
 
     #[test]
     fn recognizes_private_modules_and_packages() {
-        assert!(is_private_module(Path::new("src/_module.py")));
-        assert!(is_private_module(Path::new("src/_package/module.py")));
-        assert!(is_private_module(Path::new("src/_package/__init__.py")));
-        assert!(!is_private_module(Path::new("src/package/__init__.py")));
-        assert!(!is_private_module(Path::new("src/package/module.py")));
+        assert!(is_private_module(
+            Path::new("src/_module.py"),
+            &Reexports::default()
+        ));
+        assert!(is_private_module(
+            Path::new("src/_package/module.py"),
+            &Reexports::default()
+        ));
+        assert!(is_private_module(
+            Path::new("src/_package/__init__.py"),
+            &Reexports::default()
+        ));
+        assert!(!is_private_module(
+            Path::new("src/package/__init__.py"),
+            &Reexports::default()
+        ));
+        assert!(!is_private_module(
+            Path::new("src/package/module.py"),
+            &Reexports::default()
+        ));
     }
 
     #[test]
@@ -2265,6 +2789,7 @@ mod tests {
             root: PathBuf::from("project"),
             config: Config {
                 private_only: false,
+                respect_reexports: false,
                 per_file_enforcement: BTreeMap::from([
                     ("src/**".to_owned(), Enforcement::Private),
                     ("tests/**".to_owned(), Enforcement::All),
@@ -2293,6 +2818,7 @@ mod tests {
             root: PathBuf::from("project"),
             config: Config {
                 private_only: true,
+                respect_reexports: false,
                 per_file_enforcement: BTreeMap::from([(
                     "src/package/_compat.py".to_owned(),
                     Enforcement::None,
@@ -2330,7 +2856,7 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let exempt = root.join("exempt.py");
         std::fs::write(&exempt, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
-        let settings = settings_for_files(&[exempt], true)?;
+        let settings = settings_for_files(&[exempt], true, false)?;
         assert_eq!(settings[0].private_only, None);
         Ok(())
     }
@@ -2344,7 +2870,12 @@ mod tests {
             "from dataclasses import dataclass, field\n\ndef f(a: int = 1, *, b=2): pass\n\n@dataclass\nclass C:\n    a: int = 1\n    b: int = field(default=2, repr=False)\n    c: int = field(kw_only=True, default_factory=int)\n    not_a_field = 3\n",
         )
         .map_err(|error| error.to_string())?;
-        assert_eq!(check_file(&path, false, false)?.diagnostics.len(), 5);
+        assert_eq!(
+            check_file(&path, false, &Reexports::default(), false)?
+                .diagnostics
+                .len(),
+            5
+        );
         fix_all(std::slice::from_ref(&path))?;
         let fixed = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
         assert!(fixed.contains("def f(a: int, *, b): pass"));
@@ -2515,6 +3046,7 @@ mod tests {
             Path::new("fixture.py"),
             "def public(x=1): pass  # noqa: NOD001\n",
             true,
+            &Reexports::default(),
             false,
         )?;
         assert_eq!(
@@ -2796,7 +3328,7 @@ mod tests {
         let nested_file = nested.join("nested.py");
         std::fs::write(&root_file, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
         std::fs::write(&nested_file, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
-        let settings = settings_for_files(&[root_file, nested_file], false)?;
+        let settings = settings_for_files(&[root_file, nested_file], false, false)?;
         assert_eq!(settings[0].private_only, Some(true));
         assert_eq!(settings[1].private_only, Some(false));
         Ok(())

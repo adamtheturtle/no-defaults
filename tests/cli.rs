@@ -311,3 +311,98 @@ fn fix_does_not_warn_when_only_unused_directives_are_removed(
     assert!(!stderr.contains("call sites"), "{stderr:?}");
     Ok(())
 }
+
+/// A project whose package root re-exports a helper defined in a private
+/// module, so the helper's defaults are public API.
+fn reexporting_project(respect_reexports: bool) -> Result<tempfile::TempDir, std::io::Error> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("package");
+    std::fs::create_dir_all(&package)?;
+    std::fs::write(
+        directory.path().join("pyproject.toml"),
+        format!(
+            "[tool.no_defaults]\nprivate_only = true\nrespect_reexports = {respect_reexports}\n"
+        ),
+    )?;
+    std::fs::write(
+        package.join("__init__.py"),
+        "from ._upload import upload\n\n__all__ = [\"upload\"]\n",
+    )?;
+    std::fs::write(
+        package.join("_upload.py"),
+        "def upload(timeout=30): pass\n\n\ndef _helper(retries=3): pass\n",
+    )?;
+    Ok(directory)
+}
+
+#[test]
+fn respect_reexports_leaves_publicly_reexported_defaults_alone(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = reexporting_project(true)?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("function `_helper`"), "{stdout}");
+    assert!(!stdout.contains("function `upload`"), "{stdout}");
+    assert!(stdout.contains("Found 1 error."), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn without_respect_reexports_a_private_module_is_checked_whole(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = reexporting_project(false)?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("function `upload`"), "{stdout}");
+    assert!(stdout.contains("Found 2 errors."), "{stdout}");
+    // The flag turns it on for every checked file, whatever the file says.
+    let output = Command::new(binary())
+        .arg("--respect-reexports")
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("Found 1 error."), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn fix_leaves_a_reexported_default_in_place() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = reexporting_project(true)?;
+    let upload = directory.path().join("package/_upload.py");
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&upload)?,
+        "def upload(timeout=30): pass\n\n\ndef _helper(retries): pass\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn show_settings_reports_reexport_handling() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = reexporting_project(true)?;
+    let output = Command::new(binary())
+        .arg("--show-settings")
+        .arg(directory.path().join("package/_upload.py"))
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("enforcement = private"), "{stdout}");
+    assert!(stdout.contains("respect-reexports = true"), "{stdout}");
+    Ok(())
+}

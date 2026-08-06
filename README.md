@@ -31,6 +31,7 @@ no-defaults .
 no-defaults --fix .
 no-defaults --diff .
 no-defaults --private-only src tests
+no-defaults --private-only --respect-reexports src
 no-defaults --output-format json .
 no-defaults --output-format github .
 no-defaults --show-settings src/package/api.py
@@ -88,7 +89,7 @@ Class names are exempt from the named-without-being-called check, because they a
 
 Two things `--fix` still cannot reach: **callers outside the files you checked** — for a function that is part of your public API, they are in other people's code — and **calls made dynamically**, through `getattr` or a variable holding the function. A warning after fixing says so, and **your test suite is what confirms the result**.
 
-`--fix` is therefore safest under `private_only = true`, where the symbols it touches have no callers outside the project, and it sees the most when you run it over the whole project at once. Under pre-commit, which passes only the changed files, a call in a file that did not change is not in the run and is not updated — run `no-defaults --fix .` by hand when you are removing a default that is called from elsewhere.
+`--fix` is therefore safest under `private_only = true` with `respect_reexports = true`, where the symbols it touches have no callers outside the project, and it sees the most when you run it over the whole project at once. Under pre-commit, which passes only the changed files, a call in a file that did not change is not in the run and is not updated — run `no-defaults --fix .` by hand when you are removing a default that is called from elsewhere.
 
 `--diff` shows the call-site edits alongside the signature edits, and reports the same warnings, so you can preview the whole change before writing anything.
 
@@ -155,6 +156,7 @@ Configuration lives in `pyproject.toml`:
 ```toml
 [tool.no_defaults]
 private_only = true
+respect_reexports = true
 
 [tool.no_defaults.per_file_enforcement]
 "tests/**" = "all"
@@ -165,11 +167,53 @@ Private means a name that starts with one underscore. In private-only mode, the 
 
 ### Private modules that are re-exported publicly
 
-Privacy is decided from module and symbol names alone. A function defined in `_upload.py` counts as private even when the package's `__init__.py` re-exports it, whether through `__all__` or a plain import. Under `private_only = true` it is still checked, although its defaults are part of the public API, where removing one is a breaking change for callers.
+By default, privacy is decided from module and symbol names alone. A function defined in `_upload.py` counts as private even when the package's `__init__.py` re-exports it, whether through `__all__` or a plain import. Under `private_only = true` it is still checked, although its defaults are part of the public API, where removing one is a breaking change for callers.
 
-This is deliberate. `no-defaults` checks each file on its own, which is what lets it resolve configuration per file and stay fast when pre-commit passes only the changed files. It never reads `__init__.py` to work out which names a private module re-exports, so it cannot tell an internal helper from a re-exported one.
+`respect_reexports = true` reads those `__init__.py` files and treats what they export as public:
 
-Either exempt the module in configuration:
+```python
+# src/package/__init__.py
+from ._upload import upload
+
+__all__ = ["upload"]
+```
+
+```python
+# src/package/_upload.py
+def upload(source, timeout=30):  # not reported: `upload` is public API
+    ...
+
+def _chunk(data, size=8192):     # reported as before
+    ...
+```
+
+The `--respect-reexports` flag turns this on for every checked file, whatever the configuration says. It only has an effect in private-only mode, since every default is checked otherwise.
+
+#### What counts as a re-export
+
+For each checked file, `no-defaults` reads the `__init__.py` of its directory and of each directory above it, stopping where the package does — at the first directory without an `__init__.py`. Walking back down, it stops again at the first private directory, because a name re-exported by `_internal/__init__.py` is no more reachable from outside than the module it came from.
+
+In each of those files, these make a name public:
+
+- an import that binds it, including `from . import x`, `from ._mod import x`, `import x.y as z`, and imports inside `try` or `if TYPE_CHECKING` blocks;
+- an entry in `__all__`, when `__all__` is written out as a list or tuple of string literals.
+
+A name treated as public is public wherever it is defined in that package. A public class carries its members with it — `class Client` re-exported from `_upload.py` keeps the defaults of `fetch`, but `_retry` is private by its own name and is still checked. A re-exported dataclass keeps its field defaults.
+
+#### Limitations
+
+The check is by name. It never resolves an import back to the module it came from, so it is deliberately loose in the direction of leaving defaults alone, and it does not see re-exports that leave the package:
+
+- **Names only.** If `__init__.py` exports an unrelated `upload` from another module, a private `upload` elsewhere in the package is treated as public too, and stops being checked. This is what makes chains work — `package/__init__.py` re-exporting from `_internal`, which re-exports from `_upload.py` — without reading every module in the package.
+- **`from ... import *` makes everything public.** The names behind a star import cannot be listed without resolving the module, so every name in that package is treated as re-exported and `private_only` effectively stops applying there. Prefer explicit imports in `__init__.py` if you want the rule back.
+- **Only a literal `__all__` is read.** One built by a call, a loop, or `__all__ += other.__all__` says nothing this run can use. The imports in the file are still read, and usually cover the same names.
+- **Only the file's own package chain is read.** Another package that does `from package._upload import upload` and exports it from its own root is not consulted; nor is a `setup.py`-style re-export outside the package.
+- **Deletions and rebinding are not tracked.** A name imported and then `del`-ed in `__init__.py` still counts as re-exported.
+- **Every `__init__.py` in the chain must parse.** One that does not is an error, the same as a checked file that does not parse.
+
+Reading these files costs one parse per directory containing checked files, done once and shared, and only in private-only mode with the option on.
+
+Where a re-export is not detected, or where you want a public default checked anyway, the per-file levers still apply. Exempt the module:
 
 ```toml
 [tool.no_defaults.per_file_enforcement]
@@ -188,7 +232,7 @@ def upload(
 
 `per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`. Use `"all"` to reject every default in matching files, `"private"` to reject defaults only in private scopes, or `"none"` to exempt matching files from the rule. `"none"` also wins over `--private-only`, so an exempt file stays exempt. An exempt file keeps its own defaults, but its call sites are still updated when a callable it uses is fixed elsewhere: exemption decides which definitions are checked, not whether the file keeps working. Patterns without a slash match file names at any depth. An initial `!` negates a pattern. If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
 
-The `--private-only` CLI flag overrides the configuration for every checked file.
+The `--private-only` and `--respect-reexports` CLI flags override the configuration for every checked file.
 
 Like Ruff, `no-defaults` discovers the closest `pyproject.toml` containing `[tool.no_defaults]` separately for each file. This supports monorepos with nested configuration; files without a local table continue searching parent directories.
 

@@ -68,6 +68,18 @@ def compatible(timeout=30):  # noqa: NOD001
     pass
 ```
 
+A directive on the line holding `def` covers every parameter of that signature, so a multi-line signature needs one directive rather than one per parameter:
+
+```python
+def compatible(  # noqa: NOD001
+    timeout=30,
+    retries=3,
+):
+    pass
+```
+
+Decorators do not move that line, and the scope stops at the signature: nested functions and dataclass fields keep their own violations. A directive placed elsewhere in the signature, such as on the closing parenthesis, still applies only to its own line.
+
 Suppress the rule for an entire file with `# ruff: noqa` or `# ruff: noqa: NOD001`.
 
 A directive that names `NOD001` without suppressing anything is reported as `NOD002` and removed by `--fix`:

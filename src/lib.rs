@@ -575,6 +575,7 @@ fn check_source(path: &Path, source: &str, private_only: bool) -> Result<Vec<Dia
         private_only,
         private_scope: is_private_module(path),
         dataclass_scope: false,
+        header: None,
         directives,
         diagnostics: Vec::new(),
     };
@@ -728,6 +729,9 @@ struct Checker<'a> {
     private_only: bool,
     private_scope: bool,
     dataclass_scope: bool,
+    /// Start of the `def` line of the function whose signature is being
+    /// checked, so one directive there can cover every parameter.
+    header: Option<TextSize>,
     directives: Vec<Directive>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -743,10 +747,15 @@ impl Checker<'_> {
         let file_level = self.select(|directive| directive.file_level);
         let inline =
             self.select(|directive| !directive.file_level && directive.line.contains(offset));
-        for index in [file_level, inline].into_iter().flatten() {
+        let header = self.header.and_then(|start| {
+            self.select(|directive| !directive.file_level && directive.line.start() == start)
+        });
+        let mut suppressed = false;
+        for index in [file_level, inline, header].into_iter().flatten() {
             self.directives[index].used = true;
+            suppressed = true;
         }
-        file_level.is_some() || inline.is_some()
+        suppressed
     }
 
     fn select(&self, applies: impl Fn(&Directive) -> bool) -> Option<usize> {
@@ -803,6 +812,9 @@ impl Checker<'_> {
         if !self.enabled(function.name.as_str()) {
             return;
         }
+        // The function's own range starts at its first decorator, so the name
+        // locates the `def` line that a signature-wide directive sits on.
+        self.header = Some(line_start(self.source, function.name.start()));
         for parameter in function
             .parameters
             .posonlyargs
@@ -821,6 +833,7 @@ impl Checker<'_> {
                 );
             }
         }
+        self.header = None;
     }
 
     fn check_dataclass_field(&mut self, statement: &Stmt) {
@@ -989,6 +1002,15 @@ fn argument_removal_range(
     } else {
         target
     }
+}
+
+/// The offset of the first character of the line containing `offset`.
+fn line_start(source: &str, offset: TextSize) -> TextSize {
+    text_size(
+        source[..offset.to_usize()]
+            .rfind('\n')
+            .map_or(0, |end| end + 1),
+    )
 }
 
 fn line_column(source: &str, offset: TextSize) -> (usize, usize) {
@@ -1193,6 +1215,51 @@ mod tests {
         assert_eq!(codes("# ruff: noqa: E501\ndef f(x=1): pass\n")?, ["NOD001"]);
         assert!(codes("# ruff: noqa\ndef f(x=1): pass\n")?.is_empty());
         assert!(codes("# flake8: noqa\ndef f(x=1): pass\n")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_directive_on_the_def_line_covers_the_whole_signature() -> Result<(), String> {
+        assert!(
+            codes("def f(  # noqa: NOD001\n    a=1,\n    b=2,\n):\n    pass\n")?.is_empty(),
+            "one directive covers every parameter of the signature"
+        );
+        assert!(
+            codes("@decorator\nasync def f(  # noqa: NOD001\n    a=1,\n) -> None:\n    pass\n")?
+                .is_empty(),
+            "decorators do not move the `def` line"
+        );
+        assert!(
+            codes("def f(  # noqa\n    a=1,\n):\n    pass\n")?.is_empty(),
+            "a blanket directive on the `def` line covers the signature too"
+        );
+        assert_eq!(
+            codes("def f(  # noqa: E501\n    a=1,\n):\n    pass\n")?,
+            ["NOD001"],
+            "directives for other rules suppress nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_directive_on_the_def_line_stops_at_the_signature() -> Result<(), String> {
+        assert_eq!(
+            codes("def f(  # noqa: NOD001\n    a,\n):\n    def inner(b=1): pass\n")?,
+            ["NOD002", "NOD001"],
+            "a nested function keeps its own violations and leaves the directive unused"
+        );
+        assert_eq!(
+            codes("def f(\n    a=1,\n):  # noqa: NOD001\n    pass\n")?,
+            ["NOD001", "NOD002"],
+            "only the `def` line carries a signature-wide directive"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_signature_directive_leaves_defaults_in_place() -> Result<(), String> {
+        let source = "def f(  # noqa: NOD001\n    a=1,\n):\n    pass\n";
+        assert_eq!(fixed(source)?, source);
         Ok(())
     }
 

@@ -71,15 +71,20 @@ The same applies to dataclass fields, which become required at construction: `Jo
 
 Arguments are appended as keywords wherever Python allows it, so the change is stable under later edits to the signature. Positional-only parameters are appended positionally instead.
 
-Calls are matched by the name being called, so both `connect(...)` and `api.connect(...)` are found. Nothing is guessed: a call is left alone, with a warning naming the file and line, when
+Calls are resolved through the calling file's own imports, not by matching the bare name. A project with its own `connect` does not get `socket.connect` rewritten, and two modules that each define `helper` are told apart. A method is only rewritten when reached through `self` or `cls` inside the class that defines it, because the type of any other receiver would have to be guessed.
 
-- several fixed definitions share the name, so the call cannot be resolved;
+Nothing is guessed. A call is left alone, with a warning naming the file and line, when
+
+- it cannot be tied to the definition that was fixed: an unrelated callable of the same name, a method on a receiver whose type is unknown such as `client.fetch(...)` or `Client.fetch(instance, ...)`, or a call through an import this run could not resolve;
 - the call unpacks `*args` or `**kwargs`, so what it already supplies is unknown;
 - the removed default is not a literal (`value=SENTINEL`, `path=Path.cwd()`), because repeating that text at the call site would depend on names the caller may not have imported, or would re-evaluate the expression;
 - a positional-only argument cannot be appended without reordering the call;
-- the function is named without being called — a bare `@decorator`, or a callback passed as `run(cb)` — because Python calls it somewhere with no argument list to add to. This one is a breakage you have to resolve by hand.
+- the dataclass inherits fields, whose order in the constructor the defining file cannot see;
+- the function is named without being called — a bare `@decorator`, or a callback passed as `run(cb)` — because Python calls it somewhere with no argument list to add to.
 
-Class names are exempt from that last check, because they appear in annotations and `isinstance` checks constantly and none of those are calls.
+Fields that `__init__` never accepts are never added to a call: `field(..., init=False)`, a `_: KW_ONLY` marker, and a class whose decorator says `init=False`.
+
+Class names are exempt from the named-without-being-called check, because they appear in annotations and `isinstance` checks constantly and none of those are calls.
 
 Two things `--fix` still cannot reach: **callers outside the files you checked** — for a function that is part of your public API, they are in other people's code — and **calls made dynamically**, through `getattr` or a variable holding the function. A warning after fixing says so, and **your test suite is what confirms the result**.
 

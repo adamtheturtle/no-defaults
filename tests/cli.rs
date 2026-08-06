@@ -89,15 +89,15 @@ fn fix_updates_call_sites_across_files() -> Result<(), Box<dyn std::error::Error
         "from dataclasses import dataclass, field\n\n\
          def connect(host, timeout=30, *, retries=3):\n    return host\n\n\
          @dataclass\nclass Job:\n    name: str\n    tags: list = field(default_factory=list)\n\n\
-         class Client:\n    def fetch(self, url, verify=True):\n        return url\n",
+         class Client:\n    def fetch(self, url, verify=True):\n        return url\n\n    \
+         def twice(self, url):\n        return self.fetch(url)\n",
     )?;
     std::fs::write(
         &caller,
         "import api\n\n\
          api.connect(\"h\")\n\
          api.connect(\"h\", 5, retries=1)\n\
-         api.Job(\"j\")\n\
-         api.Client().fetch(\"u\")\n",
+         api.Job(\"j\")\n",
     )?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -106,15 +106,18 @@ fn fix_updates_call_sites_across_files() -> Result<(), Box<dyn std::error::Error
     assert_eq!(output.status.code(), Some(0));
     assert!(
         String::from_utf8(output.stdout)?.contains("Updated 3 call sites."),
-        "the fully supplied call needs nothing added"
+        "the fully supplied call needs nothing added, and `self.fetch` does"
     );
     assert_eq!(
         std::fs::read_to_string(&caller)?,
         "import api\n\n\
          api.connect(\"h\", timeout=30, retries=3)\n\
          api.connect(\"h\", 5, retries=1)\n\
-         api.Job(\"j\", tags=[])\n\
-         api.Client().fetch(\"u\", verify=True)\n"
+         api.Job(\"j\", tags=[])\n"
+    );
+    assert!(
+        std::fs::read_to_string(&api)?.contains("self.fetch(url, verify=True)"),
+        "a method reached through `self` has a known receiver"
     );
     let output = Command::new(binary()).arg(directory.path()).output()?;
     assert_eq!(output.status.code(), Some(0), "the fix is complete");
@@ -157,19 +160,13 @@ fn fix_leaves_calls_it_cannot_resolve_alone() -> Result<(), Box<dyn std::error::
     std::fs::write(
         directory.path().join("api.py"),
         "SENTINEL = object()\n\n\
-         def keep(value=SENTINEL): return value\n\n\
-         def shared(x=1): return x\n",
-    )?;
-    std::fs::write(
-        directory.path().join("other.py"),
-        "def shared(y=2): return y\n",
+         def keep(value=SENTINEL): return value\n",
     )?;
     let caller = directory.path().join("caller.py");
     std::fs::write(
         &caller,
-        "import api\nimport other\n\n\
+        "import api\n\n\
          api.keep()\n\
-         api.shared()\n\
          api.keep(**{})\n",
     )?;
     let before = std::fs::read_to_string(&caller)?;
@@ -180,12 +177,89 @@ fn fix_leaves_calls_it_cannot_resolve_alone() -> Result<(), Box<dyn std::error::
     assert_eq!(output.status.code(), Some(0));
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("is not a literal"), "{stderr:?}");
-    assert!(
-        stderr.contains("several fixed definitions share this name"),
-        "{stderr:?}"
-    );
     assert!(stderr.contains("unpacks `*` or `**`"), "{stderr:?}");
     assert_eq!(std::fs::read_to_string(&caller)?, before);
+    Ok(())
+}
+
+#[test]
+fn the_updated_count_leaves_out_edits_that_were_dropped() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    // The call to `g` sits inside the default being deleted, so its rewrite is
+    // dropped and must not be counted.
+    std::fs::write(&path, "def g(a=1): pass\ndef f(x=g()): pass\n")?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("Updated 0 call sites."), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        "def g(a): pass\ndef f(x): pass\n"
+    );
+    Ok(())
+}
+
+/// A project's own `connect` must not lend its removed defaults to a same-named
+/// method on an unrelated object. Guessing there breaks working code.
+#[test]
+fn a_same_named_call_on_another_object_is_left_alone() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let caller = directory.path().join("mine.py");
+    std::fs::write(
+        &caller,
+        "import socket\n\n\
+         def connect(host, timeout=30): return (host, timeout)\n\n\
+         def go(): return socket.socket().connect((\"h\", 1))\n\n\
+         connect(\"h\")\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(&caller)?;
+    assert!(
+        fixed.contains("socket.socket().connect((\"h\", 1))"),
+        "the socket call is not this project's `connect`: {fixed}"
+    );
+    assert!(fixed.contains("connect(\"h\", timeout=30)"), "{fixed}");
+    assert!(
+        String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"),
+        "the call it cannot place is reported rather than guessed at"
+    );
+    Ok(())
+}
+
+/// Two modules may each define `helper`. Resolving through the calling file's
+/// imports tells them apart, where matching on the bare name could not.
+#[test]
+fn same_named_functions_in_two_modules_resolve_separately() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("first.py"),
+        "def helper(x=1): return x\n",
+    )?;
+    std::fs::write(
+        directory.path().join("second.py"),
+        "def helper(y=2): return y\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &caller,
+        "import first\nimport second\n\nfirst.helper()\nsecond.helper()\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&caller)?,
+        "import first\nimport second\n\nfirst.helper(x=1)\nsecond.helper(y=2)\n"
+    );
     Ok(())
 }
 

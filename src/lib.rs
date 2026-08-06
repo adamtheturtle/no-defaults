@@ -110,18 +110,46 @@ struct Removed {
 #[derive(Clone, Debug)]
 struct Signature {
     name: String,
+    /// The file that defines it. A call only resolves here when the caller
+    /// actually imported this file, so an unrelated `connect` is left alone.
+    path: PathBuf,
     /// Parameters that a call can fill positionally, in order. For a method
-    /// this includes `self`; for a dataclass these are the fields.
+    /// this includes `self`; for a dataclass these are the constructor fields.
     positional: Vec<String>,
     /// How many leading entries of `positional` are positional-only.
     positional_only: usize,
-    /// Whether an attribute call binds the first positional parameter.
-    bound: bool,
-    /// Whether this is a function rather than a dataclass. A function's name
-    /// appearing outside a call is worth a warning; a class name appears in
-    /// annotations and `isinstance` checks all the time.
-    function: bool,
+    kind: Callable,
+    /// Whether `positional` is the whole parameter list. A dataclass that
+    /// inherits fields has a constructor this file cannot see.
+    complete: bool,
     removed: Vec<Removed>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Callable {
+    Function,
+    /// A method. Only `self.name(...)` and `cls.name(...)` inside this class
+    /// are rewritten, because the type of any other receiver is unknown.
+    Method(String),
+    Dataclass,
+}
+
+impl Callable {
+    /// Whether the name refers to a function, whose appearance outside a call
+    /// is worth a warning. A class name appears in annotations and `isinstance`
+    /// checks all the time, so those stay quiet.
+    fn is_function(&self) -> bool {
+        matches!(self, Self::Function | Self::Method(_))
+    }
+}
+
+/// What a name in a file refers to, as far as the import statements say.
+#[derive(Clone, Debug)]
+enum Binding {
+    /// A module, so `name.attribute(...)` resolves into that file.
+    Module(PathBuf),
+    /// A symbol imported from a module, so `name(...)` resolves to it.
+    Symbol(PathBuf, String),
 }
 
 /// A replacement for a range of a file. Deletions carry an empty replacement;
@@ -142,9 +170,20 @@ struct Skipped {
     reason: String,
 }
 
-/// Callables indexed by name. `None` marks a name that several definitions
+/// The callables `--fix` changed, indexed for resolution from a call site.
+///
+/// `None` against a name marks one that several definitions in the same file
 /// share, which makes calls to it unresolvable.
-type SignatureIndex = BTreeMap<String, Option<Signature>>;
+#[derive(Default)]
+struct Definitions {
+    /// Functions and dataclasses, by defining file and then name.
+    symbols: BTreeMap<PathBuf, BTreeMap<String, Option<Signature>>>,
+    /// Methods, by defining file and class name, and then method name.
+    methods: BTreeMap<(PathBuf, String), BTreeMap<String, Option<Signature>>>,
+    /// Every name a fixed callable goes by, so a call that cannot be resolved
+    /// to one can still be reported rather than silently left behind.
+    names: BTreeSet<String>,
+}
 
 /// What checking one file produced.
 #[derive(Default)]
@@ -158,7 +197,6 @@ struct Checked {
 struct CallSites {
     edits: BTreeMap<PathBuf, Vec<Edit>>,
     skipped: Vec<Skipped>,
-    updated: usize,
 }
 
 /// The calls one file makes to fixed callables.
@@ -236,7 +274,8 @@ fn run() -> Result<bool, String> {
                     replacement: String::new(),
                 });
         }
-        let changes = fixed_sources(call_sites.edits)?;
+        let mut updated = 0;
+        let changes = fixed_sources(call_sites.edits, &mut updated)?;
         if cli.diff {
             print_diffs(&changes);
             warn_about_skipped_calls(&call_sites.skipped);
@@ -249,7 +288,7 @@ fn run() -> Result<bool, String> {
             if diagnostics.len() == 1 { "" } else { "s" },
             diagnostics.len()
         );
-        report_call_sites(&diagnostics, &call_sites.skipped, call_sites.updated);
+        report_call_sites(&diagnostics, &call_sites.skipped, updated);
         return Ok(false);
     }
     report_diagnostics(&diagnostics, cli.output_format)?;
@@ -294,12 +333,24 @@ fn report_call_sites(diagnostics: &[Diagnostic], skipped: &[Skipped], updated: u
 /// Insert the removed defaults as explicit arguments at every call the checked
 /// files make to a callable that `--fix` changed.
 ///
-/// Resolution is by name across the checked files, so a name that several
-/// definitions share is left alone rather than guessed at.
+/// A call resolves only when the calling file's own imports say it refers to
+/// the file that was fixed. A bare name match is not enough: a project with its
+/// own `connect` must not have `socket.connect` rewritten.
 fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<CallSites, String> {
-    let mut index = SignatureIndex::new();
+    let mut definitions = Definitions::default();
     for signature in signatures {
-        match index.entry(signature.name.clone()) {
+        definitions.names.insert(signature.name.clone());
+        let table = match &signature.kind {
+            Callable::Method(class) => definitions
+                .methods
+                .entry((signature.path.clone(), class.clone()))
+                .or_default(),
+            Callable::Function | Callable::Dataclass => definitions
+                .symbols
+                .entry(signature.path.clone())
+                .or_default(),
+        };
+        match table.entry(signature.name.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(Some(signature));
             }
@@ -309,20 +360,20 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         }
     }
     let mut call_sites = CallSites::default();
-    if index.is_empty() {
+    if definitions.names.is_empty() {
         return Ok(call_sites);
     }
+    let known: BTreeSet<&Path> = files.iter().map(PathBuf::as_path).collect();
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()
         .map(|path| {
             let source = std::fs::read_to_string(path)
                 .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-            rewrite_calls(path, &source, &index)
+            rewrite_calls(path, &source, &definitions, &known)
         })
         .collect();
     for (path, result) in files.iter().zip(results) {
         let file = result?;
-        call_sites.updated += file.edits.len();
         if !file.edits.is_empty() {
             call_sites
                 .edits
@@ -336,6 +387,66 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
     Ok(call_sites)
+}
+
+/// Find the checked file a dotted module name refers to.
+///
+/// Absolute imports are matched by path suffix, because the import root is not
+/// known; an ambiguous suffix resolves to nothing rather than to a guess.
+fn resolve_module(
+    module: &str,
+    level: u32,
+    importer: &Path,
+    known: &BTreeSet<&Path>,
+) -> Option<PathBuf> {
+    let parts: Vec<&str> = module.split('.').filter(|part| !part.is_empty()).collect();
+    if level > 0 {
+        let mut directory = importer.parent()?.to_path_buf();
+        for _ in 1..level {
+            if !directory.pop() {
+                return None;
+            }
+        }
+        for part in &parts {
+            directory.push(part);
+        }
+        for candidate in [
+            directory.with_extension("py"),
+            directory.join("__init__.py"),
+        ] {
+            if known.contains(candidate.as_path()) {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let matches = |suffix: &[String], path: &Path| {
+        let components: Vec<String> = path
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        components.len() >= suffix.len() && components[components.len() - suffix.len()..] == *suffix
+    };
+    for last in [
+        format!("{}.py", parts[parts.len() - 1]),
+        "__init__.py".to_owned(),
+    ] {
+        let mut suffix: Vec<String> = parts.iter().map(|part| (*part).to_owned()).collect();
+        if last == "__init__.py" {
+            suffix.push(last);
+        } else {
+            let index = suffix.len() - 1;
+            suffix[index] = last;
+        }
+        let mut found = known.iter().filter(|path| matches(&suffix, path));
+        if let (Some(path), None) = (found.next(), found.next()) {
+            return Some((*path).to_path_buf());
+        }
+    }
+    None
 }
 
 #[derive(Serialize)]
@@ -543,8 +654,11 @@ fn load_config_path(path: &Path) -> Result<LoadedConfig, String> {
     })
 }
 
+/// The rewritten source of every file an edit touches, and the number of call
+/// sites actually rewritten.
 fn fixed_sources(
     edits: BTreeMap<PathBuf, Vec<Edit>>,
+    updated: &mut usize,
 ) -> Result<BTreeMap<PathBuf, (String, String)>, String> {
     edits
         .into_iter()
@@ -552,7 +666,8 @@ fn fixed_sources(
             let source = std::fs::read_to_string(&path).map_err(|error| {
                 format!("could not read {} for fixing: {error}", path.display())
             })?;
-            let fixed = apply_edits(&source, edits);
+            let (fixed, applied) = apply_edits(&source, edits);
+            *updated += applied;
             parse_module(&fixed).map_err(|error| {
                 format!(
                     "refusing to write invalid Python to {} after fixing: {error}",
@@ -564,11 +679,13 @@ fn fixed_sources(
         .collect()
 }
 
-/// Apply edits from the end of the file backwards so earlier offsets stay valid.
+/// Apply edits from the end of the file backwards so earlier offsets stay
+/// valid, returning the result and how many insertions survived.
 ///
 /// A call site nested inside a default that is being deleted would otherwise be
-/// rewritten into text that no longer exists, so those insertions are dropped.
-fn apply_edits(source: &str, mut edits: Vec<Edit>) -> String {
+/// rewritten into text that no longer exists, so those insertions are dropped
+/// and are not counted as call sites updated.
+fn apply_edits(source: &str, mut edits: Vec<Edit>) -> (String, usize) {
     let deletions: Vec<TextRange> = edits
         .iter()
         .filter(|edit| edit.replacement.is_empty())
@@ -581,6 +698,10 @@ fn apply_edits(source: &str, mut edits: Vec<Edit>) -> String {
                 .any(|deletion| deletion.contains(edit.range.start()))
     });
     edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start()));
+    let applied = edits
+        .iter()
+        .filter(|edit| !edit.replacement.is_empty())
+        .count();
     let mut fixed = source.to_owned();
     for edit in edits {
         fixed.replace_range(
@@ -588,7 +709,7 @@ fn apply_edits(source: &str, mut edits: Vec<Edit>) -> String {
             &edit.replacement,
         );
     }
-    fixed
+    (fixed, applied)
 }
 
 fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Result<(), String> {
@@ -978,6 +1099,11 @@ struct Scope {
 struct ClassCollector {
     name: String,
     dataclass: bool,
+    /// Whether the class has base classes, whose fields come first in the
+    /// constructor and are not visible from this class body.
+    inherits: bool,
+    /// Whether the decorator generates a constructor at all.
+    constructs: bool,
     fields: Vec<String>,
     removed: Vec<Removed>,
 }
@@ -1108,8 +1234,14 @@ impl Checker<'_> {
                 .map(parameter_name)
                 .collect(),
             positional_only: function.parameters.posonlyargs.len(),
-            bound: self.scope.class_body && !is_static_method(function),
-            function: true,
+            path: self.path.to_path_buf(),
+            kind: match self.classes.last() {
+                Some(class) if self.scope.class_body && !is_static_method(function) => {
+                    Callable::Method(class.name.clone())
+                }
+                _ => Callable::Function,
+            },
+            complete: true,
             removed,
         });
     }
@@ -1124,9 +1256,18 @@ impl Checker<'_> {
         if is_class_var(statement) {
             return;
         }
-        // Every field counts towards the constructor's positional order, even
-        // one without a default or one this run is not enforcing.
-        if self.collect_signatures {
+        // A `_: KW_ONLY` marker is not a field, so it takes no place in the
+        // constructor's positional order.
+        let pseudo_field = annotates_kw_only(&assign.annotation);
+        // A field declared `init=False` is not a constructor parameter, so a
+        // call must never be given it.
+        let constructs = assign
+            .value
+            .as_deref()
+            .is_none_or(|value| !field_excluded_from_init(value));
+        // Every other field counts towards the positional order, even one
+        // without a default or one this run is not enforcing.
+        if self.collect_signatures && !pseudo_field && constructs {
             if let Some(class) = self.classes.last_mut() {
                 class.fields.push(name.id.to_string());
             }
@@ -1145,6 +1286,7 @@ impl Checker<'_> {
             format!("dataclass field `{}` has a {}", name.id, default.kind),
             default.fix,
         ) && self.collect_signatures
+            && constructs
         {
             if let Some(class) = self.classes.last_mut() {
                 class.removed.push(Removed {
@@ -1187,6 +1329,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     self.classes.push(ClassCollector {
                         name: class.name.to_string(),
                         dataclass: self.scope.dataclass,
+                        inherits: class
+                            .arguments
+                            .as_ref()
+                            .is_some_and(|arguments| !arguments.args.is_empty()),
+                        constructs: generates_init(class),
                         fields: Vec::new(),
                         removed: Vec::new(),
                     });
@@ -1197,13 +1344,15 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     .then(|| self.classes.pop())
                     .flatten()
                 {
-                    if collector.dataclass && !collector.removed.is_empty() {
+                    if collector.dataclass && collector.constructs && !collector.removed.is_empty()
+                    {
                         self.signatures.push(Signature {
                             name: collector.name,
+                            path: self.path.to_path_buf(),
                             positional: collector.fields,
                             positional_only: 0,
-                            bound: false,
-                            function: false,
+                            kind: Callable::Dataclass,
+                            complete: !collector.inherits,
                             removed: collector.removed,
                         });
                     }
@@ -1241,6 +1390,46 @@ fn has_dataclass_decorator(class: &ast::StmtClassDef) -> bool {
         matches!(expression, Expr::Name(name) if name.id.as_str() == "dataclass")
             || matches!(expression, Expr::Attribute(attribute) if attribute.attr.as_str() == "dataclass")
     })
+}
+
+/// Whether the decorator leaves the class with a generated `__init__`.
+fn generates_init(class: &ast::StmtClassDef) -> bool {
+    !class.decorator_list.iter().any(|decorator| {
+        let Expr::Call(call) = &decorator.expression else {
+            return false;
+        };
+        call.arguments.keywords.iter().any(|keyword| {
+            keyword
+                .arg
+                .as_ref()
+                .is_some_and(|name| name.as_str() == "init")
+                && matches!(&keyword.value, Expr::BooleanLiteral(literal) if !literal.value)
+        })
+    })
+}
+
+/// Whether an annotation is the `KW_ONLY` marker, which declares no field.
+fn annotates_kw_only(annotation: &Expr) -> bool {
+    matches!(annotation, Expr::Name(name) if name.id.as_str() == "KW_ONLY")
+        || matches!(annotation, Expr::Attribute(attribute) if attribute.attr.as_str() == "KW_ONLY")
+}
+
+/// Whether a field is declared `init=False`, which keeps it out of the
+/// constructor even though it is still a field.
+fn field_excluded_from_init(value: &Expr) -> bool {
+    let Expr::Call(call) = value else {
+        return false;
+    };
+    let is_field = matches!(&*call.func, Expr::Name(name) if name.id.as_str() == "field")
+        || matches!(&*call.func, Expr::Attribute(attribute) if attribute.attr.as_str() == "field");
+    is_field
+        && call.arguments.keywords.iter().any(|keyword| {
+            keyword
+                .arg
+                .as_ref()
+                .is_some_and(|name| name.as_str() == "init")
+                && matches!(&keyword.value, Expr::BooleanLiteral(literal) if !literal.value)
+        })
 }
 
 fn is_class_var(statement: &Stmt) -> bool {
@@ -1423,14 +1612,19 @@ fn factory_call_text(factory: &Expr) -> Option<String> {
 fn rewrite_calls(
     path: &Path,
     source: &str,
-    index: &SignatureIndex,
+    definitions: &Definitions,
+    known: &BTreeSet<&Path>,
 ) -> Result<FileCallSites, String> {
     let parsed = parse_module(source)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    let mut bindings = BTreeMap::new();
+    collect_bindings(parsed.suite(), path, known, &mut bindings);
     let mut rewriter = Rewriter {
         path,
         source,
-        index,
+        definitions,
+        bindings,
+        classes: Vec::new(),
         called: BTreeSet::new(),
         edits: Vec::new(),
         skipped: Vec::new(),
@@ -1444,10 +1638,108 @@ fn rewrite_calls(
     })
 }
 
+/// Record what each imported name in a file refers to.
+///
+/// Imports nested in functions or `if TYPE_CHECKING` blocks bind names just as
+/// top-level ones do, so the whole tree is walked.
+fn collect_bindings(
+    suite: &[Stmt],
+    importer: &Path,
+    known: &BTreeSet<&Path>,
+    bindings: &mut BTreeMap<String, Binding>,
+) {
+    for statement in suite {
+        match statement {
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let module = alias.name.as_str();
+                    // Without an alias, `import a.b` binds `a`, and only a
+                    // single-component import gives a usable module name.
+                    let bound = match alias.asname.as_ref() {
+                        Some(name) => name.to_string(),
+                        None if !module.contains('.') => module.to_owned(),
+                        None => continue,
+                    };
+                    if let Some(file) = resolve_module(module, 0, importer, known) {
+                        bindings.insert(bound, Binding::Module(file));
+                    }
+                }
+            }
+            Stmt::ImportFrom(import) => {
+                let module = import.module.as_ref().map_or("", ast::Identifier::as_str);
+                let Some(file) = resolve_module(module, import.level, importer, known) else {
+                    continue;
+                };
+                for alias in &import.names {
+                    let name = alias.name.as_str();
+                    if name == "*" {
+                        continue;
+                    }
+                    let bound = alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| name.to_owned(), ToString::to_string);
+                    // `from package import module` names a module, not a
+                    // symbol, when it resolves to a file of its own.
+                    let submodule = import
+                        .module
+                        .as_ref()
+                        .map(|parent| format!("{}.{name}", parent.as_str()))
+                        .and_then(|dotted| resolve_module(&dotted, import.level, importer, known));
+                    bindings.insert(
+                        bound,
+                        submodule.map_or_else(
+                            || Binding::Symbol(file.clone(), name.to_owned()),
+                            Binding::Module,
+                        ),
+                    );
+                }
+            }
+            Stmt::FunctionDef(function) => {
+                collect_bindings(&function.body, importer, known, bindings);
+            }
+            Stmt::ClassDef(class) => collect_bindings(&class.body, importer, known, bindings),
+            Stmt::If(branch) => {
+                collect_bindings(&branch.body, importer, known, bindings);
+                for clause in &branch.elif_else_clauses {
+                    collect_bindings(&clause.body, importer, known, bindings);
+                }
+            }
+            Stmt::Try(block) => {
+                collect_bindings(&block.body, importer, known, bindings);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_bindings(&handler.body, importer, known, bindings);
+                }
+                collect_bindings(&block.orelse, importer, known, bindings);
+                collect_bindings(&block.finalbody, importer, known, bindings);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The dotted name an expression spells, for `a`, `a.b`, and `a.b.c`.
+fn dotted_name(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Name(name) => Some(name.id.to_string()),
+        Expr::Attribute(attribute) => Some(format!(
+            "{}.{}",
+            dotted_name(&attribute.value)?,
+            attribute.attr
+        )),
+        _ => None,
+    }
+}
+
 struct Rewriter<'a> {
     path: &'a Path,
     source: &'a str,
-    index: &'a SignatureIndex,
+    definitions: &'a Definitions,
+    /// What each imported name in this file refers to.
+    bindings: BTreeMap<String, Binding>,
+    /// The class bodies being walked, so `self.method(...)` can be resolved.
+    classes: Vec<String>,
     /// Ranges of the expressions being called, so that the same expression is
     /// not later mistaken for a reference that never calls the function.
     called: BTreeSet<(TextSize, TextSize)>,
@@ -1477,15 +1769,16 @@ impl Rewriter<'_> {
         {
             return;
         }
-        let name = match expression {
-            Expr::Name(name) => name.id.as_str(),
-            Expr::Attribute(attribute) => attribute.attr.as_str(),
-            _ => return,
+        let Some(name) = (match expression {
+            Expr::Name(name) => Some(name.id.as_str()),
+            Expr::Attribute(attribute) => Some(attribute.attr.as_str()),
+            _ => None,
+        }) else {
+            return;
         };
         if !self
-            .index
-            .get(name)
-            .is_some_and(|entry| entry.as_ref().is_some_and(|signature| signature.function))
+            .resolve(expression)
+            .is_some_and(|signature| signature.kind.is_function())
         {
             return;
         }
@@ -1497,27 +1790,82 @@ impl Rewriter<'_> {
         );
     }
 
+    /// The callable an expression names, when the file's own imports say so.
+    fn resolve(&self, expression: &Expr) -> Option<&Signature> {
+        match expression {
+            // A bare name is either defined in this file or imported into it.
+            Expr::Name(name) => match self.bindings.get(name.id.as_str()) {
+                Some(Binding::Symbol(file, symbol)) => {
+                    self.definitions.symbols.get(file)?.get(symbol)?.as_ref()
+                }
+                Some(Binding::Module(_)) => None,
+                None => self
+                    .definitions
+                    .symbols
+                    .get(self.path)?
+                    .get(name.id.as_str())?
+                    .as_ref(),
+            },
+            Expr::Attribute(attribute) => {
+                // `self.method(...)` and `cls.method(...)` are the only calls
+                // whose receiver type is known without inference.
+                if let Expr::Name(receiver) = &*attribute.value {
+                    if matches!(receiver.id.as_str(), "self" | "cls") {
+                        let class = self.classes.last()?;
+                        return self
+                            .definitions
+                            .methods
+                            .get(&(self.path.to_path_buf(), class.clone()))?
+                            .get(attribute.attr.as_str())?
+                            .as_ref();
+                    }
+                }
+                let dotted = dotted_name(&attribute.value)?;
+                let Some(Binding::Module(file)) = self.bindings.get(&dotted) else {
+                    return None;
+                };
+                self.definitions
+                    .symbols
+                    .get(file)?
+                    .get(attribute.attr.as_str())?
+                    .as_ref()
+            }
+            _ => None,
+        }
+    }
+
     fn check_call(&mut self, call: &ast::ExprCall) {
-        // Calls are resolved by the name being called, so `helper(...)` and
-        // `module.helper(...)` both reach a `helper` that was fixed.
-        let (name, attribute) = match &*call.func {
-            Expr::Name(name) => (name.id.as_str(), false),
-            Expr::Attribute(attribute) => (attribute.attr.as_str(), true),
+        let name = match &*call.func {
+            Expr::Name(name) => name.id.as_str(),
+            Expr::Attribute(attribute) => attribute.attr.as_str(),
             _ => return,
         };
-        let Some(entry) = self.index.get(name) else {
+        let Some(signature) = self.resolve(&call.func) else {
+            // A name a fixed callable also goes by, reached some other way: an
+            // unrelated `connect`, a method on a receiver whose type is not
+            // known, or a call through an unresolved import. Rewriting it would
+            // break working code, so say so instead.
+            if self.definitions.names.contains(name) {
+                self.skip(
+                    call.start(),
+                    name,
+                    "this call cannot be tied to the definition that was fixed".to_owned(),
+                );
+            }
             return;
         };
-        let Some(signature) = entry else {
+        if !signature.complete {
             self.skip(
                 call.start(),
                 name,
-                "several fixed definitions share this name".to_owned(),
+                "the dataclass inherits fields, so its constructor is not known from the file \
+                 that defines it"
+                    .to_owned(),
             );
             return;
-        };
-        // An attribute call on a bound method has already supplied `self`.
-        let bound = usize::from(attribute && signature.bound);
+        }
+        // A method reached through `self` or `cls` has already been given it.
+        let bound = usize::from(matches!(signature.kind, Callable::Method(_)));
         let arguments = match missing_arguments(&call.arguments, signature, bound) {
             Ok(arguments) => arguments,
             Err(reason) => {
@@ -1616,6 +1964,16 @@ fn missing_arguments(
 }
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        if let Stmt::ClassDef(class) = statement {
+            self.classes.push(class.name.to_string());
+            walk_stmt(self, statement);
+            self.classes.pop();
+            return;
+        }
+        walk_stmt(self, statement);
+    }
+
     fn visit_expr(&mut self, expression: &'a Expr) {
         match expression {
             Expr::Call(call) => {
@@ -1689,7 +2047,8 @@ mod tests {
                     replacement: String::new(),
                 });
         }
-        write_fixes_atomically(fixed_sources(call_sites.edits)?)?;
+        let mut updated = 0;
+        write_fixes_atomically(fixed_sources(call_sites.edits, &mut updated)?)?;
         for path in files {
             assert!(
                 check_file(path, false, false)?.diagnostics.is_empty(),
@@ -2240,6 +2599,59 @@ mod tests {
             source
                 .replace("def f(b=2): pass", "def f(b): pass")
                 .replace("\nf()\n", "\nf(b=2)\n")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_inheriting_dataclass_is_left_alone() -> Result<(), String> {
+        // The parent's fields come first in the constructor and are not
+        // visible from this class body, so the argument positions are unknown.
+        let source = "@dataclass\nclass Child(Parent):\n    b: int = 2\n\n\nChild()\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass\nclass Child(Parent):\n    b: int\n\n\nChild()\n"
+        );
+        assert_eq!(
+            skipped_reasons(source)?.first().map(String::as_str),
+            Some(
+                "the dataclass inherits fields, so its constructor is not known from the file \
+                 that defines it"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_kept_out_of_the_constructor_is_not_passed() -> Result<(), String> {
+        // `init=False` keeps the field out of `__init__`, so naming it in a
+        // call would raise `TypeError: unexpected keyword argument`.
+        assert_eq!(
+            fixed(
+                "@dataclass\nclass C:\n    x: int = 1\n    y: int = field(default=5, init=False)\n\n\nC()\n"
+            )?,
+            "@dataclass\nclass C:\n    x: int\n    y: int = field(init=False)\n\n\nC(x=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_kw_only_marker_takes_no_argument_position() -> Result<(), String> {
+        // `_: KW_ONLY` declares no field, so it must not consume the slot that
+        // tells whether `b` was already supplied positionally.
+        assert_eq!(
+            fixed("@dataclass\nclass C:\n    a: int\n    _: KW_ONLY\n    b: int = 2\n\n\nC(1)\n")?,
+            "@dataclass\nclass C:\n    a: int\n    _: KW_ONLY\n    b: int\n\n\nC(1, b=2)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_without_a_generated_constructor_is_left_alone() -> Result<(), String> {
+        let source = "@dataclass(init=False)\nclass C:\n    x: int = 1\n\n\nC()\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass(init=False)\nclass C:\n    x: int\n\n\nC()\n"
         );
         Ok(())
     }

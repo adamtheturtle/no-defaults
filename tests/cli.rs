@@ -122,6 +122,36 @@ fn fix_updates_call_sites_across_files() -> Result<(), Box<dyn std::error::Error
 }
 
 #[test]
+fn an_exempt_file_keeps_its_defaults_but_has_its_calls_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("pyproject.toml"),
+        "[tool.no_defaults]\n\n[tool.no_defaults.per_file_enforcement]\n\"exempt.py\" = \"none\"\n",
+    )?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def connect(host, timeout=30): return (host, timeout)\n",
+    )?;
+    let exempt = directory.path().join("exempt.py");
+    std::fs::write(
+        &exempt,
+        "from api import connect\n\ndef keeps_its_own(value=99): return value\n\nconnect(\"h\")\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&exempt)?,
+        "from api import connect\n\ndef keeps_its_own(value=99): return value\n\nconnect(\"h\", timeout=30)\n",
+        "exemption decides which definitions are checked, not whether the file's calls keep working"
+    );
+    Ok(())
+}
+
+#[test]
 fn fix_leaves_calls_it_cannot_resolve_alone() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

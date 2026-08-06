@@ -203,8 +203,12 @@ fn run() -> Result<bool, String> {
         .par_iter()
         .zip(settings.par_iter())
         .map(|(path, setting)| {
+            // An exempt file contributes no violations and no signatures, but
+            // its calls are still rewritten when a callable it uses is fixed
+            // elsewhere. Exemption is about which definitions are checked, not
+            // about leaving the file broken at runtime.
             setting.private_only.map_or_else(
-                || Ok(Vec::new()),
+                || Ok(Checked::default()),
                 |private_only| check_file(path, private_only),
             )
         })

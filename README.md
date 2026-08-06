@@ -122,6 +122,22 @@ private_only = true
 
 Private means a name that starts with one underscore. In private-only mode, the rule applies to private modules and packages, private functions and methods, all members of private classes, and private dataclass fields. For example, all defaults in `_module.py` and `_package/module.py` are checked. Dunder names such as `__init__.py` are not considered private by themselves.
 
+### Private modules that are re-exported publicly
+
+Privacy is decided from module and symbol names alone. A function defined in `_upload.py` counts as private even when the package's `__init__.py` re-exports it, whether through `__all__` or a plain import. Under `private_only = true` it is still checked, although its defaults are part of the public API, where removing one is a breaking change for callers.
+
+This is deliberate. `no-defaults` checks each file on its own, which is what lets it resolve configuration per file and stay fast when pre-commit passes only the changed files. It never reads `__init__.py` to work out which names a private module re-exports, so it cannot tell an internal helper from a re-exported one.
+
+Suppress the rule on the signatures that are public in practice:
+
+```python
+def upload(
+    *,
+    strategy: Strategy = Strategy.DIFF,  # noqa: NOD001
+) -> None:
+    """Re-exported from the package root, so the default is public API."""
+```
+
 `per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`. Use `"all"` to reject every default in matching files or `"private"` to reject defaults only in private scopes. Patterns without a slash match file names at any depth. An initial `!` negates a pattern. If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
 
 The `--private-only` CLI flag overrides the configuration for every checked file.

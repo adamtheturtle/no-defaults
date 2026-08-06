@@ -91,7 +91,7 @@ The default `full` output includes source excerpts and carets. `concise` emits o
 
 The linter detects defaults on positional-only, positional-or-keyword, and keyword-only parameters.
 For classes decorated with `@dataclass` or `@dataclasses.dataclass`, it detects assigned defaults plus `field(default=...)` and `field(default_factory=...)` in the class body.
-`ClassVar` assignments are ignored because they are not dataclass fields, and annotated assignments inside method bodies are ignored because they are locals.
+`ClassVar` assignments are ignored because they are not dataclass fields, whether the annotation is bare, qualified, or quoted as in `x: "ClassVar[int]" = 1`. Annotated assignments inside method bodies are ignored because they are locals.
 
 Suppress an individual violation with either a blanket `# noqa` or the rule-specific `# noqa: NOD001` on the line containing the default:
 
@@ -164,7 +164,14 @@ Privacy is decided from module and symbol names alone. A function defined in `_u
 
 This is deliberate. `no-defaults` checks each file on its own, which is what lets it resolve configuration per file and stay fast when pre-commit passes only the changed files. It never reads `__init__.py` to work out which names a private module re-exports, so it cannot tell an internal helper from a re-exported one.
 
-Suppress the rule on the signatures that are public in practice:
+Either exempt the module in configuration:
+
+```toml
+[tool.no_defaults.per_file_enforcement]
+"src/package/_upload.py" = "none"
+```
+
+or suppress the rule on the signatures that are public in practice:
 
 ```python
 def upload(
@@ -174,7 +181,7 @@ def upload(
     """Re-exported from the package root, so the default is public API."""
 ```
 
-`per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`. Use `"all"` to reject every default in matching files or `"private"` to reject defaults only in private scopes. Patterns without a slash match file names at any depth. An initial `!` negates a pattern. If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
+`per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`. Use `"all"` to reject every default in matching files, `"private"` to reject defaults only in private scopes, or `"none"` to exempt matching files from the rule. `"none"` also wins over `--private-only`, so an exempt file stays exempt. Patterns without a slash match file names at any depth. An initial `!` negates a pattern. If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
 
 The `--private-only` CLI flag overrides the configuration for every checked file.
 

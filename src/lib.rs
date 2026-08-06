@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
-use ruff_python_parser::parse_module;
+use ruff_python_parser::{parse_expression, parse_module};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
@@ -61,6 +61,7 @@ enum OutputFormat {
 enum Enforcement {
     All,
     Private,
+    None,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -189,10 +190,10 @@ fn run() -> Result<bool, String> {
             println!("  project-root = {}", setting.project_root.display());
             println!(
                 "  enforcement = {}",
-                if setting.private_only {
-                    "private"
-                } else {
-                    "all"
+                match setting.private_only {
+                    Some(true) => "private",
+                    Some(false) => "all",
+                    None => "none",
                 }
             );
         }
@@ -201,7 +202,12 @@ fn run() -> Result<bool, String> {
     let results: Vec<Result<Checked, String>> = files
         .par_iter()
         .zip(settings.par_iter())
-        .map(|(path, setting)| check_file(path, setting.private_only))
+        .map(|(path, setting)| {
+            setting.private_only.map_or_else(
+                || Ok(Vec::new()),
+                |private_only| check_file(path, private_only),
+            )
+        })
         .collect();
     let mut diagnostics = Vec::new();
     let mut signatures = Vec::new();
@@ -433,7 +439,8 @@ fn github_escape_property(value: &str) -> String {
 
 struct FileSettings {
     project_root: PathBuf,
-    private_only: bool,
+    /// `None` when the file is exempt from the rule entirely.
+    private_only: Option<bool>,
 }
 
 fn settings_for_files(
@@ -467,7 +474,8 @@ fn settings_for_files(
         let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
         settings.push(FileSettings {
             project_root: loaded.root.clone(),
-            private_only: cli_private_only || private_only_for(path, &loaded, &overrides),
+            private_only: private_only_for(path, &loaded, &overrides)
+                .map(|private_only| cli_private_only || private_only),
         });
     }
     Ok(settings)
@@ -673,7 +681,11 @@ fn compile_overrides(
         .collect()
 }
 
-fn private_only_for(path: &Path, loaded: &LoadedConfig, overrides: &[PerFileEnforcement]) -> bool {
+fn private_only_for(
+    path: &Path,
+    loaded: &LoadedConfig,
+    overrides: &[PerFileEnforcement],
+) -> Option<bool> {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let relative = resolved.strip_prefix(&loaded.root).unwrap_or(&resolved);
     let filename = relative.file_name().unwrap_or_default();
@@ -692,9 +704,10 @@ fn private_only_for(path: &Path, loaded: &LoadedConfig, overrides: &[PerFileEnfo
         })
         .map(|entry| entry.enforcement);
     match selected {
-        Some(Enforcement::All) => false,
-        Some(Enforcement::Private) => true,
-        None => loaded.config.private_only,
+        Some(Enforcement::All) => Some(false),
+        Some(Enforcement::Private) => Some(true),
+        Some(Enforcement::None) => None,
+        None => Some(loaded.config.private_only),
     }
 }
 
@@ -1207,10 +1220,32 @@ fn is_class_var(statement: &Stmt) -> bool {
     let Stmt::AnnAssign(assign) = statement else {
         return false;
     };
-    matches!(&*assign.annotation, Expr::Name(name) if name.id.as_str() == "ClassVar")
-        || matches!(&*assign.annotation, Expr::Subscript(subscript)
-            if matches!(&*subscript.value, Expr::Name(name) if name.id.as_str() == "ClassVar")
-                || matches!(&*subscript.value, Expr::Attribute(attribute) if attribute.attr.as_str() == "ClassVar"))
+    annotates_class_var(&assign.annotation)
+}
+
+/// Whether an annotation names `ClassVar`, bare, qualified, or quoted.
+///
+/// `dataclasses` resolves a string annotation textually, so
+/// `x: "ClassVar[int]" = 1` really is a class variable rather than a field.
+fn annotates_class_var(annotation: &Expr) -> bool {
+    match annotation {
+        Expr::Name(name) => name.id.as_str() == "ClassVar",
+        Expr::Attribute(attribute) => attribute.attr.as_str() == "ClassVar",
+        Expr::Subscript(subscript) => annotates_class_var(&subscript.value),
+        // Quoted annotations are only one level deep: the contents of
+        // `"ClassVar[int]"` are an expression, not another string. Surrounding
+        // whitespace is trimmed because `dataclasses` accepts it and the
+        // parser would reject the leading indentation.
+        Expr::StringLiteral(literal) => {
+            parse_expression(literal.value.to_str().trim()).is_ok_and(|parsed| {
+                match parsed.expr() {
+                    Expr::StringLiteral(_) => false,
+                    expression => annotates_class_var(expression),
+                }
+            })
+        }
+        _ => false,
+    }
 }
 
 struct FieldDefault {
@@ -1674,6 +1709,26 @@ mod tests {
     }
 
     #[test]
+    fn quoted_class_var_annotations_are_not_fields() -> Result<(), String> {
+        let found = messages(
+            "@dataclass\nclass C:\n a: \"ClassVar[int]\" = 1\n b: \"typing.ClassVar[int]\" = 2\n c: 'ClassVar' = 3\n d: \"  ClassVar[int]  \" = 4\n",
+            false,
+        )?;
+        assert!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn quoted_non_class_var_annotations_are_still_fields() -> Result<(), String> {
+        let found = messages(
+            "@dataclass\nclass C:\n a: \"int\" = 1\n b: \"NotClassVar[int]\" = 2\n c: \"((\" = 3\n",
+            false,
+        )?;
+        assert_eq!(found.len(), 3, "{found:?}");
+        Ok(())
+    }
+
+    #[test]
     fn ignores_annotated_locals_in_dataclass_methods() -> Result<(), String> {
         let found = messages(
             "@dataclass\nclass C:\n x: int = 1\n def _validate(self) -> None:\n  seen: set[str] = set()\n  def inner() -> None:\n   nested: int = 0\n",
@@ -1756,21 +1811,66 @@ mod tests {
             },
         };
         let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
-        assert!(!private_only_for(
-            Path::new("project/tests/test_api.py"),
-            &loaded,
-            &overrides
-        ));
-        assert!(private_only_for(
-            Path::new("project/src/package/api.py"),
-            &loaded,
-            &overrides
-        ));
-        assert!(!private_only_for(
-            Path::new("project/scripts/release.py"),
-            &loaded,
-            &overrides
-        ));
+        assert_eq!(
+            private_only_for(Path::new("project/tests/test_api.py"), &loaded, &overrides),
+            Some(false)
+        );
+        assert_eq!(
+            private_only_for(Path::new("project/src/package/api.py"), &loaded, &overrides),
+            Some(true)
+        );
+        assert_eq!(
+            private_only_for(Path::new("project/scripts/release.py"), &loaded, &overrides),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn none_enforcement_exempts_matching_files() -> Result<(), String> {
+        let loaded = LoadedConfig {
+            root: PathBuf::from("project"),
+            config: Config {
+                private_only: true,
+                per_file_enforcement: BTreeMap::from([(
+                    "src/package/_compat.py".to_owned(),
+                    Enforcement::None,
+                )]),
+            },
+        };
+        let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
+        assert_eq!(
+            private_only_for(
+                Path::new("project/src/package/_compat.py"),
+                &loaded,
+                &overrides
+            ),
+            None
+        );
+        // Files the pattern does not name keep the project-wide setting.
+        assert_eq!(
+            private_only_for(Path::new("project/src/package/api.py"), &loaded, &overrides),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn none_enforcement_survives_the_private_only_flag() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory
+            .path()
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[tool.no_defaults]\nper_file_enforcement.\"exempt.py\" = \"none\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let exempt = root.join("exempt.py");
+        std::fs::write(&exempt, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
+        let settings = settings_for_files(&[exempt], true)?;
+        assert_eq!(settings[0].private_only, None);
         Ok(())
     }
 
@@ -2145,8 +2245,8 @@ mod tests {
         std::fs::write(&root_file, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
         std::fs::write(&nested_file, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
         let settings = settings_for_files(&[root_file, nested_file], false)?;
-        assert!(settings[0].private_only);
-        assert!(!settings[1].private_only);
+        assert_eq!(settings[0].private_only, Some(true));
+        assert_eq!(settings[1].private_only, Some(false));
         Ok(())
     }
 }

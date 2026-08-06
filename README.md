@@ -55,6 +55,23 @@ retries: int = field(kw_only=True)
 
 After a successful fix, the command exits with status `0` and prints a Ruff-style summary such as `Found 2 errors (2 fixed, 0 remaining).` Writes use an atomic same-directory replacement. `--diff` prints a unified diff, writes nothing, and exits with status `1` when changes are available.
 
+### `--fix` does not update call sites
+
+`--fix` rewrites signatures and nothing else. Removing a default makes that argument required, so every caller that omitted it now raises `TypeError` at runtime:
+
+```python
+def connect(timeout=30):     # becomes  def connect(timeout):
+    ...
+
+connect()                    # TypeError: connect() missing 1 required positional argument
+```
+
+The same applies to dataclass fields, which become required at construction. The fixed code still imports and still lints clean, so a warning is printed after fixing and **your test suite is what confirms the result**.
+
+Rewriting call sites would mean resolving every call to its definition across the whole project, which this per-file design deliberately avoids. It would not be sufficient either: for a function that is part of your public API, the callers that break are in other people's code.
+
+`--fix` is therefore safest under `private_only = true`, where the symbols it touches have no callers outside the project.
+
 The default `full` output includes source excerpts and carets. `concise` emits one diagnostic per line, `json` emits a machine-readable array, and `github` emits workflow commands for GitHub Actions annotations.
 
 The linter detects defaults on positional-only, positional-or-keyword, and keyword-only parameters.

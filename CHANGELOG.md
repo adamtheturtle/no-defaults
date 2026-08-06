@@ -12,6 +12,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 ### Documentation
 
 - Document that `--fix` rewrites signatures only, so callers that relied on a removed default fail at runtime.
+- Document registering `NOD` in Ruff's `lint.external`, without which `ruff check --fix` deletes `# noqa: NOD001` suppressions.
 
 ## 1.0.1 - 2026-08-05
 

@@ -95,6 +95,18 @@ src/example.py:1:21: NOD002 unused `noqa` directive for `NOD001`
 
 Only directives that name the code are checked. A blanket `# noqa` may exist for another linter, so it is never reported, and a blanket `# ruff: noqa` or `# flake8: noqa` silences every rule in the file, including this one. When `--fix` removes the last code from a directive, it removes the whole comment; otherwise it removes just `NOD001` from the list.
 
+### Using suppressions alongside Ruff
+
+`NOD001` is not a Ruff rule, so Ruff reports every `# noqa: NOD001` as `RUF102 Invalid rule code`.
+That diagnostic is fixable, which means `ruff check --fix` deletes the suppression comment and leaves the violation behind for `no-defaults` to report.
+
+Register the prefix as an external code so Ruff leaves the suppressions alone:
+
+```toml
+[tool.ruff]
+lint.external = [ "NOD" ]
+```
+
 ## Configuration
 
 Configuration lives in `pyproject.toml`:

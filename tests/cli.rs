@@ -67,7 +67,7 @@ fn diff_previews_without_writing() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn fix_warns_that_call_sites_are_not_updated() -> Result<(), Box<dyn std::error::Error>> {
+fn fix_warns_about_callers_it_cannot_see() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");
     std::fs::write(&path, "def f(value=1): pass\ndef g(other=2): pass\n")?;
@@ -75,7 +75,87 @@ fn fix_warns_that_call_sites_are_not_updated() -> Result<(), Box<dyn std::error:
     assert_eq!(output.status.code(), Some(0));
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("2 defaults removed"), "{stderr:?}");
-    assert!(stderr.contains("call sites are not updated"), "{stderr:?}");
+    assert!(stderr.contains("callers outside them"), "{stderr:?}");
+    Ok(())
+}
+
+#[test]
+fn fix_updates_call_sites_across_files() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &api,
+        "from dataclasses import dataclass, field\n\n\
+         def connect(host, timeout=30, *, retries=3):\n    return host\n\n\
+         @dataclass\nclass Job:\n    name: str\n    tags: list = field(default_factory=list)\n\n\
+         class Client:\n    def fetch(self, url, verify=True):\n        return url\n",
+    )?;
+    std::fs::write(
+        &caller,
+        "import api\n\n\
+         api.connect(\"h\")\n\
+         api.connect(\"h\", 5, retries=1)\n\
+         api.Job(\"j\")\n\
+         api.Client().fetch(\"u\")\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        String::from_utf8(output.stdout)?.contains("Updated 3 call sites."),
+        "the fully supplied call needs nothing added"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&caller)?,
+        "import api\n\n\
+         api.connect(\"h\", timeout=30, retries=3)\n\
+         api.connect(\"h\", 5, retries=1)\n\
+         api.Job(\"j\", tags=[])\n\
+         api.Client().fetch(\"u\", verify=True)\n"
+    );
+    let output = Command::new(binary()).arg(directory.path()).output()?;
+    assert_eq!(output.status.code(), Some(0), "the fix is complete");
+    Ok(())
+}
+
+#[test]
+fn fix_leaves_calls_it_cannot_resolve_alone() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "SENTINEL = object()\n\n\
+         def keep(value=SENTINEL): return value\n\n\
+         def shared(x=1): return x\n",
+    )?;
+    std::fs::write(
+        directory.path().join("other.py"),
+        "def shared(y=2): return y\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &caller,
+        "import api\nimport other\n\n\
+         api.keep()\n\
+         api.shared()\n\
+         api.keep(**{})\n",
+    )?;
+    let before = std::fs::read_to_string(&caller)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("is not a literal"), "{stderr:?}");
+    assert!(
+        stderr.contains("several fixed definitions share this name"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("unpacks `*` or `**`"), "{stderr:?}");
+    assert_eq!(std::fs::read_to_string(&caller)?, before);
     Ok(())
 }
 

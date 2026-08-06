@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -8,7 +9,7 @@ use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use ruff_python_ast::token::{TokenKind, Tokens};
-use ruff_python_ast::visitor::{walk_stmt, Visitor};
+use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
@@ -95,6 +96,77 @@ struct Diagnostic {
     fix: TextRange,
 }
 
+/// A default that `--fix` removed, and the argument that replaces it.
+#[derive(Clone, Debug)]
+struct Removed {
+    parameter: String,
+    /// Source text to pass at call sites, when the default can be reproduced
+    /// without depending on names that the caller may not have imported.
+    value: Option<String>,
+}
+
+/// Enough of a callable's shape to decide what a call to it is missing.
+#[derive(Clone, Debug)]
+struct Signature {
+    name: String,
+    /// Parameters that a call can fill positionally, in order. For a method
+    /// this includes `self`; for a dataclass these are the fields.
+    positional: Vec<String>,
+    /// How many leading entries of `positional` are positional-only.
+    positional_only: usize,
+    /// Whether an attribute call binds the first positional parameter.
+    bound: bool,
+    /// Whether this is a function rather than a dataclass. A function's name
+    /// appearing outside a call is worth a warning; a class name appears in
+    /// annotations and `isinstance` checks all the time.
+    function: bool,
+    removed: Vec<Removed>,
+}
+
+/// A replacement for a range of a file. Deletions carry an empty replacement;
+/// call-site rewrites carry an empty range and the text to insert.
+#[derive(Clone, Debug)]
+struct Edit {
+    range: TextRange,
+    replacement: String,
+}
+
+/// A call that could not be updated, and why.
+#[derive(Debug)]
+struct Skipped {
+    path: PathBuf,
+    line: usize,
+    column: usize,
+    callable: String,
+    reason: String,
+}
+
+/// Callables indexed by name. `None` marks a name that several definitions
+/// share, which makes calls to it unresolvable.
+type SignatureIndex = BTreeMap<String, Option<Signature>>;
+
+/// What checking one file produced.
+#[derive(Default)]
+struct Checked {
+    diagnostics: Vec<Diagnostic>,
+    signatures: Vec<Signature>,
+}
+
+/// What scanning files for calls to fixed callables produced.
+#[derive(Default)]
+struct CallSites {
+    edits: BTreeMap<PathBuf, Vec<Edit>>,
+    skipped: Vec<Skipped>,
+    updated: usize,
+}
+
+/// The calls one file makes to fixed callables.
+#[derive(Default)]
+struct FileCallSites {
+    edits: Vec<Edit>,
+    skipped: Vec<Skipped>,
+}
+
 #[must_use]
 pub fn main() -> ExitCode {
     match run() {
@@ -126,22 +198,37 @@ fn run() -> Result<bool, String> {
         }
         return Ok(false);
     }
-    let results: Vec<Result<Vec<Diagnostic>, String>> = files
+    let results: Vec<Result<Checked, String>> = files
         .par_iter()
         .zip(settings.par_iter())
         .map(|(path, setting)| check_file(path, setting.private_only))
         .collect();
     let mut diagnostics = Vec::new();
+    let mut signatures = Vec::new();
     for result in results {
-        diagnostics.extend(result?);
+        let checked = result?;
+        diagnostics.extend(checked.diagnostics);
+        signatures.extend(checked.signatures);
     }
     diagnostics.sort_by(|left, right| {
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
     if (cli.fix || cli.diff) && !diagnostics.is_empty() {
-        let changes = fixed_sources(&diagnostics)?;
+        let mut call_sites = call_site_edits(&files, signatures)?;
+        for diagnostic in &diagnostics {
+            call_sites
+                .edits
+                .entry(diagnostic.path.clone())
+                .or_default()
+                .push(Edit {
+                    range: diagnostic.fix,
+                    replacement: String::new(),
+                });
+        }
+        let changes = fixed_sources(call_sites.edits)?;
         if cli.diff {
             print_diffs(&changes);
+            warn_about_skipped_calls(&call_sites.skipped);
             return Ok(true);
         }
         write_fixes_atomically(changes)?;
@@ -151,24 +238,93 @@ fn run() -> Result<bool, String> {
             if diagnostics.len() == 1 { "" } else { "s" },
             diagnostics.len()
         );
-        // Removing a default makes the argument required, but call sites are
-        // never rewritten, so callers that relied on it now fail at runtime.
-        let removed = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "NOD001")
-            .count();
-        if removed > 0 {
-            eprintln!(
-                "warning: {removed} default{} removed; call sites are not updated. \
-                 Callers relying on {} raise `TypeError`. Run your tests.",
-                if removed == 1 { "" } else { "s" },
-                if removed == 1 { "it" } else { "them" },
-            );
-        }
+        report_call_sites(&diagnostics, &call_sites.skipped, call_sites.updated);
         return Ok(false);
     }
     report_diagnostics(&diagnostics, cli.output_format)?;
     Ok(!diagnostics.is_empty())
+}
+
+fn warn_about_skipped_calls(skipped: &[Skipped]) {
+    for skip in skipped {
+        eprintln!(
+            "warning: {}:{}:{}: left the call to `{}` alone: {}",
+            skip.path.display(),
+            skip.line,
+            skip.column,
+            skip.callable,
+            skip.reason
+        );
+    }
+}
+
+/// Report what `--fix` did to call sites, and what it could not reach.
+fn report_call_sites(diagnostics: &[Diagnostic], skipped: &[Skipped], updated: usize) {
+    let removed = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "NOD001")
+        .count();
+    if removed == 0 {
+        return;
+    }
+    println!(
+        "Updated {updated} call site{}.",
+        if updated == 1 { "" } else { "s" }
+    );
+    warn_about_skipped_calls(skipped);
+    eprintln!(
+        "warning: {removed} default{} removed. Call sites in the checked files were \
+         updated, but callers outside them, and calls made dynamically, were not. \
+         Run your tests.",
+        if removed == 1 { "" } else { "s" },
+    );
+}
+
+/// Insert the removed defaults as explicit arguments at every call the checked
+/// files make to a callable that `--fix` changed.
+///
+/// Resolution is by name across the checked files, so a name that several
+/// definitions share is left alone rather than guessed at.
+fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<CallSites, String> {
+    let mut index = SignatureIndex::new();
+    for signature in signatures {
+        match index.entry(signature.name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(Some(signature));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
+    }
+    let mut call_sites = CallSites::default();
+    if index.is_empty() {
+        return Ok(call_sites);
+    }
+    let results: Vec<Result<FileCallSites, String>> = files
+        .par_iter()
+        .map(|path| {
+            let source = std::fs::read_to_string(path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            rewrite_calls(path, &source, &index)
+        })
+        .collect();
+    for (path, result) in files.iter().zip(results) {
+        let file = result?;
+        call_sites.updated += file.edits.len();
+        if !file.edits.is_empty() {
+            call_sites
+                .edits
+                .entry(path.clone())
+                .or_default()
+                .extend(file.edits);
+        }
+        call_sites.skipped.extend(file.skipped);
+    }
+    call_sites.skipped.sort_by(|left, right| {
+        (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
+    });
+    Ok(call_sites)
 }
 
 #[derive(Serialize)]
@@ -375,35 +531,51 @@ fn load_config_path(path: &Path) -> Result<LoadedConfig, String> {
 }
 
 fn fixed_sources(
-    diagnostics: &[Diagnostic],
+    edits: BTreeMap<PathBuf, Vec<Edit>>,
 ) -> Result<BTreeMap<PathBuf, (String, String)>, String> {
-    let mut by_path: BTreeMap<&Path, Vec<TextRange>> = BTreeMap::new();
-    for diagnostic in diagnostics {
-        by_path
-            .entry(&diagnostic.path)
-            .or_default()
-            .push(diagnostic.fix);
-    }
-    by_path
+    edits
         .into_iter()
-        .map(|(path, mut ranges)| {
-            let source = std::fs::read_to_string(path).map_err(|error| {
+        .map(|(path, edits)| {
+            let source = std::fs::read_to_string(&path).map_err(|error| {
                 format!("could not read {} for fixing: {error}", path.display())
             })?;
-            let mut fixed = source.clone();
-            ranges.sort_by_key(|range| std::cmp::Reverse(range.start()));
-            for range in ranges {
-                fixed.replace_range(range.start().to_usize()..range.end().to_usize(), "");
-            }
+            let fixed = apply_edits(&source, edits);
             parse_module(&fixed).map_err(|error| {
                 format!(
                     "refusing to write invalid Python to {} after fixing: {error}",
                     path.display()
                 )
             })?;
-            Ok((path.to_path_buf(), (source, fixed)))
+            Ok((path, (source, fixed)))
         })
         .collect()
+}
+
+/// Apply edits from the end of the file backwards so earlier offsets stay valid.
+///
+/// A call site nested inside a default that is being deleted would otherwise be
+/// rewritten into text that no longer exists, so those insertions are dropped.
+fn apply_edits(source: &str, mut edits: Vec<Edit>) -> String {
+    let deletions: Vec<TextRange> = edits
+        .iter()
+        .filter(|edit| edit.replacement.is_empty())
+        .map(|edit| edit.range)
+        .collect();
+    edits.retain(|edit| {
+        edit.replacement.is_empty()
+            || !deletions
+                .iter()
+                .any(|deletion| deletion.contains(edit.range.start()))
+    });
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start()));
+    let mut fixed = source.to_owned();
+    for edit in edits {
+        fixed.replace_range(
+            edit.range.start().to_usize()..edit.range.end().to_usize(),
+            &edit.replacement,
+        );
+    }
+    fixed
 }
 
 fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Result<(), String> {
@@ -562,16 +734,20 @@ fn is_python(path: &Path) -> bool {
 /// This is primarily exposed for performance benchmarks.
 #[doc(hidden)]
 pub fn lint_source(source: &str, private_only: bool) -> Result<usize, String> {
-    Ok(check_source(Path::new("benchmark.py"), source, private_only)?.len())
+    Ok(
+        check_source(Path::new("benchmark.py"), source, private_only)?
+            .diagnostics
+            .len(),
+    )
 }
 
-fn check_file(path: &Path, private_only: bool) -> Result<Vec<Diagnostic>, String> {
+fn check_file(path: &Path, private_only: bool) -> Result<Checked, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     check_source(path, &source, private_only)
 }
 
-fn check_source(path: &Path, source: &str, private_only: bool) -> Result<Vec<Diagnostic>, String> {
+fn check_source(path: &Path, source: &str, private_only: bool) -> Result<Checked, String> {
     let parsed = parse_module(source)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
     let directives = collect_directives(source, parsed.tokens());
@@ -581,14 +757,18 @@ fn check_source(path: &Path, source: &str, private_only: bool) -> Result<Vec<Dia
         .iter()
         .any(|directive| directive.file_level && !directive.explicit)
     {
-        return Ok(Vec::new());
+        return Ok(Checked::default());
     }
     let mut checker = Checker {
         path,
         source,
         private_only,
-        private_scope: is_private_module(path),
-        dataclass_scope: false,
+        scope: Scope {
+            private: is_private_module(path),
+            ..Scope::default()
+        },
+        classes: Vec::new(),
+        signatures: Vec::new(),
         directives,
         diagnostics: Vec::new(),
     };
@@ -740,15 +920,36 @@ struct Checker<'a> {
     path: &'a Path,
     source: &'a str,
     private_only: bool,
-    private_scope: bool,
-    dataclass_scope: bool,
+    scope: Scope,
+    classes: Vec<ClassCollector>,
+    signatures: Vec<Signature>,
     directives: Vec<Directive>,
     diagnostics: Vec<Diagnostic>,
 }
 
+/// What the enclosing definitions say about the statement being visited.
+#[derive(Clone, Copy, Default)]
+struct Scope {
+    /// Whether an enclosing module, class, or function is private.
+    private: bool,
+    /// Whether assignments here are dataclass fields.
+    dataclass: bool,
+    /// Whether definitions here sit directly in a class body.
+    class_body: bool,
+}
+
+/// The fields of a class body, gathered so a dataclass can be given a signature
+/// once its body has been walked.
+struct ClassCollector {
+    name: String,
+    dataclass: bool,
+    fields: Vec<String>,
+    removed: Vec<Removed>,
+}
+
 impl Checker<'_> {
     fn enabled(&self, name: &str) -> bool {
-        !self.private_only || self.private_scope || is_private(name)
+        !self.private_only || self.scope.private || is_private(name)
     }
 
     /// Mark the directives that suppress a violation at `offset`, preferring
@@ -776,9 +977,10 @@ impl Checker<'_> {
             .map(|(index, _)| index)
     }
 
-    fn report(&mut self, offset: TextSize, message: String, fix: TextRange) {
+    /// Record a violation, returning whether it survived `noqa` suppression.
+    fn report(&mut self, offset: TextSize, message: String, fix: TextRange) -> bool {
         if self.suppress(offset) {
-            return;
+            return false;
         }
         let (line, column) = line_column(self.source, offset);
         self.diagnostics.push(Diagnostic {
@@ -789,11 +991,12 @@ impl Checker<'_> {
             message,
             fix,
         });
+        true
     }
 
     /// Add a diagnostic for every directive that named `NOD001` without
     /// suppressing anything, then return the file's diagnostics in order.
-    fn finish(mut self) -> Vec<Diagnostic> {
+    fn finish(mut self) -> Checked {
         for directive in &self.directives {
             if !directive.explicit || directive.used {
                 continue;
@@ -810,13 +1013,17 @@ impl Checker<'_> {
         }
         self.diagnostics
             .sort_by_key(|diagnostic| (diagnostic.line, diagnostic.column));
-        self.diagnostics
+        Checked {
+            diagnostics: self.diagnostics,
+            signatures: self.signatures,
+        }
     }
 
     fn check_function(&mut self, function: &ast::StmtFunctionDef) {
         if !self.enabled(function.name.as_str()) {
             return;
         }
+        let mut removed = Vec::new();
         for parameter in function
             .parameters
             .posonlyargs
@@ -825,36 +1032,78 @@ impl Checker<'_> {
             .chain(&function.parameters.kwonlyargs)
         {
             if let Some(default) = &parameter.default {
-                self.report(
+                if self.report(
                     default.start(),
                     format!(
                         "parameter `{}` of function `{}` has a default",
                         parameter.parameter.name, function.name
                     ),
                     TextRange::new(parameter.parameter.end(), default.end()),
-                );
+                ) {
+                    removed.push(Removed {
+                        parameter: parameter.parameter.name.to_string(),
+                        value: literal_text(default, self.source),
+                    });
+                }
             }
         }
+        if removed.is_empty() {
+            return;
+        }
+        let parameter_name =
+            |parameter: &ast::ParameterWithDefault| parameter.parameter.name.to_string();
+        self.signatures.push(Signature {
+            name: function.name.to_string(),
+            positional: function
+                .parameters
+                .posonlyargs
+                .iter()
+                .chain(&function.parameters.args)
+                .map(parameter_name)
+                .collect(),
+            positional_only: function.parameters.posonlyargs.len(),
+            bound: self.scope.class_body && !is_static_method(function),
+            function: true,
+            removed,
+        });
     }
 
     fn check_dataclass_field(&mut self, statement: &Stmt) {
         let Stmt::AnnAssign(assign) = statement else {
             return;
         };
-        let (Expr::Name(name), Some(value)) = (&*assign.target, assign.value.as_deref()) else {
+        let Expr::Name(name) = &*assign.target else {
             return;
         };
-        if !self.enabled(name.id.as_str()) || is_class_var(statement) {
+        if is_class_var(statement) {
             return;
         }
-        let Some(default) = field_default(value, assign.annotation.end()) else {
+        // Every field counts towards the constructor's positional order, even
+        // one without a default or one this run is not enforcing.
+        if let Some(class) = self.classes.last_mut() {
+            class.fields.push(name.id.to_string());
+        }
+        let Some(value) = assign.value.as_deref() else {
             return;
         };
-        self.report(
+        if !self.enabled(name.id.as_str()) {
+            return;
+        }
+        let Some(default) = field_default(value, assign.annotation.end(), self.source) else {
+            return;
+        };
+        if self.report(
             value.start(),
             format!("dataclass field `{}` has a {}", name.id, default.kind),
             default.fix,
-        );
+        ) {
+            if let Some(class) = self.classes.last_mut() {
+                class.removed.push(Removed {
+                    parameter: name.id.to_string(),
+                    value: default.value,
+                });
+            }
+        }
     }
 }
 
@@ -863,26 +1112,46 @@ impl<'a> Visitor<'a> for Checker<'a> {
         match statement {
             Stmt::FunctionDef(function) => {
                 self.check_function(function);
-                let old_private = self.private_scope;
-                let old_dataclass = self.dataclass_scope;
-                self.private_scope = old_private || is_private(function.name.as_str());
-                // Annotated assignments in a method body are locals, not
-                // fields, so field detection stops at the function boundary.
-                self.dataclass_scope = false;
+                let outer = self.scope;
+                self.scope = Scope {
+                    private: outer.private || is_private(function.name.as_str()),
+                    // Annotated assignments in a method body are locals, not
+                    // fields, so field detection stops at the function boundary.
+                    dataclass: false,
+                    class_body: false,
+                };
                 walk_stmt(self, statement);
-                self.dataclass_scope = old_dataclass;
-                self.private_scope = old_private;
+                self.scope = outer;
             }
             Stmt::ClassDef(class) => {
-                let old_private = self.private_scope;
-                let old_dataclass = self.dataclass_scope;
-                self.private_scope = old_private || is_private(class.name.as_str());
-                self.dataclass_scope = has_dataclass_decorator(class);
+                let outer = self.scope;
+                self.scope = Scope {
+                    private: outer.private || is_private(class.name.as_str()),
+                    dataclass: has_dataclass_decorator(class),
+                    class_body: true,
+                };
+                self.classes.push(ClassCollector {
+                    name: class.name.to_string(),
+                    dataclass: self.scope.dataclass,
+                    fields: Vec::new(),
+                    removed: Vec::new(),
+                });
                 walk_stmt(self, statement);
-                self.dataclass_scope = old_dataclass;
-                self.private_scope = old_private;
+                if let Some(collector) = self.classes.pop() {
+                    if collector.dataclass && !collector.removed.is_empty() {
+                        self.signatures.push(Signature {
+                            name: collector.name,
+                            positional: collector.fields,
+                            positional_only: 0,
+                            bound: false,
+                            function: false,
+                            removed: collector.removed,
+                        });
+                    }
+                }
+                self.scope = outer;
             }
-            _ if self.dataclass_scope => {
+            _ if self.scope.dataclass => {
                 self.check_dataclass_field(statement);
                 walk_stmt(self, statement);
             }
@@ -927,22 +1196,23 @@ fn is_class_var(statement: &Stmt) -> bool {
 struct FieldDefault {
     kind: &'static str,
     fix: TextRange,
+    /// Source text to pass at call sites, when it can be reproduced.
+    value: Option<String>,
 }
 
-fn field_default(value: &Expr, annotation_end: TextSize) -> Option<FieldDefault> {
+fn field_default(value: &Expr, annotation_end: TextSize, source: &str) -> Option<FieldDefault> {
+    let plain = || FieldDefault {
+        kind: "default",
+        fix: TextRange::new(annotation_end, value.end()),
+        value: literal_text(value, source),
+    };
     let Expr::Call(call) = value else {
-        return Some(FieldDefault {
-            kind: "default",
-            fix: TextRange::new(annotation_end, value.end()),
-        });
+        return Some(plain());
     };
     let is_field = matches!(&*call.func, Expr::Name(name) if name.id.as_str() == "field")
         || matches!(&*call.func, Expr::Attribute(attribute) if attribute.attr.as_str() == "field");
     if !is_field {
-        return Some(FieldDefault {
-            kind: "default",
-            fix: TextRange::new(annotation_end, value.end()),
-        });
+        return Some(plain());
     }
     if let Some(first) = call.arguments.args.first() {
         return Some(FieldDefault {
@@ -956,6 +1226,7 @@ fn field_default(value: &Expr, annotation_end: TextSize) -> Option<FieldDefault>
                     .or_else(|| call.arguments.keywords.first().map(Ranged::range)),
                 None,
             ),
+            value: literal_text(first, source),
         });
     }
     let (index, keyword) = call
@@ -969,17 +1240,23 @@ fn field_default(value: &Expr, annotation_end: TextSize) -> Option<FieldDefault>
                 .as_ref()
                 .is_some_and(|name| matches!(name.as_str(), "default" | "default_factory"))
         })?;
-    let kind = if keyword
+    let factory = keyword
         .arg
         .as_ref()
-        .is_some_and(|name| name.as_str() == "default_factory")
-    {
+        .is_some_and(|name| name.as_str() == "default_factory");
+    let kind = if factory {
         "default factory"
     } else {
         "default"
     };
+    let value = if factory {
+        factory_call_text(&keyword.value)
+    } else {
+        literal_text(&keyword.value, source)
+    };
     Some(FieldDefault {
         kind,
+        value,
         fix: argument_removal_range(
             keyword.range(),
             call.arguments.keywords.get(index + 1).map(Ranged::range),
@@ -1005,6 +1282,271 @@ fn argument_removal_range(
     }
 }
 
+fn is_static_method(function: &ast::StmtFunctionDef) -> bool {
+    function.decorator_list.iter().any(|decorator| {
+        matches!(&decorator.expression, Expr::Name(name) if name.id.as_str() == "staticmethod")
+    })
+}
+
+/// The source text of a default that a call site can repeat verbatim.
+///
+/// Only self-contained literals qualify. A default such as `SENTINEL` or
+/// `Path.cwd()` depends on names the caller may not have imported, and copying
+/// it would change what the call means, so those are left to the reader.
+fn literal_text(expression: &Expr, source: &str) -> Option<String> {
+    is_literal(expression).then(|| {
+        source[expression.range().start().to_usize()..expression.range().end().to_usize()]
+            .to_owned()
+    })
+}
+
+fn is_literal(expression: &Expr) -> bool {
+    match expression {
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_) => true,
+        Expr::UnaryOp(unary) => is_literal(&unary.operand),
+        Expr::Tuple(tuple) => tuple.elts.iter().all(is_literal),
+        Expr::List(list) => list.elts.iter().all(is_literal),
+        Expr::Set(set) => set.elts.iter().all(is_literal),
+        Expr::Dict(dict) => dict
+            .items
+            .iter()
+            .all(|item| item.key.as_ref().is_some_and(is_literal) && is_literal(&item.value)),
+        _ => false,
+    }
+}
+
+/// The value a `default_factory` produces, for factories whose result can be
+/// written as a literal. Any other factory is left alone.
+fn factory_call_text(factory: &Expr) -> Option<String> {
+    let Expr::Name(name) = factory else {
+        return None;
+    };
+    match name.id.as_str() {
+        "list" => Some("[]".to_owned()),
+        "dict" => Some("{}".to_owned()),
+        "tuple" => Some("()".to_owned()),
+        "set" => Some("set()".to_owned()),
+        "frozenset" => Some("frozenset()".to_owned()),
+        _ => None,
+    }
+}
+
+/// Find the calls in `source` that relied on a default `--fix` removed, and
+/// build the edits that pass that default explicitly instead.
+fn rewrite_calls(
+    path: &Path,
+    source: &str,
+    index: &SignatureIndex,
+) -> Result<FileCallSites, String> {
+    let parsed = parse_module(source)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    let mut rewriter = Rewriter {
+        path,
+        source,
+        index,
+        called: BTreeSet::new(),
+        edits: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for statement in parsed.suite() {
+        rewriter.visit_stmt(statement);
+    }
+    Ok(FileCallSites {
+        edits: rewriter.edits,
+        skipped: rewriter.skipped,
+    })
+}
+
+struct Rewriter<'a> {
+    path: &'a Path,
+    source: &'a str,
+    index: &'a SignatureIndex,
+    /// Ranges of the expressions being called, so that the same expression is
+    /// not later mistaken for a reference that never calls the function.
+    called: BTreeSet<(TextSize, TextSize)>,
+    edits: Vec<Edit>,
+    skipped: Vec<Skipped>,
+}
+
+impl Rewriter<'_> {
+    fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
+        let (line, column) = line_column(self.source, offset);
+        self.skipped.push(Skipped {
+            path: self.path.to_path_buf(),
+            line,
+            column,
+            callable: callable.to_owned(),
+            reason,
+        });
+    }
+
+    /// Warn about a fixed function named somewhere other than a call, such as
+    /// a bare `@decorator` or a callback passed by name. Python still calls it,
+    /// but there is no argument list to add the removed default to.
+    fn check_reference(&mut self, expression: &Expr) {
+        if self
+            .called
+            .contains(&(expression.start(), expression.end()))
+        {
+            return;
+        }
+        let name = match expression {
+            Expr::Name(name) => name.id.as_str(),
+            Expr::Attribute(attribute) => attribute.attr.as_str(),
+            _ => return,
+        };
+        if !self
+            .index
+            .get(name)
+            .is_some_and(|entry| entry.as_ref().is_some_and(|signature| signature.function))
+        {
+            return;
+        }
+        self.skip(
+            expression.start(),
+            name,
+            "it is named here without being called, so the removed default cannot be supplied"
+                .to_owned(),
+        );
+    }
+
+    fn check_call(&mut self, call: &ast::ExprCall) {
+        // Calls are resolved by the name being called, so `helper(...)` and
+        // `module.helper(...)` both reach a `helper` that was fixed.
+        let (name, attribute) = match &*call.func {
+            Expr::Name(name) => (name.id.as_str(), false),
+            Expr::Attribute(attribute) => (attribute.attr.as_str(), true),
+            _ => return,
+        };
+        let Some(entry) = self.index.get(name) else {
+            return;
+        };
+        let Some(signature) = entry else {
+            self.skip(
+                call.start(),
+                name,
+                "several fixed definitions share this name".to_owned(),
+            );
+            return;
+        };
+        // An attribute call on a bound method has already supplied `self`.
+        let bound = usize::from(attribute && signature.bound);
+        let arguments = match missing_arguments(&call.arguments, signature, bound) {
+            Ok(arguments) => arguments,
+            Err(reason) => {
+                self.skip(call.start(), name, reason);
+                return;
+            }
+        };
+        if arguments.is_empty() {
+            return;
+        }
+        let arguments = arguments.join(", ");
+        let last = call
+            .arguments
+            .args
+            .iter()
+            .map(Ranged::end)
+            .chain(call.arguments.keywords.iter().map(Ranged::end))
+            .max();
+        // Inserting after the final argument rather than before the closing
+        // parenthesis keeps trailing commas and trailing comments intact.
+        let (offset, replacement) = last.map_or_else(
+            || {
+                (
+                    call.arguments.range().end() - TextSize::from(1),
+                    arguments.clone(),
+                )
+            },
+            |end| (end, format!(", {arguments}")),
+        );
+        self.edits.push(Edit {
+            range: TextRange::empty(offset),
+            replacement,
+        });
+    }
+}
+
+/// The arguments a call must gain to keep meaning what it meant before the
+/// defaults were removed, or the reason the call has to be left alone.
+fn missing_arguments(
+    call: &ast::Arguments,
+    signature: &Signature,
+    bound: usize,
+) -> Result<Vec<String>, String> {
+    if call
+        .args
+        .iter()
+        .any(|argument| matches!(argument, Expr::Starred(_)))
+        || call.keywords.iter().any(|keyword| keyword.arg.is_none())
+    {
+        return Err(
+            "the call unpacks `*` or `**` arguments, so its arguments are not known".to_owned(),
+        );
+    }
+    let positional = call.args.len();
+    let named: Vec<&str> = call
+        .keywords
+        .iter()
+        .filter_map(|keyword| keyword.arg.as_ref().map(ast::Identifier::as_str))
+        .collect();
+    let mut appended: Vec<String> = Vec::new();
+    let mut keywords: Vec<String> = Vec::new();
+    for removed in &signature.removed {
+        if named.contains(&removed.parameter.as_str()) {
+            continue;
+        }
+        let slot = signature
+            .positional
+            .iter()
+            .position(|parameter| *parameter == removed.parameter);
+        if slot.is_some_and(|slot| slot >= bound && slot - bound < positional) {
+            continue;
+        }
+        let Some(value) = &removed.value else {
+            return Err(format!(
+                "the default removed from `{}` is not a literal, so repeating it here \
+                 could change what the call means",
+                removed.parameter
+            ));
+        };
+        if slot.is_some_and(|slot| slot < signature.positional_only) {
+            // A positional-only argument can only be appended when it fills the
+            // very next slot and no keyword argument precedes it.
+            if !call.keywords.is_empty() || slot != Some(bound + positional + appended.len()) {
+                return Err(format!(
+                    "`{}` is positional-only and cannot be appended to this call",
+                    removed.parameter
+                ));
+            }
+            appended.push(value.clone());
+        } else {
+            keywords.push(format!("{}={}", removed.parameter, value));
+        }
+    }
+    appended.extend(keywords);
+    Ok(appended)
+}
+
+impl<'a> Visitor<'a> for Rewriter<'a> {
+    fn visit_expr(&mut self, expression: &'a Expr) {
+        match expression {
+            Expr::Call(call) => {
+                self.called.insert((call.func.start(), call.func.end()));
+                self.check_call(call);
+            }
+            Expr::Name(_) | Expr::Attribute(_) => self.check_reference(expression),
+            _ => {}
+        }
+        walk_expr(self, expression);
+    }
+}
+
 fn line_column(source: &str, offset: TextSize) -> (usize, usize) {
     let offset = offset.to_usize();
     let before = &source[..offset];
@@ -1019,6 +1561,7 @@ mod tests {
 
     fn messages(source: &str, private_only: bool) -> Result<Vec<String>, String> {
         Ok(check_source(Path::new("fixture.py"), source, private_only)?
+            .diagnostics
             .into_iter()
             .map(|item| item.message)
             .collect())
@@ -1026,20 +1569,61 @@ mod tests {
 
     fn codes(source: &str) -> Result<Vec<&'static str>, String> {
         Ok(check_source(Path::new("fixture.py"), source, false)?
+            .diagnostics
             .into_iter()
             .map(|item| item.code)
             .collect())
+    }
+
+    /// Fix every file in `directory` the way `--fix` does, and report the calls
+    /// that were left alone.
+    fn fix_all(files: &[PathBuf]) -> Result<Vec<Skipped>, String> {
+        let mut diagnostics = Vec::new();
+        let mut signatures = Vec::new();
+        for path in files {
+            let checked = check_file(path, false)?;
+            diagnostics.extend(checked.diagnostics);
+            signatures.extend(checked.signatures);
+        }
+        let mut call_sites = call_site_edits(files, signatures)?;
+        for diagnostic in &diagnostics {
+            call_sites
+                .edits
+                .entry(diagnostic.path.clone())
+                .or_default()
+                .push(Edit {
+                    range: diagnostic.fix,
+                    replacement: String::new(),
+                });
+        }
+        write_fixes_atomically(fixed_sources(call_sites.edits)?)?;
+        for path in files {
+            assert!(
+                check_file(path, false)?.diagnostics.is_empty(),
+                "{}",
+                path.display()
+            );
+        }
+        Ok(call_sites.skipped)
     }
 
     fn fixed(source: &str) -> Result<String, String> {
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let path = directory.path().join("example.py");
         std::fs::write(&path, source).map_err(|error| error.to_string())?;
-        let diagnostics = check_file(&path, false)?;
-        write_fixes_atomically(fixed_sources(&diagnostics)?)?;
-        let fixed = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
-        assert!(check_file(&path, false)?.is_empty(), "{fixed:?}");
-        Ok(fixed)
+        fix_all(std::slice::from_ref(&path))?;
+        std::fs::read_to_string(&path).map_err(|error| error.to_string())
+    }
+
+    /// Fix `source` and report why any call in it was left alone.
+    fn skipped_reasons(source: &str) -> Result<Vec<String>, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.py");
+        std::fs::write(&path, source).map_err(|error| error.to_string())?;
+        Ok(fix_all(std::slice::from_ref(&path))?
+            .into_iter()
+            .map(|skip| skip.reason)
+            .collect())
     }
 
     #[test]
@@ -1170,16 +1754,14 @@ mod tests {
             "from dataclasses import dataclass, field\n\ndef f(a: int = 1, *, b=2): pass\n\n@dataclass\nclass C:\n    a: int = 1\n    b: int = field(default=2, repr=False)\n    c: int = field(kw_only=True, default_factory=int)\n    not_a_field = 3\n",
         )
         .map_err(|error| error.to_string())?;
-        let diagnostics = check_file(&path, false)?;
-        assert_eq!(diagnostics.len(), 5);
-        write_fixes_atomically(fixed_sources(&diagnostics)?)?;
-        let fixed = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        assert_eq!(check_file(&path, false)?.diagnostics.len(), 5);
+        fix_all(std::slice::from_ref(&path))?;
+        let fixed = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
         assert!(fixed.contains("def f(a: int, *, b): pass"));
         assert!(fixed.contains("a: int"));
         assert!(fixed.contains("b: int = field(repr=False)"));
         assert!(fixed.contains("c: int = field(kw_only=True)"));
         assert!(fixed.contains("not_a_field = 3"));
-        assert!(check_file(&directory.path().join("example.py"), false)?.is_empty());
         Ok(())
     }
 
@@ -1192,12 +1774,10 @@ mod tests {
             "def f(\n    value: int = 1,  # useful comment\n    *,\n    flag=True,\n):\n    pass\n",
         )
         .map_err(|error| error.to_string())?;
-        let diagnostics = check_file(&path, false)?;
-        write_fixes_atomically(fixed_sources(&diagnostics)?)?;
+        fix_all(std::slice::from_ref(&path))?;
         let fixed = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
         assert!(fixed.contains("value: int,  # useful comment"));
         assert!(fixed.contains("flag,"));
-        assert!(check_file(&path, false)?.is_empty());
         Ok(())
     }
 
@@ -1260,6 +1840,7 @@ mod tests {
         )?;
         assert_eq!(
             found
+                .diagnostics
                 .iter()
                 .map(|item| item.code)
                 .collect::<Vec<_>>()
@@ -1317,6 +1898,98 @@ mod tests {
         assert_eq!(
             fixed("def f(x=1): pass  # noqa: E501\ndef g(x): pass  # noqa: NOD001\n")?,
             "def f(x): pass  # noqa: E501\ndef g(x): pass\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn positional_only_defaults_are_appended_positionally() -> Result<(), String> {
+        assert_eq!(
+            fixed("def f(a, b=2, /): pass\nf(1)\nf(1, 9)\n")?,
+            "def f(a, b, /): pass\nf(1, 2)\nf(1, 9)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_positional_only_argument_is_never_appended_after_a_keyword() -> Result<(), String> {
+        assert_eq!(
+            skipped_reasons("def f(a=1, /, *, b=2): pass\nf(b=3)\n")?
+                .first()
+                .map(String::as_str),
+            Some("`a` is positional-only and cannot be appended to this call"),
+            "appending `1` after `b=3` would not parse"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn call_sites_keep_trailing_commas_and_comments() -> Result<(), String> {
+        assert_eq!(
+            fixed("def f(a, b=2): pass\nf(\n    1,  # first\n)\n")?,
+            "def f(a, b): pass\nf(\n    1, b=2,  # first\n)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_default_factory_becomes_a_fresh_value_at_each_call() -> Result<(), String> {
+        assert_eq!(
+            fixed("@dataclass\nclass C:\n    a: list = field(default_factory=list)\n    b: dict = field(default_factory=dict)\nC()\n")?,
+            "@dataclass\nclass C:\n    a: list = field()\n    b: dict = field()\nC(a=[], b={})\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unresolvable_factory_leaves_the_call_alone() -> Result<(), String> {
+        assert_eq!(
+            skipped_reasons(
+                "@dataclass\nclass C:\n    a: int = field(default_factory=Thing)\nC()\n"
+            )?
+            .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_function_named_without_being_called_is_reported() -> Result<(), String> {
+        assert_eq!(
+            skipped_reasons("def deco(cls=None): return cls\n\n\n@deco\ndef f(): pass\n")?
+                .first()
+                .map(String::as_str),
+            Some(
+                "it is named here without being called, so the removed default cannot be supplied"
+            ),
+            "a bare decorator calls the function with no argument list to add to"
+        );
+        assert_eq!(
+            skipped_reasons("def cb(x=1): return x\nrun(cb)\n")?.len(),
+            1,
+            "a callback passed by name is called somewhere this cannot see"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dataclass_named_without_being_called_is_left_quiet() -> Result<(), String> {
+        // Class names appear in annotations and `isinstance` checks constantly,
+        // and none of those are calls.
+        assert!(skipped_reasons(
+            "@dataclass\nclass C:\n    x: int = 1\n\n\ndef f(c: C) -> C:\n    return c\n"
+        )?
+        .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_call_inside_a_removed_default_is_not_rewritten() -> Result<(), String> {
+        // The call is deleted along with the default, so inserting into it
+        // would write into text that no longer exists.
+        assert_eq!(
+            fixed("def g(a=1): pass\ndef f(x=g()): pass\n")?,
+            "def g(a): pass\ndef f(x): pass\n"
         );
         Ok(())
     }

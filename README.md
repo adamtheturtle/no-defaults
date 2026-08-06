@@ -53,24 +53,39 @@ retries: int = field(default=3, kw_only=True)
 retries: int = field(kw_only=True)
 ```
 
-After a successful fix, the command exits with status `0` and prints a Ruff-style summary such as `Found 2 errors (2 fixed, 0 remaining).` Writes use an atomic same-directory replacement. `--diff` prints a unified diff, writes nothing, and exits with status `1` when changes are available.
+After a successful fix, the command exits with status `0` and prints a Ruff-style summary such as `Found 2 errors (2 fixed, 0 remaining).` followed by `Updated 3 call sites.` Writes use an atomic same-directory replacement. `--diff` prints a unified diff, writes nothing, and exits with status `1` when changes are available.
 
-### `--fix` does not update call sites
+### `--fix` updates call sites
 
-`--fix` rewrites signatures and nothing else. Removing a default makes that argument required, so every caller that omitted it now raises `TypeError` at runtime:
+Removing a default makes that argument required, so `--fix` also passes the removed default explicitly at every call it can see in the files you asked it to check:
 
 ```python
-def connect(timeout=30):     # becomes  def connect(timeout):
+def connect(host, timeout=30):     # becomes  def connect(host, timeout):
     ...
 
-connect()                    # TypeError: connect() missing 1 required positional argument
+connect("example.com")             # becomes  connect("example.com", timeout=30)
+connect("example.com", 5)          # already supplies it, so it is left alone
 ```
 
-The same applies to dataclass fields, which become required at construction. The fixed code still imports and still lints clean, so a warning is printed after fixing and **your test suite is what confirms the result**.
+The same applies to dataclass fields, which become required at construction: `Job("j")` becomes `Job("j", retries=3)`. A `default_factory` becomes the value it produces, so `field(default_factory=list)` adds `tags=[]` — a fresh list per call, which is what the factory gave you.
 
-Rewriting call sites would mean resolving every call to its definition across the whole project, which this per-file design deliberately avoids. It would not be sufficient either: for a function that is part of your public API, the callers that break are in other people's code.
+Arguments are appended as keywords wherever Python allows it, so the change is stable under later edits to the signature. Positional-only parameters are appended positionally instead.
 
-`--fix` is therefore safest under `private_only = true`, where the symbols it touches have no callers outside the project.
+Calls are matched by the name being called, so both `connect(...)` and `api.connect(...)` are found. Nothing is guessed: a call is left alone, with a warning naming the file and line, when
+
+- several fixed definitions share the name, so the call cannot be resolved;
+- the call unpacks `*args` or `**kwargs`, so what it already supplies is unknown;
+- the removed default is not a literal (`value=SENTINEL`, `path=Path.cwd()`), because repeating that text at the call site would depend on names the caller may not have imported, or would re-evaluate the expression;
+- a positional-only argument cannot be appended without reordering the call;
+- the function is named without being called — a bare `@decorator`, or a callback passed as `run(cb)` — because Python calls it somewhere with no argument list to add to. This one is a breakage you have to resolve by hand.
+
+Class names are exempt from that last check, because they appear in annotations and `isinstance` checks constantly and none of those are calls.
+
+Two things `--fix` still cannot reach: **callers outside the files you checked** — for a function that is part of your public API, they are in other people's code — and **calls made dynamically**, through `getattr` or a variable holding the function. A warning after fixing says so, and **your test suite is what confirms the result**.
+
+`--fix` is therefore safest under `private_only = true`, where the symbols it touches have no callers outside the project, and it sees the most when you run it over the whole project at once. Under pre-commit, which passes only the changed files, a call in a file that did not change is not in the run and is not updated — run `no-defaults --fix .` by hand when you are removing a default that is called from elsewhere.
+
+`--diff` shows the call-site edits alongside the signature edits, and reports the same warnings, so you can preview the whole change before writing anything.
 
 The default `full` output includes source excerpts and carets. `concise` emits one diagnostic per line, `json` emits a machine-readable array, and `github` emits workflow commands for GitHub Actions annotations.
 

@@ -199,6 +199,7 @@ fn run() -> Result<bool, String> {
         }
         return Ok(false);
     }
+    let fixing = cli.fix || cli.diff;
     let results: Vec<Result<Checked, String>> = files
         .par_iter()
         .zip(settings.par_iter())
@@ -209,7 +210,7 @@ fn run() -> Result<bool, String> {
             // about leaving the file broken at runtime.
             setting.private_only.map_or_else(
                 || Ok(Checked::default()),
-                |private_only| check_file(path, private_only),
+                |private_only| check_file(path, private_only, fixing),
             )
         })
         .collect();
@@ -223,7 +224,7 @@ fn run() -> Result<bool, String> {
     diagnostics.sort_by(|left, right| {
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
-    if (cli.fix || cli.diff) && !diagnostics.is_empty() {
+    if fixing && !diagnostics.is_empty() {
         let mut call_sites = call_site_edits(&files, signatures)?;
         for diagnostic in &diagnostics {
             call_sites
@@ -752,19 +753,27 @@ fn is_python(path: &Path) -> bool {
 #[doc(hidden)]
 pub fn lint_source(source: &str, private_only: bool) -> Result<usize, String> {
     Ok(
-        check_source(Path::new("benchmark.py"), source, private_only)?
+        check_source(Path::new("benchmark.py"), source, private_only, false)?
             .diagnostics
             .len(),
     )
 }
 
-fn check_file(path: &Path, private_only: bool) -> Result<Checked, String> {
+fn check_file(path: &Path, private_only: bool, signatures: bool) -> Result<Checked, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    check_source(path, &source, private_only)
+    check_source(path, &source, private_only, signatures)
 }
 
-fn check_source(path: &Path, source: &str, private_only: bool) -> Result<Checked, String> {
+/// Check one file. `signatures` records what each fixed callable looks like so
+/// call sites can be updated; it costs allocation per parameter and per field,
+/// so reporting runs leave it off.
+fn check_source(
+    path: &Path,
+    source: &str,
+    private_only: bool,
+    signatures: bool,
+) -> Result<Checked, String> {
     let parsed = parse_module(source)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
     let directives = collect_directives(source, parsed.tokens());
@@ -785,6 +794,7 @@ fn check_source(path: &Path, source: &str, private_only: bool) -> Result<Checked
             ..Scope::default()
         },
         header: None,
+        collect_signatures: signatures,
         classes: Vec::new(),
         signatures: Vec::new(),
         directives,
@@ -943,6 +953,9 @@ struct Checker<'a> {
     /// reported, so one directive there can cover every parameter of a
     /// signature or every field of a dataclass.
     header: Option<TextSize>,
+    /// Whether to record what each fixed callable looks like. Only `--fix` and
+    /// `--diff` use it, and building it allocates per parameter and per field.
+    collect_signatures: bool,
     classes: Vec<ClassCollector>,
     signatures: Vec<Signature>,
     directives: Vec<Directive>,
@@ -1070,7 +1083,8 @@ impl Checker<'_> {
                         parameter.parameter.name, function.name
                     ),
                     TextRange::new(parameter.parameter.end(), default.end()),
-                ) {
+                ) && self.collect_signatures
+                {
                     removed.push(Removed {
                         parameter: parameter.parameter.name.to_string(),
                         value: literal_text(default, self.source),
@@ -1112,8 +1126,10 @@ impl Checker<'_> {
         }
         // Every field counts towards the constructor's positional order, even
         // one without a default or one this run is not enforcing.
-        if let Some(class) = self.classes.last_mut() {
-            class.fields.push(name.id.to_string());
+        if self.collect_signatures {
+            if let Some(class) = self.classes.last_mut() {
+                class.fields.push(name.id.to_string());
+            }
         }
         let Some(value) = assign.value.as_deref() else {
             return;
@@ -1128,7 +1144,8 @@ impl Checker<'_> {
             value.start(),
             format!("dataclass field `{}` has a {}", name.id, default.kind),
             default.fix,
-        ) {
+        ) && self.collect_signatures
+        {
             if let Some(class) = self.classes.last_mut() {
                 class.removed.push(Removed {
                     parameter: name.id.to_string(),
@@ -1166,14 +1183,20 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     dataclass: has_dataclass_decorator(class),
                     class_body: true,
                 };
-                self.classes.push(ClassCollector {
-                    name: class.name.to_string(),
-                    dataclass: self.scope.dataclass,
-                    fields: Vec::new(),
-                    removed: Vec::new(),
-                });
+                if self.collect_signatures {
+                    self.classes.push(ClassCollector {
+                        name: class.name.to_string(),
+                        dataclass: self.scope.dataclass,
+                        fields: Vec::new(),
+                        removed: Vec::new(),
+                    });
+                }
                 walk_stmt(self, statement);
-                if let Some(collector) = self.classes.pop() {
+                if let Some(collector) = self
+                    .collect_signatures
+                    .then(|| self.classes.pop())
+                    .flatten()
+                {
                     if collector.dataclass && !collector.removed.is_empty() {
                         self.signatures.push(Signature {
                             name: collector.name,
@@ -1628,15 +1651,17 @@ mod tests {
     use super::*;
 
     fn messages(source: &str, private_only: bool) -> Result<Vec<String>, String> {
-        Ok(check_source(Path::new("fixture.py"), source, private_only)?
-            .diagnostics
-            .into_iter()
-            .map(|item| item.message)
-            .collect())
+        Ok(
+            check_source(Path::new("fixture.py"), source, private_only, false)?
+                .diagnostics
+                .into_iter()
+                .map(|item| item.message)
+                .collect(),
+        )
     }
 
     fn codes(source: &str) -> Result<Vec<&'static str>, String> {
-        Ok(check_source(Path::new("fixture.py"), source, false)?
+        Ok(check_source(Path::new("fixture.py"), source, false, false)?
             .diagnostics
             .into_iter()
             .map(|item| item.code)
@@ -1649,7 +1674,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         let mut signatures = Vec::new();
         for path in files {
-            let checked = check_file(path, false)?;
+            let checked = check_file(path, false, true)?;
             diagnostics.extend(checked.diagnostics);
             signatures.extend(checked.signatures);
         }
@@ -1667,7 +1692,7 @@ mod tests {
         write_fixes_atomically(fixed_sources(call_sites.edits)?)?;
         for path in files {
             assert!(
-                check_file(path, false)?.diagnostics.is_empty(),
+                check_file(path, false, false)?.diagnostics.is_empty(),
                 "{}",
                 path.display()
             );
@@ -1887,7 +1912,7 @@ mod tests {
             "from dataclasses import dataclass, field\n\ndef f(a: int = 1, *, b=2): pass\n\n@dataclass\nclass C:\n    a: int = 1\n    b: int = field(default=2, repr=False)\n    c: int = field(kw_only=True, default_factory=int)\n    not_a_field = 3\n",
         )
         .map_err(|error| error.to_string())?;
-        assert_eq!(check_file(&path, false)?.diagnostics.len(), 5);
+        assert_eq!(check_file(&path, false, false)?.diagnostics.len(), 5);
         fix_all(std::slice::from_ref(&path))?;
         let fixed = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
         assert!(fixed.contains("def f(a: int, *, b): pass"));
@@ -2058,6 +2083,7 @@ mod tests {
             Path::new("fixture.py"),
             "def public(x=1): pass  # noqa: NOD001\n",
             true,
+            false,
         )?;
         assert_eq!(
             found

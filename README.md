@@ -191,7 +191,7 @@ The `--respect-reexports` flag turns this on for every checked file, whatever th
 
 #### What counts as a re-export
 
-For each checked file, `no-defaults` reads the `__init__.py` of its directory and of each directory above it, stopping where the package does — at the first directory without an `__init__.py`. A private package seals what is inside it: a name re-exported by `_internal/__init__.py` is no more reachable from outside than the module it came from, and that holds for a public sub-package inside `_internal` too.
+For each checked file, `no-defaults` reads the `__init__.py` of its directory and of each directory above it, up to the directory holding the `pyproject.toml` that configured the run. A directory without an `__init__.py` contributes nothing but does not end the walk, because a namespace package under a regular one is imported through it: a module in `package/data/` still sees what `package/__init__.py` exports. A file checked from outside any configured project follows its package chain as far as that reaches instead. A private package seals what is inside it: a name re-exported by `_internal/__init__.py` is no more reachable from outside than the module it came from, and that holds for a public sub-package inside `_internal` too.
 
 In each of the files it reads, these make a name public:
 
@@ -213,7 +213,7 @@ The check is by name. It never resolves an import back to the module it came fro
 - **Deletions and rebinding are not tracked.** A name imported and then `del`-ed in `__init__.py` still counts as re-exported.
 - **Every `__init__.py` in the chain must parse.** One that does not is an error, the same as a checked file that does not parse.
 
-Reading these files costs one parse per package, shared by every checked file below it, and only in private-only mode with the option on. On the pinned Typeshed checkout described under [Performance](#performance) — 5,368 files across several thousand stub packages — `--private-only` takes a median 0.19 seconds and `--private-only --respect-reexports` a median 0.28 seconds, while dropping 4,579 diagnostics to 3,209. A package's `__init__.pyi` counts where there is no `__init__.py`, so a stub-only distribution is read the same way.
+Reading these files costs one parse per directory on the way to the project root, shared by every checked file below it, and only in private-only mode with the option on. On the pinned Typeshed checkout described under [Performance](#performance) — 5,368 files across several thousand stub packages — turning the option on adds roughly 0.07 seconds to a run, around a tenth of its time, and drops 4,579 diagnostics to 3,209. A package's `__init__.pyi` counts where there is no `__init__.py`, so a stub-only distribution is read the same way.
 
 #### Turning it on
 

@@ -645,7 +645,7 @@ fn settings_for_files(
         let reexports = if respect_reexports && private_only == Some(true) {
             let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
             let directory = resolved.parent().unwrap_or(Path::new("."));
-            package_reexports(directory, &mut reexport_cache)?.names
+            package_reexports(directory, &loaded.root, &mut reexport_cache)?.names
         } else {
             Arc::new(Reexports::default())
         };
@@ -672,40 +672,50 @@ struct PackageReexports {
 
 /// The names the `__init__.py` files above a file re-export.
 ///
-/// Each directory's answer is its parent's plus its own `__init__.py`, so the
-/// walk stops where the package does: at the first directory without an
-/// `__init__.py`. A private package seals what is below it, because a name
-/// re-exported by `_internal/__init__.py` is no more reachable from outside
-/// than the module it came from — unless the package above re-exports
-/// `_internal` itself, which puts it back within reach.
+/// Each directory's answer is its parent's plus its own `__init__.py`. A
+/// directory without one holds no names of its own but is still a link in the
+/// chain, because a namespace package under a regular one is imported through
+/// it, so the walk climbs to the project root rather than stopping at the
+/// first missing `__init__.py`. Outside the root — a file checked from an
+/// unrelated working directory — it follows the package chain as far as that
+/// reaches instead.
+///
+/// A private package seals what is below it, because a name re-exported by
+/// `_internal/__init__.py` is no more reachable from outside than the module
+/// it came from — unless the package above re-exports `_internal` itself,
+/// which puts it back within reach.
 fn package_reexports(
     directory: &Path,
+    root: &Path,
     cache: &mut BTreeMap<PathBuf, PackageReexports>,
 ) -> Result<PackageReexports, String> {
-    let Some(init) = package_init(directory) else {
-        return Ok(PackageReexports::default());
-    };
     if let Some(cached) = cache.get(directory) {
         return Ok(cached.clone());
     }
-    let parent = match directory.parent() {
-        Some(parent) => package_reexports(parent, cache)?,
+    let init = package_init(directory);
+    let climbs = directory != root && (directory.starts_with(root) || init.is_some());
+    let inherited = match directory.parent().filter(|_| climbs) {
+        Some(parent) => package_reexports(parent, root, cache)?,
         None => PackageReexports::default(),
     };
     let name = directory.file_name().unwrap_or_default().to_string_lossy();
-    let sealed = parent.sealed || (is_private(&name) && !parent.names.covers(&name));
-    let package = if sealed {
-        PackageReexports {
-            names: parent.names,
-            sealed,
+    // The directory the walk stops at is not reached by an import, so its own
+    // name says nothing about what is inside it.
+    let sealed =
+        inherited.sealed || (climbs && is_private(&name) && !inherited.names.covers(&name));
+    let package = match init {
+        Some(init) if !sealed => {
+            let mut names = (*inherited.names).clone();
+            collect_reexports(&init, &mut names)?;
+            PackageReexports {
+                names: Arc::new(names),
+                sealed,
+            }
         }
-    } else {
-        let mut names = (*parent.names).clone();
-        collect_reexports(&init, &mut names)?;
-        PackageReexports {
-            names: Arc::new(names),
+        _ => PackageReexports {
+            names: inherited.names,
             sealed,
-        }
+        },
     };
     cache.insert(directory.to_path_buf(), package.clone());
     Ok(package)
@@ -2594,7 +2604,7 @@ mod tests {
             "from ._upload import buried\n",
         )
         .map_err(|error| error.to_string())?;
-        let reexports = package_reexports(&internal, &mut BTreeMap::new())?.names;
+        let reexports = package_reexports(&internal, directory.path(), &mut BTreeMap::new())?.names;
         assert!(reexports.covers("send"));
         assert!(reexports.covers("Job"));
         assert!(reexports.covers("os"));
@@ -2614,7 +2624,7 @@ mod tests {
         std::fs::write(root.join("__init__.py"), "from ._upload import *\n")
             .map_err(|error| error.to_string())?;
         assert!(
-            package_reexports(&root, &mut BTreeMap::new())?
+            package_reexports(&root, directory.path(), &mut BTreeMap::new())?
                 .names
                 .wildcard
         );
@@ -2638,12 +2648,48 @@ mod tests {
         std::fs::write(deeper.join("__init__.py"), "from ._mod import deep\n")
             .map_err(|error| error.to_string())?;
         let mut cache = BTreeMap::new();
-        let reexports = package_reexports(&deeper, &mut cache)?.names;
+        let reexports = package_reexports(&deeper, directory.path(), &mut cache)?.names;
         assert!(reexports.covers("reachable"));
         assert!(reexports.covers("deep"));
-        // Each package in the chain answered once, for the parent as well as
-        // for the directory that asked.
-        assert_eq!(cache.len(), 3);
+        // Each directory in the chain answered once, for the ancestors as well
+        // as for the directory that asked: the three packages and the root the
+        // walk stopped at.
+        assert_eq!(cache.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_namespace_package_does_not_break_the_chain() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("package");
+        // `data` has no `__init__.py`, but `package.data._mod` is imported
+        // through it all the same.
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).map_err(|error| error.to_string())?;
+        std::fs::write(root.join("__init__.py"), "from .data._mod import upload\n")
+            .map_err(|error| error.to_string())?;
+        let reexports = package_reexports(&data, directory.path(), &mut BTreeMap::new())?.names;
+        assert!(reexports.covers("upload"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_project_root() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("project");
+        let package = root.join("package");
+        std::fs::create_dir_all(&package).map_err(|error| error.to_string())?;
+        // An `__init__.py` above the root belongs to no package this run knows.
+        std::fs::write(
+            directory.path().join("__init__.py"),
+            "from ._outer import far\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(package.join("__init__.py"), "from ._upload import near\n")
+            .map_err(|error| error.to_string())?;
+        let reexports = package_reexports(&package, &root, &mut BTreeMap::new())?.names;
+        assert!(reexports.covers("near"));
+        assert!(!reexports.covers("far"));
         Ok(())
     }
 
@@ -2659,7 +2705,7 @@ mod tests {
         std::fs::write(internal.join("__init__.py"), "").map_err(|error| error.to_string())?;
         std::fs::write(deeper.join("__init__.py"), "from ._mod import buried\n")
             .map_err(|error| error.to_string())?;
-        let package = package_reexports(&deeper, &mut BTreeMap::new())?;
+        let package = package_reexports(&deeper, directory.path(), &mut BTreeMap::new())?;
         assert!(package.sealed);
         assert!(package.names.covers("shown"));
         assert!(
@@ -2679,7 +2725,7 @@ mod tests {
             "from . import _upload\nfrom ._upload import upload\n",
         )
         .map_err(|error| error.to_string())?;
-        let reexports = package_reexports(&root, &mut BTreeMap::new())?.names;
+        let reexports = package_reexports(&root, directory.path(), &mut BTreeMap::new())?.names;
         assert!(reexports.covers("upload"));
         assert!(
             !is_private_module(Path::new("package/_upload.pyi"), &reexports),
@@ -2695,7 +2741,8 @@ mod tests {
     #[test]
     fn a_file_outside_a_package_has_no_reexports() -> Result<(), String> {
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let reexports = package_reexports(directory.path(), &mut BTreeMap::new())?.names;
+        let reexports =
+            package_reexports(directory.path(), directory.path(), &mut BTreeMap::new())?.names;
         assert!(reexports.names.is_empty());
         assert!(!reexports.wildcard);
         Ok(())

@@ -434,3 +434,35 @@ fn a_module_reexported_whole_keeps_its_public_defaults() -> Result<(), Box<dyn s
     assert!(stdout.contains("Found 1 error."), "{stdout}");
     Ok(())
 }
+
+#[test]
+fn a_namespace_package_still_reaches_the_package_root() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // `data` holds no `__init__.py`, so it is a namespace package, and the
+    // root's re-export still applies to what is inside it.
+    let data = directory.path().join("package/data");
+    std::fs::create_dir_all(&data)?;
+    std::fs::write(
+        directory.path().join("pyproject.toml"),
+        "[tool.no_defaults]\nprivate_only = true\nrespect_reexports = true\n",
+    )?;
+    std::fs::write(
+        directory.path().join("package/__init__.py"),
+        "from .data._mod import upload\n",
+    )?;
+    std::fs::write(
+        data.join("_mod.py"),
+        "def upload(timeout=30): pass\n\n\ndef _helper(retries=3): pass\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("function `_helper`"), "{stdout}");
+    assert!(!stdout.contains("function `upload`"), "{stdout}");
+    assert!(stdout.contains("Found 1 error."), "{stdout}");
+    Ok(())
+}

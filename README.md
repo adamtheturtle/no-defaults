@@ -181,7 +181,7 @@ def upload(
     """Re-exported from the package root, so the default is public API."""
 ```
 
-`per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`. Use `"all"` to reject every default in matching files, `"private"` to reject defaults only in private scopes, or `"none"` to exempt matching files from the rule. `"none"` also wins over `--private-only`, so an exempt file stays exempt. Patterns without a slash match file names at any depth. An initial `!` negates a pattern. If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
+`per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`. Use `"all"` to reject every default in matching files, `"private"` to reject defaults only in private scopes, or `"none"` to exempt matching files from the rule. `"none"` also wins over `--private-only`, so an exempt file stays exempt. An exempt file keeps its own defaults, but its call sites are still updated when a callable it uses is fixed elsewhere: exemption decides which definitions are checked, not whether the file keeps working. Patterns without a slash match file names at any depth. An initial `!` negates a pattern. If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
 
 The `--private-only` CLI flag overrides the configuration for every checked file.
 
@@ -198,7 +198,7 @@ CodSpeed runs parser-and-rule benchmarks for representative modules on every pul
 ```yaml
 repos:
   - repo: https://github.com/adamtheturtle/no-defaults
-    rev: v1.0.0
+    rev: v1.1.0
     hooks:
       - id: no-defaults
 ```

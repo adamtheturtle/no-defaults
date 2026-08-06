@@ -1816,6 +1816,33 @@ impl Rewriter<'_> {
         );
     }
 
+    /// The class a receiver expression stands for, the file defining it, and
+    /// whether the receiver is an instance rather than the class itself.
+    ///
+    /// `self` and `cls` name the enclosing class; `Client` names a class of
+    /// this file; and `api.Client` names one of an imported module.
+    fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool)> {
+        if let Expr::Name(name) = receiver {
+            if matches!(name.id.as_str(), "self" | "cls") {
+                return Some((self.path.to_path_buf(), self.classes.last()?.clone(), true));
+            }
+            return match self.bindings.get(name.id.as_str()) {
+                // `from api import Client` names a class of another file.
+                Some(Binding::Symbol(file, symbol)) => Some((file.clone(), symbol.clone(), false)),
+                Some(Binding::Module(_)) => None,
+                None => Some((self.path.to_path_buf(), name.id.to_string(), false)),
+            };
+        }
+        let Expr::Attribute(attribute) = receiver else {
+            return None;
+        };
+        let dotted = dotted_name(&attribute.value)?;
+        match self.bindings.get(&dotted)? {
+            Binding::Module(file) => Some((file.clone(), attribute.attr.to_string(), false)),
+            Binding::Symbol(..) => None,
+        }
+    }
+
     /// The callable an expression names, when the file's own imports say so,
     /// and how many parameters the call has already been given implicitly.
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
@@ -1838,18 +1865,14 @@ impl Rewriter<'_> {
             },
             Expr::Attribute(attribute) => {
                 // A method's receiver type is only known when it is `self`,
-                // `cls`, or the class's own name in the file that defines it.
-                if let Expr::Name(receiver) = &*attribute.value {
-                    let through_instance = matches!(receiver.id.as_str(), "self" | "cls");
-                    let class = if through_instance {
-                        self.classes.last()?.clone()
-                    } else {
-                        receiver.id.to_string()
-                    };
+                // `cls`, or a class this file can name.
+                if let Some((file, class, through_instance)) =
+                    self.receiving_class(&attribute.value)
+                {
                     if let Some(method) = self
                         .definitions
                         .methods
-                        .get(&(self.path.to_path_buf(), class))
+                        .get(&(file, class))
                         .and_then(|methods| methods.get(attribute.attr.as_str()))
                     {
                         let signature = method.as_ref()?;

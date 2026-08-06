@@ -71,7 +71,7 @@ The same applies to dataclass fields, which become required at construction: `Jo
 
 Arguments are appended as keywords wherever Python allows it, so the change is stable under later edits to the signature. Positional-only parameters are appended positionally instead.
 
-Calls are resolved through the calling file's own imports, not by matching the bare name. A project with its own `connect` does not get `socket.connect` rewritten, and two modules that each define `helper` are told apart. A method is rewritten when reached through `self`, `cls`, or its own class's name, which is as far as the receiver's type can be known without inference. What each method already receives is accounted for, so `instance.fetch(url)` and `Client.fetch(instance, url)` are both filled in correctly, and a `staticmethod` is given nothing extra.
+Calls are resolved through the calling file's own imports, not by matching the bare name. A project with its own `connect` does not get `socket.connect` rewritten, and two modules that each define `helper` are told apart. A method is rewritten when reached through `self`, `cls`, or a class the file can name — `Client`, `api.Client`, or one imported by name — which is as far as the receiver's type can be known without inference. What each method already receives is accounted for, so `instance.fetch(url)` and `Client.fetch(instance, url)` are both filled in correctly, and a `staticmethod` is given nothing extra.
 
 Nothing is guessed. A call is left alone, with a warning naming the file and line, when
 

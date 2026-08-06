@@ -232,6 +232,42 @@ fn a_same_named_call_on_another_object_is_left_alone() -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// A class reached through an imported module, or imported by name, is as
+/// resolvable as one defined locally.
+#[test]
+fn methods_of_an_imported_class_are_updated() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "class Client:\n    @staticmethod\n    def build(kind=1): return kind\n\n    \
+         @classmethod\n    def make(cls, mode=2): return mode\n\n    \
+         def fetch(self, url, verify=3): return (url, verify)\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &caller,
+        "import api\nfrom api import Client\n\n\
+         api.Client.build()\n\
+         api.Client.make()\n\
+         api.Client.fetch(api.Client(), \"u\")\n\
+         Client.build()\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&caller)?,
+        "import api\nfrom api import Client\n\n\
+         api.Client.build(kind=1)\n\
+         api.Client.make(mode=2)\n\
+         api.Client.fetch(api.Client(), \"u\", verify=3)\n\
+         Client.build(kind=1)\n"
+    );
+    Ok(())
+}
+
 /// Two modules may each define `helper`. Resolving through the calling file's
 /// imports tells them apart, where matching on the bare name could not.
 #[test]

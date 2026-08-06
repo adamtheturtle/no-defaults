@@ -7,6 +7,7 @@ use clap::{Parser, ValueEnum};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::{walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
@@ -89,6 +90,7 @@ struct Diagnostic {
     path: PathBuf,
     line: usize,
     column: usize,
+    code: &'static str,
     message: String,
     fix: TextRange,
 }
@@ -169,10 +171,11 @@ fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Resul
         OutputFormat::Full => {
             for diagnostic in diagnostics {
                 println!(
-                    "{}:{}:{}: NOD001 {}",
+                    "{}:{}:{}: {} {}",
                     diagnostic.path.display(),
                     diagnostic.line,
                     diagnostic.column,
+                    diagnostic.code,
                     diagnostic.message
                 );
                 if let Ok(source) = std::fs::read_to_string(&diagnostic.path) {
@@ -195,10 +198,11 @@ fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Resul
         OutputFormat::Concise => {
             for diagnostic in diagnostics {
                 println!(
-                    "{}:{}:{}: NOD001 {}",
+                    "{}:{}:{}: {} {}",
                     diagnostic.path.display(),
                     diagnostic.line,
                     diagnostic.column,
+                    diagnostic.code,
                     diagnostic.message
                 );
             }
@@ -210,7 +214,7 @@ fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Resul
                     path: diagnostic.path.display().to_string(),
                     line: diagnostic.line,
                     column: diagnostic.column,
-                    code: "NOD001",
+                    code: diagnostic.code,
                     message: &diagnostic.message,
                 })
                 .collect::<Vec<_>>();
@@ -223,10 +227,11 @@ fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Resul
         OutputFormat::Github => {
             for diagnostic in diagnostics {
                 println!(
-                    "::error file={},line={},col={},title=NOD001::{}",
+                    "::error file={},line={},col={},title={}::{}",
                     github_escape_property(&diagnostic.path.display().to_string()),
                     diagnostic.line,
                     diagnostic.column,
+                    diagnostic.code,
                     github_escape_message(&diagnostic.message)
                 );
             }
@@ -543,58 +548,178 @@ fn is_python(path: &Path) -> bool {
 /// This is primarily exposed for performance benchmarks.
 #[doc(hidden)]
 pub fn lint_source(source: &str, private_only: bool) -> Result<usize, String> {
-    let parsed = parse_module(source).map_err(|error| error.to_string())?;
-    let mut checker = Checker {
-        path: Path::new("benchmark.py"),
-        source,
-        private_only,
-        private_scope: false,
-        dataclass_scope: false,
-        diagnostics: Vec::new(),
-    };
-    for statement in parsed.suite() {
-        checker.visit_stmt(statement);
-    }
-    Ok(checker.diagnostics.len())
+    Ok(check_source(Path::new("benchmark.py"), source, private_only)?.len())
 }
 
 fn check_file(path: &Path, private_only: bool) -> Result<Vec<Diagnostic>, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let parsed = parse_module(&source)
+    check_source(path, &source, private_only)
+}
+
+fn check_source(path: &Path, source: &str, private_only: bool) -> Result<Vec<Diagnostic>, String> {
+    let parsed = parse_module(source)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-    if has_file_noqa(&source) {
+    let directives = collect_directives(source, parsed.tokens());
+    // A blanket file-level directive silences every rule for the file,
+    // including the unused-directive rule itself.
+    if directives
+        .iter()
+        .any(|directive| directive.file_level && !directive.explicit)
+    {
         return Ok(Vec::new());
     }
     let mut checker = Checker {
         path,
-        source: &source,
+        source,
         private_only,
         private_scope: is_private_module(path),
         dataclass_scope: false,
+        directives,
         diagnostics: Vec::new(),
     };
     for statement in parsed.suite() {
         checker.visit_stmt(statement);
     }
-    Ok(checker.diagnostics)
+    Ok(checker.finish())
 }
 
-fn has_file_noqa(source: &str) -> bool {
-    source.lines().any(|line| {
-        let line = line.trim().to_ascii_lowercase();
-        let Some(directive) = line.strip_prefix('#').map(str::trim) else {
-            return false;
-        };
-        let Some(rest) = directive.strip_prefix("ruff: noqa") else {
-            return directive == "flake8: noqa";
-        };
-        let rest = rest.trim();
-        rest.is_empty()
-            || rest
-                .strip_prefix(':')
-                .is_some_and(|codes| codes.split(',').any(|code| code.trim() == "nod001"))
+/// A `noqa` directive that suppresses this linter's rule.
+///
+/// Directives that cannot suppress `NOD001`, such as `# noqa: E501`, are not
+/// collected at all.
+struct Directive {
+    /// Range of the line the directive sits on, excluding the line break.
+    line: TextRange,
+    /// Offset of the `#` that starts the directive.
+    start: TextSize,
+    /// Whether the directive names `NOD001` explicitly rather than blanketing.
+    explicit: bool,
+    /// Text to delete to drop `NOD001` from the directive.
+    fix: TextRange,
+    /// Whether the directive applies to the whole file.
+    file_level: bool,
+    /// Whether the directive suppressed at least one violation.
+    used: bool,
+}
+
+/// Comments come from the parser, so a `#` inside a string is never mistaken
+/// for a directive.
+fn collect_directives(source: &str, tokens: &Tokens) -> Vec<Directive> {
+    tokens
+        .iter()
+        .filter(|token| token.kind() == TokenKind::Comment)
+        .filter_map(|token| parse_directive(source, token.start().to_usize()))
+        .collect()
+}
+
+fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
+    let line_start = source[..hash].rfind('\n').map_or(0, |end| end + 1);
+    let break_start = source[hash..]
+        .find('\n')
+        .map_or(source.len(), |end| hash + end);
+    let content_end = source[..break_start].trim_end_matches('\r').len();
+    let comment = source.get(hash + 1..content_end)?;
+    let body = comment.trim_start();
+    let body_start = hash + 1 + (comment.len() - body.len());
+    let lower = body.to_ascii_lowercase();
+    let alone = source[line_start..hash].trim().is_empty();
+    let (file_level, rest) = if alone && lower.starts_with("flake8: noqa") {
+        (lower == "flake8: noqa", None)
+    } else if let Some(rest) = lower.strip_prefix("ruff: noqa").filter(|_| alone) {
+        (true, Some((rest, body_start + "ruff: noqa".len())))
+    } else {
+        (false, Some((lower.strip_prefix("noqa")?, body_start + 4)))
+    };
+    let line = TextRange::new(text_size(line_start), text_size(content_end));
+    let blanket = || Directive {
+        line,
+        start: text_size(hash),
+        explicit: false,
+        fix: TextRange::empty(text_size(hash)),
+        file_level,
+        used: false,
+    };
+    let Some((rest, rest_start)) = rest else {
+        // A `# flake8: noqa` with anything appended is not a directive.
+        return file_level.then(blanket);
+    };
+    if rest.trim().is_empty() {
+        return Some(blanket());
+    }
+    let codes_start = rest_start + rest.len() - rest.trim_start().len();
+    let codes = rest.trim_start().strip_prefix(':')?;
+    let tokens = code_tokens(codes, codes_start + 1);
+    // A code list that omits this rule cannot suppress it, so it is not a
+    // directive this linter tracks.
+    let index = tokens
+        .iter()
+        .position(|(_, code)| code.eq_ignore_ascii_case("NOD001"))?;
+    let fix = if tokens.len() == 1 {
+        whole_directive_range(source, line_start, hash, break_start, content_end)
+    } else {
+        argument_removal_range(
+            tokens[index].0,
+            tokens.get(index + 1).map(|(range, _)| *range),
+            index
+                .checked_sub(1)
+                .and_then(|previous| tokens.get(previous))
+                .map(|(range, _)| *range),
+        )
+    };
+    Some(Directive {
+        explicit: true,
+        fix,
+        ..blanket()
     })
+}
+
+/// The range to delete to remove a directive that names only `NOD001`.
+///
+/// A directive on its own line takes the line with it; a trailing directive
+/// takes the whitespace that separated it from the code.
+fn whole_directive_range(
+    source: &str,
+    line_start: usize,
+    hash: usize,
+    break_start: usize,
+    content_end: usize,
+) -> TextRange {
+    if source[line_start..hash].trim().is_empty() {
+        let line_end = if source[break_start..].starts_with('\n') {
+            break_start + 1
+        } else {
+            break_start
+        };
+        return TextRange::new(text_size(line_start), text_size(line_end));
+    }
+    TextRange::new(
+        text_size(line_start + source[line_start..hash].trim_end().len()),
+        text_size(content_end),
+    )
+}
+
+/// The codes of a `noqa` directive, with their offsets in the source.
+fn code_tokens(codes: &str, codes_start: usize) -> Vec<(TextRange, &str)> {
+    let mut tokens = Vec::new();
+    let mut cursor = codes_start;
+    for part in codes.split(',') {
+        let trimmed = part.trim_start();
+        let token = trimmed.split_whitespace().next().unwrap_or_default();
+        if !token.is_empty() {
+            let start = cursor + (part.len() - trimmed.len());
+            tokens.push((
+                TextRange::new(text_size(start), text_size(start + token.len())),
+                token,
+            ));
+        }
+        cursor += part.len() + 1;
+    }
+    tokens
+}
+
+fn text_size(value: usize) -> TextSize {
+    TextSize::new(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 struct Checker<'a> {
@@ -603,6 +728,7 @@ struct Checker<'a> {
     private_only: bool,
     private_scope: bool,
     dataclass_scope: bool,
+    directives: Vec<Directive>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -611,8 +737,33 @@ impl Checker<'_> {
         !self.private_only || self.private_scope || is_private(name)
     }
 
+    /// Mark the directives that suppress a violation at `offset`, preferring
+    /// directives that name the code so blanket ones stay unclaimed.
+    fn suppress(&mut self, offset: TextSize) -> bool {
+        let file_level = self.select(|directive| directive.file_level);
+        let inline =
+            self.select(|directive| !directive.file_level && directive.line.contains(offset));
+        for index in [file_level, inline].into_iter().flatten() {
+            self.directives[index].used = true;
+        }
+        file_level.is_some() || inline.is_some()
+    }
+
+    fn select(&self, applies: impl Fn(&Directive) -> bool) -> Option<usize> {
+        let candidates = || {
+            self.directives
+                .iter()
+                .enumerate()
+                .filter(|(_, directive)| applies(directive))
+        };
+        candidates()
+            .find(|(_, directive)| directive.explicit)
+            .or_else(|| candidates().next())
+            .map(|(index, _)| index)
+    }
+
     fn report(&mut self, offset: TextSize, message: String, fix: TextRange) {
-        if is_suppressed(self.source, offset) {
+        if self.suppress(offset) {
             return;
         }
         let (line, column) = line_column(self.source, offset);
@@ -620,9 +771,32 @@ impl Checker<'_> {
             path: self.path.to_path_buf(),
             line,
             column,
+            code: "NOD001",
             message,
             fix,
         });
+    }
+
+    /// Add a diagnostic for every directive that named `NOD001` without
+    /// suppressing anything, then return the file's diagnostics in order.
+    fn finish(mut self) -> Vec<Diagnostic> {
+        for directive in &self.directives {
+            if !directive.explicit || directive.used {
+                continue;
+            }
+            let (line, column) = line_column(self.source, directive.start);
+            self.diagnostics.push(Diagnostic {
+                path: self.path.to_path_buf(),
+                line,
+                column,
+                code: "NOD002",
+                message: "unused `noqa` directive for `NOD001`".to_owned(),
+                fix: directive.fix,
+            });
+        }
+        self.diagnostics
+            .sort_by_key(|diagnostic| (diagnostic.line, diagnostic.column));
+        self.diagnostics
     }
 
     fn check_function(&mut self, function: &ast::StmtFunctionDef) {
@@ -825,56 +999,33 @@ fn line_column(source: &str, offset: TextSize) -> (usize, usize) {
     (line, offset - line_start + 1)
 }
 
-fn is_suppressed(source: &str, offset: TextSize) -> bool {
-    let offset = offset.to_usize();
-    let line_start = source[..offset]
-        .rfind('\n')
-        .map_or(0, |position| position + 1);
-    let line_end = source[offset..]
-        .find('\n')
-        .map_or(source.len(), |position| offset + position);
-    let line = &source[line_start..line_end];
-    let Some(comment) = line.split_once('#').map(|(_, comment)| comment.trim()) else {
-        return false;
-    };
-    let lower = comment.to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix("noqa") else {
-        return false;
-    };
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return true;
-    }
-    let Some(codes) = rest.strip_prefix(':') else {
-        return false;
-    };
-    codes
-        .split(',')
-        .any(|code| code.split_whitespace().next() == Some("nod001"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn messages(source: &str, private_only: bool) -> Result<Vec<String>, String> {
-        let parsed = parse_module(source).map_err(|error| error.to_string())?;
-        let mut checker = Checker {
-            path: Path::new("fixture.py"),
-            source,
-            private_only,
-            private_scope: false,
-            dataclass_scope: false,
-            diagnostics: Vec::new(),
-        };
-        for statement in parsed.suite() {
-            checker.visit_stmt(statement);
-        }
-        Ok(checker
-            .diagnostics
+        Ok(check_source(Path::new("fixture.py"), source, private_only)?
             .into_iter()
             .map(|item| item.message)
             .collect())
+    }
+
+    fn codes(source: &str) -> Result<Vec<&'static str>, String> {
+        Ok(check_source(Path::new("fixture.py"), source, false)?
+            .into_iter()
+            .map(|item| item.code)
+            .collect())
+    }
+
+    fn fixed(source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.py");
+        std::fs::write(&path, source).map_err(|error| error.to_string())?;
+        let diagnostics = check_file(&path, false)?;
+        write_fixes_atomically(fixed_sources(&diagnostics)?)?;
+        let fixed = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        assert!(check_file(&path, false)?.is_empty(), "{fixed:?}");
+        Ok(fixed)
     }
 
     #[test]
@@ -1037,9 +1188,123 @@ mod tests {
     }
 
     #[test]
-    fn file_level_noqa_suppresses_rule() {
-        assert!(has_file_noqa("# ruff: noqa: NOD001\ndef f(x=1): pass\n"));
-        assert!(!has_file_noqa("# ruff: noqa: E501\ndef f(x=1): pass\n"));
+    fn file_level_noqa_suppresses_rule() -> Result<(), String> {
+        assert!(codes("# ruff: noqa: NOD001\ndef f(x=1): pass\n")?.is_empty());
+        assert_eq!(codes("# ruff: noqa: E501\ndef f(x=1): pass\n")?, ["NOD001"]);
+        assert!(codes("# ruff: noqa\ndef f(x=1): pass\n")?.is_empty());
+        assert!(codes("# flake8: noqa\ndef f(x=1): pass\n")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unused_directives_are_reported() -> Result<(), String> {
+        assert_eq!(
+            codes("def f(x): pass  # noqa: NOD001\n")?,
+            ["NOD002"],
+            "an inline directive that suppresses nothing is unused"
+        );
+        assert!(
+            codes("def f(x): pass  # noqa\n")?.is_empty(),
+            "a blanket directive may serve another linter"
+        );
+        assert!(
+            codes("def f(x): pass  # noqa: E501\n")?.is_empty(),
+            "directives for other rules are not this linter's business"
+        );
+        assert_eq!(
+            codes("# ruff: noqa: NOD001\ndef f(x): pass\n")?,
+            ["NOD002"],
+            "a file-level directive that suppresses nothing is unused"
+        );
+        assert!(
+            codes("# ruff: noqa\ndef f(x): pass  # noqa: NOD001\n")?.is_empty(),
+            "a blanket file-level directive silences every rule"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_level_directive_claims_the_inline_directives_it_covers() -> Result<(), String> {
+        assert!(
+            codes("# ruff: noqa: NOD001\ndef f(x=1): pass  # noqa: NOD001\n")?.is_empty(),
+            "both directives cover the same violation"
+        );
+        assert_eq!(
+            codes("# ruff: noqa: NOD001\ndef f(x=1): pass\ndef g(x): pass  # noqa: NOD001\n")?,
+            ["NOD002"],
+            "only the inline directive covering nothing is unused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn private_only_makes_directives_for_public_symbols_unused() -> Result<(), String> {
+        let found = check_source(
+            Path::new("fixture.py"),
+            "def public(x=1): pass  # noqa: NOD001\n",
+            true,
+        )?;
+        assert_eq!(
+            found
+                .iter()
+                .map(|item| item.code)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            ["NOD002"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn text_that_only_looks_like_a_directive_is_ignored() -> Result<(), String> {
+        assert!(
+            codes("example = \"# noqa: NOD001\"\n")?.is_empty(),
+            "a `#` inside a string does not start a comment"
+        );
+        assert!(
+            codes("def f(x): pass  # noqattention: NOD001\n")?.is_empty(),
+            "`noqa` must be a word of its own"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directives_survive_carriage_returns() -> Result<(), String> {
+        assert!(codes("def f(x=1): pass  # noqa: NOD001\r\n")?.is_empty());
+        assert_eq!(
+            fixed("def f(x): pass  # noqa: NOD001\r\n")?,
+            "def f(x): pass\r\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unused_directives_are_removed_by_fix() -> Result<(), String> {
+        assert_eq!(
+            fixed("def f(x): pass  # noqa: NOD001\n")?,
+            "def f(x): pass\n"
+        );
+        assert_eq!(
+            fixed("def f(x): pass  # noqa: NOD001, E501\n")?,
+            "def f(x): pass  # noqa: E501\n"
+        );
+        assert_eq!(
+            fixed("def f(x): pass  # noqa: E501, NOD001\n")?,
+            "def f(x): pass  # noqa: E501\n"
+        );
+        assert_eq!(
+            fixed("# ruff: noqa: NOD001\ndef f(x): pass\n")?,
+            "def f(x): pass\n"
+        );
+        assert_eq!(
+            fixed("# ruff: noqa: NOD001, E501\ndef f(x): pass\n")?,
+            "# ruff: noqa: E501\ndef f(x): pass\n"
+        );
+        assert_eq!(
+            fixed("def f(x=1): pass  # noqa: E501\ndef g(x): pass  # noqa: NOD001\n")?,
+            "def f(x): pass  # noqa: E501\ndef g(x): pass\n"
+        );
+        Ok(())
     }
 
     #[test]

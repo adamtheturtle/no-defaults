@@ -70,6 +70,14 @@ def compatible(timeout=30):  # noqa: NOD001
 
 Suppress the rule for an entire file with `# ruff: noqa` or `# ruff: noqa: NOD001`.
 
+A directive that names `NOD001` without suppressing anything is reported as `NOD002` and removed by `--fix`:
+
+```text
+src/example.py:1:21: NOD002 unused `noqa` directive for `NOD001`
+```
+
+Only directives that name the code are checked. A blanket `# noqa` may exist for another linter, so it is never reported, and a blanket `# ruff: noqa` or `# flake8: noqa` silences every rule in the file, including this one. When `--fix` removes the last code from a directive, it removes the whole comment; otherwise it removes just `NOD001` from the list.
+
 ## Configuration
 
 Configuration lives in `pyproject.toml`:

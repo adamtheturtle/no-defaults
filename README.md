@@ -183,7 +183,7 @@ CodSpeed runs parser-and-rule benchmarks for representative modules on every pul
 ```yaml
 repos:
   - repo: https://github.com/adamtheturtle/no-defaults
-    rev: v1.0.0
+    rev: v1.1.0
     hooks:
       - id: no-defaults
 ```

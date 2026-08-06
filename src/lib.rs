@@ -128,10 +128,24 @@ struct Signature {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Callable {
     Function,
-    /// A method. Only `self.name(...)` and `cls.name(...)` inside this class
-    /// are rewritten, because the type of any other receiver is unknown.
-    Method(String),
+    /// A method. Only calls through `self`, `cls`, or the class's own name are
+    /// rewritten, because the type of any other receiver is unknown.
+    Method {
+        class: String,
+        receiver: Receiver,
+    },
     Dataclass,
+}
+
+/// What a method is implicitly given ahead of its written arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Receiver {
+    /// An ordinary method, given the instance.
+    Instance,
+    /// A `classmethod`, given the class however it is reached.
+    Class,
+    /// A `staticmethod`, given nothing.
+    None,
 }
 
 impl Callable {
@@ -139,7 +153,7 @@ impl Callable {
     /// is worth a warning. A class name appears in annotations and `isinstance`
     /// checks all the time, so those stay quiet.
     fn is_function(&self) -> bool {
-        matches!(self, Self::Function | Self::Method(_))
+        matches!(self, Self::Function | Self::Method { .. })
     }
 }
 
@@ -341,7 +355,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
     for signature in signatures {
         definitions.names.insert(signature.name.clone());
         let table = match &signature.kind {
-            Callable::Method(class) => definitions
+            Callable::Method { class, .. } => definitions
                 .methods
                 .entry((signature.path.clone(), class.clone()))
                 .or_default(),
@@ -1236,9 +1250,10 @@ impl Checker<'_> {
             positional_only: function.parameters.posonlyargs.len(),
             path: self.path.to_path_buf(),
             kind: match self.classes.last() {
-                Some(class) if self.scope.class_body && !is_static_method(function) => {
-                    Callable::Method(class.name.clone())
-                }
+                Some(class) if self.scope.class_body => Callable::Method {
+                    class: class.name.clone(),
+                    receiver: method_receiver(function),
+                },
                 _ => Callable::Function,
             },
             complete: true,
@@ -1553,10 +1568,21 @@ fn argument_removal_range(
     }
 }
 
-fn is_static_method(function: &ast::StmtFunctionDef) -> bool {
-    function.decorator_list.iter().any(|decorator| {
-        matches!(&decorator.expression, Expr::Name(name) if name.id.as_str() == "staticmethod")
-    })
+/// What a method is given ahead of its written arguments, from its decorators.
+fn method_receiver(function: &ast::StmtFunctionDef) -> Receiver {
+    let decorated = |wanted: &str| {
+        function
+            .decorator_list
+            .iter()
+            .any(|decorator| matches!(&decorator.expression, Expr::Name(name) if name.id == wanted))
+    };
+    if decorated("staticmethod") {
+        Receiver::None
+    } else if decorated("classmethod") {
+        Receiver::Class
+    } else {
+        Receiver::Instance
+    }
 }
 
 /// The source text of a default that a call site can repeat verbatim.
@@ -1778,7 +1804,7 @@ impl Rewriter<'_> {
         };
         if !self
             .resolve(expression)
-            .is_some_and(|signature| signature.kind.is_function())
+            .is_some_and(|(signature, _)| signature.kind.is_function())
         {
             return;
         }
@@ -1790,45 +1816,71 @@ impl Rewriter<'_> {
         );
     }
 
-    /// The callable an expression names, when the file's own imports say so.
-    fn resolve(&self, expression: &Expr) -> Option<&Signature> {
+    /// The callable an expression names, when the file's own imports say so,
+    /// and how many parameters the call has already been given implicitly.
+    fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
             // A bare name is either defined in this file or imported into it.
             Expr::Name(name) => match self.bindings.get(name.id.as_str()) {
-                Some(Binding::Symbol(file, symbol)) => {
-                    self.definitions.symbols.get(file)?.get(symbol)?.as_ref()
-                }
+                Some(Binding::Symbol(file, symbol)) => Some((
+                    self.definitions.symbols.get(file)?.get(symbol)?.as_ref()?,
+                    0,
+                )),
                 Some(Binding::Module(_)) => None,
-                None => self
-                    .definitions
-                    .symbols
-                    .get(self.path)?
-                    .get(name.id.as_str())?
-                    .as_ref(),
+                None => Some((
+                    self.definitions
+                        .symbols
+                        .get(self.path)?
+                        .get(name.id.as_str())?
+                        .as_ref()?,
+                    0,
+                )),
             },
             Expr::Attribute(attribute) => {
-                // `self.method(...)` and `cls.method(...)` are the only calls
-                // whose receiver type is known without inference.
+                // A method's receiver type is only known when it is `self`,
+                // `cls`, or the class's own name in the file that defines it.
                 if let Expr::Name(receiver) = &*attribute.value {
-                    if matches!(receiver.id.as_str(), "self" | "cls") {
-                        let class = self.classes.last()?;
-                        return self
-                            .definitions
-                            .methods
-                            .get(&(self.path.to_path_buf(), class.clone()))?
-                            .get(attribute.attr.as_str())?
-                            .as_ref();
+                    let through_instance = matches!(receiver.id.as_str(), "self" | "cls");
+                    let class = if through_instance {
+                        self.classes.last()?.clone()
+                    } else {
+                        receiver.id.to_string()
+                    };
+                    if let Some(method) = self
+                        .definitions
+                        .methods
+                        .get(&(self.path.to_path_buf(), class))
+                        .and_then(|methods| methods.get(attribute.attr.as_str()))
+                    {
+                        let signature = method.as_ref()?;
+                        let Callable::Method { receiver, .. } = &signature.kind else {
+                            return None;
+                        };
+                        // Reached through the class itself, an ordinary method
+                        // is unbound: `Client.fetch(instance, url)` writes out
+                        // the instance that `instance.fetch(url)` implies.
+                        let given = match (receiver, through_instance) {
+                            (Receiver::None, _) | (Receiver::Instance, false) => 0,
+                            (Receiver::Class, _) | (Receiver::Instance, true) => 1,
+                        };
+                        return Some((signature, given));
+                    }
+                    if through_instance {
+                        return None;
                     }
                 }
                 let dotted = dotted_name(&attribute.value)?;
                 let Some(Binding::Module(file)) = self.bindings.get(&dotted) else {
                     return None;
                 };
-                self.definitions
-                    .symbols
-                    .get(file)?
-                    .get(attribute.attr.as_str())?
-                    .as_ref()
+                Some((
+                    self.definitions
+                        .symbols
+                        .get(file)?
+                        .get(attribute.attr.as_str())?
+                        .as_ref()?,
+                    0,
+                ))
             }
             _ => None,
         }
@@ -1840,7 +1892,7 @@ impl Rewriter<'_> {
             Expr::Attribute(attribute) => attribute.attr.as_str(),
             _ => return,
         };
-        let Some(signature) = self.resolve(&call.func) else {
+        let Some((signature, bound)) = self.resolve(&call.func) else {
             // A name a fixed callable also goes by, reached some other way: an
             // unrelated `connect`, a method on a receiver whose type is not
             // known, or a call through an unresolved import. Rewriting it would
@@ -1864,8 +1916,6 @@ impl Rewriter<'_> {
             );
             return;
         }
-        // A method reached through `self` or `cls` has already been given it.
-        let bound = usize::from(matches!(signature.kind, Callable::Method(_)));
         let arguments = match missing_arguments(&call.arguments, signature, bound) {
             Ok(arguments) => arguments,
             Err(reason) => {
@@ -2599,6 +2649,43 @@ mod tests {
             source
                 .replace("def f(b=2): pass", "def f(b): pass")
                 .replace("\nf()\n", "\nf(b=2)\n")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn each_kind_of_method_is_given_what_it_already_receives() -> Result<(), String> {
+        // A `staticmethod` is given nothing, a `classmethod` is given the class
+        // however it is reached, and an ordinary method is given the instance
+        // only when it is reached through one.
+        assert_eq!(
+            fixed(
+                "class C:\n    @staticmethod\n    def build(kind=1): pass\n\n    \
+                 @classmethod\n    def make(cls, mode=2): pass\n\n    \
+                 def fetch(self, url, verify=3): pass\n\n    \
+                 def use(self):\n        self.build()\n        self.make()\n        \
+                 self.fetch(\"u\")\n\n\nC.build()\nC.make()\nC.fetch(None, \"u\")\n"
+            )?,
+            "class C:\n    @staticmethod\n    def build(kind): pass\n\n    \
+             @classmethod\n    def make(cls, mode): pass\n\n    \
+             def fetch(self, url, verify): pass\n\n    \
+             def use(self):\n        self.build(kind=1)\n        self.make(mode=2)\n        \
+             self.fetch(\"u\", verify=3)\n\n\nC.build(kind=1)\nC.make(mode=2)\n\
+             C.fetch(None, \"u\", verify=3)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_on_an_unknown_receiver_is_left_alone() -> Result<(), String> {
+        assert_eq!(
+            skipped_reasons(
+                "class C:\n    def fetch(self, url, verify=1): pass\n\n\nclient.fetch(\"u\")\n"
+            )?
+            .first()
+            .map(String::as_str),
+            Some("this call cannot be tied to the definition that was fixed"),
+            "`client` could be anything, so its `fetch` is not known to be this one"
         );
         Ok(())
     }

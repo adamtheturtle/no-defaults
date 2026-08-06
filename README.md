@@ -71,11 +71,11 @@ The same applies to dataclass fields, which become required at construction: `Jo
 
 Arguments are appended as keywords wherever Python allows it, so the change is stable under later edits to the signature. Positional-only parameters are appended positionally instead.
 
-Calls are resolved through the calling file's own imports, not by matching the bare name. A project with its own `connect` does not get `socket.connect` rewritten, and two modules that each define `helper` are told apart. A method is only rewritten when reached through `self` or `cls` inside the class that defines it, because the type of any other receiver would have to be guessed.
+Calls are resolved through the calling file's own imports, not by matching the bare name. A project with its own `connect` does not get `socket.connect` rewritten, and two modules that each define `helper` are told apart. A method is rewritten when reached through `self`, `cls`, or its own class's name, which is as far as the receiver's type can be known without inference. What each method already receives is accounted for, so `instance.fetch(url)` and `Client.fetch(instance, url)` are both filled in correctly, and a `staticmethod` is given nothing extra.
 
 Nothing is guessed. A call is left alone, with a warning naming the file and line, when
 
-- it cannot be tied to the definition that was fixed: an unrelated callable of the same name, a method on a receiver whose type is unknown such as `client.fetch(...)` or `Client.fetch(instance, ...)`, or a call through an import this run could not resolve;
+- it cannot be tied to the definition that was fixed: an unrelated callable of the same name, a method on a receiver whose type is unknown such as `client.fetch(...)`, or a call through an import this run could not resolve;
 - the call unpacks `*args` or `**kwargs`, so what it already supplies is unknown;
 - the removed default is not a literal (`value=SENTINEL`, `path=Path.cwd()`), because repeating that text at the call site would depend on names the caller may not have imported, or would re-evaluate the expression;
 - a positional-only argument cannot be appended without reordering the call;

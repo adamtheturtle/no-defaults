@@ -474,7 +474,13 @@ fn apply_fixes(
         }
         OutputFormat::Full | OutputFormat::Concise => println!("{summary}"),
     }
-    report_call_sites(diagnostics, &call_sites.skipped, updated, cli.output_format);
+    report_call_sites(
+        diagnostics,
+        &call_sites.skipped,
+        updated,
+        cli.output_format,
+        &unfixed,
+    );
     Ok(remaining > 0)
 }
 
@@ -492,16 +498,30 @@ fn warn_about_skipped_calls(skipped: &[Skipped]) {
 }
 
 /// Report what `--fix` did to call sites, and what it could not reach.
+/// How many defaults `--fix` actually removed.
+///
+/// A default counts only if it carried a fix and its file was written. One
+/// left on disk because its result would not have parsed still has every
+/// default it started with.
+fn removed_defaults(diagnostics: &[Diagnostic], unfixed: &BTreeSet<PathBuf>) -> usize {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.code == "NOD001"
+                && diagnostic.fix.is_some()
+                && !unfixed.contains(&diagnostic.path)
+        })
+        .count()
+}
+
 fn report_call_sites(
     diagnostics: &[Diagnostic],
     skipped: &[Skipped],
     updated: usize,
     format: OutputFormat,
+    unfixed: &BTreeSet<PathBuf>,
 ) {
-    let removed = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code == "NOD001" && diagnostic.fix.is_some())
-        .count();
+    let removed = removed_defaults(diagnostics, unfixed);
     if removed == 0 {
         return;
     }
@@ -5217,6 +5237,26 @@ mod tests {
             source.replace("host, timeout=30", "host, timeout")
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_default_in_an_unfixed_file_is_not_counted_as_removed() {
+        let unfixed = PathBuf::from("left.py");
+        let diagnostic = |path: &str| Diagnostic {
+            path: PathBuf::from(path),
+            line: 1,
+            column: 1,
+            code: "NOD001",
+            message: String::new(),
+            fix: Some(TextRange::default()),
+        };
+        let diagnostics = [diagnostic("left.py"), diagnostic("written.py")];
+        assert_eq!(
+            removed_defaults(&diagnostics, &BTreeSet::from([unfixed])),
+            1,
+            "the file left on disk still has its default"
+        );
+        assert_eq!(removed_defaults(&diagnostics, &BTreeSet::new()), 2);
     }
 
     #[test]

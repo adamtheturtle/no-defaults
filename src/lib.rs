@@ -588,8 +588,11 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
 
 /// Find the checked file a dotted module name refers to.
 ///
-/// Absolute imports are matched by path suffix, because the import root is not
-/// known; an ambiguous suffix resolves to nothing rather than to a guess.
+/// An absolute import is resolved against the importer's own import root, and
+/// failing that by path suffix, because the import root of another source tree
+/// is not known. A single-component import is only ever resolved against the
+/// importer's root, since one filename matches at any depth; an ambiguous
+/// suffix resolves to nothing rather than to a guess.
 fn resolve_module(
     module: &str,
     level: u32,
@@ -620,6 +623,31 @@ fn resolve_module(
     if parts.is_empty() {
         return None;
     }
+    // The importer's own root is where Python would look first, and it is the
+    // only root this can establish from the tree alone.
+    if let Some(mut candidate) = import_root(importer) {
+        for part in &parts {
+            candidate.push(part);
+        }
+        for candidate in [
+            candidate.with_extension("py"),
+            candidate.join("__init__.py"),
+        ] {
+            if known.contains(candidate.as_path()) {
+                return Some(candidate);
+            }
+        }
+    }
+    // Elsewhere in the tree, a dotted import is still matched by path suffix,
+    // because the import root of another source tree is not knowable. A
+    // single-component import is not: its suffix is one filename, so it would
+    // match `anything/at/any/depth/utils.py`, which is not what `import utils`
+    // resolves to under any `sys.path` the tree implies. Two or more
+    // components are evidence enough, and an ambiguous suffix still resolves
+    // to nothing.
+    if parts.len() < 2 {
+        return None;
+    }
     let matches = |suffix: &[String], path: &Path| {
         let components: Vec<String> = path
             .components()
@@ -644,6 +672,22 @@ fn resolve_module(
         }
     }
     None
+}
+
+/// The directory an absolute import in `importer` resolves against.
+///
+/// Python resolves `import utils` against `sys.path`, which a per-file linter
+/// cannot know. What it can establish is the importer's own position: walk out
+/// of the packages containing it, and the first directory that is not a package
+/// is where its own top-level imports are rooted.
+fn import_root(importer: &Path) -> Option<PathBuf> {
+    let mut directory = importer.parent()?.to_path_buf();
+    while package_init(&directory).is_some() {
+        if !directory.pop() {
+            return None;
+        }
+    }
+    Some(directory)
 }
 
 #[derive(Serialize)]

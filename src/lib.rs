@@ -2896,6 +2896,19 @@ fn missing_arguments(
             "the call unpacks `*` or `**` arguments, so its arguments are not known".to_owned(),
         );
     }
+    // Python allows a bare generator expression as an argument only when it is
+    // the sole one, so appending anything after it would not parse.
+    if call
+        .args
+        .iter()
+        .any(|argument| matches!(argument, Expr::Generator(generator) if !generator.parenthesized))
+    {
+        return Err(
+            "the call's argument is a bare generator expression, which Python allows only \
+             when it is the only one"
+                .to_owned(),
+        );
+    }
     let positional = call.args.len();
     let named: Vec<&str> = call
         .keywords
@@ -4515,6 +4528,46 @@ mod tests {
                 "the dataclass inherits fields, so its constructor is not known from the file \
                  that defines it"
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_generator_argument_is_left_alone() -> Result<(), String> {
+        // Appending after `x for x in y` would not parse, and the post-fix
+        // parse guard turned that into a failure for the whole run.
+        let source = "def f(items, timeout=30):\n    pass\n\n\nf(x for x in range(3))\n";
+        assert_eq!(
+            fixed(source)?,
+            "def f(items, timeout):\n    pass\n\n\nf(x for x in range(3))\n"
+        );
+        assert_eq!(
+            skipped_reasons(source)?,
+            [
+                "the call's argument is a bare generator expression, which Python allows only \
+              when it is the only one"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_parenthesized_generator_argument_is_still_filled_in() -> Result<(), String> {
+        let source = "def f(items, timeout=30):\n    pass\n\n\nf((x for x in range(3)))\n";
+        assert_eq!(
+            fixed(source)?,
+            "def f(items, timeout):\n    pass\n\n\nf((x for x in range(3)), timeout=30)\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn one_unfixable_call_does_not_hold_back_the_rest() -> Result<(), String> {
+        let source = "def f(items, timeout=30):\n    pass\n\n\nf(x for x in range(3))\nf([1])\n";
+        assert_eq!(
+            fixed(source)?,
+            "def f(items, timeout):\n    pass\n\n\nf(x for x in range(3))\nf([1], timeout=30)\n"
         );
         Ok(())
     }

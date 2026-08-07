@@ -1436,6 +1436,24 @@ fn file_level_prefix<'a>(body: &'a str, tool: &str) -> Option<(&'a str, usize)> 
     Some((rest, body.len() - rest.len()))
 }
 
+/// The offset within a lowercased comment body of its `noqa` marker.
+///
+/// Ruff and flake8 both search the comment for the marker rather than requiring
+/// it first, which is what lets a type-checker pragma and a lint suppression
+/// share a line: `# type: ignore[misc]  # noqa: NOD001`. The marker has to be a
+/// word of its own, so `noqattention` is not one.
+fn noqa_marker(body: &str) -> Option<usize> {
+    let boundary = |character: Option<char>| {
+        character.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+    };
+    body.match_indices("noqa")
+        .find(|(index, _)| {
+            boundary(body[..*index].chars().next_back())
+                && boundary(body[index + "noqa".len()..].chars().next())
+        })
+        .map(|(index, _)| index)
+}
+
 fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
     let line_start = source[..hash].rfind('\n').map_or(0, |end| end + 1);
     let break_start = source[hash..]
@@ -1455,14 +1473,23 @@ fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
     } else if let Some((rest, consumed)) = ruff {
         (true, Some((rest, body_start + consumed)))
     } else {
-        (false, Some((lower.strip_prefix("noqa")?, body_start + 4)))
+        let marker = noqa_marker(&lower)? + "noqa".len();
+        (false, Some((&lower[marker..], body_start + marker)))
     };
+    // A `#` runs to end of line, so `# type: ignore[misc]  # noqa: NOD001` is
+    // a single comment token. What the directive owns starts at its own `#`,
+    // not at whichever one opened the comment.
+    let directive_hash = rest.map_or(hash, |(_, rest_start)| {
+        source[hash..rest_start]
+            .rfind('#')
+            .map_or(hash, |offset| hash + offset)
+    });
     let line = TextRange::new(text_size(line_start), text_size(content_end));
     let blanket = || Directive {
         line,
-        start: text_size(hash),
+        start: text_size(directive_hash),
         explicit: false,
-        fix: TextRange::empty(text_size(hash)),
+        fix: TextRange::empty(text_size(directive_hash)),
         file_level,
         used: false,
     };
@@ -1482,7 +1509,7 @@ fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
         .iter()
         .position(|(_, code)| code.eq_ignore_ascii_case("NOD001"))?;
     let fix = if tokens.len() == 1 {
-        whole_directive_range(source, line_start, hash, break_start, content_end)
+        whole_directive_range(source, line_start, directive_hash, break_start, content_end)
     } else {
         argument_removal_range(
             tokens[index].0,
@@ -3442,6 +3469,43 @@ mod tests {
         assert_eq!(codes("# ruff: noqa: E501\ndef f(x=1): pass\n"), ["NOD001"]);
         assert!(codes("# ruff: noqa\ndef f(x=1): pass\n").is_empty());
         assert!(codes("# flake8: noqa\ndef f(x=1): pass\n").is_empty());
+    }
+
+    #[test]
+    fn a_directive_may_follow_another_pragma_on_the_same_line() {
+        assert!(
+            codes("def a(x=1): pass  # type: ignore[misc]  # noqa: NOD001\n").is_empty(),
+            "`# type: ignore` has to come first for some mypy versions"
+        );
+        assert!(codes("def a(x=1): pass  # pragma: no cover  # noqa\n").is_empty());
+        assert!(
+            codes("def a(x=1): pass  # explains why  # NOQA: NOD001\n").is_empty(),
+            "the marker is matched case-insensitively wherever it sits"
+        );
+        assert_eq!(
+            codes("def a(x=1): pass  # type: ignore  # noqa: E501\n"),
+            ["NOD001"],
+            "a code list that omits this rule still suppresses nothing"
+        );
+        assert_eq!(
+            codes("def a(x=1): pass  # see noqattention\n"),
+            ["NOD001"],
+            "`noqa` must still be a word of its own wherever it sits"
+        );
+    }
+
+    #[test]
+    fn removing_a_directive_that_follows_a_pragma_keeps_the_pragma() -> Result<(), String> {
+        assert_eq!(
+            fixed("def c(z): pass  # type: ignore[misc]  # noqa: NOD001\n")?,
+            "def c(z): pass  # type: ignore[misc]\n"
+        );
+        assert_eq!(
+            fixed("# type: ignore  # noqa: NOD001\ndef c(z): pass\n")?,
+            "# type: ignore\ndef c(z): pass\n",
+            "a comment-only line keeps the part that is not the directive"
+        );
+        Ok(())
     }
 
     #[test]

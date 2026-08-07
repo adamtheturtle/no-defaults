@@ -124,6 +124,15 @@ def compatible(timeout=30):  # noqa: NOD001
     pass
 ```
 
+As in Ruff and flake8, the marker is found anywhere on the line, so it can follow another tool's pragma — which matters because `# type: ignore` has to come first for some mypy versions:
+
+```python
+def compatible(timeout=30):  # type: ignore[misc]  # noqa: NOD001
+    pass
+```
+
+Removing such a directive removes only its own `#` segment, leaving the other pragma in place.
+
 A directive on the line holding `def` covers every parameter of that signature, so a multi-line signature needs one directive rather than one per parameter:
 
 ```python

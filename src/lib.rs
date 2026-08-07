@@ -1462,6 +1462,7 @@ fn check_source(
         },
         header: None,
         collect_signatures: signatures,
+        lines: LineIndex::new(source),
         classes: Vec::new(),
         signatures: Vec::new(),
         skipped: Vec::new(),
@@ -1684,6 +1685,9 @@ struct Checker<'a> {
     /// Whether to record what each fixed callable looks like. Only `--fix` and
     /// `--diff` use it, and building it allocates per parameter and per field.
     collect_signatures: bool,
+    /// Where each line of `source` starts, so reporting a diagnostic does not
+    /// rescan the file from the top.
+    lines: LineIndex,
     classes: Vec<ClassCollector>,
     signatures: Vec<Signature>,
     skipped: Vec<Skipped>,
@@ -1801,7 +1805,7 @@ impl Checker<'_> {
         if self.suppress(offset) {
             return false;
         }
-        let (line, column) = line_column(self.source, offset);
+        let (line, column) = self.lines.locate(self.source, offset);
         self.diagnostics.push(Diagnostic {
             path: self.path.to_path_buf(),
             line,
@@ -1840,7 +1844,7 @@ impl Checker<'_> {
             if !directive.explicit || directive.used {
                 continue;
             }
-            let (line, column) = line_column(self.source, directive.start);
+            let (line, column) = self.lines.locate(self.source, directive.start);
             self.diagnostics.push(Diagnostic {
                 path: self.path.to_path_buf(),
                 line,
@@ -1895,7 +1899,7 @@ impl Checker<'_> {
         if !removed || !self.collect_signatures {
             return;
         }
-        let (line, column) = line_column(self.source, lambda.start());
+        let (line, column) = self.lines.locate(self.source, lambda.start());
         self.skipped.push(Skipped {
             path: self.path.to_path_buf(),
             line,
@@ -2525,6 +2529,7 @@ fn rewrite_calls(
         bindings,
         classes: Vec::new(),
         called: BTreeSet::new(),
+        lines: LineIndex::new(source),
         edits: Vec::new(),
         skipped: Vec::new(),
     };
@@ -2642,13 +2647,16 @@ struct Rewriter<'a> {
     /// Ranges of the expressions being called, so that the same expression is
     /// not later mistaken for a reference that never calls the function.
     called: BTreeSet<(TextSize, TextSize)>,
+    /// Where each line of `source` starts, for the same reason the checker
+    /// keeps one.
+    lines: LineIndex,
     edits: Vec<Edit>,
     skipped: Vec<Skipped>,
 }
 
 impl Rewriter<'_> {
     fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
-        let (line, column) = line_column(self.source, offset);
+        let (line, column) = self.lines.locate(self.source, offset);
         self.skipped.push(Skipped {
             path: self.path.to_path_buf(),
             line,
@@ -2942,18 +2950,41 @@ fn line_start(source: &str, offset: TextSize) -> TextSize {
     )
 }
 
-/// The one-based line and column of `offset`, with the column counted in
-/// characters.
+/// The offset each line of a source starts at.
 ///
-/// Ruff, whose concise format this imitates, reports character columns. Byte
-/// offsets would shift the reported column of anything that follows non-ASCII
-/// text on its line, and put the caret in `full` output that many cells too
-/// far right.
+/// Built once per file, so converting an offset to a line is a binary search
+/// rather than a scan from the top of the file. Scanning made producing a
+/// file's diagnostics quadratic in how many it holds.
+struct LineIndex(Vec<usize>);
+
+impl LineIndex {
+    fn new(source: &str) -> Self {
+        Self(
+            std::iter::once(0)
+                .chain(source.match_indices('\n').map(|(position, _)| position + 1))
+                .collect(),
+        )
+    }
+
+    /// The one-based line and column of `offset`, with the column counted in
+    /// characters.
+    ///
+    /// Ruff, whose concise format this imitates, reports character columns.
+    /// Byte offsets would shift the reported column of anything that follows
+    /// non-ASCII text on its line, and put the caret in `full` output that
+    /// many cells too far right.
+    fn locate(&self, source: &str, offset: TextSize) -> (usize, usize) {
+        let offset = offset.to_usize();
+        // Every source has a line starting at 0, so this is never zero.
+        let line = self.0.partition_point(|start| *start <= offset);
+        let start = self.0.get(line - 1).copied().unwrap_or(0);
+        (line, source[start..offset].chars().count() + 1)
+    }
+}
+
+/// The line and column of a single offset, for the callers that need only one.
 fn line_column(source: &str, offset: TextSize) -> (usize, usize) {
-    let before = &source[..offset.to_usize()];
-    let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let line_start = before.rfind('\n').map_or(0, |position| position + 1);
-    (line, before[line_start..].chars().count() + 1)
+    LineIndex::new(source).locate(source, offset)
 }
 
 #[cfg(test)]
@@ -3005,6 +3036,36 @@ mod tests {
             assert_eq!(source.line(0), None, "{text:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn the_line_index_agrees_with_scanning_the_source() {
+        for source in [
+            "one\ntwo\nthree\n",
+            "one\ntwo\nthree",
+            "one\r\ntwo\r\n",
+            "\n\nthird\n",
+            "single",
+            "trailing\n\n",
+            "ä\nlonger ä line\n",
+            "",
+        ] {
+            let index = LineIndex::new(source);
+            for offset in 0..=source.len() {
+                if !source.is_char_boundary(offset) {
+                    continue;
+                }
+                let offset = TextSize::new(u32::try_from(offset).unwrap_or(u32::MAX));
+                let before = &source[..offset.to_usize()];
+                let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let start = before.rfind('\n').map_or(0, |position| position + 1);
+                assert_eq!(
+                    index.locate(source, offset),
+                    (line, before[start..].chars().count() + 1),
+                    "{source:?} at {offset:?}"
+                );
+            }
+        }
     }
 
     #[test]

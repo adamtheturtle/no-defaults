@@ -1781,6 +1781,13 @@ struct ClassCollector {
     inherits: bool,
     /// Whether the decorator generates a constructor at all.
     constructs: bool,
+    /// Whether every field from here on is keyword-only, because the decorator
+    /// said `kw_only=True` or a `_: KW_ONLY` marker has been passed.
+    kw_only: bool,
+    /// The fields the constructor takes positionally, in order. A keyword-only
+    /// field is left out: `dataclasses` moves it after the `*`, so it holds no
+    /// position and every field after it in the source keeps the position the
+    /// source suggests.
     fields: Vec<String>,
     removed: Vec<Removed>,
 }
@@ -2026,7 +2033,8 @@ impl Checker<'_> {
             return;
         }
         // A `_: KW_ONLY` marker is not a field, so it takes no place in the
-        // constructor's positional order.
+        // constructor's positional order. It also makes every field after it
+        // keyword-only, which does hold for the rest of the class body.
         let pseudo_field = annotates_kw_only(&assign.annotation, &self.aliases);
         // A field declared `init=False` is not a constructor parameter, so a
         // call must never be given it.
@@ -2034,10 +2042,21 @@ impl Checker<'_> {
             .value
             .as_deref()
             .is_none_or(|value| !field_excluded_from_init(value, &self.aliases));
-        // Every other field counts towards the positional order, even one
-        // without a default or one this run is not enforcing.
-        if self.collect_signatures && !pseudo_field && constructs {
-            if let Some(class) = self.classes.last_mut() {
+        // `field(kw_only=...)` decides for one field, over whatever the
+        // decorator or a marker said for the class.
+        let kw_only = assign
+            .value
+            .as_deref()
+            .and_then(|value| field_says_kw_only(value, &self.aliases))
+            .unwrap_or_else(|| self.classes.last().is_some_and(|class| class.kw_only));
+        if let Some(class) = self.classes.last_mut() {
+            if pseudo_field {
+                class.kw_only = true;
+            }
+            // Every other field that the constructor takes positionally counts
+            // towards the order, even one without a default or one this run is
+            // not enforcing. A keyword-only field holds no position.
+            else if constructs && !kw_only {
                 class.fields.push(name.id.to_string());
             }
         }
@@ -2103,6 +2122,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         style,
                         inherits: inherits_fields(class, style, self.field_bases),
                         constructs: generates_init(class),
+                        kw_only: decorator_says_kw_only(class),
                         fields: Vec::new(),
                         removed: Vec::new(),
                     });
@@ -2335,6 +2355,47 @@ fn generates_init(class: &ast::StmtClassDef) -> bool {
                 && matches!(&keyword.value, Expr::BooleanLiteral(literal) if !literal.value)
         })
     })
+}
+
+/// Whether the decorator says `kw_only=True`, making every field of the class
+/// keyword-only in the generated constructor.
+fn decorator_says_kw_only(class: &ast::StmtClassDef) -> bool {
+    class.decorator_list.iter().any(|decorator| {
+        let Expr::Call(call) = &decorator.expression else {
+            return false;
+        };
+        call.arguments
+            .keywords
+            .iter()
+            .any(|keyword| keyword_is(keyword, "kw_only") == Some(true))
+    })
+}
+
+/// Whether a `field(...)` call says `kw_only=`, and what it said. `None` where
+/// it does not say, so the class-wide setting stands.
+fn field_says_kw_only(value: &Expr, aliases: &Aliases) -> Option<bool> {
+    let Expr::Call(call) = value else {
+        return None;
+    };
+    if matched_name(&call.func, aliases) != Some("field") {
+        return None;
+    }
+    call.arguments
+        .keywords
+        .iter()
+        .find_map(|keyword| keyword_is(keyword, "kw_only"))
+}
+
+/// The boolean a keyword argument was given, when it is named `name` and its
+/// value is written as a literal.
+fn keyword_is(keyword: &ast::Keyword, name: &str) -> Option<bool> {
+    if keyword.arg.as_ref()?.as_str() != name {
+        return None;
+    }
+    match &keyword.value {
+        Expr::BooleanLiteral(literal) => Some(literal.value),
+        _ => None,
+    }
 }
 
 /// Whether an annotation is the `KW_ONLY` marker, which declares no field.
@@ -4858,6 +4919,72 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "def f(items, timeout):\n    pass\n\n\nf(x for x in range(3))\nf([1], timeout=30)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_keyword_only_field_holds_no_position_in_the_constructor() -> Result<(), String> {
+        // The real constructor is `__init__(self, b=2, *, a=1)`, so `C(5)`
+        // means `b=5`. Reading `a` as the first positional slot made the fix
+        // drop the default `a` now needs and pass `b` twice.
+        let source = "@dataclass\nclass C:\n    a: int = field(kw_only=True, default=1)\n    \
+                      b: int = 2\n\n\nC(5)\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass\nclass C:\n    a: int = field(kw_only=True)\n    b: int\n\n\nC(5, a=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_decorator_that_says_kw_only_makes_every_field_keyword_only() -> Result<(), String> {
+        let source =
+            "@dataclass(kw_only=True)\nclass D:\n    a: int = 1\n    b: int = 2\n\n\nD()\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass(kw_only=True)\nclass D:\n    a: int\n    b: int\n\n\nD(a=1, b=2)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_kw_only_marker_makes_the_fields_after_it_keyword_only() -> Result<(), String> {
+        let source =
+            "@dataclass\nclass E:\n    a: int = 1\n    _: KW_ONLY\n    b: int = 2\n\n\nE()\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass\nclass E:\n    a: int\n    _: KW_ONLY\n    b: int\n\n\nE(a=1, b=2)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_that_says_kw_only_false_overrides_the_class() -> Result<(), String> {
+        // `__init__(self, a=1, *, b=2)`, so `F(9)` already supplies `a`.
+        let source = "@dataclass(kw_only=True)\nclass F:\n    \
+                      a: int = field(kw_only=False, default=1)\n    b: int = 2\n\n\nF(9)\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass(kw_only=True)\nclass F:\n    a: int = field(kw_only=False)\n    \
+             b: int\n\n\nF(9, b=2)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_positional_field_after_a_keyword_only_one_keeps_its_slot() -> Result<(), String> {
+        // `__init__(self, b=2, c=3, *, a=1)`: `G(5)` supplies `b`, so only `c`
+        // and `a` are missing.
+        let source = "@dataclass\nclass G:\n    a: int = field(kw_only=True, default=1)\n    \
+                      b: int = 2\n    c: int = 3\n\n\nG(5)\n";
+        // The keywords are appended in the order the fields are written, which
+        // is what the rest of the fixer does; only which fields are missing is
+        // at stake here.
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass\nclass G:\n    a: int = field(kw_only=True)\n    b: int\n    \
+             c: int\n\n\nG(5, a=1, c=3)\n"
         );
         Ok(())
     }

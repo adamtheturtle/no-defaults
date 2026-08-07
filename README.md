@@ -105,6 +105,8 @@ Nothing is guessed. A call is left alone, with a warning naming the file and lin
 
 Fields that `__init__` never accepts are never added to a call: `field(..., init=False)`, a `_: KW_ONLY` marker, and a class whose decorator says `init=False`.
 
+Keyword-only fields are accounted for. `dataclasses` moves a field declared `field(kw_only=True)`, or any field under `@dataclass(kw_only=True)` or after a `_: KW_ONLY` marker, past the `*` in the generated `__init__`, so it holds no positional slot and the fields written after it keep the positions the source suggests.
+
 Class names are exempt from the named-without-being-called check, because they appear in annotations and `isinstance` checks constantly and none of those are calls.
 
 Two things `--fix` still cannot reach: **callers outside the files you checked** — for a function that is part of your public API, they are in other people's code — and **calls made dynamically**, through `getattr` or a variable holding the function. A warning after fixing says so, and **your test suite is what confirms the result**.

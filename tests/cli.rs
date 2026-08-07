@@ -1001,3 +1001,85 @@ fn a_dotted_import_still_reaches_another_source_root() -> Result<(), Box<dyn std
     );
     Ok(())
 }
+
+#[test]
+fn a_top_level_import_does_not_resolve_inside_its_own_package(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir_all(&package)?;
+    std::fs::write(package.join("__init__.py"), "")?;
+    // Python has no implicit relative imports, so `import utils` inside `pkg`
+    // reaches the root `utils`, not `pkg/utils.py`.
+    std::fs::write(package.join("utils.py"), "def other(): pass\n")?;
+    std::fs::write(
+        directory.path().join("utils.py"),
+        "def helper(a, size=8192): return a\n",
+    )?;
+    let module = package.join("mod.py");
+    std::fs::write(&module, "from utils import helper\nhelper(1)\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&module)?,
+        "from utils import helper\nhelper(1, size=8192)\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_import_two_roots_could_answer_is_left_alone() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir_all(&package)?;
+    // Neither directory is a package, so either could be the one on sys.path.
+    std::fs::write(
+        directory.path().join("utils.py"),
+        "def helper(a, size=8192): return a\n",
+    )?;
+    std::fs::write(
+        package.join("utils.py"),
+        "def helper(a, size=4096): return a\n",
+    )?;
+    let module = package.join("mod.py");
+    std::fs::write(&module, "from utils import helper\nhelper(1)\n")?;
+    let before = std::fs::read_to_string(&module)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("cannot be tied to the definition that was fixed"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&module)?, before);
+    Ok(())
+}
+
+#[test]
+fn a_namespace_package_still_sees_a_module_at_the_root() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir_all(&package)?;
+    std::fs::write(
+        directory.path().join("utils.py"),
+        "def helper(a, size=8192): return a\n",
+    )?;
+    let module = package.join("mod.py");
+    std::fs::write(&module, "from utils import helper\nhelper(1)\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&module)?,
+        "from utils import helper\nhelper(1, size=8192)\n"
+    );
+    Ok(())
+}

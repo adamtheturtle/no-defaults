@@ -456,19 +456,21 @@ fn apply_fixes(
         .iter()
         .filter(|diagnostic| diagnostic.fix.is_none())
         .count();
+    let summary = format!(
+        "Found {} error{} ({} fixed, {remaining} remaining).",
+        diagnostics.len(),
+        if diagnostics.len() == 1 { "" } else { "s" },
+        diagnostics.len() - remaining,
+    );
     match cli.output_format {
         // The machine formats carry the diagnostics themselves. A summary line
-        // on stdout would make the JSON unparseable, so the counts stay in the
-        // human formats where they belong.
+        // on stdout would make the JSON unparseable, so it joins the warnings
+        // on stderr rather than being dropped.
         OutputFormat::Json | OutputFormat::Github => {
             report_diagnostics(diagnostics, cli.output_format)?;
+            eprintln!("{summary}");
         }
-        OutputFormat::Full | OutputFormat::Concise => println!(
-            "Found {} error{} ({} fixed, {remaining} remaining).",
-            diagnostics.len(),
-            if diagnostics.len() == 1 { "" } else { "s" },
-            diagnostics.len() - remaining,
-        ),
+        OutputFormat::Full | OutputFormat::Concise => println!("{summary}"),
     }
     report_call_sites(diagnostics, &call_sites.skipped, updated, cli.output_format);
     Ok(remaining > 0)
@@ -588,11 +590,12 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
 
 /// Find the checked file a dotted module name refers to.
 ///
-/// An absolute import is resolved against the importer's own import root, and
-/// failing that by path suffix, because the import root of another source tree
-/// is not known. A single-component import is only ever resolved against the
-/// importer's root, since one filename matches at any depth; an ambiguous
-/// suffix resolves to nothing rather than to a guess.
+/// An absolute import is resolved against the importer's own directory and the
+/// ancestors above it, which is where `sys.path` must point for the import to
+/// work at all, and failing that by path suffix, because the root of another
+/// source tree is not known. A single-component import is only ever resolved
+/// against those ancestors, since one filename matches at any depth; an
+/// ambiguous suffix resolves to nothing rather than to a guess.
 fn resolve_module(
     module: &str,
     level: u32,
@@ -623,20 +626,40 @@ fn resolve_module(
     if parts.is_empty() {
         return None;
     }
-    // The importer's own root is where Python would look first, and it is the
-    // only root this can establish from the tree alone.
-    if let Some(mut candidate) = import_root(importer) {
-        for part in &parts {
-            candidate.push(part);
-        }
-        for candidate in [
-            candidate.with_extension("py"),
-            candidate.join("__init__.py"),
-        ] {
-            if known.contains(candidate.as_path()) {
-                return Some(candidate);
+    // Whichever directory is on `sys.path`, a top-level import from this file
+    // resolves at or above the file itself, so those are the roots to try —
+    // and none of them can reach sideways into another subtree. A directory
+    // that is a package of its own is not among them: Python has no implicit
+    // relative imports, so `import utils` inside a package does not find the
+    // package's own `utils`. Where more than one root answers, which is on
+    // `sys.path` decides, and that is not knowable, so nothing does.
+    let mut found: Option<PathBuf> = None;
+    if let Some(mut directory) = importer.parent().map(Path::to_path_buf) {
+        loop {
+            if package_init(&directory).is_none() {
+                let mut candidate = directory.clone();
+                for part in &parts {
+                    candidate.push(part);
+                }
+                for candidate in [
+                    candidate.with_extension("py"),
+                    candidate.join("__init__.py"),
+                ] {
+                    if known.contains(candidate.as_path()) {
+                        if found.as_ref().is_some_and(|first| *first != candidate) {
+                            return None;
+                        }
+                        found = Some(candidate);
+                    }
+                }
+            }
+            if !directory.pop() {
+                break;
             }
         }
+    }
+    if found.is_some() {
+        return found;
     }
     // Elsewhere in the tree, a dotted import is still matched by path suffix,
     // because the import root of another source tree is not knowable. A
@@ -672,22 +695,6 @@ fn resolve_module(
         }
     }
     None
-}
-
-/// The directory an absolute import in `importer` resolves against.
-///
-/// Python resolves `import utils` against `sys.path`, which a per-file linter
-/// cannot know. What it can establish is the importer's own position: walk out
-/// of the packages containing it, and the first directory that is not a package
-/// is where its own top-level imports are rooted.
-fn import_root(importer: &Path) -> Option<PathBuf> {
-    let mut directory = importer.parent()?.to_path_buf();
-    while package_init(&directory).is_some() {
-        if !directory.pop() {
-            return None;
-        }
-    }
-    Some(directory)
 }
 
 #[derive(Serialize)]
@@ -1493,6 +1500,8 @@ fn check_source(
     }
     let mut aliases = Aliases::default();
     aliases.collect(parsed.suite());
+    let mut local_classes = BTreeSet::new();
+    collect_class_names(parsed.suite(), &mut local_classes);
     let mut checker = Checker {
         path,
         source,
@@ -1500,6 +1509,7 @@ fn check_source(
         reexports,
         field_bases,
         aliases,
+        local_classes,
         scope: Scope {
             private: is_private_module(path, project_root, reexports),
             ..Scope::default()
@@ -1639,7 +1649,7 @@ fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
         // a `# type: ignore`, a `# pylint: disable`, an explanation — and
         // taking the line to its end would delete it along with the directive.
         let after_codes = tokens[index].0.end().to_usize();
-        source[after_codes..content_end].find('#').map_or_else(
+        next_segment(&source[after_codes..content_end]).map_or_else(
             || whole_directive_range(source, line_start, directive_hash, break_start, content_end),
             |offset| TextRange::new(text_size(directive_hash), text_size(after_codes + offset)),
         )
@@ -1657,6 +1667,30 @@ fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
         explicit: true,
         fix,
         ..blanket()
+    })
+}
+
+/// Where the next comment segment starts in `rest`, if it does.
+///
+/// A `#` runs to end of line, so `# noqa: NOD001  # type: ignore` is one
+/// comment made of two segments. A `#` inside the prose of a segment does not
+/// start a new one: an issue reference such as `see #35` is text, not a pragma,
+/// and stopping there would leave a mangled fragment behind. A segment opens
+/// with a `#` followed by whitespace, or by a pragma's `word:`.
+fn next_segment(rest: &str) -> Option<usize> {
+    rest.match_indices('#').find_map(|(offset, _)| {
+        let after = &rest[offset + 1..];
+        let opens = after
+            .chars()
+            .next()
+            .is_none_or(|character| character.is_whitespace() || character == '#')
+            || after.split_once(':').is_some_and(|(word, _)| {
+                !word.is_empty()
+                    && word
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || character == '_')
+            });
+        opens.then_some(offset)
     })
 }
 
@@ -1721,6 +1755,9 @@ struct Checker<'a> {
     /// What the file's renaming imports bound to `dataclasses` and `pydantic`
     /// members, so an aliased `@dataclass` is still recognised.
     aliases: Aliases,
+    /// The class names the file defines, so a base written `Protocol` that is
+    /// one of them is not mistaken for the typing construct.
+    local_classes: BTreeSet<String>,
     scope: Scope,
     /// Start of the `def` or `class` line that owns the violations being
     /// reported, so one directive there can cover every parameter of a
@@ -2120,7 +2157,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     self.classes.push(ClassCollector {
                         name: class.name.to_string(),
                         style,
-                        inherits: inherits_fields(class, style, self.field_bases),
+                        inherits: inherits_fields(
+                            class,
+                            style,
+                            self.field_bases,
+                            &self.local_classes,
+                        ),
                         constructs: generates_init(class),
                         kw_only: decorator_says_kw_only(class),
                         fields: Vec::new(),
@@ -2222,12 +2264,13 @@ fn inherits_fields(
     class: &ast::StmtClassDef,
     style: Option<FieldStyle>,
     bases: &FieldBases,
+    local: &BTreeSet<String>,
 ) -> bool {
     match style {
         Some(FieldStyle::Base) => {
-            class_bases(class).any(|base| !bases.matches(base) && !carries_no_fields(base))
+            class_bases(class).any(|base| !bases.matches(base) && !carries_no_fields(base, local))
         }
-        _ => class_bases(class).any(|base| !carries_no_fields(base)),
+        _ => class_bases(class).any(|base| !carries_no_fields(base, local)),
     }
 }
 
@@ -2239,12 +2282,15 @@ fn inherits_fields(
 /// own body and its constructor is known from the file that defines it. Without
 /// this a generic dataclass could never have its call sites updated, however
 /// the project is laid out — the safe path was never escaped.
-fn carries_no_fields(base: &Expr) -> bool {
+fn carries_no_fields(base: &Expr, local: &BTreeSet<String>) -> bool {
     let base = match base {
         Expr::Subscript(subscript) => &*subscript.value,
         expression => expression,
     };
     let name = match base {
+        // A class the file defines under one of these names is that class, not
+        // the typing construct, and may carry fields of its own.
+        Expr::Name(name) if local.contains(name.id.as_str()) => return false,
         Expr::Name(name) => name.id.as_str(),
         Expr::Attribute(attribute) => attribute.attr.as_str(),
         _ => return false,
@@ -2266,14 +2312,17 @@ fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
 /// Decorators, annotations, and field calls are matched by the name they are
 /// written with, so `from dataclasses import dataclass as dc` would otherwise
 /// leave `@dc` unrecognised and the whole class unchecked.
+/// `None` against a local name marks one the file bound to more than one
+/// member, which makes it resolve to neither.
 #[derive(Debug, Default)]
-struct Aliases(BTreeMap<String, String>);
+struct Aliases(BTreeMap<String, Option<String>>);
 
 impl Aliases {
     /// The `dataclasses` or `pydantic` member `name` was imported as, or `name`
-    /// itself when the file did not rename anything to it.
+    /// itself when the file did not rename anything to it, or renamed more
+    /// than one thing to it.
     fn resolve<'a>(&'a self, name: &'a str) -> &'a str {
-        self.0.get(name).map_or(name, String::as_str)
+        self.0.get(name).and_then(Option::as_deref).unwrap_or(name)
     }
 
     /// Collect the renaming imports of a module, including those nested in an
@@ -2289,8 +2338,18 @@ impl Aliases {
                         continue;
                     }
                     for alias in &import.names {
-                        if let Some(local) = &alias.asname {
-                            self.0.insert(local.to_string(), alias.name.to_string());
+                        let Some(local) = &alias.asname else {
+                            continue;
+                        };
+                        match self.0.entry(local.to_string()) {
+                            Entry::Vacant(entry) => {
+                                entry.insert(Some(alias.name.to_string()));
+                            }
+                            Entry::Occupied(mut entry) => {
+                                if entry.get().as_deref() != Some(alias.name.as_str()) {
+                                    entry.insert(None);
+                                }
+                            }
                         }
                     }
                 }
@@ -2314,6 +2373,39 @@ impl Aliases {
                 Stmt::With(block) => self.collect(&block.body),
                 _ => {}
             }
+        }
+    }
+}
+
+/// The class names the file defines at module level.
+///
+/// A class nested in a function or another class is not in scope where a
+/// module-level `class Box(Protocol)` is written, so it says nothing about what
+/// that base means. Branches and blocks at module level are descended into,
+/// because a class under `if TYPE_CHECKING:` is a module-level name.
+fn collect_class_names(statements: &[Stmt], into: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            Stmt::ClassDef(class) => {
+                into.insert(class.name.to_string());
+            }
+            Stmt::If(branch) => {
+                collect_class_names(&branch.body, into);
+                for clause in &branch.elif_else_clauses {
+                    collect_class_names(&clause.body, into);
+                }
+            }
+            Stmt::Try(block) => {
+                collect_class_names(&block.body, into);
+                collect_class_names(&block.orelse, into);
+                collect_class_names(&block.finalbody, into);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_class_names(&handler.body, into);
+                }
+            }
+            Stmt::With(block) => collect_class_names(&block.body, into),
+            _ => {}
         }
     }
 }
@@ -2765,6 +2857,10 @@ fn collect_bindings(
 /// that really has a scope of its own — it is collected anyway: over-collecting
 /// costs a call left alone with a warning, and under-collecting costs a wrong
 /// rewrite.
+///
+/// A nested `def` or `class` is a scope of its own, and the rewriter pushes one
+/// for it on the way in, so what it binds is left to it. Only its own name is
+/// taken, because that is what the body being collected binds.
 #[derive(Default)]
 struct BoundNames(BTreeSet<String>);
 
@@ -2847,12 +2943,15 @@ impl<'a> Visitor<'a> for BoundNames {
                     }
                 }
             }
+            // A nested scope binds its own name here and everything else
+            // inside itself, so it is not descended into.
             Stmt::FunctionDef(function) => {
                 self.0.insert(function.name.to_string());
-                self.parameters(&function.parameters);
+                return;
             }
             Stmt::ClassDef(class) => {
                 self.0.insert(class.name.to_string());
+                return;
             }
             Stmt::Import(import) => {
                 for alias in &import.names {
@@ -2895,11 +2994,9 @@ impl<'a> Visitor<'a> for BoundNames {
     fn visit_expr(&mut self, expression: &'a Expr) {
         match expression {
             Expr::Named(named) => self.bind(&named.target),
-            Expr::Lambda(lambda) => {
-                if let Some(parameters) = &lambda.parameters {
-                    self.parameters(parameters);
-                }
-            }
+            // As with a nested `def`, a lambda's parameters belong to the
+            // lambda, and the rewriter pushes a scope for it.
+            Expr::Lambda(_) => return,
             Expr::ListComp(comprehension) => self.comprehensions(&comprehension.generators),
             Expr::SetComp(comprehension) => self.comprehensions(&comprehension.generators),
             Expr::DictComp(comprehension) => self.comprehensions(&comprehension.generators),
@@ -3172,19 +3269,6 @@ fn missing_arguments(
             "the call unpacks `*` or `**` arguments, so its arguments are not known".to_owned(),
         );
     }
-    // Python allows a bare generator expression as an argument only when it is
-    // the sole one, so appending anything after it would not parse.
-    if call
-        .args
-        .iter()
-        .any(|argument| matches!(argument, Expr::Generator(generator) if !generator.parenthesized))
-    {
-        return Err(
-            "the call's argument is a bare generator expression, which Python allows only \
-             when it is the only one"
-                .to_owned(),
-        );
-    }
     let positional = call.args.len();
     let named: Vec<&str> = call
         .keywords
@@ -3226,6 +3310,20 @@ fn missing_arguments(
         }
     }
     appended.extend(keywords);
+    // Python allows a bare generator expression as an argument only when it is
+    // the sole one, so nothing can follow it. A call that needs nothing added
+    // is not affected, so it is not worth a warning.
+    if !appended.is_empty()
+        && call.args.iter().any(
+            |argument| matches!(argument, Expr::Generator(generator) if !generator.parenthesized),
+        )
+    {
+        return Err(
+            "the call's argument is a bare generator expression, which Python allows only \
+             when it is the only one"
+                .to_owned(),
+        );
+    }
     Ok(appended)
 }
 
@@ -4858,7 +4956,6 @@ mod tests {
             "class connect: pass",
             "[connect for connect in []]",
             "if (connect := open): pass",
-            "(lambda connect: connect(\"h\"))(open)",
         ] {
             let source =
                 format!("def connect(host, timeout=30):\n    pass\n\n\ndef f():\n    {binding}\n    connect(\"h\")\n");
@@ -4868,6 +4965,109 @@ mod tests {
                 "{binding}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_scope_does_not_shadow_the_scope_holding_it() -> Result<(), String> {
+        // `inner`'s parameter belongs to `inner`. The call in `outer` still
+        // reaches the module-level definition and must still be filled in.
+        let source = "def connect(host, timeout=30):\n    pass\n\n\n\
+                      def outer():\n    def inner(connect):\n        return connect\n    \
+                      connect(\"h\")\n";
+        assert_eq!(
+            fixed(source)?,
+            "def connect(host, timeout):\n    pass\n\n\n\
+             def outer():\n    def inner(connect):\n        return connect\n    \
+             connect(\"h\", timeout=30)\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_lambda_parameter_shadows_only_inside_the_lambda() -> Result<(), String> {
+        let source = "def connect(host, timeout=30):\n    pass\n\n\n\
+                      def f():\n    (lambda connect: connect(\"h\"))(open)\n    \
+                      connect(\"h\")\n";
+        assert_eq!(
+            fixed(source)?,
+            "def connect(host, timeout):\n    pass\n\n\n\
+             def f():\n    (lambda connect: connect(\"h\"))(open)\n    \
+             connect(\"h\", timeout=30)\n",
+            "the call inside the lambda goes to its parameter; the one after it does not"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_hash_in_comment_prose_does_not_bound_the_deletion() -> Result<(), String> {
+        // `#35` is text, not a pragma. Stopping there left a mangled fragment.
+        assert_eq!(
+            fixed("def b(y): pass  # noqa: NOD001  see #35  # type: ignore[misc]\n")?,
+            "def b(y): pass  # type: ignore[misc]\n"
+        );
+        assert_eq!(
+            fixed("def b(y): pass  # noqa: NOD001  #type:ignore\n")?,
+            "def b(y): pass  #type:ignore\n",
+            "a pragma written without a space still opens a segment"
+        );
+        assert_eq!(
+            fixed("def b(y): pass  # noqa: NOD001  refs #1 and #2\n")?,
+            "def b(y): pass\n",
+            "prose alone leaves nothing worth keeping"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_alias_bound_to_more_than_one_member_resolves_to_neither() {
+        // Whichever import comes last must not decide it.
+        let source = "from dataclasses import dataclass, field as f\n\n\
+                      def helper():\n    from pydantic import Field as f\n    return f\n\n\
+                      @dataclass\nclass C:\n    x: int = f(...)\n";
+        assert_eq!(
+            messages(source, false),
+            ["dataclass field `x` has a default"],
+            "reading `f` as pydantic's `Field` would have taken the `...` for `required`"
+        );
+    }
+
+    #[test]
+    fn a_class_the_file_defines_is_not_the_typing_construct() -> Result<(), String> {
+        let source = "@dataclass\nclass Protocol:\n    base_field: int = 0\n\n\n\
+                      @dataclass\nclass Box(Protocol):\n    value: int = 1\n\n\nBox()\n";
+        assert_eq!(
+            skipped_reasons(source)?.first().map(String::as_str),
+            Some(
+                "the dataclass inherits fields, so its constructor is not known from the file \
+                 that defines it"
+            ),
+            "this `Protocol` is a dataclass of the file's own, and carries a field"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_nested_out_of_scope_does_not_shadow_the_typing_construct() -> Result<(), String> {
+        // The `Protocol` in scope where `Box` is written is the imported one.
+        let source = "def factory():\n    class Protocol:\n        pass\n    \
+                      return Protocol\n\n\n\
+                      @dataclass\nclass Box(Protocol):\n    value: int = 1\n\n\nBox()\n";
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_generator_call_that_needs_nothing_added_is_not_warned_about() -> Result<(), String> {
+        // The generator already supplies the only parameter whose default went,
+        // so no argument would be appended and there is nothing to refuse.
+        let source = "def f(items=1):\n    pass\n\n\nf(x for x in range(3))\n";
+        assert_eq!(
+            fixed(source)?,
+            "def f(items):\n    pass\n\n\nf(x for x in range(3))\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
         Ok(())
     }
 

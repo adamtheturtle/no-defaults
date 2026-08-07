@@ -631,3 +631,31 @@ fn fixing_a_symlink_writes_through_to_its_target() -> Result<(), Box<dyn std::er
     );
     Ok(())
 }
+
+#[test]
+fn the_caret_lands_under_a_default_on_a_non_ascii_line() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("u.py");
+    std::fs::write(&path, "def f(\u{e4}=1):\n    pass\n")?;
+    let output = Command::new(binary()).arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains(":1:9: NOD001"), "{stdout}");
+    let caret = stdout
+        .lines()
+        .find(|line| line.contains('^'))
+        .ok_or("expected a caret line")?;
+    let source = stdout
+        .lines()
+        .find(|line| line.contains("def f("))
+        .ok_or("expected a source line")?;
+    // Both lines carry the same `N | ` gutter, so counting characters into
+    // each of them says which character the caret points at. It must be the
+    // default, not the `)` a byte column would land on.
+    let column = caret
+        .chars()
+        .position(|character| character == '^')
+        .ok_or("expected a caret")?;
+    assert_eq!(source.chars().nth(column), Some('1'), "{stdout}");
+    Ok(())
+}

@@ -2521,12 +2521,18 @@ fn line_start(source: &str, offset: TextSize) -> TextSize {
     )
 }
 
+/// The one-based line and column of `offset`, with the column counted in
+/// characters.
+///
+/// Ruff, whose concise format this imitates, reports character columns. Byte
+/// offsets would shift the reported column of anything that follows non-ASCII
+/// text on its line, and put the caret in `full` output that many cells too
+/// far right.
 fn line_column(source: &str, offset: TextSize) -> (usize, usize) {
-    let offset = offset.to_usize();
-    let before = &source[..offset];
+    let before = &source[..offset.to_usize()];
     let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let line_start = before.rfind('\n').map_or(0, |position| position + 1);
-    (line, offset - line_start + 1)
+    (line, before[line_start..].chars().count() + 1)
 }
 
 #[cfg(test)]
@@ -2536,6 +2542,33 @@ mod tests {
     /// The field-carrying base classes a run with no configuration uses.
     fn default_bases() -> FieldBases {
         FieldBases::new(&default_field_base_classes())
+    }
+
+    fn positions(source: &str) -> Result<Vec<(usize, usize)>, String> {
+        Ok(check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            &Reexports::default(),
+            &default_bases(),
+            false,
+        )?
+        .diagnostics
+        .into_iter()
+        .map(|item| (item.line, item.column))
+        .collect())
+    }
+
+    #[test]
+    fn columns_count_characters_rather_than_bytes() -> Result<(), String> {
+        // `ä` is two bytes, so a byte column would report 10 for the `1`.
+        assert_eq!(positions("def f(ä=1):\n    pass\n")?, [(1, 9)]);
+        assert_eq!(positions("def f(x=1):\n    pass\n")?, [(1, 9)]);
+        // An emoji outside the basic multilingual plane is one character.
+        assert_eq!(positions("def f(𝔞=1):\n    pass\n")?, [(1, 9)]);
+        // Lines after the first are measured from their own start.
+        assert_eq!(positions("# ä\ndef f(ä=1): pass\n")?, [(2, 9)]);
+        Ok(())
     }
 
     fn messages(source: &str, private_only: bool) -> Result<Vec<String>, String> {

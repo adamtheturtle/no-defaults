@@ -70,6 +70,7 @@ enum Enforcement {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     #[serde(default, alias = "private-only")]
     private_only: bool,
@@ -3656,6 +3657,35 @@ mod tests {
             fixed("def g(a=1): pass\ndef f(x=g()): pass\n")?,
             "def g(a): pass\ndef f(x): pass\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_configuration_keys_are_rejected() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("pyproject.toml");
+        std::fs::write(&path, "[tool.no_defaults]\nprivateonly = true\n")
+            .map_err(|error| error.to_string())?;
+        let error = load_config_path(&path).err().ok_or("expected an error")?;
+        assert!(error.contains("invalid [tool.no_defaults]"), "{error}");
+        assert!(error.contains("privateonly"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn hyphenated_configuration_keys_are_still_accepted() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("pyproject.toml");
+        std::fs::write(
+            &path,
+            "[tool.no_defaults]\nprivate-only = true\nrespect-reexports = true\nfield-base-classes = [ \"msgspec.Struct\" ]\nper-file-enforcement.\"tests/**\" = \"all\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let loaded = load_config_path(&path)?;
+        assert!(loaded.config.private_only);
+        assert!(loaded.config.respect_reexports);
+        assert_eq!(loaded.config.field_base_classes, ["msgspec.Struct"]);
+        assert_eq!(loaded.config.per_file_enforcement.len(), 1);
         Ok(())
     }
 

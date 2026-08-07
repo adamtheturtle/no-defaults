@@ -265,6 +265,15 @@ The `--private-only` and `--respect-reexports` CLI flags override the configurat
 
 Like Ruff, `no-defaults` discovers the closest `pyproject.toml` containing `[tool.no_defaults]` separately for each file. This supports monorepos with nested configuration; files without a local table continue searching parent directories.
 
+An unrecognised key in `[tool.no_defaults]` is an error, so a misspelled option fails the run rather than silently leaving the defaults in place:
+
+```console
+$ no-defaults .
+no-defaults: invalid [tool.no_defaults] in pyproject.toml: unknown field `privateonly`, expected one of `private-only`, `private_only`, `respect-reexports`, `respect_reexports`, `per-file-enforcement`, `per_file_enforcement`, `field-base-classes`, `field_base_classes`
+$ echo $?
+2
+```
+
 ## Performance
 
 An optimized `1.0.0` development build checked a pinned Typeshed checkout containing 5,368 Python and stub files (12.5 MiB) in a median 0.29 seconds across five warm runs on an Apple Silicon Mac, or roughly 18,000 files per second. It produced 50,974 diagnostics; an earlier full-output measurement used approximately 41 MiB maximum RSS.

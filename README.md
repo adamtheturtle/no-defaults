@@ -193,6 +193,8 @@ field_base_classes = [ "pydantic.BaseModel" ]
 "src/**" = "private"
 ```
 
+Privacy is judged from the path below the project root, so a checkout living under a directory such as `_work/` is not treated as a private package and the answer does not change with whether you pass a relative or an absolute path.
+
 Private means a name that starts with one underscore. In private-only mode, the rule applies to private modules and packages, private functions and methods, all members of private classes, and private fields of a dataclass or model. For example, all defaults in `_module.py` and `_package/module.py` are checked. Dunder names such as `__init__.py` are not considered private by themselves.
 
 ### Classes that carry fields

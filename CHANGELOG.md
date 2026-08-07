@@ -24,6 +24,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - The default `full` output reads and indexes each file once instead of rereading it and walking to the reported line for every diagnostic in it. On a file with 16,000 violations this took reporting from 1.7 s to 0.36 s, which is what the same run costs in `concise`.
 - `per_file_enforcement` glob patterns are compiled once per configuration file rather than once per checked file. Over 3,000 files with a 40-pattern table this took a run from 1.1 s to 0.07 s, which is what the same run costs with no patterns at all.
 
+### Added
+
+- Defaults on `lambda` parameters are reported. A lambda takes the same parameter kinds as a `def` and carries the same late-binding hazard, and the rule was documented as covering defaults in function signatures without excluding them. Because a lambda is anonymous, `--fix` cannot resolve its call sites, so removing one is reported as a call it left alone. The loop-capture idiom `lambda x=x: ...` needs a `# noqa: NOD001`.
+
 ### Fixed
 
 - Module privacy is judged from the path below the project root rather than from every component of the path as written. A checkout living under a directory whose name starts with an underscore — `_work/proj` — no longer has every symbol in it treated as private under `private_only`, and the answer no longer depends on whether a relative or an absolute path was passed on the command line.

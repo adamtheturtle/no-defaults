@@ -309,6 +309,9 @@ struct Definitions {
 struct Checked {
     diagnostics: Vec<Diagnostic>,
     signatures: Vec<Signature>,
+    /// Calls the checker already knows `--fix` will not reach, such as those
+    /// to a lambda whose default it removed.
+    skipped: Vec<Skipped>,
 }
 
 /// What scanning files for calls to fixed callables produced.
@@ -393,16 +396,18 @@ fn run() -> Result<bool, String> {
         .collect();
     let mut diagnostics = Vec::new();
     let mut signatures = Vec::new();
+    let mut skipped = Vec::new();
     for result in results {
         let checked = result?;
         diagnostics.extend(checked.diagnostics);
         signatures.extend(checked.signatures);
+        skipped.extend(checked.skipped);
     }
     diagnostics.sort_by(|left, right| {
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
     if fixing && !diagnostics.is_empty() {
-        return apply_fixes(&cli, &files, &diagnostics, signatures);
+        return apply_fixes(&cli, &files, &diagnostics, signatures, skipped);
     }
     report_diagnostics(&diagnostics, cli.output_format)?;
     Ok(!diagnostics.is_empty())
@@ -415,8 +420,15 @@ fn apply_fixes(
     files: &[PathBuf],
     diagnostics: &[Diagnostic],
     signatures: Vec<Signature>,
+    skipped: Vec<Skipped>,
 ) -> Result<bool, String> {
     let mut call_sites = call_site_edits(files, signatures)?;
+    // Calls the checker already knew were out of reach, such as those to a
+    // lambda whose default was removed, are warned about alongside the rest.
+    call_sites.skipped.extend(skipped);
+    call_sites.skipped.sort_by(|left, right| {
+        (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
+    });
     for diagnostic in diagnostics {
         let Some(range) = diagnostic.fix else {
             continue;
@@ -1402,6 +1414,7 @@ fn syntax_error(path: &Path, source: &str, error: &ruff_python_parser::ParseErro
             fix: None,
         }],
         signatures: Vec::new(),
+        skipped: Vec::new(),
     }
 }
 
@@ -1451,6 +1464,7 @@ fn check_source(
         collect_signatures: signatures,
         classes: Vec::new(),
         signatures: Vec::new(),
+        skipped: Vec::new(),
         directives,
         diagnostics: Vec::new(),
     };
@@ -1672,6 +1686,7 @@ struct Checker<'a> {
     collect_signatures: bool,
     classes: Vec<ClassCollector>,
     signatures: Vec<Signature>,
+    skipped: Vec<Skipped>,
     directives: Vec<Directive>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -1723,6 +1738,12 @@ struct ClassCollector {
 }
 
 impl Checker<'_> {
+    /// Whether the rule applies to something with no name of its own, such as
+    /// a lambda. It takes the privacy of the scope holding it.
+    fn enabled_unnamed(&self) -> bool {
+        !self.private_only || self.scope.private
+    }
+
     fn enabled(&self, name: &str) -> bool {
         if !self.private_only {
             return true;
@@ -1807,7 +1828,54 @@ impl Checker<'_> {
         Checked {
             diagnostics: self.diagnostics,
             signatures: self.signatures,
+            skipped: self.skipped,
         }
+    }
+
+    /// Report the defaults on a lambda's parameters.
+    ///
+    /// A lambda takes the same parameter kinds as a `def` and carries the same
+    /// late-binding hazard, so the rule covers it. Its call sites cannot be
+    /// updated the way a `def`'s are — an anonymous function has no name to
+    /// resolve a call through — so removing one is reported as a call `--fix`
+    /// left alone, rather than passing silently.
+    fn check_lambda(&mut self, lambda: &ast::ExprLambda) {
+        if !self.enabled_unnamed() {
+            return;
+        }
+        let Some(parameters) = &lambda.parameters else {
+            return;
+        };
+        let mut removed = false;
+        for parameter in parameters
+            .posonlyargs
+            .iter()
+            .chain(&parameters.args)
+            .chain(&parameters.kwonlyargs)
+        {
+            let Some(default) = &parameter.default else {
+                continue;
+            };
+            removed |= self.report(
+                default.start(),
+                format!(
+                    "parameter `{}` of lambda has a default",
+                    parameter.parameter.name
+                ),
+                TextRange::new(parameter.parameter.end(), default.end()),
+            );
+        }
+        if !removed || !self.collect_signatures {
+            return;
+        }
+        let (line, column) = line_column(self.source, lambda.start());
+        self.skipped.push(Skipped {
+            path: self.path.to_path_buf(),
+            line,
+            column,
+            callable: "<lambda>".to_owned(),
+            reason: "an anonymous function has no name to resolve a call through".to_owned(),
+        });
     }
 
     fn check_function(&mut self, function: &ast::StmtFunctionDef) {
@@ -1995,6 +2063,13 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 walk_stmt(self, statement);
             }
         }
+    }
+
+    fn visit_expr(&mut self, expression: &'a Expr) {
+        if let Expr::Lambda(lambda) = expression {
+            self.check_lambda(lambda);
+        }
+        walk_expr(self, expression);
     }
 }
 
@@ -2953,6 +3028,7 @@ mod tests {
     fn fix_all(files: &[PathBuf]) -> Result<Vec<Skipped>, String> {
         let mut diagnostics = Vec::new();
         let mut signatures = Vec::new();
+        let mut skipped = Vec::new();
         for path in files {
             let checked = check_file(
                 path,
@@ -2964,8 +3040,10 @@ mod tests {
             )?;
             diagnostics.extend(checked.diagnostics);
             signatures.extend(checked.signatures);
+            skipped.extend(checked.skipped);
         }
         let mut call_sites = call_site_edits(files, signatures)?;
+        call_sites.skipped.extend(skipped);
         for diagnostic in &diagnostics {
             let Some(range) = diagnostic.fix else {
                 continue;
@@ -3066,6 +3144,61 @@ mod tests {
                 "class field `y` has a default factory",
             ]
         );
+    }
+
+    #[test]
+    fn detects_defaults_on_lambda_parameters() {
+        assert_eq!(
+            messages("lam = lambda z=4: z\n", false),
+            ["parameter `z` of lambda has a default"]
+        );
+        assert_eq!(
+            messages("key = lambda a, b=1, *, c=2: (a, b, c)\n", false).len(),
+            2,
+            "every parameter kind a lambda has counts, as for a `def`"
+        );
+        assert!(
+            messages("plain = lambda q: q\n", false).is_empty(),
+            "a lambda without defaults is not a violation"
+        );
+        assert_eq!(
+            messages("def f(callback=lambda z=1: z): pass\n", false).len(),
+            2,
+            "a lambda inside a signature keeps its own violation"
+        );
+    }
+
+    #[test]
+    fn a_lambda_takes_the_privacy_of_the_scope_holding_it() {
+        assert!(
+            messages("lam = lambda z=4: z\n", true).is_empty(),
+            "a lambda has no name of its own to call private"
+        );
+        assert_eq!(
+            messages("def _helper():\n    return lambda z=4: z\n", true),
+            ["parameter `z` of lambda has a default"]
+        );
+    }
+
+    #[test]
+    fn a_lambda_default_is_suppressible_and_fixable() -> Result<(), String> {
+        assert!(codes("lam = lambda z=4: z  # noqa: NOD001\n").is_empty());
+        assert_eq!(fixed("lam = lambda z=4: z\n")?, "lam = lambda z: z\n");
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_lambda_default_warns_that_its_calls_were_left_alone() -> Result<(), String> {
+        let reasons = skipped_reasons("lam = lambda z=4: z\n")?;
+        assert_eq!(
+            reasons,
+            ["an anonymous function has no name to resolve a call through"]
+        );
+        assert!(
+            skipped_reasons("plain = lambda q: q\n")?.is_empty(),
+            "a lambda that was not changed has nothing to warn about"
+        );
+        Ok(())
     }
 
     #[test]

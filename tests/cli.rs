@@ -1083,3 +1083,22 @@ fn a_namespace_package_still_sees_a_module_at_the_root() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[test]
+fn skipped_calls_are_reported_even_with_nothing_removed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    // The default is not a literal, so it is removed from the signature but
+    // the call cannot be completed. The warning about that call must not
+    // depend on how the removed-defaults count came out.
+    std::fs::write(
+        &path,
+        "SENTINEL = object()\n\n\ndef keep(value=SENTINEL): return value\n\n\nkeep()\n",
+    )?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("is not a literal"), "{stderr}");
+    Ok(())
+}

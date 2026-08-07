@@ -522,7 +522,10 @@ fn report_call_sites(
     unfixed: &BTreeSet<PathBuf>,
 ) {
     let removed = removed_defaults(diagnostics, unfixed);
-    if removed == 0 {
+    // A run that removed only unused `noqa` directives touched no call site
+    // and has nothing to say here. Rewritten or skipped calls are reported
+    // whether or not a default survived in a file that could not be written.
+    if removed == 0 && updated == 0 && skipped.is_empty() {
         return;
     }
     // Under a machine format stdout carries the diagnostics and nothing else,
@@ -537,12 +540,14 @@ fn report_call_sites(
         OutputFormat::Json | OutputFormat::Github => eprintln!("{count}"),
     }
     warn_about_skipped_calls(skipped);
-    eprintln!(
-        "warning: {removed} default{} removed. Call sites in the checked files were \
-         updated, but callers outside them, and calls made dynamically, were not. \
-         Run your tests.",
-        if removed == 1 { "" } else { "s" },
-    );
+    if removed > 0 {
+        eprintln!(
+            "warning: {removed} default{} removed. Call sites in the checked files were \
+             updated, but callers outside them, and calls made dynamically, were not. \
+             Run your tests.",
+            if removed == 1 { "" } else { "s" },
+        );
+    }
 }
 
 /// Insert the removed defaults as explicit arguments at every call the checked

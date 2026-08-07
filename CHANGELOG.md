@@ -12,6 +12,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 - `--fix` updates the construction sites of a dataclass whose base is a dataclass in the same file. The base's fields come first in the generated constructor, so `Child()` becomes `Child(a=1, b=2)` where `a` is the base's, and a subclass that removed nothing of its own still gets back the defaults its base lost. It stays narrow: one base only, because `dataclasses` walks the reverse MRO to order several; the base must be named directly and its own constructor fully known; and a name two classes share resolves to neither. Anything else keeps the existing warning.
 
+### Fixed
+
+- A default that cannot be removed now keeps the defaults after it. Since 2.0.0 made `= ...` in a stub unfixable, a signature mixing it with an ordinary default was rewritten into `def f(x: int = ..., y: int)`, which Python rejects — on the pinned Typeshed checkout that hit 175 files, and 2.0.0 aborted the whole run over it, fixing nothing anywhere. The dataclass form was worse: `a: int = ...` followed by a fixed `b: int` is valid syntax, so it was written out and raised `TypeError: non-default argument 'b' follows default argument 'a'` at import. Keyword-only parameters and fields are exempt, since order does not constrain them.
+
 ### Changed
 
 - A file whose fix would not have parsed is left alone by itself, rather than aborting the whole run with exit status `2` and writing nothing anywhere. One file this linter has a bug on no longer blocks fixing an entire project. The file is named in a warning, counted as remaining rather than fixed, and the run exits `1` with an accurate summary.

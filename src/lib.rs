@@ -1824,6 +1824,10 @@ struct Scope {
     fields: Option<FieldStyle>,
     /// Whether definitions here sit directly in a class body.
     class_body: bool,
+    /// Whether a field of this class has kept its default, which forces every
+    /// field after it to keep its own: `dataclasses` rejects a field without a
+    /// default following one with it.
+    kept_default: bool,
 }
 
 /// What made a class carry fields, which is what its violations are called
@@ -2046,28 +2050,50 @@ impl Checker<'_> {
         let enclosing = self.header;
         self.header = Some(line_start(self.source, function.name.start()));
         let mut removed = Vec::new();
-        for parameter in function
+        // A parameter without a default cannot follow one with a default, so
+        // once a default has to stay, every positional default after it stays
+        // too. Keyword-only parameters sit after the `*`, where order does not
+        // constrain them, so they are judged on their own.
+        let mut kept = false;
+        for (parameter, positional) in function
             .parameters
             .posonlyargs
             .iter()
             .chain(&function.parameters.args)
-            .chain(&function.parameters.kwonlyargs)
+            .map(|parameter| (parameter, true))
+            .chain(
+                function
+                    .parameters
+                    .kwonlyargs
+                    .iter()
+                    .map(|parameter| (parameter, false)),
+            )
         {
-            if let Some(default) = &parameter.default {
-                if self.report(
-                    default,
-                    format!(
-                        "parameter `{}` of function `{}` has a default",
-                        parameter.parameter.name, function.name
-                    ),
-                    TextRange::new(parameter.parameter.end(), default.end()),
-                ) && self.collect_signatures
-                {
-                    removed.push(Removed {
-                        parameter: parameter.parameter.name.to_string(),
-                        value: literal_text(default, self.source),
-                    });
-                }
+            let Some(default) = &parameter.default else {
+                continue;
+            };
+            let range = TextRange::new(parameter.parameter.end(), default.end());
+            let fix = if positional && kept {
+                None
+            } else {
+                self.fixable(default, range)
+            };
+            if positional && fix.is_none() {
+                kept = true;
+            }
+            if self.report_with(
+                default.start(),
+                format!(
+                    "parameter `{}` of function `{}` has a default",
+                    parameter.parameter.name, function.name
+                ),
+                fix,
+            ) && self.collect_signatures
+            {
+                removed.push(Removed {
+                    parameter: parameter.parameter.name.to_string(),
+                    value: literal_text(default, self.source),
+                });
             }
         }
         self.header = enclosing;
@@ -2148,10 +2174,21 @@ impl Checker<'_> {
         else {
             return;
         };
-        if self.report(
-            value,
+        // As in a signature, a field that keeps its default forces every field
+        // after it to keep its own. A keyword-only field is exempt, since
+        // `dataclasses` moves it past the `*` where order does not constrain it.
+        let fix = if self.scope.kept_default && !kw_only {
+            None
+        } else {
+            self.fixable(value, default.fix)
+        };
+        if fix.is_none() && !kw_only {
+            self.scope.kept_default = true;
+        }
+        if self.report_with(
+            value.start(),
             format!("{} `{}` has a {}", style.noun(), name.id, default.kind),
-            default.fix,
+            fix,
         ) && self.collect_signatures
             && constructs
         {
@@ -2177,6 +2214,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     // fields, so field detection stops at the function boundary.
                     fields: None,
                     class_body: false,
+                    kept_default: false,
                 };
                 walk_stmt(self, statement);
                 self.scope = outer;
@@ -2192,6 +2230,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     private: self.encloses_private(class.name.as_str(), outer),
                     fields: style,
                     class_body: true,
+                    // Each class body starts fresh; a base's fields are not
+                    // written here.
+                    kept_default: false,
                 };
                 if self.collect_signatures {
                     let inherited = inherited_fields(
@@ -5240,6 +5281,119 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             source.replace("host, timeout=30", "host, timeout")
+        );
+        Ok(())
+    }
+
+    /// Fix `source` as a `.pyi` stub, where `= ...` cannot be removed.
+    ///
+    /// Unlike `fixed`, this does not assert that nothing is left afterwards:
+    /// a kept `= ...` is exactly what these cases are about.
+    fn stub_fixed(source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.pyi");
+        std::fs::write(&path, source).map_err(|error| error.to_string())?;
+        let checked = check_file(
+            &path,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        )?;
+        let mut edits: BTreeMap<PathBuf, Vec<Edit>> = BTreeMap::new();
+        for diagnostic in &checked.diagnostics {
+            if let Some(range) = diagnostic.fix {
+                edits
+                    .entry(diagnostic.path.clone())
+                    .or_default()
+                    .push(Edit {
+                        range,
+                        replacement: String::new(),
+                    });
+            }
+        }
+        let mut updated = 0;
+        let mut unfixed = BTreeSet::new();
+        write_fixes_atomically(fixed_sources(edits, &mut updated, &mut unfixed)?)?;
+        assert!(unfixed.is_empty(), "the result must parse");
+        std::fs::read_to_string(&path).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_default_after_one_that_is_kept_is_kept_too() -> Result<(), String> {
+        // `= ...` in a stub cannot be removed, and Python does not allow a
+        // parameter without a default to follow one with a default, so `y`
+        // has to stay as well.
+        assert_eq!(
+            stub_fixed("def f(x: int = ..., y: int = 5) -> None: ...\n")?,
+            "def f(x: int = ..., y: int = 5) -> None: ...\n"
+        );
+        assert_eq!(
+            stub_fixed("def f(x: int = 1, y: int = ...) -> None: ...\n")?,
+            "def f(x: int, y: int = ...) -> None: ...\n",
+            "a default before the kept one is still removed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_keyword_only_default_is_not_constrained_by_order() -> Result<(), String> {
+        // Everything after the `*` may take a default or not, in any order.
+        assert_eq!(
+            stub_fixed("def f(x: int = ..., *, y: int = 5) -> None: ...\n")?,
+            "def f(x: int = ..., *, y: int) -> None: ...\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_positional_only_default_obeys_the_same_order() -> Result<(), String> {
+        assert_eq!(
+            stub_fixed("def f(x: int = ..., y: int = 5, /) -> None: ...\n")?,
+            "def f(x: int = ..., y: int = 5, /) -> None: ...\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dataclass_field_after_a_kept_one_is_kept_too() -> Result<(), String> {
+        // `dataclasses` rejects a field without a default following one with
+        // it, and that is a `TypeError` at class creation rather than a
+        // syntax error, so the post-fix parse guard would not have caught it.
+        assert_eq!(
+            stub_fixed("@dataclass\nclass C:\n    a: int = ...\n    b: int = 5\n")?,
+            "@dataclass\nclass C:\n    a: int = ...\n    b: int = 5\n"
+        );
+        assert_eq!(
+            stub_fixed("@dataclass\nclass C:\n    a: int = 1\n    b: int = ...\n")?,
+            "@dataclass\nclass C:\n    a: int\n    b: int = ...\n",
+            "a field before the kept one is still fixed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_keyword_only_field_is_not_constrained_by_order() -> Result<(), String> {
+        assert_eq!(
+            stub_fixed("@dataclass\nclass C:\n    a: int = ...\n    _: KW_ONLY\n    b: int = 5\n")?,
+            "@dataclass\nclass C:\n    a: int = ...\n    _: KW_ONLY\n    b: int\n"
+        );
+        assert_eq!(
+            stub_fixed("@dataclass(kw_only=True)\nclass C:\n    a: int = ...\n    b: int = 5\n")?,
+            "@dataclass(kw_only=True)\nclass C:\n    a: int = ...\n    b: int\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn each_class_body_starts_free_of_the_last_one() -> Result<(), String> {
+        assert_eq!(
+            stub_fixed(
+                "@dataclass\nclass C:\n    a: int = ...\n\n\n@dataclass\nclass D:\n    b: int = 5\n"
+            )?,
+            "@dataclass\nclass C:\n    a: int = ...\n\n\n@dataclass\nclass D:\n    b: int\n",
+            "what `C` kept says nothing about `D`"
         );
         Ok(())
     }

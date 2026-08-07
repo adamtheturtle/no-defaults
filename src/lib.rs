@@ -503,8 +503,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()
         .map(|path| {
-            let source = std::fs::read_to_string(path)
-                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            let source = read_source(path)?;
             rewrite_calls(path, &source, &definitions, &known)
         })
         .collect();
@@ -606,7 +605,7 @@ fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Resul
                     diagnostic.code,
                     diagnostic.message
                 );
-                if let Ok(source) = std::fs::read_to_string(&diagnostic.path) {
+                if let Ok(source) = read_source(&diagnostic.path) {
                     if let Some(line) = source.lines().nth(diagnostic.line.saturating_sub(1)) {
                         let width = diagnostic.line.to_string().len();
                         println!("{space:width$} |", space = "", width = width);
@@ -978,9 +977,7 @@ fn fixed_sources(
     edits
         .into_iter()
         .map(|(path, edits)| {
-            let source = std::fs::read_to_string(&path).map_err(|error| {
-                format!("could not read {} for fixing: {error}", path.display())
-            })?;
+            let source = read_source(&path)?;
             let (fixed, applied) = apply_edits(&source, edits);
             *updated += applied;
             parse_module(&fixed).map_err(|error| {
@@ -1035,6 +1032,13 @@ fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Resul
         // also puts the temporary file on the target's filesystem, which is
         // what makes the rename atomic.
         let path = std::fs::canonicalize(&path).unwrap_or(path);
+        // The source was read without its byte-order mark so that offsets
+        // measured from the first real character; a file that had one keeps it.
+        let fixed = if has_bom(&path) {
+            format!("{BOM}{fixed}")
+        } else {
+            fixed
+        };
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let permissions = std::fs::metadata(&path)
             .map_err(|error| {
@@ -1196,6 +1200,31 @@ fn is_python(path: &Path) -> bool {
         .is_some_and(|extension| extension == "py" || extension == "pyi")
 }
 
+/// The UTF-8 byte-order mark, which Windows editors write and which is not part
+/// of the program.
+const BOM: &str = "\u{feff}";
+
+/// Read a checked file with any leading byte-order mark removed.
+///
+/// Measuring offsets from the mark would report every diagnostic on the first
+/// line three columns too far right and misplace the caret. Every read of a
+/// checked file goes through here, so an offset means the same thing to the
+/// checker, the fixer, and the reporter; `write_fixes_atomically` puts the mark
+/// back.
+fn read_source(path: &Path) -> Result<String, String> {
+    let mut source = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if source.starts_with(BOM) {
+        source.drain(..BOM.len());
+    }
+    Ok(source)
+}
+
+/// Whether a file starts with a byte-order mark, so fixing can preserve it.
+fn has_bom(path: &Path) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| bytes.starts_with(BOM.as_bytes()))
+}
+
 /// Lint Python source without filesystem or configuration-discovery overhead.
 ///
 /// This is primarily exposed for performance benchmarks.
@@ -1220,8 +1249,7 @@ fn check_file(
     field_bases: &FieldBases,
     signatures: bool,
 ) -> Result<Checked, String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let source = read_source(path)?;
     check_source(
         path,
         &source,

@@ -659,3 +659,35 @@ fn the_caret_lands_under_a_default_on_a_non_ascii_line() -> Result<(), Box<dyn s
     assert_eq!(source.chars().nth(column), Some('1'), "{stdout}");
     Ok(())
 }
+
+#[test]
+fn a_byte_order_mark_does_not_shift_the_first_line() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("bom.py");
+    std::fs::write(&path, "\u{feff}def f(x=1):\n    pass\n")?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains(":1:9: NOD001"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn fixing_a_file_with_a_byte_order_mark_keeps_it() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("bom.py");
+    std::fs::write(&path, "\u{feff}def f(x=1):\n    pass\n\n\nf()\n")?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    // The mark survives, and the edits landed where the source said they would
+    // rather than three bytes off.
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        "\u{feff}def f(x):\n    pass\n\n\nf(x=1)\n"
+    );
+    Ok(())
+}

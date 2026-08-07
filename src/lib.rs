@@ -1509,7 +1509,14 @@ fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
         .iter()
         .position(|(_, code)| code.eq_ignore_ascii_case("NOD001"))?;
     let fix = if tokens.len() == 1 {
-        whole_directive_range(source, line_start, directive_hash, break_start, content_end)
+        // Anything after the code list on the line is another `#` segment —
+        // a `# type: ignore`, a `# pylint: disable`, an explanation — and
+        // taking the line to its end would delete it along with the directive.
+        let after_codes = tokens[index].0.end().to_usize();
+        source[after_codes..content_end].find('#').map_or_else(
+            || whole_directive_range(source, line_start, directive_hash, break_start, content_end),
+            |offset| TextRange::new(text_size(directive_hash), text_size(after_codes + offset)),
+        )
     } else {
         argument_removal_range(
             tokens[index].0,
@@ -3492,6 +3499,39 @@ mod tests {
             ["NOD001"],
             "`noqa` must still be a word of its own wherever it sits"
         );
+    }
+
+    #[test]
+    fn removing_a_directive_keeps_a_pragma_that_follows_it() -> Result<(), String> {
+        assert_eq!(
+            fixed("def b(y): pass  # noqa: NOD001  # type: ignore[misc]\n")?,
+            "def b(y): pass  # type: ignore[misc]\n"
+        );
+        assert_eq!(
+            fixed("def b(y): pass  # noqa: NOD001  # pragma: no cover\n")?,
+            "def b(y): pass  # pragma: no cover\n"
+        );
+        assert_eq!(
+            fixed("# noqa: NOD001  # type: ignore\ndef b(y): pass\n")?,
+            "# type: ignore\ndef b(y): pass\n",
+            "the line survives because something on it is not the directive"
+        );
+        assert_eq!(
+            fixed("def b(y): pass  # noqa: NOD001, E501  # type: ignore\n")?,
+            "def b(y): pass  # noqa: E501  # type: ignore\n",
+            "dropping one code from a list never reached the rest of the line"
+        );
+        assert_eq!(
+            fixed("def b(y): pass  # noqa: NOD001\n")?,
+            "def b(y): pass\n",
+            "a directive with nothing after it still takes its whitespace"
+        );
+        assert_eq!(
+            fixed("# noqa: NOD001\ndef b(y): pass\n")?,
+            "def b(y): pass\n",
+            "a directive alone on its line still takes the line"
+        );
+        Ok(())
     }
 
     #[test]

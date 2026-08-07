@@ -26,6 +26,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- `--fix` no longer deletes a pragma that follows an unused `# noqa: NOD001` on the same line. A `#` runs to end of line, so `# noqa: NOD001  # type: ignore[misc]` is one comment, and removing the directive took the mypy suppression — or a `# pylint: disable`, a `# pragma: no cover`, or a plain explanation — with it. The deletion now stops at the next `#`.
 - A `noqa` directive is recognised anywhere in a comment rather than only at its start, matching Ruff and flake8, so `# type: ignore[misc]  # noqa: NOD001` suppresses the rule. That combination previously did nothing and reported nothing, because the directive was never collected at all, and reordering the pragmas is not always possible. `--fix` removes only the directive's own `#` segment, leaving the other pragma in place.
 - `# ruff:noqa` and `# flake8:noqa` without a space after the colon are recognised as file-level suppressions. Ruff and flake8 both accept that form, and it is common in the wild; only the spaced variants worked before.
 

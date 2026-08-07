@@ -1029,6 +1029,12 @@ fn apply_edits(source: &str, mut edits: Vec<Edit>) -> (String, usize) {
 
 fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Result<(), String> {
     for (path, (_, fixed)) in changes {
+        // `persist` replaces whatever sits at the path, so writing to a
+        // symlink would leave a regular file where the link was and leave the
+        // source it pointed at still holding its defaults. Resolving first
+        // also puts the temporary file on the target's filesystem, which is
+        // what makes the rename atomic.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let permissions = std::fs::metadata(&path)
             .map_err(|error| {

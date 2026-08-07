@@ -822,3 +822,56 @@ fn fixing_keeps_the_summary_in_the_text_formats() -> Result<(), Box<dyn std::err
     assert!(stdout.contains("Updated 0 call sites."), "{stdout}");
     Ok(())
 }
+
+#[test]
+fn an_ellipsis_default_in_a_stub_is_reported_but_not_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let stub = directory.path().join("stub.pyi");
+    let source = "from typing import overload\n\n\
+                  @overload\ndef f(x: int = ...) -> int: ...\n\
+                  @overload\ndef f(x: str = ...) -> str: ...\n\
+                  def g(y: int = 5) -> int: ...\n";
+    std::fs::write(&stub, source)?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&stub)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout.matches("NOD001").count(), 3, "{stdout}");
+
+    let output = Command::new(binary()).arg("--fix").arg(&stub).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("Found 3 errors (1 fixed, 2 remaining)."),
+        "{stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    // `= ...` is the convention for "has a default, unspecified here", so
+    // removing it would make the parameter required and stop the stub matching
+    // the implementation it describes. Only the real default goes.
+    assert_eq!(
+        std::fs::read_to_string(&stub)?,
+        "from typing import overload\n\n\
+         @overload\ndef f(x: int = ...) -> int: ...\n\
+         @overload\ndef f(x: str = ...) -> str: ...\n\
+         def g(y: int) -> int: ...\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_ellipsis_default_outside_a_stub_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("module.py");
+    std::fs::write(&path, "def f(x: int = ...) -> int: ...\n")?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        "def f(x: int) -> int: ...\n"
+    );
+    Ok(())
+}

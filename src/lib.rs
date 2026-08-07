@@ -1520,6 +1520,7 @@ fn check_source(
         field_bases,
         aliases,
         local_classes,
+        shapes: BTreeMap::new(),
         scope: Scope {
             private: is_private_module(path, project_root, reexports),
             ..Scope::default()
@@ -1768,6 +1769,9 @@ struct Checker<'a> {
     /// The class names the file defines, so a base written `Protocol` that is
     /// one of them is not mistaken for the typing construct.
     local_classes: BTreeSet<String>,
+    /// What each field-carrying class of this file's own contributes to a
+    /// subclass's constructor, by the name it was defined under.
+    shapes: BTreeMap<String, Option<Shape>>,
     scope: Scope,
     /// Start of the `def` or `class` line that owns the violations being
     /// reported, so one directive there can cover every parameter of a
@@ -1821,10 +1825,11 @@ impl FieldStyle {
 struct ClassCollector {
     name: String,
     style: Option<FieldStyle>,
-    /// Whether the class has base classes, whose fields come first in the
-    /// constructor and are not visible from this class body. The base that
-    /// made the class carry fields does not count: `BaseModel` contributes
-    /// none of its own.
+    /// Whether the class inherits fields this file cannot see, which makes its
+    /// constructor unknown. A base that declares no fields does not count, nor
+    /// does the base that made the class carry fields at all: `BaseModel`
+    /// contributes none of its own. A base that is a dataclass in this file
+    /// does not either — its fields are prepended instead.
     inherits: bool,
     /// Whether the decorator generates a constructor at all.
     constructs: bool,
@@ -2164,19 +2169,29 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     class_body: true,
                 };
                 if self.collect_signatures {
+                    let inherited = inherited_fields(
+                        class,
+                        style,
+                        self.field_bases,
+                        &self.local_classes,
+                        &self.shapes,
+                    );
+                    // A base of this file's own contributes its fields ahead of
+                    // the body's, which is where `dataclasses` puts them, and
+                    // its removed defaults too: a subclass constructed with
+                    // none of them still needs every one back.
+                    let (fields, removed) = match &inherited {
+                        Inherited::Known(shape) => (shape.fields.clone(), shape.removed.clone()),
+                        Inherited::Nothing | Inherited::Unknown => (Vec::new(), Vec::new()),
+                    };
                     self.classes.push(ClassCollector {
                         name: class.name.to_string(),
                         style,
-                        inherits: inherits_fields(
-                            class,
-                            style,
-                            self.field_bases,
-                            &self.local_classes,
-                        ),
+                        inherits: matches!(inherited, Inherited::Unknown),
                         constructs: generates_init(class),
                         kw_only: decorator_says_kw_only(class),
-                        fields: Vec::new(),
-                        removed: Vec::new(),
+                        fields,
+                        removed,
                     });
                 }
                 walk_stmt(self, statement);
@@ -2185,6 +2200,24 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     .then(|| self.classes.pop())
                     .flatten()
                 {
+                    if collector.style.is_some() {
+                        // Recorded whether or not anything was removed: a base
+                        // contributes its field order either way. A name two
+                        // classes share resolves to neither.
+                        let shape = Shape {
+                            fields: collector.fields.clone(),
+                            removed: collector.removed.clone(),
+                            complete: !collector.inherits,
+                        };
+                        match self.shapes.entry(collector.name.clone()) {
+                            Entry::Vacant(entry) => {
+                                entry.insert(Some(shape));
+                            }
+                            Entry::Occupied(mut entry) => {
+                                entry.insert(None);
+                            }
+                        }
+                    }
                     if collector.style.is_some()
                         && collector.constructs
                         && !collector.removed.is_empty()
@@ -2270,17 +2303,55 @@ fn field_style(
 /// no fields, so a model naming it directly has its whole constructor here. Any
 /// other base might declare some, including another model, which is why a
 /// subclass of a subclass is left alone rather than half understood.
-fn inherits_fields(
+/// The constructor a class inherits, as far as this file can see it.
+#[derive(Debug)]
+enum Inherited {
+    /// No base contributes fields, so the constructor is what the body says.
+    Nothing,
+    /// One base is a class of this file's own whose constructor is known. Its
+    /// fields come first in the generated constructor.
+    Known(Shape),
+    /// A base this file cannot see into, so the constructor is not known.
+    Unknown,
+}
+
+/// What a class of this file's own contributes to a subclass's constructor.
+#[derive(Clone, Debug)]
+struct Shape {
+    /// The positional constructor parameters, in order.
+    fields: Vec<String>,
+    /// The defaults `--fix` removed, which a subclass's call sites need too.
+    removed: Vec<Removed>,
+    /// Whether this class's own constructor is fully known.
+    complete: bool,
+}
+
+fn inherited_fields(
     class: &ast::StmtClassDef,
     style: Option<FieldStyle>,
     bases: &FieldBases,
     local: &BTreeSet<String>,
-) -> bool {
-    match style {
-        Some(FieldStyle::Base) => {
-            class_bases(class).any(|base| !bases.matches(base) && !carries_no_fields(base, local))
-        }
-        _ => class_bases(class).any(|base| !carries_no_fields(base, local)),
+    shapes: &BTreeMap<String, Option<Shape>>,
+) -> Inherited {
+    let carrying: Vec<&Expr> = class_bases(class)
+        .filter(|base| !carries_no_fields(base, local))
+        // The base that made the class carry fields contributes none itself.
+        .filter(|base| !(matches!(style, Some(FieldStyle::Base)) && bases.matches(base)))
+        .collect();
+    match carrying.as_slice() {
+        [] => Inherited::Nothing,
+        // `dataclasses` walks the reverse MRO to order the fields of several
+        // bases, and writing them in the wrong order is worse than not writing
+        // them, so one base is as far as this goes.
+        [Expr::Name(name)] => match shapes.get(name.id.as_str()) {
+            // An unqualified name is the only form that can be tied to a class
+            // of this file's own. A name two classes share resolves to
+            // neither, and a base whose own constructor is unknown makes this
+            // one unknown too.
+            Some(Some(shape)) if shape.complete => Inherited::Known(shape.clone()),
+            _ => Inherited::Unknown,
+        },
+        _ => Inherited::Unknown,
     }
 }
 
@@ -5046,16 +5117,70 @@ mod tests {
 
     #[test]
     fn a_class_the_file_defines_is_not_the_typing_construct() -> Result<(), String> {
+        // This `Protocol` is a dataclass of the file's own carrying a field.
+        // Taking it for the typing construct would drop `base_field` from the
+        // constructor; it is prepended instead.
         let source = "@dataclass\nclass Protocol:\n    base_field: int = 0\n\n\n\
                       @dataclass\nclass Box(Protocol):\n    value: int = 1\n\n\nBox()\n";
         assert_eq!(
-            skipped_reasons(source)?.first().map(String::as_str),
-            Some(
-                "the dataclass inherits fields, so its constructor is not known from the file \
-                 that defines it"
-            ),
-            "this `Protocol` is a dataclass of the file's own, and carries a field"
+            fixed(source)?,
+            "@dataclass\nclass Protocol:\n    base_field: int\n\n\n\
+             @dataclass\nclass Box(Protocol):\n    value: int\n\n\n\
+             Box(base_field=0, value=1)\n"
         );
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_that_is_a_dataclass_of_this_file_contributes_its_fields() -> Result<(), String> {
+        let source = "@dataclass\nclass Parent:\n    a: int = 1\n\n\n\
+                      @dataclass\nclass Child(Parent):\n    b: int = 2\n\n\n\
+                      Child()\nChild(9)\nChild(9, 8)\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass\nclass Parent:\n    a: int\n\n\n\
+             @dataclass\nclass Child(Parent):\n    b: int\n\n\n\
+             Child(a=1, b=2)\nChild(9, b=2)\nChild(9, 8)\n",
+            "the base's fields come first, so `Child(9)` already supplies `a`"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_needs_the_defaults_its_base_lost() -> Result<(), String> {
+        // `Child` removes nothing of its own, but its constructor still lost
+        // the default `a` had, so its call sites need it back.
+        let source = "@dataclass\nclass Parent:\n    a: int = 1\n\n\n\
+                      @dataclass\nclass Child(Parent):\n    b: int = 2\n\n\nChild()\n";
+        assert!(fixed(source)?.contains("Child(a=1, b=2)"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_this_file_cannot_see_still_gives_up() -> Result<(), String> {
+        for source in [
+            // Imported from elsewhere.
+            "@dataclass\nclass Child(Imported):\n    b: int = 2\n\n\nChild()\n",
+            // Reached through a module, so not a bare name of this file.
+            "@dataclass\nclass Child(other.Parent):\n    b: int = 2\n\n\nChild()\n",
+            // Two bases: `dataclasses` walks the reverse MRO to order them.
+            "@dataclass\nclass A:\n    a: int = 1\n\n\n@dataclass\nclass B:\n    b: int = 2\n\n\n@dataclass\nclass C(A, B):\n    c: int = 3\n\n\nC()\n",
+            // A base whose own constructor is unknown.
+            "@dataclass\nclass Middle(Imported):\n    a: int = 1\n\n\n@dataclass\nclass Child(Middle):\n    b: int = 2\n\n\nChild()\n",
+            // A name two classes of this file share resolves to neither.
+            "@dataclass\nclass Parent:\n    a: int = 1\n\n\ndef later():\n    @dataclass\n    class Parent:\n        z: int = 9\n\n\n@dataclass\nclass Child(Parent):\n    b: int = 2\n\n\nChild()\n",
+        ] {
+            assert_eq!(
+                skipped_reasons(source)?.first().map(String::as_str),
+                Some(
+                    "the dataclass inherits fields, so its constructor is not known from the \
+                     file that defines it"
+                ),
+                "{source}"
+            );
+        }
         Ok(())
     }
 

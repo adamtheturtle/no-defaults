@@ -401,45 +401,64 @@ fn run() -> Result<bool, String> {
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
     if fixing && !diagnostics.is_empty() {
-        let mut call_sites = call_site_edits(&files, signatures)?;
-        for diagnostic in &diagnostics {
-            let Some(range) = diagnostic.fix else {
-                continue;
-            };
-            call_sites
-                .edits
-                .entry(diagnostic.path.clone())
-                .or_default()
-                .push(Edit {
-                    range,
-                    replacement: String::new(),
-                });
+        return apply_fixes(&cli, &files, &diagnostics, signatures);
+    }
+    report_diagnostics(&diagnostics, cli.output_format)?;
+    Ok(!diagnostics.is_empty())
+}
+
+/// Remove the defaults the diagnostics name, update the call sites that relied
+/// on them, and report what happened. Returns whether anything is left over.
+fn apply_fixes(
+    cli: &Cli,
+    files: &[PathBuf],
+    diagnostics: &[Diagnostic],
+    signatures: Vec<Signature>,
+) -> Result<bool, String> {
+    let mut call_sites = call_site_edits(files, signatures)?;
+    for diagnostic in diagnostics {
+        let Some(range) = diagnostic.fix else {
+            continue;
+        };
+        call_sites
+            .edits
+            .entry(diagnostic.path.clone())
+            .or_default()
+            .push(Edit {
+                range,
+                replacement: String::new(),
+            });
+    }
+    let mut updated = 0;
+    let changes = fixed_sources(call_sites.edits, &mut updated)?;
+    if cli.diff {
+        print_diffs(&changes);
+        warn_about_skipped_calls(&call_sites.skipped);
+        return Ok(true);
+    }
+    write_fixes_atomically(changes)?;
+    // A syntax error carries no fix, so it is still there afterwards and the
+    // run has to say so rather than claim everything was fixed.
+    let remaining = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.fix.is_none())
+        .count();
+    match cli.output_format {
+        // The machine formats carry the diagnostics themselves. A summary line
+        // on stdout would make the JSON unparseable, so the counts stay in the
+        // human formats where they belong.
+        OutputFormat::Json | OutputFormat::Github => {
+            report_diagnostics(diagnostics, cli.output_format)?;
         }
-        let mut updated = 0;
-        let changes = fixed_sources(call_sites.edits, &mut updated)?;
-        if cli.diff {
-            print_diffs(&changes);
-            warn_about_skipped_calls(&call_sites.skipped);
-            return Ok(true);
-        }
-        write_fixes_atomically(changes)?;
-        // A syntax error carries no fix, so it is still there afterwards and
-        // the run has to say so rather than claim everything was fixed.
-        let remaining = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.fix.is_none())
-            .count();
-        println!(
+        OutputFormat::Full | OutputFormat::Concise => println!(
             "Found {} error{} ({} fixed, {remaining} remaining).",
             diagnostics.len(),
             if diagnostics.len() == 1 { "" } else { "s" },
             diagnostics.len() - remaining,
-        );
-        report_call_sites(&diagnostics, &call_sites.skipped, updated);
-        return Ok(remaining > 0);
+        ),
     }
-    report_diagnostics(&diagnostics, cli.output_format)?;
-    Ok(!diagnostics.is_empty())
+    report_call_sites(diagnostics, &call_sites.skipped, updated, cli.output_format);
+    Ok(remaining > 0)
 }
 
 fn warn_about_skipped_calls(skipped: &[Skipped]) {
@@ -456,7 +475,12 @@ fn warn_about_skipped_calls(skipped: &[Skipped]) {
 }
 
 /// Report what `--fix` did to call sites, and what it could not reach.
-fn report_call_sites(diagnostics: &[Diagnostic], skipped: &[Skipped], updated: usize) {
+fn report_call_sites(
+    diagnostics: &[Diagnostic],
+    skipped: &[Skipped],
+    updated: usize,
+    format: OutputFormat,
+) {
     let removed = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.code == "NOD001")
@@ -464,10 +488,17 @@ fn report_call_sites(diagnostics: &[Diagnostic], skipped: &[Skipped], updated: u
     if removed == 0 {
         return;
     }
-    println!(
+    // Under a machine format stdout carries the diagnostics and nothing else,
+    // so this count joins the warnings on stderr rather than making the JSON
+    // unparseable.
+    let count = format!(
         "Updated {updated} call site{}.",
         if updated == 1 { "" } else { "s" }
     );
+    match format {
+        OutputFormat::Full | OutputFormat::Concise => println!("{count}"),
+        OutputFormat::Json | OutputFormat::Github => eprintln!("{count}"),
+    }
     warn_about_skipped_calls(skipped);
     eprintln!(
         "warning: {removed} default{} removed. Call sites in the checked files were \

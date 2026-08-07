@@ -112,6 +112,8 @@ Two things `--fix` still cannot reach: **callers outside the files you checked**
 
 The default `full` output includes source excerpts and carets. `concise` emits one diagnostic per line, `json` emits a machine-readable array, and `github` emits workflow commands for GitHub Actions annotations.
 
+`--output-format` applies when fixing too. Under `json` and `github` the diagnostics are all that reaches standard output, so the result stays parseable and CI annotations still appear; the `N fixed` summary and the call-site count go to standard error with the other warnings. Under `full` and `concise` both stay on standard output as before.
+
 The linter detects defaults on positional-only, positional-or-keyword, and keyword-only parameters.
 For classes decorated with `@dataclass` or `@dataclasses.dataclass`, it detects assigned defaults plus `field(default=...)` and `field(default_factory=...)` in the class body.
 A class that carries fields through a base class instead, as a pydantic model does, is detected the same way once that base is in [`field_base_classes`](#classes-that-carry-fields), which lists `pydantic.BaseModel` by default.

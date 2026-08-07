@@ -3,11 +3,12 @@
 
 # no-defaults
 
-A fast, standalone Python linter that forbids defaults in function signatures and dataclasses.
+A fast, standalone Python linter that forbids defaults in function signatures, dataclasses, and pydantic models.
 It is implemented in Rust and parses Python with Ruff's parser.
 
 ```python
 from dataclasses import dataclass, field
+from pydantic import BaseModel, Field
 
 def connect(timeout=30):  # NOD001
     pass
@@ -16,6 +17,11 @@ def connect(timeout=30):  # NOD001
 class Job:
     retries: int = 3  # NOD001
     tags: list[str] = field(default_factory=list)  # NOD001
+
+class Request(BaseModel):
+    method: str = "GET"  # NOD001
+    headers: dict[str, str] = Field(default_factory=dict)  # NOD001
+    url: str = Field(..., description="required, so no default to remove")
 ```
 
 ## Installation
@@ -97,7 +103,8 @@ The default `full` output includes source excerpts and carets. `concise` emits o
 
 The linter detects defaults on positional-only, positional-or-keyword, and keyword-only parameters.
 For classes decorated with `@dataclass` or `@dataclasses.dataclass`, it detects assigned defaults plus `field(default=...)` and `field(default_factory=...)` in the class body.
-`ClassVar` assignments are ignored because they are not dataclass fields, whether the annotation is bare, qualified, or quoted as in `x: "ClassVar[int]" = 1`. Annotated assignments inside method bodies are ignored because they are locals.
+A class that carries fields through a base class instead, as a pydantic model does, is detected the same way once that base is in [`field_base_classes`](#classes-that-carry-fields), which lists `pydantic.BaseModel` by default.
+`ClassVar` assignments are ignored because they are not fields, whether the annotation is bare, qualified, or quoted as in `x: "ClassVar[int]" = 1`. Annotated assignments inside method bodies are ignored because they are locals.
 
 Suppress an individual violation with either a blanket `# noqa` or the rule-specific `# noqa: NOD001` on the line containing the default:
 
@@ -116,7 +123,7 @@ def compatible(  # noqa: NOD001
     pass
 ```
 
-A directive on the `class` line does the same for every field of a dataclass:
+A directive on the `class` line does the same for every field of a dataclass or model:
 
 ```python
 @dataclass
@@ -157,13 +164,29 @@ Configuration lives in `pyproject.toml`:
 [tool.no_defaults]
 private_only = true
 respect_reexports = true
+field_base_classes = [ "pydantic.BaseModel" ]
 
 [tool.no_defaults.per_file_enforcement]
 "tests/**" = "all"
 "src/**" = "private"
 ```
 
-Private means a name that starts with one underscore. In private-only mode, the rule applies to private modules and packages, private functions and methods, all members of private classes, and private dataclass fields. For example, all defaults in `_module.py` and `_package/module.py` are checked. Dunder names such as `__init__.py` are not considered private by themselves.
+Private means a name that starts with one underscore. In private-only mode, the rule applies to private modules and packages, private functions and methods, all members of private classes, and private fields of a dataclass or model. For example, all defaults in `_module.py` and `_package/module.py` are checked. Dunder names such as `__init__.py` are not considered private by themselves.
+
+### Classes that carry fields
+
+A `@dataclass` decorator marks a class whose annotated assignments are fields. So does a base class, which is how pydantic works, and `field_base_classes` lists the ones to recognise. It defaults to `[ "pydantic.BaseModel" ]`, and setting it replaces that list rather than adding to it, so `field_base_classes = []` checks decorated classes only.
+
+A base is matched by the last segment of its name, as a decorator is, so `pydantic.BaseModel` recognises `class Job(BaseModel)` and `class Job(pydantic.BaseModel)` alike. Anything else that carries fields this way — `msgspec.Struct`, `sqlmodel.SQLModel`, `typing.NamedTuple` — works once it is listed:
+
+```toml
+[tool.no_defaults]
+field_base_classes = [ "pydantic.BaseModel", "msgspec.Struct" ]
+```
+
+Within such a class, `Field(default=…)` and `Field(default_factory=…)` are reported and `--fix` removes only those arguments, keeping the rest of the metadata, exactly as it does for `field(...)`. Pydantic's `Field(...)` and `Field(default=...)` declare a field with no default, so neither is reported.
+
+A class is recognised only where it names a listed base itself. `class Job(BaseModel)` is checked; `class SubJob(Job)` is not, because knowing that `Job` is a model means resolving imports across files. Where a model has a base beyond the listed one, its fields are still reported, but `--fix` leaves its call sites alone and says so, because that base may declare fields of its own.
 
 ### Private modules that are re-exported publicly
 

@@ -69,7 +69,7 @@ enum Enforcement {
     None,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct Config {
     #[serde(default, alias = "private-only")]
     private_only: bool,
@@ -79,12 +79,82 @@ struct Config {
 
     #[serde(default, alias = "per-file-enforcement")]
     per_file_enforcement: BTreeMap<String, Enforcement>,
+
+    /// Classes whose subclasses carry fields, the way `@dataclass` marks a
+    /// class that does. Listing one here is what makes `class Job(BaseModel)`
+    /// have its annotated assignments checked.
+    #[serde(default = "default_field_base_classes", alias = "field-base-classes")]
+    field_base_classes: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            private_only: false,
+            respect_reexports: false,
+            per_file_enforcement: BTreeMap::new(),
+            field_base_classes: default_field_base_classes(),
+        }
+    }
+}
+
+/// Pydantic models are the common way to carry fields without `@dataclass`, and
+/// a run that passed over them silently would say a codebase full of defaults
+/// has none.
+fn default_field_base_classes() -> Vec<String> {
+    vec!["pydantic.BaseModel".to_owned()]
 }
 
 #[derive(Clone)]
 struct LoadedConfig {
     root: PathBuf,
     config: Config,
+    /// Derived from `config.field_base_classes` once per configuration file
+    /// rather than once per checked file.
+    field_bases: Arc<FieldBases>,
+}
+
+/// The base classes that make a class carry fields.
+///
+/// A base is matched by the last segment of its name, as a decorator is, so
+/// `pydantic.BaseModel` in configuration recognises `class Job(BaseModel)` and
+/// `class Job(pydantic.BaseModel)` alike. Resolving the module a base really
+/// came from would need the import graph, and the name alone is what the
+/// decorator check has always gone by.
+#[derive(Clone, Debug, Default)]
+struct FieldBases {
+    /// As configured, so `--show-settings` can report it back as written.
+    configured: Vec<String>,
+    /// The last segment of each, which is what a class header is matched
+    /// against.
+    names: BTreeSet<String>,
+}
+
+impl FieldBases {
+    fn new(configured: &[String]) -> Self {
+        Self {
+            configured: configured.to_vec(),
+            names: configured
+                .iter()
+                .map(|name| name.rsplit('.').next().unwrap_or(name).to_owned())
+                .collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn matches(&self, base: &Expr) -> bool {
+        match base {
+            Expr::Name(name) => self.names.contains(name.id.as_str()),
+            Expr::Attribute(attribute) => self.names.contains(attribute.attr.as_str()),
+            // `class Job(BaseModel, Generic[T])` names its base through a
+            // subscript, as a generic model does.
+            Expr::Subscript(subscript) => self.matches(&subscript.value),
+            _ => false,
+        }
+    }
 }
 
 /// The names that a package's `__init__.py` files make part of its public API.
@@ -277,6 +347,16 @@ fn run() -> Result<bool, String> {
                 }
             );
             println!("  respect-reexports = {}", setting.respect_reexports);
+            println!(
+                "  field-base-classes = [{}]",
+                setting
+                    .field_bases
+                    .configured
+                    .iter()
+                    .map(|name| format!("\"{name}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         return Ok(false);
     }
@@ -291,7 +371,15 @@ fn run() -> Result<bool, String> {
             // about leaving the file broken at runtime.
             setting.private_only.map_or_else(
                 || Ok(Checked::default()),
-                |private_only| check_file(path, private_only, &setting.reexports, fixing),
+                |private_only| {
+                    check_file(
+                        path,
+                        private_only,
+                        &setting.reexports,
+                        &setting.field_bases,
+                        fixing,
+                    )
+                },
             )
         })
         .collect();
@@ -604,6 +692,8 @@ struct FileSettings {
     /// Empty unless the file is checked in private-only mode with
     /// `respect_reexports`, which is the only combination that consults it.
     reexports: Arc<Reexports>,
+    /// The base classes whose subclasses carry fields.
+    field_bases: Arc<FieldBases>,
 }
 
 fn settings_for_files(
@@ -618,6 +708,7 @@ fn settings_for_files(
     let mut directory_cache: BTreeMap<PathBuf, Option<PathBuf>> = BTreeMap::new();
     let mut config_cache: BTreeMap<PathBuf, LoadedConfig> = BTreeMap::new();
     let mut reexport_cache: BTreeMap<PathBuf, PackageReexports> = BTreeMap::new();
+    let fallback_field_bases = Arc::new(FieldBases::new(&default_field_base_classes()));
     let mut settings = Vec::with_capacity(files.len());
     for path in files {
         let config_path = discover_config_path(path, &mut directory_cache)?;
@@ -634,6 +725,7 @@ fn settings_for_files(
             LoadedConfig {
                 root: fallback_root.clone(),
                 config: Config::default(),
+                field_bases: Arc::clone(&fallback_field_bases),
             }
         };
         let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
@@ -654,6 +746,7 @@ fn settings_for_files(
             private_only,
             respect_reexports,
             reexports,
+            field_bases: Arc::clone(&loaded.field_bases),
         });
     }
     Ok(settings)
@@ -859,11 +952,12 @@ fn load_config_path(path: &Path) -> Result<LoadedConfig, String> {
         .and_then(|tool| tool.get("no_defaults"))
         .cloned()
         .ok_or_else(|| format!("{} does not contain [tool.no_defaults]", path.display()))?;
-    let config = table
+    let config: Config = table
         .try_into()
         .map_err(|error| format!("invalid [tool.no_defaults] in {}: {error}", path.display()))?;
     Ok(LoadedConfig {
         root: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+        field_bases: Arc::new(FieldBases::new(&config.field_base_classes)),
         config,
     })
 }
@@ -1092,6 +1186,7 @@ pub fn lint_source(source: &str, private_only: bool) -> Result<usize, String> {
         source,
         private_only,
         &Reexports::default(),
+        &FieldBases::new(&default_field_base_classes()),
         false,
     )?
     .diagnostics
@@ -1102,11 +1197,19 @@ fn check_file(
     path: &Path,
     private_only: bool,
     reexports: &Reexports,
+    field_bases: &FieldBases,
     signatures: bool,
 ) -> Result<Checked, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    check_source(path, &source, private_only, reexports, signatures)
+    check_source(
+        path,
+        &source,
+        private_only,
+        reexports,
+        field_bases,
+        signatures,
+    )
 }
 
 /// Check one file. `signatures` records what each fixed callable looks like so
@@ -1117,6 +1220,7 @@ fn check_source(
     source: &str,
     private_only: bool,
     reexports: &Reexports,
+    field_bases: &FieldBases,
     signatures: bool,
 ) -> Result<Checked, String> {
     let parsed = parse_module(source)
@@ -1135,6 +1239,7 @@ fn check_source(
         source,
         private_only,
         reexports,
+        field_bases,
         scope: Scope {
             private: is_private_module(path, reexports),
             ..Scope::default()
@@ -1298,6 +1403,8 @@ struct Checker<'a> {
     /// whichever module they are defined in. Empty unless `respect_reexports`
     /// is on.
     reexports: &'a Reexports,
+    /// The base classes whose subclasses carry fields, alongside `@dataclass`.
+    field_bases: &'a FieldBases,
     scope: Scope,
     /// Start of the `def` or `class` line that owns the violations being
     /// reported, so one directive there can cover every parameter of a
@@ -1317,19 +1424,40 @@ struct Checker<'a> {
 struct Scope {
     /// Whether an enclosing module, class, or function is private.
     private: bool,
-    /// Whether assignments here are dataclass fields.
-    dataclass: bool,
+    /// How assignments here declare fields, if they do at all.
+    fields: Option<FieldStyle>,
     /// Whether definitions here sit directly in a class body.
     class_body: bool,
 }
 
-/// The fields of a class body, gathered so a dataclass can be given a signature
-/// once its body has been walked.
+/// What made a class carry fields, which is what its violations are called
+/// after.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldStyle {
+    /// A `@dataclass` decorator.
+    Dataclass,
+    /// A configured base class, such as `pydantic.BaseModel`.
+    Base,
+}
+
+impl FieldStyle {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Dataclass => "dataclass field",
+            Self::Base => "class field",
+        }
+    }
+}
+
+/// The fields of a class body, gathered so a class that carries them can be
+/// given a signature once its body has been walked.
 struct ClassCollector {
     name: String,
-    dataclass: bool,
+    style: Option<FieldStyle>,
     /// Whether the class has base classes, whose fields come first in the
-    /// constructor and are not visible from this class body.
+    /// constructor and are not visible from this class body. The base that
+    /// made the class carry fields does not count: `BaseModel` contributes
+    /// none of its own.
     inherits: bool,
     /// Whether the decorator generates a constructor at all.
     constructs: bool,
@@ -1487,7 +1615,7 @@ impl Checker<'_> {
         });
     }
 
-    fn check_dataclass_field(&mut self, statement: &Stmt) {
+    fn check_field(&mut self, style: FieldStyle, statement: &Stmt) {
         let Stmt::AnnAssign(assign) = statement else {
             return;
         };
@@ -1524,7 +1652,7 @@ impl Checker<'_> {
         };
         if self.report(
             value.start(),
-            format!("dataclass field `{}` has a {}", name.id, default.kind),
+            format!("{} `{}` has a {}", style.noun(), name.id, default.kind),
             default.fix,
         ) && self.collect_signatures
             && constructs
@@ -1549,7 +1677,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     private: self.encloses_private(function.name.as_str(), outer),
                     // Annotated assignments in a method body are locals, not
                     // fields, so field detection stops at the function boundary.
-                    dataclass: false,
+                    fields: None,
                     class_body: false,
                 };
                 walk_stmt(self, statement);
@@ -1561,19 +1689,17 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // As with a `def` line, the name locates the `class` line a
                 // directive covering every field sits on.
                 self.header = Some(line_start(self.source, class.name.start()));
+                let style = field_style(class, self.field_bases);
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
-                    dataclass: has_dataclass_decorator(class),
+                    fields: style,
                     class_body: true,
                 };
                 if self.collect_signatures {
                     self.classes.push(ClassCollector {
                         name: class.name.to_string(),
-                        dataclass: self.scope.dataclass,
-                        inherits: class
-                            .arguments
-                            .as_ref()
-                            .is_some_and(|arguments| !arguments.args.is_empty()),
+                        style,
+                        inherits: inherits_fields(class, style, self.field_bases),
                         constructs: generates_init(class),
                         fields: Vec::new(),
                         removed: Vec::new(),
@@ -1585,7 +1711,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     .then(|| self.classes.pop())
                     .flatten()
                 {
-                    if collector.dataclass && collector.constructs && !collector.removed.is_empty()
+                    if collector.style.is_some()
+                        && collector.constructs
+                        && !collector.removed.is_empty()
                     {
                         self.signatures.push(Signature {
                             name: collector.name,
@@ -1601,11 +1729,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.header = old_header;
                 self.scope = outer;
             }
-            _ if self.scope.dataclass => {
-                self.check_dataclass_field(statement);
+            _ => {
+                if let Some(style) = self.scope.fields {
+                    self.check_field(style, statement);
+                }
                 walk_stmt(self, statement);
             }
-            _ => walk_stmt(self, statement),
         }
     }
 }
@@ -1628,6 +1757,42 @@ fn is_private_module(path: &Path, reexports: &Reexports) -> bool {
             .unwrap_or(&component);
         is_private(name) && !reexports.covers(name)
     })
+}
+
+/// What makes a class carry fields, if anything does. The decorator wins where
+/// both apply, because a `@dataclass` built on a configured base still follows
+/// the `dataclasses` rules.
+fn field_style(class: &ast::StmtClassDef, bases: &FieldBases) -> Option<FieldStyle> {
+    if has_dataclass_decorator(class) {
+        return Some(FieldStyle::Dataclass);
+    }
+    (!bases.is_empty() && class_bases(class).any(|base| bases.matches(base)))
+        .then_some(FieldStyle::Base)
+}
+
+/// Whether the class takes fields from somewhere this class body cannot see.
+///
+/// The base that made it carry fields is not such a place: `BaseModel` declares
+/// no fields, so a model naming it directly has its whole constructor here. Any
+/// other base might declare some, including another model, which is why a
+/// subclass of a subclass is left alone rather than half understood.
+fn inherits_fields(
+    class: &ast::StmtClassDef,
+    style: Option<FieldStyle>,
+    bases: &FieldBases,
+) -> bool {
+    match style {
+        Some(FieldStyle::Base) => class_bases(class).any(|base| !bases.matches(base)),
+        _ => class_bases(class).next().is_some(),
+    }
+}
+
+fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
+    class
+        .arguments
+        .as_deref()
+        .into_iter()
+        .flat_map(|arguments| arguments.args.iter())
 }
 
 fn has_dataclass_decorator(class: &ast::StmtClassDef) -> bool {
@@ -1713,6 +1878,35 @@ fn annotates_class_var(annotation: &Expr) -> bool {
     }
 }
 
+/// Which library's field helper a call is, which decides what its arguments
+/// mean.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldCall {
+    /// `dataclasses.field`, where the first argument is a real default.
+    Dataclasses,
+    /// `pydantic.Field`, where that argument may be `...` for "required".
+    Pydantic,
+}
+
+/// The call declaring a field's default, if the value is one. Recognised by
+/// name, as decorators are, so `field`, `dataclasses.field`, `Field`, and
+/// `pydantic.Field` all count.
+fn field_call(value: &Expr) -> Option<(&ast::ExprCall, FieldCall)> {
+    let Expr::Call(call) = value else {
+        return None;
+    };
+    let name = match &*call.func {
+        Expr::Name(name) => name.id.as_str(),
+        Expr::Attribute(attribute) => attribute.attr.as_str(),
+        _ => return None,
+    };
+    match name {
+        "field" => Some((call, FieldCall::Dataclasses)),
+        "Field" => Some((call, FieldCall::Pydantic)),
+        _ => None,
+    }
+}
+
 struct FieldDefault {
     kind: &'static str,
     fix: TextRange,
@@ -1726,15 +1920,15 @@ fn field_default(value: &Expr, annotation_end: TextSize, source: &str) -> Option
         fix: TextRange::new(annotation_end, value.end()),
         value: literal_text(value, source),
     };
-    let Expr::Call(call) = value else {
+    let Some((call, style)) = field_call(value) else {
         return Some(plain());
     };
-    let is_field = matches!(&*call.func, Expr::Name(name) if name.id.as_str() == "field")
-        || matches!(&*call.func, Expr::Attribute(attribute) if attribute.attr.as_str() == "field");
-    if !is_field {
-        return Some(plain());
-    }
     if let Some(first) = call.arguments.args.first() {
+        // `x: int = Field(...)` is pydantic's way of writing a field with no
+        // default at all, so there is nothing to report or remove.
+        if style == FieldCall::Pydantic && first.is_ellipsis_literal_expr() {
+            return None;
+        }
         return Some(FieldDefault {
             kind: "default",
             fix: argument_removal_range(
@@ -1760,6 +1954,10 @@ fn field_default(value: &Expr, annotation_end: TextSize, source: &str) -> Option
                 .as_ref()
                 .is_some_and(|name| matches!(name.as_str(), "default" | "default_factory"))
         })?;
+    // `Field(default=...)` says required just as `Field(...)` does.
+    if style == FieldCall::Pydantic && keyword.value.is_ellipsis_literal_expr() {
+        return None;
+    }
     let factory = keyword
         .arg
         .as_ref()
@@ -2315,12 +2513,18 @@ fn line_column(source: &str, offset: TextSize) -> (usize, usize) {
 mod tests {
     use super::*;
 
+    /// The field-carrying base classes a run with no configuration uses.
+    fn default_bases() -> FieldBases {
+        FieldBases::new(&default_field_base_classes())
+    }
+
     fn messages(source: &str, private_only: bool) -> Result<Vec<String>, String> {
         Ok(check_source(
             Path::new("fixture.py"),
             source,
             private_only,
             &Reexports::default(),
+            &default_bases(),
             false,
         )?
         .diagnostics
@@ -2335,6 +2539,7 @@ mod tests {
             source,
             false,
             &Reexports::default(),
+            &default_bases(),
             false,
         )?
         .diagnostics
@@ -2349,7 +2554,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         let mut signatures = Vec::new();
         for path in files {
-            let checked = check_file(path, false, &Reexports::default(), true)?;
+            let checked = check_file(path, false, &Reexports::default(), &default_bases(), true)?;
             diagnostics.extend(checked.diagnostics);
             signatures.extend(checked.signatures);
         }
@@ -2368,7 +2573,7 @@ mod tests {
         write_fixes_atomically(fixed_sources(call_sites.edits, &mut updated)?)?;
         for path in files {
             assert!(
-                check_file(path, false, &Reexports::default(), false)?
+                check_file(path, false, &Reexports::default(), &default_bases(), false)?
                     .diagnostics
                     .is_empty(),
                 "{}",
@@ -2412,6 +2617,143 @@ mod tests {
         )?;
         assert_eq!(found.len(), 2);
         assert!(found[1].contains("default factory"));
+        Ok(())
+    }
+
+    /// Check `source` with `bases` standing in for the configured base classes.
+    fn messages_with_bases(source: &str, bases: &[&str]) -> Result<Vec<String>, String> {
+        let names: Vec<String> = bases.iter().map(|name| (*name).to_owned()).collect();
+        Ok(check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            &Reexports::default(),
+            &FieldBases::new(&names),
+            false,
+        )?
+        .diagnostics
+        .into_iter()
+        .map(|item| item.message)
+        .collect())
+    }
+
+    #[test]
+    fn detects_defaults_on_a_pydantic_model() -> Result<(), String> {
+        let found = messages(
+            "class Job(BaseModel):\n x: int = 1\n y: list = Field(default_factory=list)\n",
+            false,
+        )?;
+        assert_eq!(
+            found,
+            [
+                "class field `x` has a default",
+                "class field `y` has a default factory",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_class_is_recognised_however_it_is_named() -> Result<(), String> {
+        let found = messages(
+            "class A(pydantic.BaseModel):\n x: int = 1\nclass B(BaseModel, Generic[T]):\n y: int = 2\n",
+            false,
+        )?;
+        assert_eq!(found.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unconfigured_base_class_carries_no_fields() -> Result<(), String> {
+        let found = messages_with_bases("class Job(BaseModel):\n x: int = 1\n", &[])?;
+        assert!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_configured_base_class_carries_fields() -> Result<(), String> {
+        let found = messages_with_bases(
+            "class Job(msgspec.Struct):\n x: int = 1\nclass Other(BaseModel):\n y: int = 2\n",
+            &["msgspec.Struct"],
+        )?;
+        assert_eq!(found, ["class field `x` has a default"]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_ellipsis_marks_a_pydantic_field_required_rather_than_defaulted() -> Result<(), String> {
+        let found = messages(
+            "class Job(BaseModel):\n x: int = Field(...)\n y: int = Field(..., description=\"d\")\n z: int = Field(default=...)\n",
+            false,
+        )?;
+        assert!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
+    /// `dataclasses.field` has no such convention: its first argument is the
+    /// default, whatever it is.
+    #[test]
+    fn an_ellipsis_is_still_a_dataclass_default() -> Result<(), String> {
+        let found = messages("@dataclass\nclass C:\n x: int = field(...)\n", false)?;
+        assert_eq!(found, ["dataclass field `x` has a default"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_pydantic_field_keeps_its_metadata_when_fixed() -> Result<(), String> {
+        let found = fixed(
+            "class Job(BaseModel):\n x: list = Field(default_factory=list, description=\"d\")\n y: int = Field(2, gt=0)\n",
+        )?;
+        assert_eq!(
+            found,
+            "class Job(BaseModel):\n x: list = Field(description=\"d\")\n y: int = Field(gt=0)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn class_level_assignments_that_declare_no_field_are_left_alone() -> Result<(), String> {
+        let found = messages(
+            "class Job(BaseModel):\n model_config = ConfigDict(frozen=True)\n kind: ClassVar[str] = \"job\"\n def build(self) -> None:\n  seen: set[str] = set()\n",
+            false,
+        )?;
+        assert!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
+    /// A model whose base is another model takes fields this file's class body
+    /// does not list, so it is not treated as carrying fields at all.
+    #[test]
+    fn a_model_subclass_is_left_alone() -> Result<(), String> {
+        let found = messages("class Sub(Job):\n x: int = 1\n", false)?;
+        assert!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_model_call_site_gains_the_removed_default() -> Result<(), String> {
+        let found = fixed(
+            "class Job(BaseModel):\n name: str\n retries: int = 3\n\njob = Job(name=\"a\")\n",
+        )?;
+        assert!(found.contains("Job(name=\"a\", retries=3)"), "{found}");
+        Ok(())
+    }
+
+    /// Any base beyond the one that made the class carry fields may declare
+    /// fields of its own, so the constructor is not known from this file.
+    #[test]
+    fn a_model_with_another_base_has_its_calls_left_alone() -> Result<(), String> {
+        let found =
+            skipped_reasons("class Job(Mixin, BaseModel):\n retries: int = 3\n\njob = Job()\n")?;
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("inherits fields"), "{found:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_directive_on_a_model_header_covers_every_field() -> Result<(), String> {
+        let found = codes("class Job(BaseModel):  # noqa: NOD001\n x: int = 1\n y: int = 2\n")?;
+        assert!(found.is_empty(), "{found:?}");
         Ok(())
     }
 
@@ -2497,6 +2839,7 @@ mod tests {
             source,
             true,
             &reexports,
+            &default_bases(),
             false,
         )?
         .diagnostics
@@ -2560,6 +2903,7 @@ mod tests {
             "def upload(timeout=30): pass  # noqa: NOD001\n",
             true,
             &reexports,
+            &default_bases(),
             false,
         )?;
         let codes: Vec<&str> = found
@@ -2582,6 +2926,7 @@ mod tests {
             "def _helper(x=1): pass\n",
             true,
             &reexports,
+            &default_bases(),
             false,
         )?;
         assert!(found.diagnostics.is_empty());
@@ -2787,6 +3132,7 @@ mod tests {
     fn per_file_enforcement_supports_tests_all_src_private() -> Result<(), String> {
         let loaded = LoadedConfig {
             root: PathBuf::from("project"),
+            field_bases: Arc::new(default_bases()),
             config: Config {
                 private_only: false,
                 respect_reexports: false,
@@ -2794,6 +3140,7 @@ mod tests {
                     ("src/**".to_owned(), Enforcement::Private),
                     ("tests/**".to_owned(), Enforcement::All),
                 ]),
+                ..Config::default()
             },
         };
         let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
@@ -2816,6 +3163,7 @@ mod tests {
     fn none_enforcement_exempts_matching_files() -> Result<(), String> {
         let loaded = LoadedConfig {
             root: PathBuf::from("project"),
+            field_bases: Arc::new(default_bases()),
             config: Config {
                 private_only: true,
                 respect_reexports: false,
@@ -2823,6 +3171,7 @@ mod tests {
                     "src/package/_compat.py".to_owned(),
                     Enforcement::None,
                 )]),
+                ..Config::default()
             },
         };
         let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
@@ -2871,7 +3220,7 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         assert_eq!(
-            check_file(&path, false, &Reexports::default(), false)?
+            check_file(&path, false, &Reexports::default(), &default_bases(), false)?
                 .diagnostics
                 .len(),
             5
@@ -3047,6 +3396,7 @@ mod tests {
             "def public(x=1): pass  # noqa: NOD001\n",
             true,
             &Reexports::default(),
+            &default_bases(),
             false,
         )?;
         assert_eq!(

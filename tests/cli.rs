@@ -466,3 +466,79 @@ fn a_namespace_package_still_reaches_the_package_root() -> Result<(), Box<dyn st
     assert!(stdout.contains("Found 1 error."), "{stdout}");
     Ok(())
 }
+
+#[test]
+fn pydantic_models_are_checked_without_configuration() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("models.py"),
+        "from pydantic import BaseModel\n\n\nclass Job(BaseModel):\n    retries: int = 3\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("class field `retries`"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn field_base_classes_replaces_the_default_list() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("pyproject.toml"),
+        "[tool.no_defaults]\nfield_base_classes = [\"msgspec.Struct\"]\n",
+    )?;
+    std::fs::write(
+        directory.path().join("models.py"),
+        "class Job(msgspec.Struct):\n    retries: int = 3\n\n\nclass Other(BaseModel):\n    tries: int = 1\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("class field `retries`"), "{stdout}");
+    assert!(stdout.contains("Found 1 error."), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn an_empty_field_base_classes_checks_decorated_classes_only(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("pyproject.toml"),
+        "[tool.no_defaults]\nfield_base_classes = []\n",
+    )?;
+    std::fs::write(
+        directory.path().join("models.py"),
+        "class Job(BaseModel):\n    retries: int = 3\n",
+    )?;
+    let output = Command::new(binary()).arg(directory.path()).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn show_settings_reports_the_field_base_classes() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("models.py");
+    std::fs::write(&path, "class Job(BaseModel):\n    retries: int = 3\n")?;
+    let output = Command::new(binary())
+        .arg("--show-settings")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("field-base-classes = [\"pydantic.BaseModel\"]"),
+        "{stdout}"
+    );
+    Ok(())
+}

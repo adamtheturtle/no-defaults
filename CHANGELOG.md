@@ -21,6 +21,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Performance
 
+- The default `full` output reads and indexes each file once instead of rereading it and walking to the reported line for every diagnostic in it. On a file with 16,000 violations this took reporting from 1.7 s to 0.36 s, which is what the same run costs in `concise`.
 - `per_file_enforcement` glob patterns are compiled once per configuration file rather than once per checked file. Over 3,000 files with a 40-pattern table this took a run from 1.1 s to 0.07 s, which is what the same run costs with no patterns at all.
 
 ### Changed

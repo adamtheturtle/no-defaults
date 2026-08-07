@@ -2160,9 +2160,32 @@ fn inherits_fields(
     bases: &FieldBases,
 ) -> bool {
     match style {
-        Some(FieldStyle::Base) => class_bases(class).any(|base| !bases.matches(base)),
-        _ => class_bases(class).next().is_some(),
+        Some(FieldStyle::Base) => {
+            class_bases(class).any(|base| !bases.matches(base) && !carries_no_fields(base))
+        }
+        _ => class_bases(class).any(|base| !carries_no_fields(base)),
     }
+}
+
+/// Whether a base cannot contribute fields to the constructor of a class built
+/// on it.
+///
+/// `Generic[T]`, `Protocol`, `ABC`, and `object` are structural: they declare
+/// no fields, so a dataclass built on one has exactly the fields written in its
+/// own body and its constructor is known from the file that defines it. Without
+/// this a generic dataclass could never have its call sites updated, however
+/// the project is laid out — the safe path was never escaped.
+fn carries_no_fields(base: &Expr) -> bool {
+    let base = match base {
+        Expr::Subscript(subscript) => &*subscript.value,
+        expression => expression,
+    };
+    let name = match base {
+        Expr::Name(name) => name.id.as_str(),
+        Expr::Attribute(attribute) => attribute.attr.as_str(),
+        _ => return false,
+    };
+    matches!(name, "Generic" | "Protocol" | "ABC" | "object")
 }
 
 fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
@@ -4492,6 +4515,43 @@ mod tests {
                 "the dataclass inherits fields, so its constructor is not known from the file \
                  that defines it"
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_that_declares_no_fields_does_not_hide_the_constructor() -> Result<(), String> {
+        // `Generic[T]`, `Protocol`, `ABC`, and `object` contribute no fields,
+        // so the constructor is exactly what this class body says it is.
+        for base in [
+            "Generic[T]",
+            "typing.Generic[T]",
+            "Protocol",
+            "Protocol[T]",
+            "ABC",
+            "object",
+        ] {
+            let source = format!("@dataclass\nclass Box({base}):\n    value: int = 1\n\n\nBox()\n");
+            assert_eq!(
+                fixed(&source)?,
+                format!("@dataclass\nclass Box({base}):\n    value: int\n\n\nBox(value=1)\n"),
+                "{base}"
+            );
+            assert!(skipped_reasons(&source)?.is_empty(), "{base}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_carrying_base_alongside_a_structural_one_still_hides_it() -> Result<(), String> {
+        let source = "@dataclass\nclass Box(Parent, Generic[T]):\n    value: int = 1\n\n\nBox()\n";
+        assert_eq!(
+            skipped_reasons(source)?.first().map(String::as_str),
+            Some(
+                "the dataclass inherits fields, so its constructor is not known from the file \
+                 that defines it"
+            ),
+            "one base that may carry fields is enough to give up"
         );
         Ok(())
     }

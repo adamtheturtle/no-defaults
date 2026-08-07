@@ -19,6 +19,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - `--show-settings` reports `respect-reexports` alongside the enforcement level.
 - A package's `__init__.pyi` is read where it has no `__init__.py`, so a stub-only distribution is treated as a package too. A namespace package, which has neither, no longer hides what the packages above it re-export.
 
+### Changed
+
+- An unrecognised key in `[tool.no_defaults]` is now an error rather than being silently ignored. Because the presence of that table is also what makes configuration discovery stop at a `pyproject.toml`, a misspelled option previously produced a run that looked configured but used the defaults throughout. This rejects configurations that earlier versions accepted.
+
 ### Documentation
 
 - Document which call sites `--fix` updates, which it deliberately leaves alone, and why.

@@ -382,6 +382,7 @@ fn run() -> Result<bool, String> {
                     check_file(
                         path,
                         private_only,
+                        &setting.project_root,
                         &setting.reexports,
                         &setting.field_bases,
                         fixing,
@@ -1355,6 +1356,7 @@ pub fn lint_source(source: &str, private_only: bool) -> Result<usize, String> {
         Path::new("benchmark.py"),
         source,
         private_only,
+        Path::new(""),
         &Reexports::default(),
         &FieldBases::new(&default_field_base_classes()),
         false,
@@ -1366,6 +1368,7 @@ pub fn lint_source(source: &str, private_only: bool) -> Result<usize, String> {
 fn check_file(
     path: &Path,
     private_only: bool,
+    project_root: &Path,
     reexports: &Reexports,
     field_bases: &FieldBases,
     signatures: bool,
@@ -1375,6 +1378,7 @@ fn check_file(
         path,
         &source,
         private_only,
+        project_root,
         reexports,
         field_bases,
         signatures,
@@ -1408,6 +1412,7 @@ fn check_source(
     path: &Path,
     source: &str,
     private_only: bool,
+    project_root: &Path,
     reexports: &Reexports,
     field_bases: &FieldBases,
     signatures: bool,
@@ -1439,7 +1444,7 @@ fn check_source(
         field_bases,
         aliases,
         scope: Scope {
-            private: is_private_module(path, reexports),
+            private: is_private_module(path, project_root, reexports),
             ..Scope::default()
         },
         header: None,
@@ -2002,8 +2007,17 @@ fn is_private(name: &str) -> bool {
 /// A private module or package that a package above re-exports under its own
 /// name — `from . import _upload` — is reachable as `package._upload`, so what
 /// it holds is public despite the underscore.
-fn is_private_module(path: &Path, reexports: &Reexports) -> bool {
-    path.components().any(|component| {
+/// Whether a file sits in a private module or package.
+///
+/// Only the part of the path below the project root is import path, so the
+/// walk starts there. A checkout living under a directory whose name starts
+/// with an underscore — `_work/proj` — says nothing about whether the code in
+/// it is private, and judging from the whole path also made the answer depend
+/// on whether a relative or an absolute path was passed on the command line.
+fn is_private_module(path: &Path, project_root: &Path, reexports: &Reexports) -> bool {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let relative = resolved.strip_prefix(project_root).unwrap_or(&resolved);
+    relative.components().any(|component| {
         let component = component.as_os_str().to_string_lossy();
         let name = component
             .strip_suffix(".py")
@@ -2854,6 +2868,7 @@ mod tests {
             Path::new("fixture.py"),
             source,
             false,
+            Path::new(""),
             &Reexports::default(),
             &default_bases(),
             false,
@@ -2906,6 +2921,7 @@ mod tests {
             Path::new("fixture.py"),
             source,
             private_only,
+            Path::new(""),
             &Reexports::default(),
             &default_bases(),
             false,
@@ -2921,6 +2937,7 @@ mod tests {
             Path::new("fixture.py"),
             source,
             false,
+            Path::new(""),
             &Reexports::default(),
             &default_bases(),
             false,
@@ -2937,7 +2954,14 @@ mod tests {
         let mut diagnostics = Vec::new();
         let mut signatures = Vec::new();
         for path in files {
-            let checked = check_file(path, false, &Reexports::default(), &default_bases(), true)?;
+            let checked = check_file(
+                path,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            )?;
             diagnostics.extend(checked.diagnostics);
             signatures.extend(checked.signatures);
         }
@@ -2959,9 +2983,16 @@ mod tests {
         write_fixes_atomically(fixed_sources(call_sites.edits, &mut updated)?)?;
         for path in files {
             assert!(
-                check_file(path, false, &Reexports::default(), &default_bases(), false)?
-                    .diagnostics
-                    .is_empty(),
+                check_file(
+                    path,
+                    false,
+                    Path::new(""),
+                    &Reexports::default(),
+                    &default_bases(),
+                    false,
+                )?
+                .diagnostics
+                .is_empty(),
                 "{}",
                 path.display()
             );
@@ -3011,6 +3042,7 @@ mod tests {
             Path::new("fixture.py"),
             source,
             false,
+            Path::new(""),
             &Reexports::default(),
             &FieldBases::new(&names),
             false,
@@ -3303,6 +3335,7 @@ mod tests {
             Path::new("package/_upload.py"),
             source,
             true,
+            Path::new(""),
             &reexports,
             &default_bases(),
             false,
@@ -3363,6 +3396,7 @@ mod tests {
             Path::new("package/_upload.py"),
             "def upload(timeout=30): pass  # noqa: NOD001\n",
             true,
+            Path::new(""),
             &reexports,
             &default_bases(),
             false,
@@ -3385,6 +3419,7 @@ mod tests {
             Path::new("package/_upload.py"),
             "def _helper(x=1): pass\n",
             true,
+            Path::new(""),
             &reexports,
             &default_bases(),
             false,
@@ -3532,11 +3567,12 @@ mod tests {
         let reexports = package_reexports(&root, directory.path(), &mut BTreeMap::new())?.names;
         assert!(reexports.covers("upload"));
         assert!(
-            !is_private_module(Path::new("package/_upload.pyi"), &reexports),
+            !is_private_module(Path::new("package/_upload.pyi"), Path::new(""), &reexports),
             "a stub's extension must not hide the module name"
         );
         assert!(is_private_module(
             Path::new("package/_other.pyi"),
+            Path::new(""),
             &reexports
         ));
         Ok(())
@@ -3564,26 +3600,54 @@ mod tests {
 
     #[test]
     fn recognizes_private_modules_and_packages() {
-        assert!(is_private_module(
-            Path::new("src/_module.py"),
-            &Reexports::default()
-        ));
-        assert!(is_private_module(
-            Path::new("src/_package/module.py"),
-            &Reexports::default()
-        ));
-        assert!(is_private_module(
-            Path::new("src/_package/__init__.py"),
-            &Reexports::default()
-        ));
-        assert!(!is_private_module(
-            Path::new("src/package/__init__.py"),
-            &Reexports::default()
-        ));
-        assert!(!is_private_module(
-            Path::new("src/package/module.py"),
-            &Reexports::default()
-        ));
+        let private =
+            |path: &str| is_private_module(Path::new(path), Path::new(""), &Reexports::default());
+        assert!(private("src/_module.py"));
+        assert!(private("src/_package/module.py"));
+        assert!(private("src/_package/__init__.py"));
+        assert!(!private("src/package/__init__.py"));
+        assert!(!private("src/package/module.py"));
+    }
+
+    #[test]
+    fn directories_above_the_project_root_are_not_module_names() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        // A checkout under a directory whose name starts with an underscore.
+        let root = directory.path().join("_work").join("proj");
+        std::fs::create_dir_all(root.join("package")).map_err(|error| error.to_string())?;
+        let root = root.canonicalize().map_err(|error| error.to_string())?;
+        let public = root.join("mod.py");
+        let private = root.join("package").join("_helper.py");
+        for path in [&public, &private] {
+            std::fs::write(path, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
+        }
+        assert!(
+            !is_private_module(&public, &root, &Reexports::default()),
+            "`_work` is not a package, so it says nothing about `mod`"
+        );
+        assert!(
+            is_private_module(&private, &root, &Reexports::default()),
+            "a private module below the root is still private"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn privacy_does_not_depend_on_how_the_path_was_written() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory.path().join("_work");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let root = root.canonicalize().map_err(|error| error.to_string())?;
+        std::fs::write(root.join("mod.py"), "def f(x=1): pass\n")
+            .map_err(|error| error.to_string())?;
+        let absolute = root.join("mod.py");
+        let indirect = root.join(".").join("mod.py");
+        assert_eq!(
+            is_private_module(&absolute, &root, &Reexports::default()),
+            is_private_module(&indirect, &root, &Reexports::default()),
+        );
+        assert!(!is_private_module(&absolute, &root, &Reexports::default()));
+        Ok(())
     }
 
     fn loaded_config(
@@ -3674,9 +3738,16 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         assert_eq!(
-            check_file(&path, false, &Reexports::default(), &default_bases(), false)?
-                .diagnostics
-                .len(),
+            check_file(
+                &path,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                false,
+            )?
+            .diagnostics
+            .len(),
             5
         );
         fix_all(std::slice::from_ref(&path))?;
@@ -3986,6 +4057,7 @@ mod tests {
             Path::new("fixture.py"),
             "def public(x=1): pass  # noqa: NOD001\n",
             true,
+            Path::new(""),
             &Reexports::default(),
             &default_bases(),
             false,

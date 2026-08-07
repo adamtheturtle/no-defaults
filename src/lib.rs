@@ -496,7 +496,7 @@ fn report_call_sites(
 ) {
     let removed = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.code == "NOD001")
+        .filter(|diagnostic| diagnostic.code == "NOD001" && diagnostic.fix.is_some())
         .count();
     if removed == 0 {
         return;
@@ -1790,7 +1790,14 @@ impl Checker<'_> {
     }
 
     /// Record a violation, returning whether it survived `noqa` suppression.
-    fn report(&mut self, offset: TextSize, message: String, fix: TextRange) -> bool {
+    /// Record a violation. Returns whether it was reported *and* is fixable,
+    /// which is what decides whether the default is one a call site has to be
+    /// given back.
+    fn report(&mut self, default: &Expr, message: String, fix: TextRange) -> bool {
+        self.report_with(default.start(), message, self.fixable(default, fix))
+    }
+
+    fn report_with(&mut self, offset: TextSize, message: String, fix: Option<TextRange>) -> bool {
         if self.suppress(offset) {
             return false;
         }
@@ -1801,9 +1808,29 @@ impl Checker<'_> {
             column,
             code: "NOD001",
             message,
-            fix: Some(fix),
+            fix,
         });
-        true
+        fix.is_some()
+    }
+
+    /// The range to delete for a default, or `None` where deleting it would
+    /// not preserve behaviour.
+    ///
+    /// In a stub, `x: int = ...` does not declare a default *value*: it is the
+    /// convention for "this parameter has a default, unspecified here".
+    /// Deleting it makes the parameter required, so the stub stops matching
+    /// the implementation it describes and type checkers reject callers that
+    /// legitimately omit the argument. Nothing in the source code changes to
+    /// match, because a stub has no runtime behaviour to change.
+    fn fixable(&self, default: &Expr, fix: TextRange) -> Option<TextRange> {
+        let stub = self
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "pyi");
+        if stub && matches!(default, Expr::EllipsisLiteral(_)) {
+            return None;
+        }
+        Some(fix)
     }
 
     /// Add a diagnostic for every directive that named `NOD001` without
@@ -1857,7 +1884,7 @@ impl Checker<'_> {
                 continue;
             };
             removed |= self.report(
-                default.start(),
+                default,
                 format!(
                     "parameter `{}` of lambda has a default",
                     parameter.parameter.name
@@ -1896,7 +1923,7 @@ impl Checker<'_> {
         {
             if let Some(default) = &parameter.default {
                 if self.report(
-                    default.start(),
+                    default,
                     format!(
                         "parameter `{}` of function `{}` has a default",
                         parameter.parameter.name, function.name
@@ -1978,7 +2005,7 @@ impl Checker<'_> {
             return;
         };
         if self.report(
-            value.start(),
+            value,
             format!("{} `{}` has a {}", style.noun(), name.id, default.kind),
             default.fix,
         ) && self.collect_signatures

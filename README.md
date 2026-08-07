@@ -99,7 +99,7 @@ Nothing is guessed. A call is left alone, with a warning naming the file and lin
 - the call unpacks `*args` or `**kwargs`, so what it already supplies is unknown;
 - the removed default is not a literal (`value=SENTINEL`, `path=Path.cwd()`), because repeating that text at the call site would depend on names the caller may not have imported, or would re-evaluate the expression;
 - a positional-only argument cannot be appended without reordering the call;
-- the dataclass inherits fields, whose order in the constructor the defining file cannot see;
+- the dataclass inherits fields, whose order in the constructor the defining file cannot see. Bases that declare no fields do not count, so a generic dataclass built on `Generic[T]`, `Protocol`, `ABC`, or `object` is still updated;
 - the function is named without being called — a bare `@decorator`, or a callback passed as `run(cb)` — because Python calls it somewhere with no argument list to add to.
 
 Fields that `__init__` never accepts are never added to a call: `field(..., init=False)`, a `_: KW_ONLY` marker, and a class whose decorator says `init=False`.

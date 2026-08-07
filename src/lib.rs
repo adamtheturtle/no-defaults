@@ -113,6 +113,10 @@ struct LoadedConfig {
     /// Derived from `config.field_base_classes` once per configuration file
     /// rather than once per checked file.
     field_bases: Arc<FieldBases>,
+    /// Compiled from `config.per_file_enforcement` once per configuration file
+    /// for the same reason: a long table would otherwise have every one of its
+    /// globs recompiled for every file in the project.
+    overrides: Arc<Vec<PerFileEnforcement>>,
 }
 
 /// The base classes that make a class carry fields.
@@ -710,6 +714,7 @@ fn settings_for_files(
     let mut config_cache: BTreeMap<PathBuf, LoadedConfig> = BTreeMap::new();
     let mut reexport_cache: BTreeMap<PathBuf, PackageReexports> = BTreeMap::new();
     let fallback_field_bases = Arc::new(FieldBases::new(&default_field_base_classes()));
+    let fallback_overrides = Arc::new(Vec::new());
     let mut settings = Vec::with_capacity(files.len());
     for path in files {
         let config_path = discover_config_path(path, &mut directory_cache)?;
@@ -727,11 +732,11 @@ fn settings_for_files(
                 root: fallback_root.clone(),
                 config: Config::default(),
                 field_bases: Arc::clone(&fallback_field_bases),
+                overrides: Arc::clone(&fallback_overrides),
             }
         };
-        let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
-        let private_only = private_only_for(path, &loaded, &overrides)
-            .map(|private_only| cli_private_only || private_only);
+        let private_only =
+            private_only_for(path, &loaded).map(|private_only| cli_private_only || private_only);
         let respect_reexports = cli_respect_reexports || loaded.config.respect_reexports;
         // Nothing else consults the package's `__init__.py` files, so nothing
         // else pays for reading them.
@@ -959,6 +964,7 @@ fn load_config_path(path: &Path) -> Result<LoadedConfig, String> {
     Ok(LoadedConfig {
         root: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
         field_bases: Arc::new(FieldBases::new(&config.field_base_classes)),
+        overrides: Arc::new(compile_overrides(&config.per_file_enforcement)?),
         config,
     })
 }
@@ -1116,15 +1122,12 @@ fn compile_overrides(
         .collect()
 }
 
-fn private_only_for(
-    path: &Path,
-    loaded: &LoadedConfig,
-    overrides: &[PerFileEnforcement],
-) -> Option<bool> {
+fn private_only_for(path: &Path, loaded: &LoadedConfig) -> Option<bool> {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let relative = resolved.strip_prefix(&loaded.root).unwrap_or(&resolved);
     let filename = relative.file_name().unwrap_or_default();
-    let selected = overrides
+    let selected = loaded
+        .overrides
         .iter()
         .filter(|entry| {
             let matched = if entry.pattern.contains('/') {
@@ -3129,32 +3132,45 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn per_file_enforcement_supports_tests_all_src_private() -> Result<(), String> {
-        let loaded = LoadedConfig {
+    fn loaded_config(
+        private_only: bool,
+        patterns: &[(&str, Enforcement)],
+    ) -> Result<LoadedConfig, String> {
+        let config = Config {
+            private_only,
+            per_file_enforcement: patterns
+                .iter()
+                .map(|(pattern, enforcement)| ((*pattern).to_owned(), *enforcement))
+                .collect(),
+            ..Config::default()
+        };
+        Ok(LoadedConfig {
             root: PathBuf::from("project"),
             field_bases: Arc::new(default_bases()),
-            config: Config {
-                private_only: false,
-                respect_reexports: false,
-                per_file_enforcement: BTreeMap::from([
-                    ("src/**".to_owned(), Enforcement::Private),
-                    ("tests/**".to_owned(), Enforcement::All),
-                ]),
-                ..Config::default()
-            },
-        };
-        let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
+            overrides: Arc::new(compile_overrides(&config.per_file_enforcement)?),
+            config,
+        })
+    }
+
+    #[test]
+    fn per_file_enforcement_supports_tests_all_src_private() -> Result<(), String> {
+        let loaded = loaded_config(
+            false,
+            &[
+                ("src/**", Enforcement::Private),
+                ("tests/**", Enforcement::All),
+            ],
+        )?;
         assert_eq!(
-            private_only_for(Path::new("project/tests/test_api.py"), &loaded, &overrides),
+            private_only_for(Path::new("project/tests/test_api.py"), &loaded),
             Some(false)
         );
         assert_eq!(
-            private_only_for(Path::new("project/src/package/api.py"), &loaded, &overrides),
+            private_only_for(Path::new("project/src/package/api.py"), &loaded),
             Some(true)
         );
         assert_eq!(
-            private_only_for(Path::new("project/scripts/release.py"), &loaded, &overrides),
+            private_only_for(Path::new("project/scripts/release.py"), &loaded),
             Some(false)
         );
         Ok(())
@@ -3162,31 +3178,14 @@ mod tests {
 
     #[test]
     fn none_enforcement_exempts_matching_files() -> Result<(), String> {
-        let loaded = LoadedConfig {
-            root: PathBuf::from("project"),
-            field_bases: Arc::new(default_bases()),
-            config: Config {
-                private_only: true,
-                respect_reexports: false,
-                per_file_enforcement: BTreeMap::from([(
-                    "src/package/_compat.py".to_owned(),
-                    Enforcement::None,
-                )]),
-                ..Config::default()
-            },
-        };
-        let overrides = compile_overrides(&loaded.config.per_file_enforcement)?;
+        let loaded = loaded_config(true, &[("src/package/_compat.py", Enforcement::None)])?;
         assert_eq!(
-            private_only_for(
-                Path::new("project/src/package/_compat.py"),
-                &loaded,
-                &overrides
-            ),
+            private_only_for(Path::new("project/src/package/_compat.py"), &loaded),
             None
         );
         // Files the pattern does not name keep the project-wide setting.
         assert_eq!(
-            private_only_for(Path::new("project/src/package/api.py"), &loaded, &overrides),
+            private_only_for(Path::new("project/src/package/api.py"), &loaded),
             Some(true)
         );
         Ok(())
@@ -3686,6 +3685,36 @@ mod tests {
         assert!(loaded.config.respect_reexports);
         assert_eq!(loaded.config.field_base_classes, ["msgspec.Struct"]);
         assert_eq!(loaded.config.per_file_enforcement.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn files_sharing_a_configuration_each_get_their_own_enforcement() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = directory
+            .path()
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[tool.no_defaults]\nprivate_only = true\n\n[tool.no_defaults.per_file_enforcement]\n\"tests/**\" = \"all\"\n\"exempt.py\" = \"none\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::create_dir(root.join("tests")).map_err(|error| error.to_string())?;
+        let paths = [
+            root.join("tests").join("test_api.py"),
+            root.join("exempt.py"),
+            root.join("api.py"),
+        ];
+        for path in &paths {
+            std::fs::write(path, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
+        }
+        // One compiled set of overrides now serves every file, so it has to
+        // stay applied per file rather than once.
+        let settings = settings_for_files(&paths, false, false)?;
+        assert_eq!(settings[0].private_only, Some(false));
+        assert_eq!(settings[1].private_only, None);
+        assert_eq!(settings[2].private_only, Some(true));
         Ok(())
     }
 

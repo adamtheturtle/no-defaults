@@ -613,3 +613,21 @@ fn a_symlink_and_its_target_are_one_file() -> Result<(), Box<dyn std::error::Err
     assert!(stdout.contains("Found 1 error."), "{stdout}");
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn fixing_a_symlink_writes_through_to_its_target() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let real = directory.path().join("real.py");
+    let link = directory.path().join("link.py");
+    std::fs::write(&real, "def f(value=1): pass\n")?;
+    std::os::unix::fs::symlink("real.py", &link)?;
+    let output = Command::new(binary()).arg("--fix").arg(&link).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(&real)?, "def f(value): pass\n");
+    assert!(
+        std::fs::symlink_metadata(&link)?.file_type().is_symlink(),
+        "the link must survive the fix"
+    );
+    Ok(())
+}

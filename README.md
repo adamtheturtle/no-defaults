@@ -313,7 +313,14 @@ $ echo $?
 
 ## Performance
 
-An optimized `1.0.0` development build checked a pinned Typeshed checkout containing 5,368 Python and stub files (12.5 MiB) in a median 0.29 seconds across five warm runs on an Apple Silicon Mac, or roughly 18,000 files per second. It produced 50,974 diagnostics; an earlier full-output measurement used approximately 41 MiB maximum RSS.
+A `--release` build of `2.0.0` checked a pinned Typeshed checkout containing 5,360 Python and stub files (12.5 MiB) on an Apple Silicon Mac, producing 50,923 diagnostics. Medians of five warm runs:
+
+| output format | wall clock | files per second | maximum RSS |
+| --- | --- | --- | --- |
+| `concise` | 0.33 s | ~16,000 | 49 MiB |
+| `full` (the default) | 0.45 s | ~12,000 | 50 MiB |
+
+`full` quotes the source line and draws a caret under every diagnostic, so it does more work than `concise` and always will; up to `1.1.0` it did quadratically more, and the same run took 1.12 s.
 
 CodSpeed runs parser-and-rule benchmarks for representative modules on every pull request and every push to `main`, providing stable comparisons against the default-branch baseline. The scheduled `Typeshed benchmark` remains as a real-project correctness and gross-regression check.
 

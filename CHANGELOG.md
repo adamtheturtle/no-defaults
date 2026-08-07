@@ -4,6 +4,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+### Documentation
+
+- The `## Performance` section quotes measured `2.0.0` figures rather than `1.0.0` ones, gives `full` and `concise` side by side, and drops a caveat about full-output memory that the fixes to its quadratic behaviour made obsolete.
+
 ### Added
 
 - `--fix` updates the construction sites of a dataclass whose base is a dataclass in the same file. The base's fields come first in the generated constructor, so `Child()` becomes `Child(a=1, b=2)` where `a` is the base's, and a subclass that removed nothing of its own still gets back the defaults its base lost. It stays narrow: one base only, because `dataclasses` walks the reverse MRO to order several; the base must be named directly and its own constructor fully known; and a name two classes share resolves to neither. Anything else keeps the existing warning.

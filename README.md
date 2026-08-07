@@ -95,7 +95,7 @@ Calls are resolved through the calling file's own imports, not by matching the b
 
 Nothing is guessed. A call is left alone, with a warning naming the file and line, when
 
-- it cannot be tied to the definition that was fixed: an unrelated callable of the same name, a method on a receiver whose type is unknown such as `client.fetch(...)`, or a call through an import this run could not resolve;
+- it cannot be tied to the definition that was fixed: an unrelated callable of the same name, a name an enclosing function or class binds and so shadows the definition with, a method on a receiver whose type is unknown such as `client.fetch(...)`, or a call through an import this run could not resolve;
 - the call unpacks `*args` or `**kwargs`, so what it already supplies is unknown;
 - the removed default is not a literal (`value=SENTINEL`, `path=Path.cwd()`), because repeating that text at the call site would depend on names the caller may not have imported, or would re-evaluate the expression;
 - a positional-only argument cannot be appended without reordering the call;

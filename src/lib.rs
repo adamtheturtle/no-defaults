@@ -2552,6 +2552,7 @@ fn rewrite_calls(
         bindings,
         classes: Vec::new(),
         called: BTreeSet::new(),
+        scopes: Vec::new(),
         lines: LineIndex::new(source),
         edits: Vec::new(),
         skipped: Vec::new(),
@@ -2651,6 +2652,159 @@ fn collect_bindings(
     }
 }
 
+/// The names a function or class body binds.
+///
+/// A call to a name bound here does not go to a module-level definition of the
+/// same name, so it must not be rewritten as though it did. Where a name cannot
+/// be ruled out — a binding in a branch never taken, a comprehension variable
+/// that really has a scope of its own — it is collected anyway: over-collecting
+/// costs a call left alone with a warning, and under-collecting costs a wrong
+/// rewrite.
+#[derive(Default)]
+struct BoundNames(BTreeSet<String>);
+
+impl BoundNames {
+    /// Collect the names an assignment target binds. An attribute or subscript
+    /// target rebinds nothing by its own name.
+    fn bind(&mut self, target: &Expr) {
+        match target {
+            Expr::Name(name) => {
+                self.0.insert(name.id.to_string());
+            }
+            Expr::Tuple(tuple) => tuple.elts.iter().for_each(|element| self.bind(element)),
+            Expr::List(list) => list.elts.iter().for_each(|element| self.bind(element)),
+            Expr::Starred(starred) => self.bind(&starred.value),
+            _ => {}
+        }
+    }
+
+    fn parameters(&mut self, parameters: &ast::Parameters) {
+        for parameter in parameters
+            .posonlyargs
+            .iter()
+            .chain(&parameters.args)
+            .chain(&parameters.kwonlyargs)
+        {
+            self.0.insert(parameter.parameter.name.to_string());
+        }
+        for parameter in [&parameters.vararg, &parameters.kwarg]
+            .into_iter()
+            .flatten()
+        {
+            self.0.insert(parameter.name.to_string());
+        }
+    }
+
+    fn comprehensions(&mut self, generators: &[ast::Comprehension]) {
+        for generator in generators {
+            self.bind(&generator.target);
+        }
+    }
+
+    /// The names bound anywhere inside a function, including its parameters.
+    fn of_function(function: &ast::StmtFunctionDef) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        collector.parameters(&function.parameters);
+        for statement in &function.body {
+            collector.visit_stmt(statement);
+        }
+        collector.0
+    }
+
+    fn of_body(body: &[Stmt]) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        for statement in body {
+            collector.visit_stmt(statement);
+        }
+        collector.0
+    }
+
+    fn of_lambda(lambda: &ast::ExprLambda) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        if let Some(parameters) = &lambda.parameters {
+            collector.parameters(parameters);
+        }
+        collector.0
+    }
+}
+
+impl<'a> Visitor<'a> for BoundNames {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        match statement {
+            Stmt::Assign(assign) => assign.targets.iter().for_each(|target| self.bind(target)),
+            Stmt::AnnAssign(assign) => self.bind(&assign.target),
+            Stmt::AugAssign(assign) => self.bind(&assign.target),
+            Stmt::For(loop_statement) => self.bind(&loop_statement.target),
+            Stmt::With(block) => {
+                for item in &block.items {
+                    if let Some(target) = &item.optional_vars {
+                        self.bind(target);
+                    }
+                }
+            }
+            Stmt::FunctionDef(function) => {
+                self.0.insert(function.name.to_string());
+                self.parameters(&function.parameters);
+            }
+            Stmt::ClassDef(class) => {
+                self.0.insert(class.name.to_string());
+            }
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let bound = alias.asname.as_ref().map_or_else(
+                        || {
+                            alias
+                                .name
+                                .split('.')
+                                .next()
+                                .unwrap_or(alias.name.as_str())
+                                .to_owned()
+                        },
+                        ToString::to_string,
+                    );
+                    self.0.insert(bound);
+                }
+            }
+            Stmt::ImportFrom(import) => {
+                for alias in &import.names {
+                    let bound = alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| alias.name.to_string(), ToString::to_string);
+                    self.0.insert(bound);
+                }
+            }
+            Stmt::Try(block) => {
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    if let Some(name) = &handler.name {
+                        self.0.insert(name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'a Expr) {
+        match expression {
+            Expr::Named(named) => self.bind(&named.target),
+            Expr::Lambda(lambda) => {
+                if let Some(parameters) = &lambda.parameters {
+                    self.parameters(parameters);
+                }
+            }
+            Expr::ListComp(comprehension) => self.comprehensions(&comprehension.generators),
+            Expr::SetComp(comprehension) => self.comprehensions(&comprehension.generators),
+            Expr::DictComp(comprehension) => self.comprehensions(&comprehension.generators),
+            Expr::Generator(comprehension) => self.comprehensions(&comprehension.generators),
+            _ => {}
+        }
+        walk_expr(self, expression);
+    }
+}
+
 /// The dotted name an expression spells, for `a`, `a.b`, and `a.b.c`.
 fn dotted_name(expression: &Expr) -> Option<String> {
     match expression {
@@ -2675,6 +2829,10 @@ struct Rewriter<'a> {
     /// Ranges of the expressions being called, so that the same expression is
     /// not later mistaken for a reference that never calls the function.
     called: BTreeSet<(TextSize, TextSize)>,
+    /// The names bound by each enclosing function, class, and lambda scope. A
+    /// name bound in one of them shadows a module-level definition, so a call
+    /// to it does not go where the definition went.
+    scopes: Vec<BTreeSet<String>>,
     /// Where each line of `source` starts, for the same reason the checker
     /// keeps one.
     lines: LineIndex,
@@ -2683,6 +2841,12 @@ struct Rewriter<'a> {
 }
 
 impl Rewriter<'_> {
+    /// Whether an enclosing function, class, or lambda binds `name`, so a call
+    /// to it does not reach a definition of the same name elsewhere.
+    fn shadowed(&self, name: &str) -> bool {
+        self.scopes.iter().any(|scope| scope.contains(name))
+    }
+
     fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
         let (line, column) = self.lines.locate(self.source, offset);
         self.skipped.push(Skipped {
@@ -2756,7 +2920,9 @@ impl Rewriter<'_> {
     /// and how many parameters the call has already been given implicitly.
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
-            // A bare name is either defined in this file or imported into it.
+            // A bare name is either defined in this file or imported into it —
+            // unless an enclosing scope binds it, in which case it is neither.
+            Expr::Name(name) if self.shadowed(name.id.as_str()) => None,
             Expr::Name(name) => match self.bindings.get(name.id.as_str()) {
                 Some(Binding::Symbol(file, symbol)) => Some((
                     self.definitions.symbols.get(file)?.get(symbol)?.as_ref()?,
@@ -2960,13 +3126,21 @@ fn missing_arguments(
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
-        if let Stmt::ClassDef(class) = statement {
-            self.classes.push(class.name.to_string());
-            walk_stmt(self, statement);
-            self.classes.pop();
-            return;
+        match statement {
+            Stmt::ClassDef(class) => {
+                self.classes.push(class.name.to_string());
+                self.scopes.push(BoundNames::of_body(&class.body));
+                walk_stmt(self, statement);
+                self.scopes.pop();
+                self.classes.pop();
+            }
+            Stmt::FunctionDef(function) => {
+                self.scopes.push(BoundNames::of_function(function));
+                walk_stmt(self, statement);
+                self.scopes.pop();
+            }
+            _ => walk_stmt(self, statement),
         }
-        walk_stmt(self, statement);
     }
 
     fn visit_expr(&mut self, expression: &'a Expr) {
@@ -2976,6 +3150,12 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.check_call(call);
             }
             Expr::Name(_) | Expr::Attribute(_) => self.check_reference(expression),
+            Expr::Lambda(lambda) => {
+                self.scopes.push(BoundNames::of_lambda(lambda));
+                walk_expr(self, expression);
+                self.scopes.pop();
+                return;
+            }
             _ => {}
         }
         walk_expr(self, expression);
@@ -4533,6 +4713,67 @@ mod tests {
                 "the dataclass inherits fields, so its constructor is not known from the file \
                  that defines it"
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_bound_in_an_enclosing_scope_is_not_the_fixed_function() -> Result<(), String> {
+        let source = "def connect(host, timeout=30):\n    pass\n\n\n\
+                      def wrapper(connect):\n    connect(\"h\")\n\n\n\
+                      def other():\n    connect = open\n    connect(\"h\")\n\n\n\
+                      def fine():\n    connect(\"h\")\n";
+        assert_eq!(
+            fixed(source)?,
+            "def connect(host, timeout):\n    pass\n\n\n\
+             def wrapper(connect):\n    connect(\"h\")\n\n\n\
+             def other():\n    connect = open\n    connect(\"h\")\n\n\n\
+             def fine():\n    connect(\"h\", timeout=30)\n",
+            "only the call that really reaches the fixed function is filled in"
+        );
+        assert_eq!(
+            skipped_reasons(source)?,
+            [
+                "this call cannot be tied to the definition that was fixed",
+                "this call cannot be tied to the definition that was fixed"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_shape_that_binds_a_name_shadows_it() -> Result<(), String> {
+        for binding in [
+            "connect = open",
+            "for connect in []: pass",
+            "with open(\"f\") as connect: pass",
+            "import connect",
+            "from os import path as connect",
+            "def connect(): pass",
+            "class connect: pass",
+            "[connect for connect in []]",
+            "if (connect := open): pass",
+            "(lambda connect: connect(\"h\"))(open)",
+        ] {
+            let source =
+                format!("def connect(host, timeout=30):\n    pass\n\n\ndef f():\n    {binding}\n    connect(\"h\")\n");
+            assert_eq!(
+                fixed(&source)?,
+                source.replace("host, timeout=30", "host, timeout"),
+                "{binding}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_binding_shadows_a_module_level_definition() -> Result<(), String> {
+        let source = "def connect(host, timeout=30):\n    pass\n\n\n\
+                      class Client:\n    connect = staticmethod(open)\n\n    \
+                      def run(self):\n        connect(\"h\")\n";
+        assert_eq!(
+            fixed(source)?,
+            source.replace("host, timeout=30", "host, timeout")
         );
         Ok(())
     }

@@ -1422,6 +1422,20 @@ fn collect_directives(source: &str, tokens: &Tokens) -> Vec<Directive> {
         .collect()
 }
 
+/// Strip a file-level directive prefix such as `ruff: noqa` from a lowercased
+/// comment body, returning what follows it and how many bytes it consumed.
+///
+/// Ruff and flake8 both accept the form without a space after the colon, and
+/// `# ruff:noqa` is common in the wild, so the space is optional here too.
+fn file_level_prefix<'a>(body: &'a str, tool: &str) -> Option<(&'a str, usize)> {
+    let rest = body
+        .strip_prefix(tool)?
+        .strip_prefix(':')?
+        .trim_start_matches([' ', '\t'])
+        .strip_prefix("noqa")?;
+    Some((rest, body.len() - rest.len()))
+}
+
 fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
     let line_start = source[..hash].rfind('\n').map_or(0, |end| end + 1);
     let break_start = source[hash..]
@@ -1433,10 +1447,13 @@ fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
     let body_start = hash + 1 + (comment.len() - body.len());
     let lower = body.to_ascii_lowercase();
     let alone = source[line_start..hash].trim().is_empty();
-    let (file_level, rest) = if alone && lower.starts_with("flake8: noqa") {
-        (lower == "flake8: noqa", None)
-    } else if let Some(rest) = lower.strip_prefix("ruff: noqa").filter(|_| alone) {
-        (true, Some((rest, body_start + "ruff: noqa".len())))
+    let flake8 = alone.then(|| file_level_prefix(&lower, "flake8")).flatten();
+    let ruff = alone.then(|| file_level_prefix(&lower, "ruff")).flatten();
+    let (file_level, rest) = if let Some((rest, _)) = flake8 {
+        // A `# flake8: noqa` with anything appended is not a directive.
+        (rest.is_empty(), None)
+    } else if let Some((rest, consumed)) = ruff {
+        (true, Some((rest, body_start + consumed)))
     } else {
         (false, Some((lower.strip_prefix("noqa")?, body_start + 4)))
     };
@@ -3425,6 +3442,30 @@ mod tests {
         assert_eq!(codes("# ruff: noqa: E501\ndef f(x=1): pass\n"), ["NOD001"]);
         assert!(codes("# ruff: noqa\ndef f(x=1): pass\n").is_empty());
         assert!(codes("# flake8: noqa\ndef f(x=1): pass\n").is_empty());
+    }
+
+    #[test]
+    fn a_file_level_directive_needs_no_space_after_the_colon() {
+        assert!(codes("# ruff:noqa: NOD001\ndef f(x=1): pass\n").is_empty());
+        assert!(codes("# ruff:noqa\ndef f(x=1): pass\n").is_empty());
+        assert!(codes("# flake8:noqa\ndef f(x=1): pass\n").is_empty());
+        assert!(codes("# ruff:\tnoqa\ndef f(x=1): pass\n").is_empty());
+        assert!(codes("# RUFF:NOQA: NOD001\ndef f(x=1): pass\n").is_empty());
+        assert_eq!(
+            codes("# ruff:noqa: E501\ndef f(x=1): pass\n"),
+            ["NOD001"],
+            "a code list that omits this rule still suppresses nothing"
+        );
+        assert_eq!(
+            codes("# flake8:noqa: NOD001\ndef f(x=1): pass\n"),
+            ["NOD001"],
+            "as with the spaced form, a `flake8: noqa` with codes appended is not a directive"
+        );
+        assert_eq!(
+            codes("# ruffnoqa\ndef f(x=1): pass\n"),
+            ["NOD001"],
+            "the colon is what makes it a file-level directive"
+        );
     }
 
     #[test]

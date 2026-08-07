@@ -24,6 +24,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - The default `full` output reads and indexes each file once instead of rereading it and walking to the reported line for every diagnostic in it. On a file with 16,000 violations this took reporting from 1.7 s to 0.36 s, which is what the same run costs in `concise`.
 - `per_file_enforcement` glob patterns are compiled once per configuration file rather than once per checked file. Over 3,000 files with a 40-pattern table this took a run from 1.1 s to 0.07 s, which is what the same run costs with no patterns at all.
 
+### Fixed
+
+- `# ruff:noqa` and `# flake8:noqa` without a space after the colon are recognised as file-level suppressions. Ruff and flake8 both accept that form, and it is common in the wild; only the spaced variants worked before.
+
 ### Changed
 
 - A file the parser rejects is reported as a `NOD000` syntax-error diagnostic and the run continues, instead of aborting with exit status `2` and printing nothing for any file. One unparseable file in a tree — a Python 2 module kept for reference, a template saved as `.py`, a file caught mid-edit — no longer hides every other file's diagnostics, which under pre-commit turned into a hook that silently stopped catching regressions. `NOD000` carries no fix, so `--fix` leaves that file alone, counts it as remaining, and exits `1`.

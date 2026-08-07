@@ -145,7 +145,7 @@ class Job:  # noqa: NOD001
 
 Decorators do not move either line, and the scope stops at the signature or the class body: methods, nested functions, and nested dataclasses keep their own violations and need their own directives. A directive placed elsewhere in the signature, such as on the closing parenthesis, still applies only to its own line.
 
-Suppress the rule for an entire file with `# ruff: noqa` or `# ruff: noqa: NOD001`.
+Suppress the rule for an entire file with `# ruff: noqa` or `# ruff: noqa: NOD001`. As in Ruff and flake8, the space after the colon is optional, so `# ruff:noqa` and `# flake8:noqa` work too. A file-level directive must be the only thing on its line.
 
 A directive that names `NOD001` without suppressing anything is reported as `NOD002` and removed by `--fix`:
 

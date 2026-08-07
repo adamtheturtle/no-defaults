@@ -1153,9 +1153,13 @@ fn collect_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     for path in paths {
         if path.is_file() {
-            if is_python(path) {
-                files.push(path.clone());
+            // Filtering a directory walk down to Python is what the walk is
+            // for, but dropping a file the user named leaves a run that
+            // checked nothing looking exactly like a clean one.
+            if !is_python(path) {
+                return Err(format!("not a Python file: {}", path.display()));
             }
+            files.push(path.clone());
         } else if path.is_dir() {
             files.extend(
                 WalkBuilder::new(path)

@@ -44,6 +44,7 @@ no-defaults --show-settings src/package/api.py
 ```
 
 Exit status is `0` when clean, `1` when violations are found, and `2` for an operational error.
+A path named on the command line that is not a `.py` or `.pyi` file is an operational error, so a mistyped path or a misconfigured `.pre-commit-config.yaml` fails rather than reporting a clean run over nothing. Directories are still walked for Python files only.
 Directories are walked in parallel, respecting `.gitignore` and standard hidden-file filters.
 Diagnostics use Ruff's concise format and include a summary:
 

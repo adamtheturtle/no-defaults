@@ -542,3 +542,37 @@ fn show_settings_reports_the_field_base_classes() -> Result<(), Box<dyn std::err
     );
     Ok(())
 }
+
+#[test]
+fn a_named_file_that_is_not_python_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let readme = directory.path().join("README.md");
+    std::fs::write(&readme, "not Python\n")?;
+    let output = Command::new(binary()).arg(&readme).output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("not a Python file"), "{stderr}");
+    assert!(stderr.contains("README.md"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn a_directory_walk_still_skips_files_that_are_not_python() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    std::fs::write(directory.path().join("README.md"), "not Python\n")?;
+    std::fs::write(
+        directory.path().join("example.py"),
+        "def f(value=1): pass\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("example.py"), "{stdout}");
+    assert!(!stdout.contains("README.md"), "{stdout}");
+    Ok(())
+}

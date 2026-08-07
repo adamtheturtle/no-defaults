@@ -4,12 +4,15 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+## 2.0.0 - 2026-08-07
+
+This release changes what the linter reports, what `--fix` writes, and which configurations it accepts. Read `### Changed` before upgrading a project that pins an earlier version.
+
 ### Added
 
 - Defaults on pydantic models are reported. A class is now checked for fields when it names a base class from `field_base_classes`, which defaults to `[ "pydantic.BaseModel" ]`, as well as when it carries `@dataclass`. Its violations are named `class field` where a dataclass's are named `dataclass field`. Codebases built on `BaseModel` will see violations that earlier versions passed over in silence; `field_base_classes = []` restores the old behaviour, and the same setting extends the rule to `msgspec.Struct`, `sqlmodel.SQLModel`, or anything else that carries fields through a base class.
 - `Field(default=…)` and `Field(default_factory=…)` are fixed the way `field(...)` is, removing only those arguments and keeping the rest of the metadata. Pydantic writes a field with no default as `Field(...)` or `Field(default=...)`, and neither is reported. A model's call sites gain the removed default as a keyword argument like any other.
 - `--show-settings` reports `field-base-classes`.
-
 - `--fix` now updates call sites. Every call in the checked files that relied on a removed default gains it as an explicit argument, so `connect("h")` becomes `connect("h", timeout=30)` and `Job("j")` becomes `Job("j", retries=3)`. A `default_factory` becomes the value it produces. Arguments are appended as keywords except for positional-only parameters. `--diff` previews these edits too. This supersedes the 1.1.0 warning that call sites were left alone.
 - Calls are resolved through the calling file's own imports rather than by matching the bare name, so a project with its own `connect` does not have `socket.connect` rewritten, and two modules that each define `helper` are told apart. A method is rewritten when reached through `self`, `cls`, or a class the file can name, whether local, imported, or reached through an imported module, and what it already receives is accounted for, so `instance.fetch(url)`, `Client.fetch(instance, url)`, and a `staticmethod` reached through either are each filled in correctly.
 - `--fix` warns, naming the file and line, about each call it left alone: one it cannot tie to the definition that was fixed, a call unpacking `*args` or `**kwargs`, a removed default that is not a literal, a positional-only argument that cannot be appended, a dataclass that inherits fields, or a function named without being called such as a bare `@decorator`. It still warns that callers outside the checked files, and dynamic calls, are beyond its reach.
@@ -18,16 +21,17 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - `respect_reexports`, and the matching `--respect-reexports` flag, treat a name that a package's `__init__.py` re-exports as public in private-only mode. A helper in `_upload.py` that the package root exports through an import or `__all__` keeps its defaults, because they are public API. A module re-exported under its own name, as in `from . import _upload`, makes what it holds public in the same way. Names behind a `from ... import *` cannot be listed, so every name in that package counts as re-exported. Off by default.
 - `--show-settings` reports `respect-reexports` alongside the enforcement level.
 - A package's `__init__.pyi` is read where it has no `__init__.py`, so a stub-only distribution is treated as a package too. A namespace package, which has neither, no longer hides what the packages above it re-export.
-
-### Performance
-
-- Converting an offset to a line and column is a binary search over each file's line starts rather than a scan from the top of the file, so producing a file's diagnostics is linear in how many it holds instead of quadratic. On a file with 64,000 violations `--output-format concise` went from 5.2 s to 0.06 s, and `full` from 1.7 s at 16,000 to 0.17 s at 64,000.
-- The default `full` output reads and indexes each file once instead of rereading it and walking to the reported line for every diagnostic in it. On a file with 16,000 violations this took reporting from 1.7 s to 0.36 s, which is what the same run costs in `concise`.
-- `per_file_enforcement` glob patterns are compiled once per configuration file rather than once per checked file. Over 3,000 files with a 40-pattern table this took a run from 1.1 s to 0.07 s, which is what the same run costs with no patterns at all.
-
-### Added
-
 - Defaults on `lambda` parameters are reported. A lambda takes the same parameter kinds as a `def` and carries the same late-binding hazard, and the rule was documented as covering defaults in function signatures without excluding them. Because a lambda is anonymous, `--fix` cannot resolve its call sites, so removing one is reported as a call it left alone. The loop-capture idiom `lambda x=x: ...` needs a `# noqa: NOD001`.
+
+### Changed
+
+- A file the parser rejects is reported as a `NOD000` syntax-error diagnostic and the run continues, instead of aborting with exit status `2` and printing nothing for any file. One unparseable file in a tree — a Python 2 module kept for reference, a template saved as `.py`, a file caught mid-edit — no longer hides every other file's diagnostics, which under pre-commit turned into a hook that silently stopped catching regressions. `NOD000` carries no fix, so `--fix` leaves that file alone, counts it as remaining, and exits `1`.
+- A leading UTF-8 byte-order mark is no longer counted as source, so diagnostics on the first line of a BOM-prefixed file report the right column instead of three too far right. `--fix` writes the mark back.
+- Diagnostic columns count characters rather than bytes, matching Ruff. Non-ASCII text earlier on a line no longer shifts the reported column in `full`, `concise`, `json`, and `github` output, or pushes the `^` in `full` output past what it points at, so editor and CI annotations land in the right place.
+- `--fix` writes through a symlink to the file it points at, instead of replacing the link with a regular file and leaving the real source unfixed. Directory walks never followed links, so this only affected a link named on the command line — which is exactly what pre-commit and shell globs produce.
+- Files are deduplicated by canonical path, so naming one file twice under different spellings — `d.py` and `./d.py`, a relative and an absolute form, or a symlink and its target — checks and reports it once instead of twice. The first spelling in sorted order is what diagnostics name.
+- A path named on the command line that exists but is not a `.py` or `.pyi` file is now an operational error rather than being silently dropped. A run that checked nothing was previously indistinguishable from a clean one, so a mistyped path, a wrong `types` setting in `.pre-commit-config.yaml`, or a shell glob that matched the wrong thing reported success over code it never opened. Directory walks still filter to Python files.
+- An unrecognised key in `[tool.no_defaults]` is now an error rather than being silently ignored. Because the presence of that table is also what makes configuration discovery stop at a `pyproject.toml`, a misspelled option previously produced a run that looked configured but used the defaults throughout. This rejects configurations that earlier versions accepted.
 
 ### Fixed
 
@@ -38,7 +42,6 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A nested `def`, `class`, or `lambda` no longer shadows names in the scope holding it, so a call in the outer scope that really does reach a fixed callable is still updated.
 - An absolute import is resolved against the ancestors of the importing file that are not themselves packages, rather than stopping at the first directory without an `__init__.py`. A sibling module at the project root is found from inside a namespace package, a top-level import inside a package no longer resolves to that package's own module, and an import that two candidate roots could answer resolves to neither.
 - The `Found N errors (N fixed, N remaining)` summary reaches standard error under `--output-format json` and `github`, as documented, rather than being dropped.
-
 - Module privacy is judged from the path below the project root rather than from every component of the path as written. A checkout living under a directory whose name starts with an underscore — `_work/proj` — no longer has every symbol in it treated as private under `private_only`, and the answer no longer depends on whether a relative or an absolute path was passed on the command line.
 - A renaming import of a `dataclasses` or `pydantic` member is followed, so `from dataclasses import dataclass as dc` makes `@dc` a dataclass decorator. The class was previously not treated as a dataclass at all, and its field defaults went unreported. The same applies to `field`, `Field`, and the `KW_ONLY` marker, including imports inside an `if TYPE_CHECKING:` block.
 - `--fix` accounts for keyword-only dataclass fields when filling in construction sites. The positional order was built from the fields in source order with nothing consulting `kw_only`, but `dataclasses` moves such a field past the `*` in the generated `__init__`, so every field after it really sat one slot lower than assumed. For `@dataclass class C: a = field(kw_only=True, default=1); b = 2`, `C(5)` became `C(5, b=2)` — which raises `TypeError: got multiple values for argument 'b'` — while the default `a` now needs was dropped. `field(kw_only=...)`, `@dataclass(kw_only=True)`, and the `_: KW_ONLY` marker are all honoured, with the per-field setting winning.
@@ -54,20 +57,15 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A `noqa` directive is recognised anywhere in a comment rather than only at its start, matching Ruff and flake8, so `# type: ignore[misc]  # noqa: NOD001` suppresses the rule. That combination previously did nothing and reported nothing, because the directive was never collected at all, and reordering the pragmas is not always possible. `--fix` removes only the directive's own `#` segment, leaving the other pragma in place.
 - `# ruff:noqa` and `# flake8:noqa` without a space after the colon are recognised as file-level suppressions. Ruff and flake8 both accept that form, and it is common in the wild; only the spaced variants worked before.
 
-### Changed
+### Performance
 
-- A file the parser rejects is reported as a `NOD000` syntax-error diagnostic and the run continues, instead of aborting with exit status `2` and printing nothing for any file. One unparseable file in a tree — a Python 2 module kept for reference, a template saved as `.py`, a file caught mid-edit — no longer hides every other file's diagnostics, which under pre-commit turned into a hook that silently stopped catching regressions. `NOD000` carries no fix, so `--fix` leaves that file alone, counts it as remaining, and exits `1`.
-- A leading UTF-8 byte-order mark is no longer counted as source, so diagnostics on the first line of a BOM-prefixed file report the right column instead of three too far right. `--fix` writes the mark back.
-- Diagnostic columns count characters rather than bytes, matching Ruff. Non-ASCII text earlier on a line no longer shifts the reported column in `full`, `concise`, `json`, and `github` output, or pushes the `^` in `full` output past what it points at, so editor and CI annotations land in the right place.
-- `--fix` writes through a symlink to the file it points at, instead of replacing the link with a regular file and leaving the real source unfixed. Directory walks never followed links, so this only affected a link named on the command line — which is exactly what pre-commit and shell globs produce.
-- Files are deduplicated by canonical path, so naming one file twice under different spellings — `d.py` and `./d.py`, a relative and an absolute form, or a symlink and its target — checks and reports it once instead of twice. The first spelling in sorted order is what diagnostics name.
-- A path named on the command line that exists but is not a `.py` or `.pyi` file is now an operational error rather than being silently dropped. A run that checked nothing was previously indistinguishable from a clean one, so a mistyped path, a wrong `types` setting in `.pre-commit-config.yaml`, or a shell glob that matched the wrong thing reported success over code it never opened. Directory walks still filter to Python files.
-- An unrecognised key in `[tool.no_defaults]` is now an error rather than being silently ignored. Because the presence of that table is also what makes configuration discovery stop at a `pyproject.toml`, a misspelled option previously produced a run that looked configured but used the defaults throughout. This rejects configurations that earlier versions accepted.
+- Converting an offset to a line and column is a binary search over each file's line starts rather than a scan from the top of the file, so producing a file's diagnostics is linear in how many it holds instead of quadratic. On a file with 64,000 violations `--output-format concise` went from 5.2 s to 0.06 s, and `full` from 1.7 s at 16,000 to 0.17 s at 64,000.
+- The default `full` output reads and indexes each file once instead of rereading it and walking to the reported line for every diagnostic in it. On a file with 16,000 violations this took reporting from 1.7 s to 0.36 s, which is what the same run costs in `concise`.
+- `per_file_enforcement` glob patterns are compiled once per configuration file rather than once per checked file. Over 3,000 files with a 40-pattern table this took a run from 1.1 s to 0.07 s, which is what the same run costs with no patterns at all.
 
 ### Documentation
 
 - Document which call sites `--fix` updates, which it deliberately leaves alone, and why.
-
 ## 1.1.0 - 2026-08-06
 
 ### Added

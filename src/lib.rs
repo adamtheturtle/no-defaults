@@ -2607,11 +2607,16 @@ fn collect_bindings(
                         .as_ref()
                         .map_or_else(|| name.to_owned(), ToString::to_string);
                     // `from package import module` names a module, not a
-                    // symbol, when it resolves to a file of its own.
-                    let submodule = import
-                        .module
-                        .as_ref()
-                        .map(|parent| format!("{}.{name}", parent.as_str()))
+                    // symbol, when it resolves to a file of its own. So does
+                    // `from . import module`, the idiomatic way to import a
+                    // sibling, where there is no module name to build on and
+                    // the level alone says where to look.
+                    let dotted = match import.module.as_ref() {
+                        Some(parent) => Some(format!("{}.{name}", parent.as_str())),
+                        None if import.level > 0 => Some(name.to_owned()),
+                        None => None,
+                    };
+                    let submodule = dotted
                         .and_then(|dotted| resolve_module(&dotted, import.level, importer, known));
                     bindings.insert(
                         bound,

@@ -593,9 +593,47 @@ struct JsonDiagnostic<'a> {
     message: &'a str,
 }
 
+/// A file's text with the offset each of its lines starts at, so quoting a line
+/// in `full` output costs neither a reread nor a walk from the top of the file.
+struct SourceLines {
+    text: String,
+    starts: Vec<usize>,
+}
+
+impl SourceLines {
+    fn read(path: &Path) -> Option<Self> {
+        let text = read_source(path).ok()?;
+        // An empty file has no lines at all, so it gets no first line either.
+        let starts = if text.is_empty() {
+            Vec::new()
+        } else {
+            std::iter::once(0)
+                .chain(
+                    text.match_indices('\n')
+                        .map(|(position, _)| position + 1)
+                        .filter(|start| *start < text.len()),
+                )
+                .collect()
+        };
+        Some(Self { text, starts })
+    }
+
+    /// The one-based `number`th line, without its line break.
+    fn line(&self, number: usize) -> Option<&str> {
+        let start = *self.starts.get(number.checked_sub(1)?)?;
+        let end = self.starts.get(number).copied().unwrap_or(self.text.len());
+        Some(self.text[start..end].trim_end_matches(['\n', '\r']))
+    }
+}
+
 fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Result<(), String> {
     match format {
         OutputFormat::Full => {
+            // Diagnostics are sorted by path, so one file at a time is read
+            // and indexed. Rereading and rewalking per diagnostic made this
+            // quadratic in the violations a file holds, and `full` is the
+            // default format.
+            let mut quoted: Option<(&Path, Option<SourceLines>)> = None;
             for diagnostic in diagnostics {
                 println!(
                     "{}:{}:{}: {} {}",
@@ -605,21 +643,27 @@ fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Resul
                     diagnostic.code,
                     diagnostic.message
                 );
-                if let Ok(source) = read_source(&diagnostic.path) {
-                    if let Some(line) = source.lines().nth(diagnostic.line.saturating_sub(1)) {
-                        let width = diagnostic.line.to_string().len();
-                        println!("{space:width$} |", space = "", width = width);
-                        println!("{} | {}", diagnostic.line, line);
-                        println!(
-                            "{space:width$} | {caret:>column$}",
-                            space = "",
-                            caret = "^",
-                            width = width,
-                            column = diagnostic.column
-                        );
-                        println!("{space:width$} |", space = "", width = width);
-                    }
+                let path = diagnostic.path.as_path();
+                if quoted.as_ref().is_none_or(|(cached, _)| *cached != path) {
+                    quoted = Some((path, SourceLines::read(path)));
                 }
+                let Some((_, Some(source))) = &quoted else {
+                    continue;
+                };
+                let Some(line) = source.line(diagnostic.line) else {
+                    continue;
+                };
+                let width = diagnostic.line.to_string().len();
+                println!("{space:width$} |", space = "", width = width);
+                println!("{} | {}", diagnostic.line, line);
+                println!(
+                    "{space:width$} | {caret:>column$}",
+                    space = "",
+                    caret = "^",
+                    width = width,
+                    column = diagnostic.column
+                );
+                println!("{space:width$} |", space = "", width = width);
             }
         }
         OutputFormat::Concise => {
@@ -2585,6 +2629,32 @@ mod tests {
         .into_iter()
         .map(|item| (item.line, item.column))
         .collect())
+    }
+
+    #[test]
+    fn indexed_lines_match_walking_the_source() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.py");
+        for text in [
+            "one\ntwo\nthree\n",
+            "one\ntwo\nthree",
+            "one\r\ntwo\r\n",
+            "\n\nthird\n",
+            "single",
+            "trailing\n\n",
+            "",
+        ] {
+            std::fs::write(&path, text).map_err(|error| error.to_string())?;
+            let source = SourceLines::read(&path).ok_or("expected to read the file")?;
+            let walked: Vec<&str> = text.lines().collect();
+            let indexed: Vec<&str> = (1..=walked.len())
+                .map(|number| source.line(number).unwrap_or("<missing>"))
+                .collect();
+            assert_eq!(indexed, walked, "{text:?}");
+            assert_eq!(source.line(walked.len() + 1), None, "{text:?}");
+            assert_eq!(source.line(0), None, "{text:?}");
+        }
+        Ok(())
     }
 
     #[test]

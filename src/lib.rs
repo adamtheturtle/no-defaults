@@ -197,7 +197,9 @@ struct Diagnostic {
     column: usize,
     code: &'static str,
     message: String,
-    fix: TextRange,
+    /// The text to delete to fix this, or `None` when there is nothing to
+    /// delete — a syntax error is reported but cannot be fixed away.
+    fix: Option<TextRange>,
 }
 
 /// A default that `--fix` removed, and the argument that replaces it.
@@ -401,12 +403,15 @@ fn run() -> Result<bool, String> {
     if fixing && !diagnostics.is_empty() {
         let mut call_sites = call_site_edits(&files, signatures)?;
         for diagnostic in &diagnostics {
+            let Some(range) = diagnostic.fix else {
+                continue;
+            };
             call_sites
                 .edits
                 .entry(diagnostic.path.clone())
                 .or_default()
                 .push(Edit {
-                    range: diagnostic.fix,
+                    range,
                     replacement: String::new(),
                 });
         }
@@ -418,14 +423,20 @@ fn run() -> Result<bool, String> {
             return Ok(true);
         }
         write_fixes_atomically(changes)?;
+        // A syntax error carries no fix, so it is still there afterwards and
+        // the run has to say so rather than claim everything was fixed.
+        let remaining = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.fix.is_none())
+            .count();
         println!(
-            "Found {} error{} ({} fixed, 0 remaining).",
+            "Found {} error{} ({} fixed, {remaining} remaining).",
             diagnostics.len(),
             if diagnostics.len() == 1 { "" } else { "s" },
-            diagnostics.len()
+            diagnostics.len() - remaining,
         );
         report_call_sites(&diagnostics, &call_sites.skipped, updated);
-        return Ok(false);
+        return Ok(remaining > 0);
     }
     report_diagnostics(&diagnostics, cli.output_format)?;
     Ok(!diagnostics.is_empty())
@@ -504,7 +515,14 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         .par_iter()
         .map(|path| {
             let source = read_source(path)?;
-            rewrite_calls(path, &source, &definitions, &known)
+            // A file the parser rejects holds no calls this pass can see. It
+            // is reported as a syntax error by the checker, so skipping it
+            // here leaves the rest of the project fixable.
+            match rewrite_calls(path, &source, &definitions, &known) {
+                Ok(file) => Ok(file),
+                Err(_) if parse_module(&source).is_err() => Ok(FileCallSites::default()),
+                Err(error) => Err(error),
+            }
         })
         .collect();
     for (path, result) in files.iter().zip(results) {
@@ -1281,7 +1299,7 @@ pub fn lint_source(source: &str, private_only: bool) -> Result<usize, String> {
         &Reexports::default(),
         &FieldBases::new(&default_field_base_classes()),
         false,
-    )?
+    )
     .diagnostics
     .len())
 }
@@ -1294,14 +1312,34 @@ fn check_file(
     signatures: bool,
 ) -> Result<Checked, String> {
     let source = read_source(path)?;
-    check_source(
+    Ok(check_source(
         path,
         &source,
         private_only,
         reexports,
         field_bases,
         signatures,
-    )
+    ))
+}
+
+/// The one diagnostic a file the parser rejects produces.
+///
+/// It carries no fix: there is nothing to delete, and the file is left out of
+/// the fixing pass entirely so a syntax error in one file cannot stop the rest
+/// of the project from being fixed.
+fn syntax_error(path: &Path, source: &str, error: &ruff_python_parser::ParseError) -> Checked {
+    let (line, column) = line_column(source, error.location.start());
+    Checked {
+        diagnostics: vec![Diagnostic {
+            path: path.to_path_buf(),
+            line,
+            column,
+            code: "NOD000",
+            message: format!("syntax error: {}", error.error),
+            fix: None,
+        }],
+        signatures: Vec::new(),
+    }
 }
 
 /// Check one file. `signatures` records what each fixed callable looks like so
@@ -1314,9 +1352,15 @@ fn check_source(
     reexports: &Reexports,
     field_bases: &FieldBases,
     signatures: bool,
-) -> Result<Checked, String> {
-    let parsed = parse_module(source)
-        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+) -> Checked {
+    // A file the parser rejects is reported like any other finding and the run
+    // carries on. A tree often holds something unparseable — a Python 2 file
+    // kept for reference, a template saved as `.py`, a file being edited — and
+    // aborting would hide every other file's diagnostics.
+    let parsed = match parse_module(source) {
+        Ok(parsed) => parsed,
+        Err(error) => return syntax_error(path, source, &error),
+    };
     let directives = collect_directives(source, parsed.tokens());
     // A blanket file-level directive silences every rule for the file,
     // including the unused-directive rule itself.
@@ -1324,7 +1368,7 @@ fn check_source(
         .iter()
         .any(|directive| directive.file_level && !directive.explicit)
     {
-        return Ok(Checked::default());
+        return Checked::default();
     }
     let mut checker = Checker {
         path,
@@ -1346,7 +1390,7 @@ fn check_source(
     for statement in parsed.suite() {
         checker.visit_stmt(statement);
     }
-    Ok(checker.finish())
+    checker.finish()
 }
 
 /// A `noqa` directive that suppresses this linter's rule.
@@ -1615,7 +1659,7 @@ impl Checker<'_> {
             column,
             code: "NOD001",
             message,
-            fix,
+            fix: Some(fix),
         });
         true
     }
@@ -1634,7 +1678,7 @@ impl Checker<'_> {
                 column,
                 code: "NOD002",
                 message: "unused `noqa` directive for `NOD001`".to_owned(),
-                fix: directive.fix,
+                fix: Some(directive.fix),
             });
         }
         self.diagnostics
@@ -2616,19 +2660,19 @@ mod tests {
         FieldBases::new(&default_field_base_classes())
     }
 
-    fn positions(source: &str) -> Result<Vec<(usize, usize)>, String> {
-        Ok(check_source(
+    fn positions(source: &str) -> Vec<(usize, usize)> {
+        check_source(
             Path::new("fixture.py"),
             source,
             false,
             &Reexports::default(),
             &default_bases(),
             false,
-        )?
+        )
         .diagnostics
         .into_iter()
         .map(|item| (item.line, item.column))
-        .collect())
+        .collect()
     }
 
     #[test]
@@ -2658,45 +2702,44 @@ mod tests {
     }
 
     #[test]
-    fn columns_count_characters_rather_than_bytes() -> Result<(), String> {
+    fn columns_count_characters_rather_than_bytes() {
         // `ä` is two bytes, so a byte column would report 10 for the `1`.
-        assert_eq!(positions("def f(ä=1):\n    pass\n")?, [(1, 9)]);
-        assert_eq!(positions("def f(x=1):\n    pass\n")?, [(1, 9)]);
+        assert_eq!(positions("def f(ä=1):\n    pass\n"), [(1, 9)]);
+        assert_eq!(positions("def f(x=1):\n    pass\n"), [(1, 9)]);
         // An emoji outside the basic multilingual plane is one character.
-        assert_eq!(positions("def f(𝔞=1):\n    pass\n")?, [(1, 9)]);
+        assert_eq!(positions("def f(𝔞=1):\n    pass\n"), [(1, 9)]);
         // Lines after the first are measured from their own start.
-        assert_eq!(positions("# ä\ndef f(ä=1): pass\n")?, [(2, 9)]);
-        Ok(())
+        assert_eq!(positions("# ä\ndef f(ä=1): pass\n"), [(2, 9)]);
     }
 
-    fn messages(source: &str, private_only: bool) -> Result<Vec<String>, String> {
-        Ok(check_source(
+    fn messages(source: &str, private_only: bool) -> Vec<String> {
+        check_source(
             Path::new("fixture.py"),
             source,
             private_only,
             &Reexports::default(),
             &default_bases(),
             false,
-        )?
+        )
         .diagnostics
         .into_iter()
         .map(|item| item.message)
-        .collect())
+        .collect()
     }
 
-    fn codes(source: &str) -> Result<Vec<&'static str>, String> {
-        Ok(check_source(
+    fn codes(source: &str) -> Vec<&'static str> {
+        check_source(
             Path::new("fixture.py"),
             source,
             false,
             &Reexports::default(),
             &default_bases(),
             false,
-        )?
+        )
         .diagnostics
         .into_iter()
         .map(|item| item.code)
-        .collect())
+        .collect()
     }
 
     /// Fix every file in `directory` the way `--fix` does, and report the calls
@@ -2711,12 +2754,15 @@ mod tests {
         }
         let mut call_sites = call_site_edits(files, signatures)?;
         for diagnostic in &diagnostics {
+            let Some(range) = diagnostic.fix else {
+                continue;
+            };
             call_sites
                 .edits
                 .entry(diagnostic.path.clone())
                 .or_default()
                 .push(Edit {
-                    range: diagnostic.fix,
+                    range,
                     replacement: String::new(),
                 });
         }
@@ -2754,46 +2800,44 @@ mod tests {
     }
 
     #[test]
-    fn detects_every_parameter_kind() -> Result<(), String> {
-        let found = messages("def f(a=1, /, b=2, *, c=3): pass\n", false)?;
+    fn detects_every_parameter_kind() {
+        let found = messages("def f(a=1, /, b=2, *, c=3): pass\n", false);
         assert_eq!(found.len(), 3);
-        Ok(())
     }
 
     #[test]
-    fn detects_dataclass_defaults_but_not_class_vars() -> Result<(), String> {
+    fn detects_dataclass_defaults_but_not_class_vars() {
         let found = messages(
             "@dataclass\nclass C:\n x: int = 1\n y: list = field(default_factory=list)\n z: ClassVar[int] = 2\n no_default: int = field()\n",
             false,
-        )?;
+        );
         assert_eq!(found.len(), 2);
         assert!(found[1].contains("default factory"));
-        Ok(())
     }
 
     /// Check `source` with `bases` standing in for the configured base classes.
-    fn messages_with_bases(source: &str, bases: &[&str]) -> Result<Vec<String>, String> {
+    fn messages_with_bases(source: &str, bases: &[&str]) -> Vec<String> {
         let names: Vec<String> = bases.iter().map(|name| (*name).to_owned()).collect();
-        Ok(check_source(
+        check_source(
             Path::new("fixture.py"),
             source,
             false,
             &Reexports::default(),
             &FieldBases::new(&names),
             false,
-        )?
+        )
         .diagnostics
         .into_iter()
         .map(|item| item.message)
-        .collect())
+        .collect()
     }
 
     #[test]
-    fn detects_defaults_on_a_pydantic_model() -> Result<(), String> {
+    fn detects_defaults_on_a_pydantic_model() {
         let found = messages(
             "class Job(BaseModel):\n x: int = 1\n y: list = Field(default_factory=list)\n",
             false,
-        )?;
+        );
         assert_eq!(
             found,
             [
@@ -2801,53 +2845,47 @@ mod tests {
                 "class field `y` has a default factory",
             ]
         );
-        Ok(())
     }
 
     #[test]
-    fn a_base_class_is_recognised_however_it_is_named() -> Result<(), String> {
+    fn a_base_class_is_recognised_however_it_is_named() {
         let found = messages(
             "class A(pydantic.BaseModel):\n x: int = 1\nclass B(BaseModel, Generic[T]):\n y: int = 2\n",
             false,
-        )?;
+        );
         assert_eq!(found.len(), 2);
-        Ok(())
     }
 
     #[test]
-    fn an_unconfigured_base_class_carries_no_fields() -> Result<(), String> {
-        let found = messages_with_bases("class Job(BaseModel):\n x: int = 1\n", &[])?;
+    fn an_unconfigured_base_class_carries_no_fields() {
+        let found = messages_with_bases("class Job(BaseModel):\n x: int = 1\n", &[]);
         assert!(found.is_empty(), "{found:?}");
-        Ok(())
     }
 
     #[test]
-    fn a_configured_base_class_carries_fields() -> Result<(), String> {
+    fn a_configured_base_class_carries_fields() {
         let found = messages_with_bases(
             "class Job(msgspec.Struct):\n x: int = 1\nclass Other(BaseModel):\n y: int = 2\n",
             &["msgspec.Struct"],
-        )?;
+        );
         assert_eq!(found, ["class field `x` has a default"]);
-        Ok(())
     }
 
     #[test]
-    fn an_ellipsis_marks_a_pydantic_field_required_rather_than_defaulted() -> Result<(), String> {
+    fn an_ellipsis_marks_a_pydantic_field_required_rather_than_defaulted() {
         let found = messages(
             "class Job(BaseModel):\n x: int = Field(...)\n y: int = Field(..., description=\"d\")\n z: int = Field(default=...)\n",
             false,
-        )?;
+        );
         assert!(found.is_empty(), "{found:?}");
-        Ok(())
     }
 
     /// `dataclasses.field` has no such convention: its first argument is the
     /// default, whatever it is.
     #[test]
-    fn an_ellipsis_is_still_a_dataclass_default() -> Result<(), String> {
-        let found = messages("@dataclass\nclass C:\n x: int = field(...)\n", false)?;
+    fn an_ellipsis_is_still_a_dataclass_default() {
+        let found = messages("@dataclass\nclass C:\n x: int = field(...)\n", false);
         assert_eq!(found, ["dataclass field `x` has a default"]);
-        Ok(())
     }
 
     #[test]
@@ -2863,22 +2901,20 @@ mod tests {
     }
 
     #[test]
-    fn class_level_assignments_that_declare_no_field_are_left_alone() -> Result<(), String> {
+    fn class_level_assignments_that_declare_no_field_are_left_alone() {
         let found = messages(
             "class Job(BaseModel):\n model_config = ConfigDict(frozen=True)\n kind: ClassVar[str] = \"job\"\n def build(self) -> None:\n  seen: set[str] = set()\n",
             false,
-        )?;
+        );
         assert!(found.is_empty(), "{found:?}");
-        Ok(())
     }
 
     /// A model whose base is another model takes fields this file's class body
     /// does not list, so it is not treated as carrying fields at all.
     #[test]
-    fn a_model_subclass_is_left_alone() -> Result<(), String> {
-        let found = messages("class Sub(Job):\n x: int = 1\n", false)?;
+    fn a_model_subclass_is_left_alone() {
+        let found = messages("class Sub(Job):\n x: int = 1\n", false);
         assert!(found.is_empty(), "{found:?}");
-        Ok(())
     }
 
     #[test]
@@ -2902,149 +2938,137 @@ mod tests {
     }
 
     #[test]
-    fn a_directive_on_a_model_header_covers_every_field() -> Result<(), String> {
-        let found = codes("class Job(BaseModel):  # noqa: NOD001\n x: int = 1\n y: int = 2\n")?;
+    fn a_directive_on_a_model_header_covers_every_field() {
+        let found = codes("class Job(BaseModel):  # noqa: NOD001\n x: int = 1\n y: int = 2\n");
         assert!(found.is_empty(), "{found:?}");
-        Ok(())
     }
 
     #[test]
-    fn quoted_class_var_annotations_are_not_fields() -> Result<(), String> {
+    fn quoted_class_var_annotations_are_not_fields() {
         let found = messages(
             "@dataclass\nclass C:\n a: \"ClassVar[int]\" = 1\n b: \"typing.ClassVar[int]\" = 2\n c: 'ClassVar' = 3\n d: \"  ClassVar[int]  \" = 4\n",
             false,
-        )?;
+        );
         assert!(found.is_empty(), "{found:?}");
-        Ok(())
     }
 
     #[test]
-    fn quoted_non_class_var_annotations_are_still_fields() -> Result<(), String> {
+    fn quoted_non_class_var_annotations_are_still_fields() {
         let found = messages(
             "@dataclass\nclass C:\n a: \"int\" = 1\n b: \"NotClassVar[int]\" = 2\n c: \"((\" = 3\n",
             false,
-        )?;
+        );
         assert_eq!(found.len(), 3, "{found:?}");
-        Ok(())
     }
 
     #[test]
-    fn ignores_annotated_locals_in_dataclass_methods() -> Result<(), String> {
+    fn ignores_annotated_locals_in_dataclass_methods() {
         let found = messages(
             "@dataclass\nclass C:\n x: int = 1\n def _validate(self) -> None:\n  seen: set[str] = set()\n  def inner() -> None:\n   nested: int = 0\n",
             false,
-        )?;
+        );
         assert_eq!(found, ["dataclass field `x` has a default"]);
-        Ok(())
     }
 
     #[test]
-    fn ignores_annotated_locals_in_async_dataclass_methods() -> Result<(), String> {
+    fn ignores_annotated_locals_in_async_dataclass_methods() {
         let found = messages(
             "@dataclass\nclass C:\n async def _fetch(self) -> None:\n  chunks: list[str] = []\n",
             false,
-        )?;
+        );
         assert!(found.is_empty(), "{found:?}");
-        Ok(())
     }
 
     #[test]
-    fn detects_fields_of_dataclass_nested_in_a_method() -> Result<(), String> {
+    fn detects_fields_of_dataclass_nested_in_a_method() {
         let found = messages(
             "@dataclass\nclass C:\n def build(self) -> None:\n  local: int = 0\n  @dataclass\n  class Inner:\n   y: int = 2\n",
             false,
-        )?;
+        );
         assert_eq!(found, ["dataclass field `y` has a default"]);
-        Ok(())
     }
 
     #[test]
-    fn resumes_field_detection_after_a_method() -> Result<(), String> {
+    fn resumes_field_detection_after_a_method() {
         let found = messages(
             "@dataclass\nclass C:\n def _validate(self) -> None:\n  local: int = 0\n after: int = 3\n",
             false,
-        )?;
+        );
         assert_eq!(found, ["dataclass field `after` has a default"]);
-        Ok(())
     }
 
     #[test]
-    fn private_only_checks_private_symbols() -> Result<(), String> {
+    fn private_only_checks_private_symbols() {
         let found = messages(
             "def public(x=1): pass\ndef _private(x=1): pass\n@dataclass\nclass C:\n public: int = 1\n _private: int = 2\n",
             true,
-        )?;
+        );
         assert_eq!(found.len(), 2);
-        Ok(())
     }
 
     /// The violations found in a private module whose package re-exports the
     /// given names.
-    fn private_module_messages(source: &str, reexported: &[&str]) -> Result<Vec<String>, String> {
+    fn private_module_messages(source: &str, reexported: &[&str]) -> Vec<String> {
         let reexports = Reexports {
             wildcard: false,
             names: reexported.iter().map(|name| (*name).to_owned()).collect(),
         };
-        Ok(check_source(
+        check_source(
             Path::new("package/_upload.py"),
             source,
             true,
             &reexports,
             &default_bases(),
             false,
-        )?
+        )
         .diagnostics
         .into_iter()
         .map(|item| item.message)
-        .collect())
+        .collect()
     }
 
     #[test]
-    fn a_reexported_name_is_public_however_private_its_module_is() -> Result<(), String> {
+    fn a_reexported_name_is_public_however_private_its_module_is() {
         let source = "def upload(timeout=30): pass\ndef helper(x=1): pass\n";
-        let found = private_module_messages(source, &["upload"])?;
+        let found = private_module_messages(source, &["upload"]);
         assert_eq!(found, ["parameter `x` of function `helper` has a default"]);
-        Ok(())
     }
 
     #[test]
-    fn a_reexported_class_carries_its_members_into_the_public_api() -> Result<(), String> {
+    fn a_reexported_class_carries_its_members_into_the_public_api() {
         let source =
             "class _Client:\n def fetch(self, retries=3): pass\n def _retry(self, x=1): pass\n";
-        let found = private_module_messages(source, &["_Client"])?;
+        let found = private_module_messages(source, &["_Client"]);
         assert_eq!(
             found,
             ["parameter `x` of function `_retry` has a default"],
             "a private method of a public class is still private"
         );
-        assert_eq!(private_module_messages(source, &[])?.len(), 2);
-        Ok(())
+        assert_eq!(private_module_messages(source, &[]).len(), 2);
     }
 
     #[test]
-    fn a_reexported_dataclass_keeps_its_field_defaults() -> Result<(), String> {
+    fn a_reexported_dataclass_keeps_its_field_defaults() {
         let source = "@dataclass\nclass Job:\n retries: int = 3\n";
-        assert!(private_module_messages(source, &["Job"])?.is_empty());
-        assert_eq!(private_module_messages(source, &[])?.len(), 1);
-        Ok(())
+        assert!(private_module_messages(source, &["Job"]).is_empty());
+        assert_eq!(private_module_messages(source, &[]).len(), 1);
     }
 
     #[test]
-    fn a_module_reexported_under_its_own_name_is_public() -> Result<(), String> {
+    fn a_module_reexported_under_its_own_name_is_public() {
         // `from . import _upload` makes `package._upload.upload` reachable.
         let source = "def upload(timeout=30): pass\ndef _helper(x=1): pass\n";
-        let found = private_module_messages(source, &["_upload"])?;
+        let found = private_module_messages(source, &["_upload"]);
         assert_eq!(
             found,
             ["parameter `x` of function `_helper` has a default"],
             "a private name in a reachable module is still private"
         );
-        assert_eq!(private_module_messages(source, &[])?.len(), 2);
-        Ok(())
+        assert_eq!(private_module_messages(source, &[]).len(), 2);
     }
 
     #[test]
-    fn a_directive_on_a_reexported_signature_becomes_unused() -> Result<(), String> {
+    fn a_directive_on_a_reexported_signature_becomes_unused() {
         let reexports = Reexports {
             wildcard: false,
             names: BTreeSet::from(["upload".to_owned()]),
@@ -3056,18 +3080,17 @@ mod tests {
             &reexports,
             &default_bases(),
             false,
-        )?;
+        );
         let codes: Vec<&str> = found
             .diagnostics
             .iter()
             .map(|diagnostic| diagnostic.code)
             .collect();
         assert_eq!(codes, ["NOD002"]);
-        Ok(())
     }
 
     #[test]
-    fn a_wildcard_reexport_makes_every_name_public() -> Result<(), String> {
+    fn a_wildcard_reexport_makes_every_name_public() {
         let reexports = Reexports {
             wildcard: true,
             names: BTreeSet::new(),
@@ -3079,9 +3102,8 @@ mod tests {
             &reexports,
             &default_bases(),
             false,
-        )?;
+        );
         assert!(found.diagnostics.is_empty());
-        Ok(())
     }
 
     #[test]
@@ -3245,14 +3267,13 @@ mod tests {
     }
 
     #[test]
-    fn noqa_suppresses_blanket_and_selected_violations() -> Result<(), String> {
+    fn noqa_suppresses_blanket_and_selected_violations() {
         let found = messages(
             "def a(x=1): pass  # noqa\ndef b(x=1): pass  # noqa: E501, NOD001\ndef c(x=1): pass  # noqa: E501\n",
             false,
-        )?;
+        );
         assert_eq!(found.len(), 1);
         assert!(found[0].contains("function `c`"));
-        Ok(())
     }
 
     #[test]
@@ -3399,50 +3420,47 @@ mod tests {
     }
 
     #[test]
-    fn file_level_noqa_suppresses_rule() -> Result<(), String> {
-        assert!(codes("# ruff: noqa: NOD001\ndef f(x=1): pass\n")?.is_empty());
-        assert_eq!(codes("# ruff: noqa: E501\ndef f(x=1): pass\n")?, ["NOD001"]);
-        assert!(codes("# ruff: noqa\ndef f(x=1): pass\n")?.is_empty());
-        assert!(codes("# flake8: noqa\ndef f(x=1): pass\n")?.is_empty());
-        Ok(())
+    fn file_level_noqa_suppresses_rule() {
+        assert!(codes("# ruff: noqa: NOD001\ndef f(x=1): pass\n").is_empty());
+        assert_eq!(codes("# ruff: noqa: E501\ndef f(x=1): pass\n"), ["NOD001"]);
+        assert!(codes("# ruff: noqa\ndef f(x=1): pass\n").is_empty());
+        assert!(codes("# flake8: noqa\ndef f(x=1): pass\n").is_empty());
     }
 
     #[test]
-    fn a_directive_on_the_def_line_covers_the_whole_signature() -> Result<(), String> {
+    fn a_directive_on_the_def_line_covers_the_whole_signature() {
         assert!(
-            codes("def f(  # noqa: NOD001\n    a=1,\n    b=2,\n):\n    pass\n")?.is_empty(),
+            codes("def f(  # noqa: NOD001\n    a=1,\n    b=2,\n):\n    pass\n").is_empty(),
             "one directive covers every parameter of the signature"
         );
         assert!(
-            codes("@decorator\nasync def f(  # noqa: NOD001\n    a=1,\n) -> None:\n    pass\n")?
+            codes("@decorator\nasync def f(  # noqa: NOD001\n    a=1,\n) -> None:\n    pass\n")
                 .is_empty(),
             "decorators do not move the `def` line"
         );
         assert!(
-            codes("def f(  # noqa\n    a=1,\n):\n    pass\n")?.is_empty(),
+            codes("def f(  # noqa\n    a=1,\n):\n    pass\n").is_empty(),
             "a blanket directive on the `def` line covers the signature too"
         );
         assert_eq!(
-            codes("def f(  # noqa: E501\n    a=1,\n):\n    pass\n")?,
+            codes("def f(  # noqa: E501\n    a=1,\n):\n    pass\n"),
             ["NOD001"],
             "directives for other rules suppress nothing"
         );
-        Ok(())
     }
 
     #[test]
-    fn a_directive_on_the_def_line_stops_at_the_signature() -> Result<(), String> {
+    fn a_directive_on_the_def_line_stops_at_the_signature() {
         assert_eq!(
-            codes("def f(  # noqa: NOD001\n    a,\n):\n    def inner(b=1): pass\n")?,
+            codes("def f(  # noqa: NOD001\n    a,\n):\n    def inner(b=1): pass\n"),
             ["NOD002", "NOD001"],
             "a nested function keeps its own violations and leaves the directive unused"
         );
         assert_eq!(
-            codes("def f(\n    a=1,\n):  # noqa: NOD001\n    pass\n")?,
+            codes("def f(\n    a=1,\n):  # noqa: NOD001\n    pass\n"),
             ["NOD001", "NOD002"],
             "only the `def` line carries a signature-wide directive"
         );
-        Ok(())
     }
 
     #[test]
@@ -3453,39 +3471,37 @@ mod tests {
     }
 
     #[test]
-    fn a_directive_on_the_class_line_covers_every_field() -> Result<(), String> {
+    fn a_directive_on_the_class_line_covers_every_field() {
         assert!(
             codes(
                 "@dataclass\nclass Job:  # noqa: NOD001\n    retries: int = 3\n    tags: list[str] = field(default_factory=list)\n"
-            )?
+            )
             .is_empty(),
             "one directive covers every field of the dataclass"
         );
         assert_eq!(
-            codes("@dataclass\nclass Job:  # noqa: NOD001\n    name: str\n")?,
+            codes("@dataclass\nclass Job:  # noqa: NOD001\n    name: str\n"),
             ["NOD002"],
             "a class directive that suppresses nothing is unused"
         );
-        Ok(())
     }
 
     #[test]
-    fn a_directive_on_the_class_line_stops_at_the_fields() -> Result<(), String> {
+    fn a_directive_on_the_class_line_stops_at_the_fields() {
         assert_eq!(
             codes(
                 "@dataclass\nclass Job:  # noqa: NOD001\n    retries: int = 3\n\n    def run(self, timeout=30): pass\n"
-            )?,
+            ),
             ["NOD001"],
             "a method keeps the violations of its own signature"
         );
         assert_eq!(
             codes(
                 "@dataclass\nclass Outer:  # noqa: NOD001\n    @dataclass\n    class Inner:\n        retries: int = 3\n"
-            )?,
+            ),
             ["NOD002", "NOD001"],
             "a nested dataclass needs its own directive"
         );
-        Ok(())
     }
 
     #[test]
@@ -3496,48 +3512,46 @@ mod tests {
     }
 
     #[test]
-    fn unused_directives_are_reported() -> Result<(), String> {
+    fn unused_directives_are_reported() {
         assert_eq!(
-            codes("def f(x): pass  # noqa: NOD001\n")?,
+            codes("def f(x): pass  # noqa: NOD001\n"),
             ["NOD002"],
             "an inline directive that suppresses nothing is unused"
         );
         assert!(
-            codes("def f(x): pass  # noqa\n")?.is_empty(),
+            codes("def f(x): pass  # noqa\n").is_empty(),
             "a blanket directive may serve another linter"
         );
         assert!(
-            codes("def f(x): pass  # noqa: E501\n")?.is_empty(),
+            codes("def f(x): pass  # noqa: E501\n").is_empty(),
             "directives for other rules are not this linter's business"
         );
         assert_eq!(
-            codes("# ruff: noqa: NOD001\ndef f(x): pass\n")?,
+            codes("# ruff: noqa: NOD001\ndef f(x): pass\n"),
             ["NOD002"],
             "a file-level directive that suppresses nothing is unused"
         );
         assert!(
-            codes("# ruff: noqa\ndef f(x): pass  # noqa: NOD001\n")?.is_empty(),
+            codes("# ruff: noqa\ndef f(x): pass  # noqa: NOD001\n").is_empty(),
             "a blanket file-level directive silences every rule"
         );
-        Ok(())
     }
 
     #[test]
-    fn a_file_level_directive_claims_the_inline_directives_it_covers() -> Result<(), String> {
+    fn a_file_level_directive_claims_the_inline_directives_it_covers() {
         assert!(
-            codes("# ruff: noqa: NOD001\ndef f(x=1): pass  # noqa: NOD001\n")?.is_empty(),
+            codes("# ruff: noqa: NOD001\ndef f(x=1): pass  # noqa: NOD001\n").is_empty(),
             "both directives cover the same violation"
         );
         assert_eq!(
-            codes("# ruff: noqa: NOD001\ndef f(x=1): pass\ndef g(x): pass  # noqa: NOD001\n")?,
+            codes("# ruff: noqa: NOD001\ndef f(x=1): pass\ndef g(x): pass  # noqa: NOD001\n"),
             ["NOD002"],
             "only the inline directive covering nothing is unused"
         );
-        Ok(())
     }
 
     #[test]
-    fn private_only_makes_directives_for_public_symbols_unused() -> Result<(), String> {
+    fn private_only_makes_directives_for_public_symbols_unused() {
         let found = check_source(
             Path::new("fixture.py"),
             "def public(x=1): pass  # noqa: NOD001\n",
@@ -3545,7 +3559,7 @@ mod tests {
             &Reexports::default(),
             &default_bases(),
             false,
-        )?;
+        );
         assert_eq!(
             found
                 .diagnostics
@@ -3555,25 +3569,23 @@ mod tests {
                 .as_slice(),
             ["NOD002"]
         );
-        Ok(())
     }
 
     #[test]
-    fn text_that_only_looks_like_a_directive_is_ignored() -> Result<(), String> {
+    fn text_that_only_looks_like_a_directive_is_ignored() {
         assert!(
-            codes("example = \"# noqa: NOD001\"\n")?.is_empty(),
+            codes("example = \"# noqa: NOD001\"\n").is_empty(),
             "a `#` inside a string does not start a comment"
         );
         assert!(
-            codes("def f(x): pass  # noqattention: NOD001\n")?.is_empty(),
+            codes("def f(x): pass  # noqattention: NOD001\n").is_empty(),
             "`noqa` must be a word of its own"
         );
-        Ok(())
     }
 
     #[test]
     fn directives_survive_carriage_returns() -> Result<(), String> {
-        assert!(codes("def f(x=1): pass  # noqa: NOD001\r\n")?.is_empty());
+        assert!(codes("def f(x=1): pass  # noqa: NOD001\r\n").is_empty());
         assert_eq!(
             fixed("def f(x): pass  # noqa: NOD001\r\n")?,
             "def f(x): pass\r\n"

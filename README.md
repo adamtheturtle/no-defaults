@@ -65,6 +65,8 @@ In a `.pyi` stub, `x: int = ...` does not declare a default *value* — it is th
 
 `NOD000` has no fix, so `--fix` counts it as remaining and exits `1` rather than claiming a clean result. The file is left out of the fixing pass entirely; the rest of the project is still fixed.
 
+The same holds if a fix would have produced Python that does not parse, which would be a bug in this linter: that file is left exactly as it was, named in a warning, and counted as remaining, and every other file is still fixed.
+
 Pass `--fix` to remove defaults automatically. Function parameters and ordinary dataclass assignments become required. For `field(...)`, only the positional default, `default=`, or `default_factory=` argument is removed; other metadata is preserved:
 
 ```python

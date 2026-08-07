@@ -756,3 +756,69 @@ fn a_syntax_error_is_reported_in_json() -> Result<(), Box<dyn std::error::Error>
     assert_eq!(diagnostics[0]["code"], "NOD000");
     Ok(())
 }
+
+#[test]
+fn fixing_honours_the_json_output_format() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def f(value=1): pass\n\nf()\n")?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("json")
+        .arg("--fix")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    // Nothing but the diagnostics goes to stdout, so a CI job can parse it.
+    let diagnostics: serde_json::Value = serde_json::from_str(&String::from_utf8(output.stdout)?)?;
+    let diagnostics = diagnostics.as_array().ok_or("expected JSON array")?;
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "NOD001");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("Updated 1 call site."), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        "def f(value): pass\n\nf(value=1)\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn fixing_honours_the_github_output_format() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def f(value=1): pass\n")?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("github")
+        .arg("--fix")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.starts_with("::error file="), "{stdout}");
+    assert!(stdout.contains("title=NOD001::"), "{stdout}");
+    assert!(!stdout.contains("Found 1 error"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn fixing_keeps_the_summary_in_the_text_formats() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def f(value=1): pass\n")?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg("--fix")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("Found 1 error (1 fixed, 0 remaining)."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Updated 0 call sites."), "{stdout}");
+    Ok(())
+}

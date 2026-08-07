@@ -1429,12 +1429,15 @@ fn check_source(
     {
         return Checked::default();
     }
+    let mut aliases = Aliases::default();
+    aliases.collect(parsed.suite());
     let mut checker = Checker {
         path,
         source,
         private_only,
         reexports,
         field_bases,
+        aliases,
         scope: Scope {
             private: is_private_module(path, reexports),
             ..Scope::default()
@@ -1651,6 +1654,9 @@ struct Checker<'a> {
     reexports: &'a Reexports,
     /// The base classes whose subclasses carry fields, alongside `@dataclass`.
     field_bases: &'a FieldBases,
+    /// What the file's renaming imports bound to `dataclasses` and `pydantic`
+    /// members, so an aliased `@dataclass` is still recognised.
+    aliases: Aliases,
     scope: Scope,
     /// Start of the `def` or `class` line that owns the violations being
     /// reported, so one directive there can cover every parameter of a
@@ -1873,13 +1879,13 @@ impl Checker<'_> {
         }
         // A `_: KW_ONLY` marker is not a field, so it takes no place in the
         // constructor's positional order.
-        let pseudo_field = annotates_kw_only(&assign.annotation);
+        let pseudo_field = annotates_kw_only(&assign.annotation, &self.aliases);
         // A field declared `init=False` is not a constructor parameter, so a
         // call must never be given it.
         let constructs = assign
             .value
             .as_deref()
-            .is_none_or(|value| !field_excluded_from_init(value));
+            .is_none_or(|value| !field_excluded_from_init(value, &self.aliases));
         // Every other field counts towards the positional order, even one
         // without a default or one this run is not enforcing.
         if self.collect_signatures && !pseudo_field && constructs {
@@ -1893,7 +1899,9 @@ impl Checker<'_> {
         if !self.enabled(name.id.as_str()) {
             return;
         }
-        let Some(default) = field_default(value, assign.annotation.end(), self.source) else {
+        let Some(default) =
+            field_default(value, assign.annotation.end(), self.source, &self.aliases)
+        else {
             return;
         };
         if self.report(
@@ -1935,7 +1943,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // As with a `def` line, the name locates the `class` line a
                 // directive covering every field sits on.
                 self.header = Some(line_start(self.source, class.name.start()));
-                let style = field_style(class, self.field_bases);
+                let style = field_style(class, self.field_bases, &self.aliases);
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
                     fields: style,
@@ -2008,8 +2016,12 @@ fn is_private_module(path: &Path, reexports: &Reexports) -> bool {
 /// What makes a class carry fields, if anything does. The decorator wins where
 /// both apply, because a `@dataclass` built on a configured base still follows
 /// the `dataclasses` rules.
-fn field_style(class: &ast::StmtClassDef, bases: &FieldBases) -> Option<FieldStyle> {
-    if has_dataclass_decorator(class) {
+fn field_style(
+    class: &ast::StmtClassDef,
+    bases: &FieldBases,
+    aliases: &Aliases,
+) -> Option<FieldStyle> {
+    if has_dataclass_decorator(class, aliases) {
         return Some(FieldStyle::Dataclass);
     }
     (!bases.is_empty() && class_bases(class).any(|base| bases.matches(base)))
@@ -2041,14 +2053,84 @@ fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
         .flat_map(|arguments| arguments.args.iter())
 }
 
-fn has_dataclass_decorator(class: &ast::StmtClassDef) -> bool {
+/// Local names that an aliased import bound to a member of `dataclasses` or
+/// `pydantic`.
+///
+/// Decorators, annotations, and field calls are matched by the name they are
+/// written with, so `from dataclasses import dataclass as dc` would otherwise
+/// leave `@dc` unrecognised and the whole class unchecked.
+#[derive(Debug, Default)]
+struct Aliases(BTreeMap<String, String>);
+
+impl Aliases {
+    /// The `dataclasses` or `pydantic` member `name` was imported as, or `name`
+    /// itself when the file did not rename anything to it.
+    fn resolve<'a>(&'a self, name: &'a str) -> &'a str {
+        self.0.get(name).map_or(name, String::as_str)
+    }
+
+    /// Collect the renaming imports of a module, including those nested in an
+    /// `if TYPE_CHECKING:` block or a function body.
+    fn collect(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            match statement {
+                Stmt::ImportFrom(import) => {
+                    let carries_fields = import.module.as_ref().is_some_and(|module| {
+                        matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
+                    });
+                    if !carries_fields {
+                        continue;
+                    }
+                    for alias in &import.names {
+                        if let Some(local) = &alias.asname {
+                            self.0.insert(local.to_string(), alias.name.to_string());
+                        }
+                    }
+                }
+                Stmt::If(branch) => {
+                    self.collect(&branch.body);
+                    for clause in &branch.elif_else_clauses {
+                        self.collect(&clause.body);
+                    }
+                }
+                Stmt::Try(block) => {
+                    self.collect(&block.body);
+                    self.collect(&block.orelse);
+                    self.collect(&block.finalbody);
+                    for handler in &block.handlers {
+                        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                        self.collect(&handler.body);
+                    }
+                }
+                Stmt::FunctionDef(function) => self.collect(&function.body),
+                Stmt::ClassDef(class) => self.collect(&class.body),
+                Stmt::With(block) => self.collect(&block.body),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The name a decorator, annotation, or call expression is matched by.
+///
+/// An attribute keeps its last segment, so `dataclasses.field` reads as
+/// `field`. A bare name is resolved through the file's imports first, so
+/// `dc` reads as `dataclass` where the file wrote `dataclass as dc`.
+fn matched_name<'a>(expression: &'a Expr, aliases: &'a Aliases) -> Option<&'a str> {
+    match expression {
+        Expr::Name(name) => Some(aliases.resolve(name.id.as_str())),
+        Expr::Attribute(attribute) => Some(attribute.attr.as_str()),
+        _ => None,
+    }
+}
+
+fn has_dataclass_decorator(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
     class.decorator_list.iter().any(|decorator| {
         let expression = match &decorator.expression {
             Expr::Call(call) => &*call.func,
             expression => expression,
         };
-        matches!(expression, Expr::Name(name) if name.id.as_str() == "dataclass")
-            || matches!(expression, Expr::Attribute(attribute) if attribute.attr.as_str() == "dataclass")
+        matched_name(expression, aliases) == Some("dataclass")
     })
 }
 
@@ -2069,20 +2151,17 @@ fn generates_init(class: &ast::StmtClassDef) -> bool {
 }
 
 /// Whether an annotation is the `KW_ONLY` marker, which declares no field.
-fn annotates_kw_only(annotation: &Expr) -> bool {
-    matches!(annotation, Expr::Name(name) if name.id.as_str() == "KW_ONLY")
-        || matches!(annotation, Expr::Attribute(attribute) if attribute.attr.as_str() == "KW_ONLY")
+fn annotates_kw_only(annotation: &Expr, aliases: &Aliases) -> bool {
+    matched_name(annotation, aliases) == Some("KW_ONLY")
 }
 
 /// Whether a field is declared `init=False`, which keeps it out of the
 /// constructor even though it is still a field.
-fn field_excluded_from_init(value: &Expr) -> bool {
+fn field_excluded_from_init(value: &Expr, aliases: &Aliases) -> bool {
     let Expr::Call(call) = value else {
         return false;
     };
-    let is_field = matches!(&*call.func, Expr::Name(name) if name.id.as_str() == "field")
-        || matches!(&*call.func, Expr::Attribute(attribute) if attribute.attr.as_str() == "field");
-    is_field
+    matched_name(&call.func, aliases) == Some("field")
         && call.arguments.keywords.iter().any(|keyword| {
             keyword
                 .arg
@@ -2137,16 +2216,11 @@ enum FieldCall {
 /// The call declaring a field's default, if the value is one. Recognised by
 /// name, as decorators are, so `field`, `dataclasses.field`, `Field`, and
 /// `pydantic.Field` all count.
-fn field_call(value: &Expr) -> Option<(&ast::ExprCall, FieldCall)> {
+fn field_call<'a>(value: &'a Expr, aliases: &Aliases) -> Option<(&'a ast::ExprCall, FieldCall)> {
     let Expr::Call(call) = value else {
         return None;
     };
-    let name = match &*call.func {
-        Expr::Name(name) => name.id.as_str(),
-        Expr::Attribute(attribute) => attribute.attr.as_str(),
-        _ => return None,
-    };
-    match name {
+    match matched_name(&call.func, aliases)? {
         "field" => Some((call, FieldCall::Dataclasses)),
         "Field" => Some((call, FieldCall::Pydantic)),
         _ => None,
@@ -2160,13 +2234,18 @@ struct FieldDefault {
     value: Option<String>,
 }
 
-fn field_default(value: &Expr, annotation_end: TextSize, source: &str) -> Option<FieldDefault> {
+fn field_default(
+    value: &Expr,
+    annotation_end: TextSize,
+    source: &str,
+    aliases: &Aliases,
+) -> Option<FieldDefault> {
     let plain = || FieldDefault {
         kind: "default",
         fix: TextRange::new(annotation_end, value.end()),
         value: literal_text(value, source),
     };
-    let Some((call, style)) = field_call(value) else {
+    let Some((call, style)) = field_call(value, aliases) else {
         return Some(plain());
     };
     if let Some(first) = call.arguments.args.first() {
@@ -2954,6 +3033,103 @@ mod tests {
                 "class field `x` has a default",
                 "class field `y` has a default factory",
             ]
+        );
+    }
+
+    #[test]
+    fn an_aliased_dataclass_import_is_still_a_dataclass() {
+        assert_eq!(
+            messages(
+                "from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    x: int = 1\n",
+                false
+            ),
+            ["dataclass field `x` has a default"]
+        );
+        assert_eq!(
+            messages(
+                "import dataclasses as dcs\n\n@dcs.dataclass\nclass C:\n    x: int = 1\n",
+                false
+            ),
+            ["dataclass field `x` has a default"],
+            "a module alias already worked, because an attribute keeps its last segment"
+        );
+        assert_eq!(
+            messages(
+                "from dataclasses import dataclass as dc\n\n@dc(frozen=True)\nclass C:\n    x: int = 1\n",
+                false
+            ),
+            ["dataclass field `x` has a default"],
+            "a called decorator resolves through its function"
+        );
+    }
+
+    #[test]
+    fn an_aliased_field_import_is_still_a_field() {
+        assert_eq!(
+            messages(
+                "from dataclasses import dataclass, field as fld\n\n@dataclass\nclass C:\n    y: list = fld(default_factory=list)\n",
+                false
+            ),
+            ["dataclass field `y` has a default factory"]
+        );
+        assert_eq!(
+            messages(
+                "from dataclasses import dataclass, field as fld\n\n@dataclass\nclass C:\n    y: list = fld()\n",
+                false
+            ),
+            Vec::<String>::new(),
+            "a `field()` with no default is not one under an alias either"
+        );
+        assert_eq!(
+            messages(
+                "from pydantic import BaseModel, Field as F\n\nclass M(BaseModel):\n    a: int = F(default=3)\n",
+                false
+            ),
+            ["class field `a` has a default"]
+        );
+    }
+
+    #[test]
+    fn an_aliased_kw_only_marker_still_declares_no_field() {
+        assert_eq!(
+            messages(
+                "from dataclasses import dataclass, KW_ONLY as KO\n\n@dataclass\nclass C:\n    _: KO\n    z: int = 2\n",
+                false
+            ),
+            ["dataclass field `z` has a default"],
+            "the marker itself is not a field"
+        );
+    }
+
+    #[test]
+    fn an_alias_from_an_unrelated_module_is_not_resolved() {
+        assert!(
+            messages(
+                "from elsewhere import thing as dataclass\n\n@dataclass\nclass C:\n    x: int = 1\n",
+                false
+            )
+            .len()
+                == 1,
+            "a bare `dataclass` is still matched by name, as it always was"
+        );
+        assert!(
+            messages(
+                "from elsewhere import helper as dc\n\n@dc\nclass C:\n    x: int = 1\n",
+                false
+            )
+            .is_empty(),
+            "only `dataclasses` and `pydantic` imports rename anything"
+        );
+    }
+
+    #[test]
+    fn an_alias_imported_under_type_checking_is_collected() {
+        assert_eq!(
+            messages(
+                "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    x: int = 1\n",
+                false
+            ),
+            ["dataclass field `x` has a default"]
         );
     }
 

@@ -875,3 +875,50 @@ fn an_ellipsis_default_outside_a_stub_is_still_fixed() -> Result<(), Box<dyn std
     );
     Ok(())
 }
+
+#[test]
+fn fix_updates_calls_reached_through_a_relative_import() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    let nested = package.join("sub");
+    std::fs::create_dir_all(&nested)?;
+    std::fs::write(package.join("__init__.py"), "")?;
+    std::fs::write(nested.join("__init__.py"), "")?;
+    std::fs::write(
+        package.join("api.py"),
+        "def connect(host, timeout=30): return host\n",
+    )?;
+    std::fs::write(
+        nested.join("tool.py"),
+        "def helper(a, size=8192): return a\n",
+    )?;
+    // Three ways of naming a sibling module. Only the middle one used to
+    // resolve; `from . import api` bound `api` as a symbol of the package.
+    let relative = package.join("use.py");
+    let absolute = package.join("use2.py");
+    let descending = package.join("use3.py");
+    std::fs::write(&relative, "from . import api\napi.connect(\"h\")\n")?;
+    std::fs::write(&absolute, "from pkg import api\napi.connect(\"h\")\n")?;
+    std::fs::write(&descending, "from .sub import tool\ntool.helper(1)\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(!stderr.contains("left the call"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&relative)?,
+        "from . import api\napi.connect(\"h\", timeout=30)\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&absolute)?,
+        "from pkg import api\napi.connect(\"h\", timeout=30)\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&descending)?,
+        "from .sub import tool\ntool.helper(1, size=8192)\n"
+    );
+    Ok(())
+}

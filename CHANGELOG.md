@@ -31,6 +31,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- `--fix` no longer stops the removal of a `noqa` directive at a `#` that is part of a comment's prose. `# noqa: NOD001  see #35  # type: ignore` left `#35  # type: ignore` behind; a new comment segment now has to open with whitespace or a pragma's `word:`.
+- A local name that a file binds to more than one `dataclasses` or `pydantic` member resolves to neither, instead of to whichever import came last.
+- A base class named `Generic`, `Protocol`, `ABC`, or `object` that the file itself defines is no longer taken for the typing construct, so a dataclass built on one keeps its construction sites intact.
+- A call whose bare generator expression already supplies every default that was removed is no longer reported as left alone, because nothing needed appending to it.
+- A nested `def`, `class`, or `lambda` no longer shadows names in the scope holding it, so a call in the outer scope that really does reach a fixed callable is still updated.
+- An absolute import is resolved against every ancestor of the importing file rather than stopping at the first directory without an `__init__.py`, so a sibling module at the project root is found from inside a namespace package.
+- The `Found N errors (N fixed, N remaining)` summary reaches standard error under `--output-format json` and `github`, as documented, rather than being dropped.
+
 - Module privacy is judged from the path below the project root rather than from every component of the path as written. A checkout living under a directory whose name starts with an underscore — `_work/proj` — no longer has every symbol in it treated as private under `private_only`, and the answer no longer depends on whether a relative or an absolute path was passed on the command line.
 - A renaming import of a `dataclasses` or `pydantic` member is followed, so `from dataclasses import dataclass as dc` makes `@dc` a dataclass decorator. The class was previously not treated as a dataclass at all, and its field defaults went unreported. The same applies to `field`, `Field`, and the `KW_ONLY` marker, including imports inside an `if TYPE_CHECKING:` block.
 - `--fix` accounts for keyword-only dataclass fields when filling in construction sites. The positional order was built from the fields in source order with nothing consulting `kw_only`, but `dataclasses` moves such a field past the `*` in the generated `__init__`, so every field after it really sat one slot lower than assumed. For `@dataclass class C: a = field(kw_only=True, default=1); b = 2`, `C(5)` became `C(5, b=2)` — which raises `TypeError: got multiple values for argument 'b'` — while the default `a` now needs was dropped. `field(kw_only=...)`, `@dataclass(kw_only=True)`, and the `_: KW_ONLY` marker are all honoured, with the per-field setting winning.

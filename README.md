@@ -53,6 +53,16 @@ src/example.py:4:17: NOD001 parameter `timeout` of function `connect` has a defa
 Found 1 error.
 ```
 
+A file the parser rejects is reported as `NOD000` and the run carries on, so one unparseable file — a Python 2 module kept for reference, a template saved as `.py`, a file caught mid-edit — does not hide every other file's diagnostics:
+
+```text
+legacy/print.py:1:7: NOD000 syntax error: Simple statements must be separated by newlines or semicolons
+src/example.py:4:17: NOD001 parameter `timeout` of function `connect` has a default
+Found 2 errors.
+```
+
+`NOD000` has no fix, so `--fix` counts it as remaining and exits `1` rather than claiming a clean result. The file is left out of the fixing pass entirely; the rest of the project is still fixed.
+
 Pass `--fix` to remove defaults automatically. Function parameters and ordinary dataclass assignments become required. For `field(...)`, only the positional default, `default=`, or `default_factory=` argument is removed; other metadata is preserved:
 
 ```python

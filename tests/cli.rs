@@ -691,3 +691,68 @@ fn fixing_a_file_with_a_byte_order_mark_keeps_it() -> Result<(), Box<dyn std::er
     );
     Ok(())
 }
+
+#[test]
+fn one_unparseable_file_does_not_hide_the_rest() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(directory.path().join("good.py"), "def f(x=1): pass\n")?;
+    std::fs::write(directory.path().join("bad.py"), "def broken(:\n")?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("bad.py:1:12: NOD000 syntax error"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("good.py:1:9: NOD001"), "{stdout}");
+    assert!(stdout.contains("Found 2 errors."), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn a_syntax_error_does_not_stop_the_rest_being_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let good = directory.path().join("good.py");
+    let bad = directory.path().join("bad.py");
+    std::fs::write(&good, "def f(x=1): pass\n\nf()\n")?;
+    std::fs::write(&bad, "def broken(:\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    // The syntax error carries no fix, so it is still there afterwards and the
+    // summary and exit status say so.
+    assert!(
+        stdout.contains("Found 2 errors (1 fixed, 1 remaining)."),
+        "{stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read_to_string(&good)?,
+        "def f(x): pass\n\nf(x=1)\n"
+    );
+    assert_eq!(std::fs::read_to_string(&bad)?, "def broken(:\n");
+    Ok(())
+}
+
+#[test]
+fn a_syntax_error_is_reported_in_json() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(directory.path().join("bad.py"), "def broken(:\n")?;
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("json")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let diagnostics: serde_json::Value = serde_json::from_str(&String::from_utf8(output.stdout)?)?;
+    let diagnostics = diagnostics.as_array().ok_or("expected JSON array")?;
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "NOD000");
+    Ok(())
+}

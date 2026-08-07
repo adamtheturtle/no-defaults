@@ -26,6 +26,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Changed
 
+- A file the parser rejects is reported as a `NOD000` syntax-error diagnostic and the run continues, instead of aborting with exit status `2` and printing nothing for any file. One unparseable file in a tree — a Python 2 module kept for reference, a template saved as `.py`, a file caught mid-edit — no longer hides every other file's diagnostics, which under pre-commit turned into a hook that silently stopped catching regressions. `NOD000` carries no fix, so `--fix` leaves that file alone, counts it as remaining, and exits `1`.
 - A leading UTF-8 byte-order mark is no longer counted as source, so diagnostics on the first line of a BOM-prefixed file report the right column instead of three too far right. `--fix` writes the mark back.
 - Diagnostic columns count characters rather than bytes, matching Ruff. Non-ASCII text earlier on a line no longer shifts the reported column in `full`, `concise`, `json`, and `github` output, or pushes the `^` in `full` output past what it points at, so editor and CI annotations land in the right place.
 - `--fix` writes through a symlink to the file it points at, instead of replacing the link with a regular file and leaving the real source unfixed. Directory walks never followed links, so this only affected a link named on the command line — which is exactly what pre-commit and shell globs produce.

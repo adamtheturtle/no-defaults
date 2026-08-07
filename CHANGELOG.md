@@ -33,10 +33,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 - `--fix` no longer stops the removal of a `noqa` directive at a `#` that is part of a comment's prose. `# noqa: NOD001  see #35  # type: ignore` left `#35  # type: ignore` behind; a new comment segment now has to open with whitespace or a pragma's `word:`.
 - A local name that a file binds to more than one `dataclasses` or `pydantic` member resolves to neither, instead of to whichever import came last.
-- A base class named `Generic`, `Protocol`, `ABC`, or `object` that the file itself defines is no longer taken for the typing construct, so a dataclass built on one keeps its construction sites intact.
+- A base class named `Generic`, `Protocol`, `ABC`, or `object` that the file itself defines at module level is no longer taken for the typing construct, so a dataclass built on one keeps its construction sites intact.
 - A call whose bare generator expression already supplies every default that was removed is no longer reported as left alone, because nothing needed appending to it.
 - A nested `def`, `class`, or `lambda` no longer shadows names in the scope holding it, so a call in the outer scope that really does reach a fixed callable is still updated.
-- An absolute import is resolved against every ancestor of the importing file rather than stopping at the first directory without an `__init__.py`, so a sibling module at the project root is found from inside a namespace package.
+- An absolute import is resolved against the ancestors of the importing file that are not themselves packages, rather than stopping at the first directory without an `__init__.py`. A sibling module at the project root is found from inside a namespace package, a top-level import inside a package no longer resolves to that package's own module, and an import that two candidate roots could answer resolves to neither.
 - The `Found N errors (N fixed, N remaining)` summary reaches standard error under `--output-format json` and `github`, as documented, rather than being dropped.
 
 - Module privacy is judged from the path below the project root rather than from every component of the path as written. A checkout living under a directory whose name starts with an underscore — `_work/proj` — no longer has every symbol in it treated as private under `private_only`, and the answer no longer depends on whether a relative or an absolute path was passed on the command line.

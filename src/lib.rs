@@ -626,30 +626,40 @@ fn resolve_module(
     if parts.is_empty() {
         return None;
     }
-    // Whichever directory above the importer is on `sys.path`, the import
-    // resolves somewhere at or above the importer itself, so those are the
-    // roots to try, nearest first. Which one it is cannot be known — a
-    // directory without an `__init__.py` may be a namespace package or may be
-    // the root — so every ancestor is a candidate, and none of them can reach
-    // sideways into another subtree.
+    // Whichever directory is on `sys.path`, a top-level import from this file
+    // resolves at or above the file itself, so those are the roots to try —
+    // and none of them can reach sideways into another subtree. A directory
+    // that is a package of its own is not among them: Python has no implicit
+    // relative imports, so `import utils` inside a package does not find the
+    // package's own `utils`. Where more than one root answers, which is on
+    // `sys.path` decides, and that is not knowable, so nothing does.
+    let mut found: Option<PathBuf> = None;
     if let Some(mut directory) = importer.parent().map(Path::to_path_buf) {
         loop {
-            let mut candidate = directory.clone();
-            for part in &parts {
-                candidate.push(part);
-            }
-            for candidate in [
-                candidate.with_extension("py"),
-                candidate.join("__init__.py"),
-            ] {
-                if known.contains(candidate.as_path()) {
-                    return Some(candidate);
+            if package_init(&directory).is_none() {
+                let mut candidate = directory.clone();
+                for part in &parts {
+                    candidate.push(part);
+                }
+                for candidate in [
+                    candidate.with_extension("py"),
+                    candidate.join("__init__.py"),
+                ] {
+                    if known.contains(candidate.as_path()) {
+                        if found.as_ref().is_some_and(|first| *first != candidate) {
+                            return None;
+                        }
+                        found = Some(candidate);
+                    }
                 }
             }
             if !directory.pop() {
                 break;
             }
         }
+    }
+    if found.is_some() {
+        return found;
     }
     // Elsewhere in the tree, a dotted import is still matched by path suffix,
     // because the import root of another source tree is not knowable. A
@@ -2367,15 +2377,18 @@ impl Aliases {
     }
 }
 
-/// Every class name the file defines, at any nesting.
+/// The class names the file defines at module level.
+///
+/// A class nested in a function or another class is not in scope where a
+/// module-level `class Box(Protocol)` is written, so it says nothing about what
+/// that base means. Branches and blocks at module level are descended into,
+/// because a class under `if TYPE_CHECKING:` is a module-level name.
 fn collect_class_names(statements: &[Stmt], into: &mut BTreeSet<String>) {
     for statement in statements {
         match statement {
             Stmt::ClassDef(class) => {
                 into.insert(class.name.to_string());
-                collect_class_names(&class.body, into);
             }
-            Stmt::FunctionDef(function) => collect_class_names(&function.body, into),
             Stmt::If(branch) => {
                 collect_class_names(&branch.body, into);
                 for clause in &branch.elif_else_clauses {
@@ -5032,6 +5045,16 @@ mod tests {
             ),
             "this `Protocol` is a dataclass of the file's own, and carries a field"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_nested_out_of_scope_does_not_shadow_the_typing_construct() -> Result<(), String> {
+        // The `Protocol` in scope where `Box` is written is the imported one.
+        let source = "def factory():\n    class Protocol:\n        pass\n    \
+                      return Protocol\n\n\n\
+                      @dataclass\nclass Box(Protocol):\n    value: int = 1\n\n\nBox()\n";
+        assert!(skipped_reasons(source)?.is_empty());
         Ok(())
     }
 

@@ -443,18 +443,20 @@ fn apply_fixes(
             });
     }
     let mut updated = 0;
-    let changes = fixed_sources(call_sites.edits, &mut updated)?;
+    let mut unfixed = BTreeSet::new();
+    let changes = fixed_sources(call_sites.edits, &mut updated, &mut unfixed)?;
     if cli.diff {
         print_diffs(&changes);
         warn_about_skipped_calls(&call_sites.skipped);
         return Ok(true);
     }
     write_fixes_atomically(changes)?;
-    // A syntax error carries no fix, so it is still there afterwards and the
+    // A syntax error carries no fix, and a file whose result would not have
+    // parsed was left as it was, so both are still there afterwards and the
     // run has to say so rather than claim everything was fixed.
     let remaining = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.fix.is_none())
+        .filter(|diagnostic| diagnostic.fix.is_none() || unfixed.contains(&diagnostic.path))
         .count();
     let summary = format!(
         "Found {} error{} ({} fixed, {remaining} remaining).",
@@ -1130,22 +1132,30 @@ fn load_config_path(path: &Path) -> Result<LoadedConfig, String> {
 fn fixed_sources(
     edits: BTreeMap<PathBuf, Vec<Edit>>,
     updated: &mut usize,
+    unfixed: &mut BTreeSet<PathBuf>,
 ) -> Result<BTreeMap<PathBuf, (String, String)>, String> {
-    edits
-        .into_iter()
-        .map(|(path, edits)| {
-            let source = read_source(&path)?;
-            let (fixed, applied) = apply_edits(&source, edits);
-            *updated += applied;
-            parse_module(&fixed).map_err(|error| {
-                format!(
-                    "refusing to write invalid Python to {} after fixing: {error}",
-                    path.display()
-                )
-            })?;
-            Ok((path, (source, fixed)))
-        })
-        .collect()
+    let mut changes = BTreeMap::new();
+    for (path, edits) in edits {
+        let source = read_source(&path)?;
+        let (fixed, applied) = apply_edits(&source, edits);
+        // A result that will not parse means this linter has a bug. The file
+        // is left exactly as it was and said so about, loudly, rather than
+        // holding back every other file's fix: one file it cannot handle used
+        // to block fixing a whole project, with no remedy but to find it and
+        // exclude it.
+        if let Err(error) = parse_module(&fixed) {
+            eprintln!(
+                "warning: left {} unfixed: the result would not have parsed ({error}). \
+                 This is a bug in no-defaults; please report it.",
+                path.display()
+            );
+            unfixed.insert(path);
+            continue;
+        }
+        *updated += applied;
+        changes.insert(path, (source, fixed));
+    }
+    Ok(changes)
 }
 
 /// Apply edits from the end of the file backwards so earlier offsets stay
@@ -3570,7 +3580,8 @@ mod tests {
                 });
         }
         let mut updated = 0;
-        write_fixes_atomically(fixed_sources(call_sites.edits, &mut updated)?)?;
+        let mut unfixed = BTreeSet::new();
+        write_fixes_atomically(fixed_sources(call_sites.edits, &mut updated, &mut unfixed)?)?;
         for path in files {
             assert!(
                 check_file(
@@ -5079,6 +5090,46 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             source.replace("host, timeout=30", "host, timeout")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_whose_fix_would_not_parse_is_left_alone_by_itself() -> Result<(), String> {
+        // The guard is a "this linter has a bug" path, so it is driven here
+        // with an edit that deliberately produces nonsense: no input shape is
+        // supposed to reach it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let broken = directory.path().join("broken.py");
+        let sound = directory.path().join("sound.py");
+        std::fs::write(&broken, "def f(x=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&sound, "def g(y=2): pass\n").map_err(|error| error.to_string())?;
+        let edits = BTreeMap::from([
+            (
+                broken.clone(),
+                // Delete the `)`, which cannot parse.
+                vec![Edit {
+                    range: TextRange::new(TextSize::new(9), TextSize::new(10)),
+                    replacement: String::new(),
+                }],
+            ),
+            (
+                sound.clone(),
+                vec![Edit {
+                    range: TextRange::new(TextSize::new(7), TextSize::new(9)),
+                    replacement: String::new(),
+                }],
+            ),
+        ]);
+        let mut updated = 0;
+        let mut unfixed = BTreeSet::new();
+        let changes = fixed_sources(edits, &mut updated, &mut unfixed)?;
+        assert_eq!(unfixed, BTreeSet::from([broken.clone()]));
+        assert!(!changes.contains_key(&broken), "the bad file is untouched");
+        assert_eq!(
+            changes.get(&sound).map(|(_, fixed)| fixed.as_str()),
+            Some("def g(y): pass\n"),
+            "every other file is still fixed"
         );
         Ok(())
     }

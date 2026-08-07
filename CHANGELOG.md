@@ -4,6 +4,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+### Changed
+
+- A file whose fix would not have parsed is left alone by itself, rather than aborting the whole run with exit status `2` and writing nothing anywhere. One file this linter has a bug on no longer blocks fixing an entire project. The file is named in a warning, counted as remaining rather than fixed, and the run exits `1` with an accurate summary.
+
 ## 2.0.0 - 2026-08-07
 
 This release changes what the linter reports, what `--fix` writes, and which configurations it accepts. Read `### Changed` before upgrading a project that pins an earlier version.

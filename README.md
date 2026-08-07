@@ -115,7 +115,7 @@ The default `full` output includes source excerpts and carets. `concise` emits o
 `--output-format` applies when fixing too. Under `json` and `github` the diagnostics are all that reaches standard output, so the result stays parseable and CI annotations still appear; the `N fixed` summary and the call-site count go to standard error with the other warnings. Under `full` and `concise` both stay on standard output as before.
 
 The linter detects defaults on positional-only, positional-or-keyword, and keyword-only parameters.
-For classes decorated with `@dataclass` or `@dataclasses.dataclass`, it detects assigned defaults plus `field(default=...)` and `field(default_factory=...)` in the class body.
+For classes decorated with `@dataclass` or `@dataclasses.dataclass`, it detects assigned defaults plus `field(default=...)` and `field(default_factory=...)` in the class body. A renaming import is followed, so `from dataclasses import dataclass as dc` makes `@dc` count too; the same holds for `field`, pydantic's `Field`, and the `KW_ONLY` marker.
 A class that carries fields through a base class instead, as a pydantic model does, is detected the same way once that base is in [`field_base_classes`](#classes-that-carry-fields), which lists `pydantic.BaseModel` by default.
 `ClassVar` assignments are ignored because they are not fields, whether the annotation is bare, qualified, or quoted as in `x: "ClassVar[int]" = 1`. Annotated assignments inside method bodies are ignored because they are locals.
 

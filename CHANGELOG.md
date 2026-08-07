@@ -25,6 +25,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Changed
 
+- Diagnostic columns count characters rather than bytes, matching Ruff. Non-ASCII text earlier on a line no longer shifts the reported column in `full`, `concise`, `json`, and `github` output, or pushes the `^` in `full` output past what it points at, so editor and CI annotations land in the right place.
 - `--fix` writes through a symlink to the file it points at, instead of replacing the link with a regular file and leaving the real source unfixed. Directory walks never followed links, so this only affected a link named on the command line — which is exactly what pre-commit and shell globs produce.
 - Files are deduplicated by canonical path, so naming one file twice under different spellings — `d.py` and `./d.py`, a relative and an absolute form, or a symlink and its target — checks and reports it once instead of twice. The first spelling in sorted order is what diagnostics name.
 - A path named on the command line that exists but is not a `.py` or `.pyi` file is now an operational error rather than being silently dropped. A run that checked nothing was previously indistinguishable from a clean one, so a mistyped path, a wrong `types` setting in `.pre-commit-config.yaml`, or a shell glob that matched the wrong thing reported success over code it never opened. Directory walks still filter to Python files.

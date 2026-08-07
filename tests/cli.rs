@@ -576,3 +576,40 @@ fn a_directory_walk_still_skips_files_that_are_not_python() -> Result<(), Box<dy
     assert!(!stdout.contains("README.md"), "{stdout}");
     Ok(())
 }
+
+#[test]
+fn one_file_named_twice_is_checked_once() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(directory.path().join("d.py"), "def g(value=1): pass\n")?;
+    let output = Command::new(binary())
+        .current_dir(directory.path())
+        .arg("--output-format")
+        .arg("concise")
+        .arg("d.py")
+        .arg("./d.py")
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("Found 1 error."), "{stdout}");
+    assert_eq!(stdout.matches("NOD001").count(), 1, "{stdout}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_and_its_target_are_one_file() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(directory.path().join("real.py"), "def g(value=1): pass\n")?;
+    std::os::unix::fs::symlink("real.py", directory.path().join("link.py"))?;
+    let output = Command::new(binary())
+        .current_dir(directory.path())
+        .arg("--output-format")
+        .arg("concise")
+        .arg("link.py")
+        .arg("real.py")
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("Found 1 error."), "{stdout}");
+    Ok(())
+}

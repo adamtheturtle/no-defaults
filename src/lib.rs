@@ -1175,7 +1175,13 @@ fn collect_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
         }
     }
     files.sort();
-    files.dedup();
+    // Two spellings of one path — `d.py` and `./d.py`, a relative and an
+    // absolute form, or a symlink and its target — are one file, and checking
+    // it twice inflates the diagnostic count and does the fixing work twice.
+    // The first spelling in sorted order is kept, so what is reported stays
+    // the path the user wrote and does not depend on argument order.
+    let mut seen = BTreeSet::new();
+    files.retain(|path| seen.insert(std::fs::canonicalize(path).unwrap_or_else(|_| path.clone())));
     Ok(files)
 }
 

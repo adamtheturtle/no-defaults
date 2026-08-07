@@ -61,6 +61,8 @@ src/example.py:4:17: NOD001 parameter `timeout` of function `connect` has a defa
 Found 2 errors.
 ```
 
+A default that has to stay keeps the defaults after it, because Python does not allow a parameter without a default to follow one with a default, and `dataclasses` says the same of fields. Keyword-only parameters and fields are exempt, since order does not constrain them.
+
 In a `.pyi` stub, `x: int = ...` does not declare a default *value* — it is the convention for "this parameter has a default, unspecified here". It is reported, because the stub still describes an optional parameter, but it is not fixed: removing it would make the parameter required, so the stub would stop matching the implementation it describes and type checkers would reject callers that legitimately omit the argument. Outside a stub, `= ...` is an ordinary default and is removed like any other.
 
 `NOD000` has no fix, so `--fix` counts it as remaining and exits `1` rather than claiming a clean result. The file is left out of the fixing pass entirely; the rest of the project is still fixed.

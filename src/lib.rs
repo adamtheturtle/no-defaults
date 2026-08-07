@@ -1059,23 +1059,25 @@ fn fixed_sources(
 /// A call site nested inside a default that is being deleted would otherwise be
 /// rewritten into text that no longer exists, so those insertions are dropped
 /// and are not counted as call sites updated.
-fn apply_edits(source: &str, mut edits: Vec<Edit>) -> (String, usize) {
-    let deletions: Vec<TextRange> = edits
-        .iter()
-        .filter(|edit| edit.replacement.is_empty())
-        .map(|edit| edit.range)
-        .collect();
-    edits.retain(|edit| {
-        edit.replacement.is_empty()
-            || !deletions
-                .iter()
-                .any(|deletion| deletion.contains(edit.range.start()))
+fn apply_edits(source: &str, edits: Vec<Edit>) -> (String, usize) {
+    let (deletions, mut insertions): (Vec<Edit>, Vec<Edit>) = edits
+        .into_iter()
+        .partition(|edit| edit.replacement.is_empty());
+    let deletions = merge_deletions(deletions.into_iter().map(|edit| edit.range).collect());
+    insertions.retain(|edit| {
+        !deletions
+            .iter()
+            .any(|deletion| deletion.contains(edit.range.start()))
     });
+    let applied = insertions.len();
+    let mut edits: Vec<Edit> = insertions
+        .into_iter()
+        .chain(deletions.into_iter().map(|range| Edit {
+            range,
+            replacement: String::new(),
+        }))
+        .collect();
     edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start()));
-    let applied = edits
-        .iter()
-        .filter(|edit| !edit.replacement.is_empty())
-        .count();
     let mut fixed = source.to_owned();
     for edit in edits {
         fixed.replace_range(
@@ -1084,6 +1086,32 @@ fn apply_edits(source: &str, mut edits: Vec<Edit>) -> (String, usize) {
         );
     }
     (fixed, applied)
+}
+
+/// Combine deletions that overlap or touch into the disjoint ranges they cover.
+///
+/// Edits are applied from the end of the file backwards so that earlier offsets
+/// stay valid, which only holds while no two of them overlap. Two overlapping
+/// deletions applied in turn would have the later one address text the earlier
+/// one had already removed — panicking when its end ran past what was left, and
+/// quietly deleting the wrong span when it did not. This happens whenever an
+/// unused `# noqa: NOD001` sits inside a multi-line default, because removing
+/// the default already removes the directive.
+///
+/// Deleting the union of two overlapping deletions removes exactly what
+/// deleting both was meant to.
+fn merge_deletions(mut ranges: Vec<TextRange>) -> Vec<TextRange> {
+    ranges.sort_by_key(|range| (range.start(), range.end()));
+    let mut merged: Vec<TextRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start() <= last.end() => {
+                *last = TextRange::new(last.start(), last.end().max(range.end()));
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
 }
 
 fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Result<(), String> {
@@ -3499,6 +3527,56 @@ mod tests {
             ["NOD001"],
             "`noqa` must still be a word of its own wherever it sits"
         );
+    }
+
+    #[test]
+    fn a_directive_inside_a_default_does_not_derail_the_fix() -> Result<(), String> {
+        // Removing the default already removes the directive inside it, so the
+        // two deletions overlap. Applying both in turn used to panic here.
+        assert_eq!(
+            fixed("def f(\n    x=[\n        1,  # noqa: NOD001\n    ],\n):\n    pass\n")?,
+            "def f(\n    x,\n):\n    pass\n"
+        );
+        // With a shorter inner deletion the outer one stayed in bounds and
+        // silently took the following parameter with it.
+        assert_eq!(
+            fixed(
+                "def f(\n    x=[\n        1,  # noqa: NOD001, E501\n    ],\n    y=2,\n):\n    pass\n"
+            )?,
+            "def f(\n    x,\n    y,\n):\n    pass\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merging_deletions_covers_what_each_of_them_covered() {
+        let range = |start: u32, end: u32| TextRange::new(TextSize::new(start), TextSize::new(end));
+        assert_eq!(
+            merge_deletions(vec![range(0, 10), range(3, 5)]),
+            [range(0, 10)],
+            "a contained deletion adds nothing"
+        );
+        assert_eq!(
+            merge_deletions(vec![range(3, 5), range(0, 10)]),
+            [range(0, 10)],
+            "the order they arrive in does not matter"
+        );
+        assert_eq!(
+            merge_deletions(vec![range(0, 5), range(3, 9)]),
+            [range(0, 9)],
+            "a partial overlap becomes the span both asked for"
+        );
+        assert_eq!(
+            merge_deletions(vec![range(0, 5), range(5, 9)]),
+            [range(0, 9)],
+            "touching deletions are one contiguous span"
+        );
+        assert_eq!(
+            merge_deletions(vec![range(0, 4), range(6, 9)]),
+            [range(0, 4), range(6, 9)],
+            "disjoint deletions stay apart"
+        );
+        assert_eq!(merge_deletions(vec![]), []);
     }
 
     #[test]

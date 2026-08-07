@@ -922,3 +922,82 @@ fn fix_updates_calls_reached_through_a_relative_import() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[test]
+fn a_single_component_import_resolves_only_at_the_importers_root(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let nested = directory.path().join("deep").join("nested");
+    std::fs::create_dir_all(&nested)?;
+    // `import utils` does not reach `deep/nested/utils.py` under any sys.path
+    // this tree implies, so the call must be left alone rather than given a
+    // keyword the callable it really reaches does not accept.
+    std::fs::write(
+        nested.join("utils.py"),
+        "def helper(a, size=8192): return a\n",
+    )?;
+    let main = directory.path().join("main.py");
+    std::fs::write(&main, "from utils import helper\nhelper(1)\n")?;
+    let before = std::fs::read_to_string(&main)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("cannot be tied to the definition that was fixed"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&main)?, before);
+    Ok(())
+}
+
+#[test]
+fn a_single_component_import_at_the_importers_root_still_resolves(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("utils.py"),
+        "def helper(a, size=8192): return a\n",
+    )?;
+    let main = directory.path().join("main.py");
+    std::fs::write(&main, "from utils import helper\nhelper(1)\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&main)?,
+        "from utils import helper\nhelper(1, size=8192)\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_dotted_import_still_reaches_another_source_root() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("src").join("pkg");
+    std::fs::create_dir_all(&package)?;
+    std::fs::create_dir_all(directory.path().join("tests"))?;
+    std::fs::write(package.join("__init__.py"), "")?;
+    std::fs::write(
+        package.join("api.py"),
+        "def connect(host, timeout=30): return host\n",
+    )?;
+    // A src layout: the test's own import root is `tests/`, so this only
+    // resolves through the suffix match that two components still allow.
+    let test = directory.path().join("tests").join("test_api.py");
+    std::fs::write(&test, "from pkg.api import connect\nconnect(\"h\")\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&test)?,
+        "from pkg.api import connect\nconnect(\"h\", timeout=30)\n"
+    );
+    Ok(())
+}

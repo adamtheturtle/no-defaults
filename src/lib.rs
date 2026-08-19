@@ -4129,7 +4129,7 @@ fn field_default(
         }
         return Some(FieldDefault {
             kind: "default",
-            fix: argument_removal_range(
+            fix: field_argument_removal_range(
                 first.range(),
                 call.arguments
                     .args
@@ -4137,6 +4137,8 @@ fn field_default(
                     .map(Ranged::range)
                     .or_else(|| call.arguments.keywords.first().map(Ranged::range)),
                 None,
+                call.arguments.range(),
+                source,
             ),
             value: literal_text(first, source),
         });
@@ -4176,13 +4178,15 @@ fn field_default(
     Some(FieldDefault {
         kind,
         value,
-        fix: argument_removal_range(
+        fix: field_argument_removal_range(
             keyword.range(),
             call.arguments.keywords.get(index + 1).map(Ranged::range),
             index
                 .checked_sub(1)
                 .and_then(|previous| call.arguments.keywords.get(previous))
                 .map(Ranged::range),
+            call.arguments.range(),
+            source,
         ),
     })
 }
@@ -4209,6 +4213,27 @@ fn argument_removal_range(
     } else {
         target
     }
+}
+
+fn field_argument_removal_range(
+    target: TextRange,
+    next: Option<TextRange>,
+    previous: Option<TextRange>,
+    arguments: TextRange,
+    source: &str,
+) -> TextRange {
+    let range = argument_removal_range(target, next, previous);
+    if next.is_some() || previous.is_some() {
+        return range;
+    }
+    let tail = &source[target.end().to_usize()..arguments.end().to_usize()];
+    let Some(comma) = tail.find(',') else {
+        return range;
+    };
+    if !tail[..comma].chars().all(char::is_whitespace) {
+        return range;
+    }
+    TextRange::new(target.start(), target.end() + text_size(comma + 1))
 }
 
 /// What a method is given ahead of its written arguments, from its decorators.

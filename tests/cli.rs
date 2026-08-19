@@ -2624,3 +2624,21 @@ fn overriding_inherited_fields_use_the_subclass_default_once(
     );
     Ok(())
 }
+
+#[test]
+fn a_sole_field_default_with_a_trailing_comma_is_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass, field\n\n@dataclass\nclass C:\n    value: int = field(default=1,)\n\nC()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "from dataclasses import dataclass, field\n\n@dataclass\nclass C:\n    value: int = field()\n\nC(value=1)\n"
+    );
+    Ok(())
+}

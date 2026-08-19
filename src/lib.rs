@@ -3049,6 +3049,9 @@ impl Checker<'_> {
         self.header = Some(line_start(self.source, function.name.start()));
         let descriptor_invoked =
             self.scope.class_body && is_property(function, &self.aliases, &self.module_bindings);
+        let implicitly_called = self.scope.class_body
+            && self.scope.fields == Some(FieldStyle::Dataclass)
+            && function.name.as_str() == "__post_init__";
         let mut removed = Vec::new();
         let known_descriptor = |expression: &Expr| match expression {
             Expr::Name(name) => {
@@ -3090,7 +3093,8 @@ impl Checker<'_> {
                 continue;
             };
             let range = TextRange::new(parameter.parameter.end(), default.end());
-            let fix = if descriptor_invoked
+            let fix = if implicitly_called
+                || descriptor_invoked
                 || unknown_decorator
                 || self.is_stub()
                 || (self.scope.class_body && implicitly_called_method(function.name.as_str()))
@@ -8574,6 +8578,23 @@ mod tests {
     #[test]
     fn init_subclass_defaults_are_retained_for_implicit_calls() {
         let source = "class Base:\n    def __init_subclass__(cls, flag=1):\n        cls.flag = flag\n\nclass Child(Base):\n    pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn dataclass_post_init_defaults_are_retained_for_generated_calls() {
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int\n\n    def __post_init__(self, extra=1):\n        self.extra = extra\n\nC(5)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

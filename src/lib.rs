@@ -2315,10 +2315,6 @@ impl Checker<'_> {
     /// Record a violation. Returns whether it was reported *and* is fixable,
     /// which is what decides whether the default is one a call site has to be
     /// given back.
-    fn report(&mut self, default: &Expr, message: String, fix: TextRange) -> bool {
-        self.report_with(default.start(), message, self.fixable(default, fix))
-    }
-
     fn report_with(&mut self, offset: TextSize, message: String, fix: Option<TextRange>) -> bool {
         if self.suppress(offset) {
             return false;
@@ -2396,23 +2392,41 @@ impl Checker<'_> {
             return;
         };
         let mut removed = false;
+        let mut kept = false;
         for parameter in parameters
             .posonlyargs
             .iter()
             .chain(&parameters.args)
-            .chain(&parameters.kwonlyargs)
+            .map(|parameter| (parameter, true))
+            .chain(
+                parameters
+                    .kwonlyargs
+                    .iter()
+                    .map(|parameter| (parameter, false)),
+            )
         {
+            let (parameter, positional) = parameter;
             let Some(default) = &parameter.default else {
                 continue;
             };
-            removed |= self.report(
-                default,
+            let range = TextRange::new(parameter.parameter.end(), default.end());
+            let fix = if positional && kept {
+                None
+            } else {
+                self.fixable(default, range)
+            };
+            let was_removed = self.report_with(
+                default.start(),
                 format!(
                     "parameter `{}` of lambda has a default",
                     parameter.parameter.name
                 ),
-                TextRange::new(parameter.parameter.end(), default.end()),
+                fix,
             );
+            removed |= was_removed;
+            if positional && !was_removed {
+                kept = true;
+            }
         }
         if !removed || !self.collect_signatures {
             return;
@@ -4628,6 +4642,13 @@ mod tests {
     fn a_lambda_default_is_suppressible_and_fixable() -> Result<(), String> {
         assert!(codes("lam = lambda z=4: z  # noqa: NOD001\n").is_empty());
         assert_eq!(fixed("lam = lambda z=4: z\n")?, "lam = lambda z: z\n");
+        Ok(())
+    }
+
+    #[test]
+    fn lambda_defaults_keep_positional_order_in_stubs() -> Result<(), String> {
+        let source = "handler = lambda first=..., second=2: second\n";
+        assert_eq!(stub_fixed(source)?, source);
         Ok(())
     }
 

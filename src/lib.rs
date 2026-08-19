@@ -3806,9 +3806,6 @@ fn rewrite_calls(
 ) -> Result<FileCallSites, String> {
     let parsed = parse_module(source)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-    let mut bindings = BTreeMap::new();
-    collect_bindings(parsed.suite(), path, known, &mut bindings);
-    collect_star_bindings(parsed.suite(), path, known, definitions, &mut bindings);
     let mut aliases = Aliases::default();
     aliases.collect(parsed.suite());
     let mut rewriter = Rewriter {
@@ -3817,7 +3814,7 @@ fn rewrite_calls(
         definitions,
         aliases,
         module_bindings: BoundNames::of_body(parsed.suite()).names,
-        bindings: vec![bindings],
+        bindings: vec![BTreeMap::new()],
         invalidated_bindings: BTreeSet::new(),
         known,
         classes: Vec::new(),
@@ -4693,6 +4690,24 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
 
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
+            Stmt::Import(_) | Stmt::ImportFrom(_) if self.scopes.is_empty() => {
+                // An import affects only calls reached after it executes.
+                if let Some(bindings) = self.bindings.last_mut() {
+                    collect_bindings(
+                        std::slice::from_ref(statement),
+                        self.path,
+                        self.known,
+                        bindings,
+                    );
+                    collect_star_bindings(
+                        std::slice::from_ref(statement),
+                        self.path,
+                        self.known,
+                        self.definitions,
+                        bindings,
+                    );
+                }
+            }
             Stmt::Assign(assign) if self.scopes.is_empty() => {
                 // The right-hand side still sees the imported binding; the
                 // assignment replaces it only after that expression runs.

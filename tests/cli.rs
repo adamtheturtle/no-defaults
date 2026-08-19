@@ -2379,3 +2379,24 @@ fn methods_on_freshly_constructed_instances_are_resolved() -> Result<(), Box<dyn
     );
     Ok(())
 }
+
+#[test]
+fn lambda_parameters_shadow_enclosing_method_receivers() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "class C:\n    def fetch(self, value=1):\n        return value\n\n    def run(self, other):\n        return (lambda self: self.fetch())(other)\n\nclass Other:\n    def fetch(self):\n        return 5\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("def fetch(self, value):"), "{fixed}");
+    assert!(fixed.contains("lambda self: self.fetch()"), "{fixed}");
+    assert!(
+        !fixed.contains("lambda self: self.fetch(value=1)"),
+        "{fixed}"
+    );
+    Ok(())
+}

@@ -5272,9 +5272,14 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 if let Some(parameters) = &lambda.parameters {
                     self.visit_parameters(parameters);
                 }
-                self.scopes.push(BoundNames::of_lambda(lambda));
+                let scope = BoundNames::of_lambda(lambda);
+                let receiver = self.implicit_receivers.last().cloned().flatten();
+                let receiver = receiver.filter(|name| !scope.names.contains(name));
+                self.implicit_receivers.push(receiver);
+                self.scopes.push(scope);
                 self.visit_expr(&lambda.body);
                 self.scopes.pop();
+                self.implicit_receivers.pop();
                 return;
             }
             _ => {}

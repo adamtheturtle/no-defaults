@@ -4138,6 +4138,16 @@ mod tests {
     }
 
     #[test]
+    fn a_function_local_field_alias_does_not_escape() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\ndef helper(value): return value\ndef load():\n    from dataclasses import field as helper\n\n@dataclass\nclass C:\n    value: int = helper(1)\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\n\ndef helper(value): return value\ndef load():\n    from dataclasses import field as helper\n\n@dataclass\nclass C:\n    value: int\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn an_aliased_kw_only_marker_still_declares_no_field() {
         assert_eq!(
             messages(

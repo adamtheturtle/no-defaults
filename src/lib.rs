@@ -2166,6 +2166,9 @@ impl Checker<'_> {
         let Some(value) = assign.value.as_deref() else {
             return;
         };
+        if style == FieldStyle::Dataclass && is_dataclasses_missing(value, &self.aliases) {
+            return;
+        }
         if !self.enabled(name.id.as_str()) {
             return;
         }
@@ -4047,6 +4050,24 @@ mod tests {
             false,
         );
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn dataclasses_missing_assignment_means_a_required_field() {
+        let found = messages(
+            "from dataclasses import MISSING as required, dataclass\nimport dataclasses\n\n@dataclass\nclass C:\n    a: int = required\n    b: int = dataclasses.MISSING\n",
+            false,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn unrelated_missing_assignments_are_still_defaults() {
+        let found = messages(
+            "from dataclasses import dataclass\nimport elsewhere\nMISSING = object()\n\n@dataclass\nclass C:\n    a: int = MISSING\n    b: int = elsewhere.MISSING\n",
+            false,
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
     }
 
     #[test]

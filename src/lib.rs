@@ -2568,6 +2568,7 @@ impl FieldStyle {
 /// given a signature once its body has been walked.
 struct ClassCollector {
     name: String,
+    qualified: String,
     style: Option<FieldStyle>,
     /// Whether the class inherits fields this file cannot see, which makes its
     /// constructor unknown. A base that declares no fields does not count, nor
@@ -2700,6 +2701,13 @@ impl Checker<'_> {
         self.path
             .extension()
             .is_some_and(|extension| extension == "pyi")
+    }
+
+    fn qualified_class(&self, name: &str) -> String {
+        qualified_name(
+            self.classes.last().map(|parent| parent.qualified.as_str()),
+            name,
+        )
     }
 
     /// Whether the rule applies to something with no name of its own, such as
@@ -2979,7 +2987,7 @@ impl Checker<'_> {
             path: self.path.to_path_buf(),
             kind: match self.classes.last() {
                 Some(class) if self.scope.class_body => Callable::Method {
-                    class: class.name.clone(),
+                    class: class.qualified.clone(),
                     receiver: method_receiver(function, &self.aliases, &self.module_bindings),
                 },
                 _ => Callable::Function,
@@ -3174,8 +3182,10 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     if let Inherited::Known(shape) = &inherited {
                         self.scope.kept_default = shape.kept_default;
                     }
+                    let qualified = self.qualified_class(class.name.as_str());
                     self.classes.push(ClassCollector {
                         name: class.name.to_string(),
+                        qualified,
                         style,
                         inherits: matches!(inherited, Inherited::Unknown),
                         constructs: generates_init(class, &self.aliases),
@@ -3408,6 +3418,10 @@ fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
         .as_deref()
         .into_iter()
         .flat_map(|arguments| arguments.args.iter())
+}
+
+fn qualified_name(parent: Option<&str>, name: &str) -> String {
+    parent.map_or_else(|| name.to_owned(), |parent| format!("{parent}.{name}"))
 }
 
 /// Local names that an aliased import bound to a member of `dataclasses` or
@@ -5197,7 +5211,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 if let Some(arguments) = &class.arguments {
                     self.visit_arguments(arguments);
                 }
-                self.classes.push(class.name.to_string());
+                let qualified =
+                    qualified_name(self.classes.last().map(String::as_str), class.name.as_str());
+                self.classes.push(qualified);
                 self.scopes.push(BoundNames::default());
                 self.class_scope_depths.push(self.scopes.len());
                 self.visit_body(&class.body);

@@ -3047,6 +3047,8 @@ impl Checker<'_> {
         // locates the `def` line that a signature-wide directive sits on.
         let enclosing = self.header;
         self.header = Some(line_start(self.source, function.name.start()));
+        let descriptor_invoked =
+            self.scope.class_body && is_property(function, &self.aliases, &self.module_bindings);
         let mut removed = Vec::new();
         let known_descriptor = |expression: &Expr| match expression {
             Expr::Name(name) => {
@@ -3088,7 +3090,8 @@ impl Checker<'_> {
                 continue;
             };
             let range = TextRange::new(parameter.parameter.end(), default.end());
-            let fix = if unknown_decorator
+            let fix = if descriptor_invoked
+                || unknown_decorator
                 || self.is_stub()
                 || (self.scope.class_body && implicitly_called_method(function.name.as_str()))
                 || self.repeated_functions.contains(function.name.as_str())
@@ -3633,6 +3636,7 @@ struct Aliases {
     pydantic_modules: BTreeSet<String>,
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
+    properties: BTreeSet<String>,
     builtins_modules: BTreeSet<String>,
     class_vars: BTreeSet<String>,
     typing_modules: BTreeSet<String>,
@@ -3681,6 +3685,9 @@ impl Aliases {
                 }
                 "classmethod" => {
                     self.classmethods.insert(local);
+                }
+                "property" => {
+                    self.properties.insert(local);
                 }
                 "object" => {
                     self.structural_bases.insert(local);
@@ -4374,6 +4381,27 @@ fn method_receiver(
     } else {
         Receiver::Instance
     }
+}
+
+/// Whether attribute access invokes this method through Python's `property`
+/// descriptor, leaving no explicit argument list that the fixer can update.
+fn is_property(
+    function: &ast::StmtFunctionDef,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> bool {
+    function.decorator_list.iter().any(|decorator| {
+        match &decorator.expression {
+            Expr::Name(name) => {
+                (name.id.as_str() == "property" && !module_bindings.contains("property"))
+                    || aliases.properties.contains(name.id.as_str())
+            }
+            Expr::Attribute(attribute) if attribute.attr.as_str() == "property" => {
+                matches!(attribute.value.as_ref(), Expr::Name(name) if aliases.builtins_modules.contains(name.id.as_str()))
+            }
+            _ => false,
+        }
+    })
 }
 
 /// The source text of a default that a call site can repeat verbatim.
@@ -8523,6 +8551,23 @@ mod tests {
             "class C:\n    def __init__(self, value):\n        self.value = value\n\nC(value=1)\n"
         );
         Ok(())
+    }
+
+    #[test]
+    fn property_getter_defaults_are_retained_for_descriptor_calls() {
+        let source = "class C:\n    @property\n    def value(self, fallback=1):\n        return fallback\n\nC().value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

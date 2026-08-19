@@ -1133,6 +1133,28 @@ fn fix_updates_calls_reached_through_an_unaliased_dotted_import(
 }
 
 #[test]
+fn from_import_resolves_a_namespace_package_module() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let namespace = directory.path().join("ns");
+    std::fs::create_dir(&namespace)?;
+    let api = namespace.join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&caller, "from ns import api\n\napi.target()\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from ns import api\n\napi.target(value=1)\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn reassigning_an_imported_module_invalidates_its_binding() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

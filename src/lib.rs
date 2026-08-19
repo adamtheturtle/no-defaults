@@ -3180,9 +3180,7 @@ fn collect_bindings(
             }
             Stmt::ImportFrom(import) => {
                 let module = import.module.as_ref().map_or("", ast::Identifier::as_str);
-                let Some(file) = resolve_module(module, import.level, importer, known) else {
-                    continue;
-                };
+                let parent = resolve_module(module, import.level, importer, known);
                 for alias in &import.names {
                     let name = alias.name.as_str();
                     if name == "*" {
@@ -3204,13 +3202,12 @@ fn collect_bindings(
                     };
                     let submodule = dotted
                         .and_then(|dotted| resolve_module(&dotted, import.level, importer, known));
-                    bindings.insert(
-                        bound,
-                        submodule.map_or_else(
-                            || Binding::Symbol(file.clone(), name.to_owned()),
-                            Binding::Module,
-                        ),
-                    );
+                    let binding = match (submodule, &parent) {
+                        (Some(file), _) => Binding::Module(file),
+                        (None, Some(file)) => Binding::Symbol(file.clone(), name.to_owned()),
+                        (None, None) => continue,
+                    };
+                    bindings.insert(bound, binding);
                 }
             }
             Stmt::FunctionDef(function) => {

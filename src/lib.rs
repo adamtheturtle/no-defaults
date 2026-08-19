@@ -303,9 +303,35 @@ struct Definitions {
     symbols: BTreeMap<PathBuf, BTreeMap<String, Option<Signature>>>,
     /// Methods, by defining file and class name, and then method name.
     methods: BTreeMap<(PathBuf, String), BTreeMap<String, Option<Signature>>>,
+    /// Imported names in checked files, used to follow package re-exports to
+    /// the file that owns a callable's signature.
+    bindings: BTreeMap<(PathBuf, String), Binding>,
     /// Every name a fixed callable goes by, so a call that cannot be resolved
     /// to one can still be reported rather than silently left behind.
     names: BTreeSet<String>,
+}
+
+impl Definitions {
+    fn symbol(&self, file: &Path, name: &str) -> Option<&Signature> {
+        let mut file = file.to_path_buf();
+        let mut name = name.to_owned();
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert((file.clone(), name.clone())) {
+                return None;
+            }
+            if let Some(signature) = self.symbols.get(&file).and_then(|table| table.get(&name)) {
+                return signature.as_ref();
+            }
+            let Binding::Symbol(next_file, next_name) =
+                self.bindings.get(&(file.clone(), name.clone()))?
+            else {
+                return None;
+            };
+            file.clone_from(next_file);
+            name.clone_from(next_name);
+        }
+    }
 }
 
 /// What checking one file produced.
@@ -597,6 +623,21 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         return Ok(call_sites);
     }
     let known: BTreeSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+    for path in files {
+        let Ok(source) = read_source(path) else {
+            continue;
+        };
+        let Ok(parsed) = parse_module(&source) else {
+            continue;
+        };
+        let mut bindings = BTreeMap::new();
+        collect_bindings(parsed.suite(), path, &known, &mut bindings);
+        definitions.bindings.extend(
+            bindings
+                .into_iter()
+                .map(|(name, binding)| ((path.clone(), name), binding)),
+        );
+    }
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()
         .map(|path| {
@@ -4061,10 +4102,9 @@ impl Rewriter<'_> {
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false) => None,
             Expr::Name(name) => match self.binding(name.id.as_str()) {
-                Some(Binding::Symbol(file, symbol)) => Some((
-                    self.definitions.symbols.get(file)?.get(symbol)?.as_ref()?,
-                    0,
-                )),
+                Some(Binding::Symbol(file, symbol)) => {
+                    Some((self.definitions.symbol(file, symbol)?, 0))
+                }
                 Some(Binding::Module(_)) => None,
                 None => Some((
                     self.definitions

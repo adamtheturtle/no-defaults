@@ -1515,7 +1515,6 @@ fn imports_inside_module_loops_resolve_calls() -> Result<(), Box<dyn std::error:
     )?;
     let caller = directory.path().join("caller.py");
     std::fs::write(&caller, "for _ in [0]:\n    import api\n\napi.target()\n")?;
-
     let output = Command::new(binary())
         .arg("--fix")
         .arg(directory.path())
@@ -1524,6 +1523,32 @@ fn imports_inside_module_loops_resolve_calls() -> Result<(), Box<dyn std::error:
     assert_eq!(
         std::fs::read_to_string(caller)?,
         "for _ in [0]:\n    import api\n\napi.target(value=1)\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn from_package_reexports_resolve_to_the_defining_module() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    std::fs::write(package.join("__init__.py"), "from .api import target\n")?;
+    std::fs::write(
+        package.join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "from pkg import target\ntarget()\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from pkg import target\ntarget(value=1)\n"
     );
     Ok(())
 }

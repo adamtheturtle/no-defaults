@@ -229,6 +229,25 @@ fn function_defaults_resolve_before_body_bindings() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn unpacked_kw_only_field_options_do_not_produce_constructor_arguments(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass, field\n\n@dataclass\nclass C:\n    first: int = 0\n    value: int = field(default=1, **{\"kw_only\": True})\n\nC(5)\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "from dataclasses import dataclass, field\n\n@dataclass\nclass C:\n    first: int\n    value: int = field(default=1, **{\"kw_only\": True})\n\nC(5)\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

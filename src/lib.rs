@@ -2662,7 +2662,8 @@ impl Checker<'_> {
         let Expr::Name(name) = &*assign.target else {
             return;
         };
-        if is_class_var(statement, &self.aliases)
+        if (style == FieldStyle::Base && name.id.starts_with('_'))
+            || is_class_var(statement, &self.aliases)
             || is_pydantic_private_attr(assign.value.as_deref(), &self.aliases)
         {
             return;
@@ -4798,6 +4799,15 @@ mod tests {
     fn pydantic_private_attribute_defaults_are_not_model_fields() {
         assert!(messages(
             "from pydantic import BaseModel, PrivateAttr\n\nclass C(BaseModel):\n    _value: int = PrivateAttr(default=1)\n",
+            false,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn underscore_model_attributes_are_not_constructor_fields() {
+        assert!(messages(
+            "from pydantic import BaseModel\n\nclass C(BaseModel):\n    _value: int = 1\n",
             false,
         )
         .is_empty());

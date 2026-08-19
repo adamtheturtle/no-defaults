@@ -2800,29 +2800,7 @@ impl Checker<'_> {
                 continue;
             };
             let range = TextRange::new(parameter.parameter.end(), default.end());
-            let fix = if (self.scope.class_body
-                && matches!(
-                    function.name.as_str(),
-                    "__call__"
-                        | "__enter__"
-                        | "__exit__"
-                        | "__aenter__"
-                        | "__aexit__"
-                        | "__iter__"
-                        | "__next__"
-                        | "__aiter__"
-                        | "__anext__"
-                        | "__len__"
-                        | "__length_hint__"
-                        | "__getitem__"
-                        | "__setitem__"
-                        | "__delitem__"
-                        | "__missing__"
-                        | "__contains__"
-                        | "__reversed__"
-                        | "__bool__"
-                        | "__str__"
-                ))
+            let fix = if (self.scope.class_body && implicitly_called_method(function.name.as_str()))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
             {
@@ -2966,6 +2944,34 @@ impl Checker<'_> {
             }
         }
     }
+}
+
+/// A method Python may call through syntax or a built-in rather than through
+/// an explicit attribute call that the fixer can rewrite.
+fn implicitly_called_method(name: &str) -> bool {
+    matches!(
+        name,
+        "__call__"
+            | "__enter__"
+            | "__exit__"
+            | "__aenter__"
+            | "__aexit__"
+            | "__iter__"
+            | "__next__"
+            | "__aiter__"
+            | "__anext__"
+            | "__len__"
+            | "__length_hint__"
+            | "__getitem__"
+            | "__setitem__"
+            | "__delitem__"
+            | "__missing__"
+            | "__contains__"
+            | "__reversed__"
+            | "__bool__"
+            | "__str__"
+            | "__repr__"
+    )
 }
 
 impl<'a> Visitor<'a> for Checker<'a> {
@@ -7163,6 +7169,24 @@ mod tests {
     fn str_defaults_are_retained_for_protocol_calls() {
         let source =
             "class C:\n    def __str__(self, extra=None):\n        return 'C'\n\nstr(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn repr_defaults_are_retained_for_protocol_calls() {
+        let source =
+            "class C:\n    def __repr__(self, extra=None):\n        return 'C'\n\nrepr(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

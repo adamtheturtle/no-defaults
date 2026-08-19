@@ -756,6 +756,46 @@ struct SourceLines {
     starts: Vec<usize>,
 }
 
+fn source_line_starts(source: &str) -> Vec<usize> {
+    let bytes = source.as_bytes();
+    let mut starts = vec![0];
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                starts.push(index + 2);
+                index += 2;
+            }
+            b'\r' | b'\n' => {
+                starts.push(index + 1);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    starts
+}
+
+fn previous_line_start(source: &str, offset: usize) -> usize {
+    source[..offset]
+        .rfind(['\n', '\r'])
+        .map_or(0, |end| end + 1)
+}
+
+fn next_line_break(source: &str, offset: usize) -> usize {
+    source[offset..]
+        .find(['\n', '\r'])
+        .map_or(source.len(), |end| offset + end)
+}
+
+fn line_break_end(source: &str, start: usize) -> usize {
+    match source.as_bytes().get(start..) {
+        Some([b'\r', b'\n', ..]) => start + 2,
+        Some([b'\r' | b'\n', ..]) => start + 1,
+        _ => start,
+    }
+}
+
 impl SourceLines {
     fn read(path: &Path) -> Option<Self> {
         let text = read_source(path).ok()?;
@@ -763,12 +803,9 @@ impl SourceLines {
         let starts = if text.is_empty() {
             Vec::new()
         } else {
-            std::iter::once(0)
-                .chain(
-                    text.match_indices('\n')
-                        .map(|(position, _)| position + 1)
-                        .filter(|start| *start < text.len()),
-                )
+            source_line_starts(&text)
+                .into_iter()
+                .filter(|start| *start < text.len())
                 .collect()
         };
         Some(Self { text, starts })
@@ -1687,11 +1724,9 @@ fn noqa_marker(body: &str) -> Option<usize> {
 }
 
 fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
-    let line_start = source[..hash].rfind('\n').map_or(0, |end| end + 1);
-    let break_start = source[hash..]
-        .find('\n')
-        .map_or(source.len(), |end| hash + end);
-    let content_end = source[..break_start].trim_end_matches('\r').len();
+    let line_start = previous_line_start(source, hash);
+    let break_start = next_line_break(source, hash);
+    let content_end = break_start;
     let comment = source.get(hash + 1..content_end)?;
     let body = comment.trim_start();
     let body_start = hash + 1 + (comment.len() - body.len());
@@ -1802,11 +1837,7 @@ fn whole_directive_range(
     content_end: usize,
 ) -> TextRange {
     if source[line_start..hash].trim().is_empty() {
-        let line_end = if source[break_start..].starts_with('\n') {
-            break_start + 1
-        } else {
-            break_start
-        };
+        let line_end = line_break_end(source, break_start);
         return TextRange::new(text_size(line_start), text_size(line_end));
     }
     TextRange::new(
@@ -3800,11 +3831,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
 
 /// The offset of the first character of the line containing `offset`.
 fn line_start(source: &str, offset: TextSize) -> TextSize {
-    text_size(
-        source[..offset.to_usize()]
-            .rfind('\n')
-            .map_or(0, |end| end + 1),
-    )
+    text_size(previous_line_start(source, offset.to_usize()))
 }
 
 /// The offset each line of a source starts at.
@@ -3816,11 +3843,7 @@ struct LineIndex(Vec<usize>);
 
 impl LineIndex {
     fn new(source: &str) -> Self {
-        Self(
-            std::iter::once(0)
-                .chain(source.match_indices('\n').map(|(position, _)| position + 1))
-                .collect(),
-        )
+        Self(source_line_starts(source))
     }
 
     /// The one-based line and column of `offset`, with the column counted in
@@ -5253,9 +5276,18 @@ mod tests {
     #[test]
     fn directives_survive_carriage_returns() -> Result<(), String> {
         assert!(codes("def f(x=1): pass  # noqa: NOD001\r\n").is_empty());
+        assert!(codes("def f(x=1): pass  # noqa: NOD001\r").is_empty());
         assert_eq!(
             fixed("def f(x): pass  # noqa: NOD001\r\n")?,
             "def f(x): pass\r\n"
+        );
+        assert_eq!(
+            fixed("def f(x): pass  # noqa: NOD001\r")?,
+            "def f(x): pass\r"
+        );
+        assert_eq!(
+            positions("def first(value=1): pass\rdef second(value=2): pass\r"),
+            [(1, 17), (2, 18)]
         );
         Ok(())
     }

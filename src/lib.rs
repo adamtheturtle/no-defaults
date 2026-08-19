@@ -2011,8 +2011,6 @@ fn check_source(
     }
     let aliases = Aliases::default();
     let module_bindings = BoundNames::of_body(parsed.suite()).names;
-    let mut local_classes = BTreeSet::new();
-    collect_class_names(parsed.suite(), &mut local_classes);
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
     for statement in parsed.suite() {
@@ -2031,7 +2029,7 @@ fn check_source(
         field_bases,
         aliases,
         module_bindings,
-        local_classes,
+        local_classes: BTreeSet::new(),
         repeated_functions,
         shapes: BTreeMap::new(),
         scope: Scope {
@@ -2377,6 +2375,7 @@ impl Checker<'_> {
         self.check_function(function);
         let outer = self.scope;
         let outer_aliases = self.aliases.clone();
+        let outer_local_classes = self.local_classes.clone();
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
             fields: None,
@@ -2385,6 +2384,7 @@ impl Checker<'_> {
         };
         walk_stmt(self, statement);
         self.aliases = outer_aliases;
+        self.local_classes = outer_local_classes;
         self.scope = outer;
     }
 
@@ -2758,6 +2758,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::ClassDef(class) => {
                 let outer = self.scope;
                 let outer_aliases = self.aliases.clone();
+                let outer_local_classes = self.local_classes.clone();
                 let old_header = self.header;
                 // As with a `def` line, the name locates the `class` line a
                 // directive covering every field sits on.
@@ -2804,6 +2805,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     });
                 }
                 walk_stmt(self, statement);
+                // The class name becomes visible only after its body has
+                // executed. A later class with the same name must not change
+                // how this class's bases were resolved.
+                self.local_classes = outer_local_classes;
+                self.local_classes.insert(class.name.to_string());
                 self.class_constructs.pop();
                 if let Some(collector) = self
                     .collect_signatures
@@ -3217,39 +3223,6 @@ impl Aliases {
                 // that function and cannot change names used by this scope.
                 _ => {}
             }
-        }
-    }
-}
-
-/// The class names the file defines at module level.
-///
-/// A class nested in a function or another class is not in scope where a
-/// module-level `class Box(Protocol)` is written, so it says nothing about what
-/// that base means. Branches and blocks at module level are descended into,
-/// because a class under `if TYPE_CHECKING:` is a module-level name.
-fn collect_class_names(statements: &[Stmt], into: &mut BTreeSet<String>) {
-    for statement in statements {
-        match statement {
-            Stmt::ClassDef(class) => {
-                into.insert(class.name.to_string());
-            }
-            Stmt::If(branch) => {
-                collect_class_names(&branch.body, into);
-                for clause in &branch.elif_else_clauses {
-                    collect_class_names(&clause.body, into);
-                }
-            }
-            Stmt::Try(block) => {
-                collect_class_names(&block.body, into);
-                collect_class_names(&block.orelse, into);
-                collect_class_names(&block.finalbody, into);
-                for handler in &block.handlers {
-                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                    collect_class_names(&handler.body, into);
-                }
-            }
-            Stmt::With(block) => collect_class_names(&block.body, into),
-            _ => {}
         }
     }
 }
@@ -6526,6 +6499,16 @@ mod tests {
                 "the dataclass inherits fields, so its constructor is not known from the file \
                  that defines it"
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_later_generic_class_does_not_shadow_an_earlier_typing_base() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n@dataclass\nclass C(Generic[T]):\n    value: int = 1\n\nC()\n\nclass Generic:\n    pass\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n@dataclass\nclass C(Generic[T]):\n    value: int\n\nC(value=1)\n\nclass Generic:\n    pass\n"
         );
         Ok(())
     }

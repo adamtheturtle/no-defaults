@@ -9,6 +9,7 @@ use clap::{Parser, ValueEnum};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use ruff_python_ast::helpers::Truthiness;
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
@@ -2625,7 +2626,10 @@ fn generates_init(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
                 .arg
                 .as_ref()
                 .is_some_and(|name| name.as_str() == "init")
-                && matches!(&keyword.value, Expr::BooleanLiteral(literal) if !literal.value)
+                && matches!(
+                    Truthiness::from_expr(&keyword.value, |_| false),
+                    Truthiness::False | Truthiness::Falsey | Truthiness::None
+                )
         })
     })
 }
@@ -5587,6 +5591,16 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "@dataclass(kw_only=True)\nclass D:\n    a: int\n    b: int\n\n\nD(a=1, b=2)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_falsey_dataclass_init_option_disables_call_site_updates() -> Result<(), String> {
+        let source = "@dataclass(init=0)\nclass C:\n    value: int = 1\n\n\nC()\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass(init=0)\nclass C:\n    value: int\n\n\nC()\n"
         );
         Ok(())
     }

@@ -3165,6 +3165,7 @@ fn rewrite_calls(
         bindings,
         invalidated_bindings: BTreeSet::new(),
         classes: Vec::new(),
+        class_scope_depths: Vec::new(),
         implicit_receivers: Vec::new(),
         called: BTreeSet::new(),
         scopes: Vec::new(),
@@ -3488,6 +3489,9 @@ struct Rewriter<'a> {
     invalidated_bindings: BTreeSet<String>,
     /// The class bodies being walked, so `self.method(...)` can be resolved.
     classes: Vec<String>,
+    /// Scope-stack depth immediately inside each class body, distinguishing a
+    /// direct method from a function nested inside one.
+    class_scope_depths: Vec<usize>,
     /// The implicit receiver name of each enclosing function. Static methods
     /// and module functions contribute `None`.
     implicit_receivers: Vec<Option<String>>,
@@ -3841,12 +3845,14 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             Stmt::ClassDef(class) => {
                 self.classes.push(class.name.to_string());
                 self.scopes.push(BoundNames::of_body(&class.body));
+                self.class_scope_depths.push(self.scopes.len());
                 walk_stmt(self, statement);
+                self.class_scope_depths.pop();
                 self.scopes.pop();
                 self.classes.pop();
             }
             Stmt::FunctionDef(function) => {
-                let receiver = (!self.classes.is_empty()
+                let receiver = (self.class_scope_depths.last() == Some(&self.scopes.len())
                     && method_receiver(function, &self.aliases) != Receiver::None)
                     .then(|| {
                         function
@@ -5616,6 +5622,16 @@ mod tests {
     #[test]
     fn a_shadowed_class_name_is_not_a_known_receiver() -> Result<(), String> {
         let source = "class Client:\n    @staticmethod\n    def build(value=1): return value\n\ndef run(Client):\n    return Client.build()\n";
+        assert_eq!(
+            skipped_reasons(source)?.first().map(String::as_str),
+            Some("this call cannot be tied to the definition that was fixed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_function_self_is_not_the_enclosing_instance() -> Result<(), String> {
+        let source = "class C:\n    def fetch(self, value=1): return value\n\n    def run(self, other):\n        def inner(self):\n            return self.fetch()\n        return inner(other)\n";
         assert_eq!(
             skipped_reasons(source)?.first().map(String::as_str),
             Some("this call cannot be tied to the definition that was fixed")

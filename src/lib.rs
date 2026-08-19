@@ -2138,7 +2138,7 @@ impl Checker<'_> {
         let Expr::Name(name) = &*assign.target else {
             return;
         };
-        if is_class_var(statement) {
+        if is_class_var(statement, &self.aliases) {
             return;
         }
         // A `_: KW_ONLY` marker is not a field, so it takes no place in the
@@ -2503,6 +2503,21 @@ impl Aliases {
                     }
                 }
                 Stmt::ImportFrom(import) => {
+                    let typing = import.module.as_ref().is_some_and(|module| {
+                        matches!(module.as_str(), "typing" | "typing_extensions")
+                    });
+                    if typing {
+                        for alias in &import.names {
+                            if alias.name.as_str() != "ClassVar" {
+                                continue;
+                            }
+                            let Some(local) = &alias.asname else {
+                                continue;
+                            };
+                            self.renamed
+                                .insert(local.to_string(), Some("ClassVar".to_owned()));
+                        }
+                    }
                     let carries_fields = import.module.as_ref().is_some_and(|module| {
                         matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
                     });
@@ -2692,22 +2707,22 @@ fn field_excluded_from_init(value: &Expr, aliases: &Aliases) -> bool {
         })
 }
 
-fn is_class_var(statement: &Stmt) -> bool {
+fn is_class_var(statement: &Stmt, aliases: &Aliases) -> bool {
     let Stmt::AnnAssign(assign) = statement else {
         return false;
     };
-    annotates_class_var(&assign.annotation)
+    annotates_class_var(&assign.annotation, aliases)
 }
 
 /// Whether an annotation names `ClassVar`, bare, qualified, or quoted.
 ///
 /// `dataclasses` resolves a string annotation textually, so
 /// `x: "ClassVar[int]" = 1` really is a class variable rather than a field.
-fn annotates_class_var(annotation: &Expr) -> bool {
+fn annotates_class_var(annotation: &Expr, aliases: &Aliases) -> bool {
     match annotation {
-        Expr::Name(name) => name.id.as_str() == "ClassVar",
+        Expr::Name(name) => aliases.resolve(name.id.as_str()) == "ClassVar",
         Expr::Attribute(attribute) => attribute.attr.as_str() == "ClassVar",
-        Expr::Subscript(subscript) => annotates_class_var(&subscript.value),
+        Expr::Subscript(subscript) => annotates_class_var(&subscript.value, aliases),
         // Quoted annotations are only one level deep: the contents of
         // `"ClassVar[int]"` are an expression, not another string. Surrounding
         // whitespace is trimmed because `dataclasses` accepts it and the
@@ -2716,7 +2731,7 @@ fn annotates_class_var(annotation: &Expr) -> bool {
             parse_expression(literal.value.to_str().trim()).is_ok_and(|parsed| {
                 match parsed.expr() {
                     Expr::StringLiteral(_) => false,
-                    expression => annotates_class_var(expression),
+                    expression => annotates_class_var(expression, aliases),
                 }
             })
         }
@@ -4126,6 +4141,15 @@ mod tests {
     fn quoted_class_var_annotations_are_not_fields() {
         let found = messages(
             "@dataclass\nclass C:\n a: \"ClassVar[int]\" = 1\n b: \"typing.ClassVar[int]\" = 2\n c: 'ClassVar' = 3\n d: \"  ClassVar[int]  \" = 4\n",
+            false,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn aliased_class_var_annotations_are_not_fields() {
+        let found = messages(
+            "from dataclasses import dataclass\nfrom typing import ClassVar as CV\nfrom typing_extensions import ClassVar as ExtendedCV\n\n@dataclass\nclass C:\n    a: CV[int] = 1\n    b: ExtendedCV[str] = 'b'\n    c: \"CV[float]\" = 3.0\n",
             false,
         );
         assert!(found.is_empty(), "{found:?}");

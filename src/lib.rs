@@ -1036,10 +1036,15 @@ fn collect_reexports(path: &Path, reexports: &mut Reexports) -> Result<(), Strin
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let parsed = parse_module(&source)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-    let mut collector = ReexportCollector { reexports };
+    let mut collector = ReexportCollector {
+        reexports,
+        bindings: BTreeSet::new(),
+        all_names: BTreeSet::new(),
+    };
     for statement in parsed.suite() {
         collector.visit_stmt(statement);
     }
+    collector.finish();
     Ok(())
 }
 
@@ -1047,13 +1052,18 @@ fn collect_reexports(path: &Path, reexports: &mut Reexports) -> Result<(), Strin
 /// literal `__all__`.
 struct ReexportCollector<'a> {
     reexports: &'a mut Reexports,
+    bindings: BTreeSet<String>,
+    all_names: BTreeSet<String>,
 }
 
 impl ReexportCollector<'_> {
     /// Add the entries of an `__all__` that is written out as a list or tuple
     /// of string literals. One computed from a call or another module's
     /// `__all__` says nothing this run can read.
-    fn collect_all(&mut self, value: &Expr) {
+    fn collect_all(&mut self, value: &Expr, replace: bool) {
+        if replace {
+            self.all_names.clear();
+        }
         let elements = match value {
             Expr::List(list) => &list.elts,
             Expr::Tuple(tuple) => &tuple.elts,
@@ -1061,9 +1071,15 @@ impl ReexportCollector<'_> {
         };
         for element in elements {
             if let Expr::StringLiteral(string) = element {
-                self.reexports.names.insert(string.value.to_string());
+                self.all_names.insert(string.value.to_string());
             }
         }
+    }
+
+    fn finish(&mut self) {
+        self.reexports
+            .names
+            .extend(self.all_names.intersection(&self.bindings).cloned());
     }
 }
 
@@ -1080,6 +1096,7 @@ impl<'a> Visitor<'a> for ReexportCollector<'_> {
                         self.reexports.wildcard = true;
                     } else {
                         let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                        self.bindings.insert(bound.to_string());
                         self.reexports.names.insert(bound.to_string());
                     }
                 }
@@ -1091,23 +1108,41 @@ impl<'a> Visitor<'a> for ReexportCollector<'_> {
                         || alias.name.split('.').next().unwrap_or_default().to_owned(),
                         ToString::to_string,
                     );
+                    self.bindings.insert(bound.clone());
                     self.reexports.names.insert(bound);
                 }
             }
             Stmt::Assign(assign) if assign.targets.iter().any(is_dunder_all) => {
-                self.collect_all(&assign.value);
+                self.collect_all(&assign.value, true);
             }
             Stmt::AnnAssign(assign) if is_dunder_all(&assign.target) => {
                 if let Some(value) = assign.value.as_deref() {
-                    self.collect_all(value);
+                    self.collect_all(value, true);
                 }
             }
             Stmt::AugAssign(assign) if is_dunder_all(&assign.target) => {
-                self.collect_all(&assign.value);
+                self.collect_all(&assign.value, false);
             }
-            // Imports and `__all__` inside a function or class bind local
-            // names or class attributes, not attributes of the package module.
-            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            Stmt::FunctionDef(function) => {
+                // The name is a module binding, but the body is another scope.
+                self.bindings.insert(function.name.to_string());
+            }
+            Stmt::ClassDef(class) => {
+                // Class-body imports become attributes, not package exports.
+                self.bindings.insert(class.name.to_string());
+            }
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    if let Expr::Name(name) = target {
+                        self.bindings.insert(name.id.to_string());
+                    }
+                }
+            }
+            Stmt::AnnAssign(assign) => {
+                if let Expr::Name(name) = assign.target.as_ref() {
+                    self.bindings.insert(name.id.to_string());
+                }
+            }
             // Imports guarded by `try` or `if TYPE_CHECKING` re-export just as
             // much as ones at the top level.
             _ => walk_stmt(self, statement),
@@ -4400,7 +4435,7 @@ mod tests {
         std::fs::create_dir_all(&internal).map_err(|error| error.to_string())?;
         std::fs::write(
             root.join("__init__.py"),
-            "import os\nfrom ._internal import upload as send\n__all__ = [\"send\", \"Job\"]\n",
+            "import os\nfrom ._internal import upload as send\nJob = object()\n__all__ = [\"send\", \"Job\"]\n",
         )
         .map_err(|error| error.to_string())?;
         std::fs::write(
@@ -4449,6 +4484,23 @@ mod tests {
         collect_reexports(&path, &mut reexports)?;
         assert!(reexports.names.is_empty());
         assert!(!reexports.wildcard);
+        Ok(())
+    }
+
+    #[test]
+    fn reassigned_dunder_all_replaces_stale_names() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(
+            &path,
+            "old = object()\nnew = object()\n__all__ = ['old']\n__all__ = ['new']\n__all__ += ['also_unbound']\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let mut reexports = Reexports::default();
+        collect_reexports(&path, &mut reexports)?;
+        assert!(!reexports.covers("old"));
+        assert!(reexports.covers("new"));
+        assert!(!reexports.covers("also_unbound"));
         Ok(())
     }
 

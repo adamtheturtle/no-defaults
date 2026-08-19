@@ -67,6 +67,29 @@ fn diff_previews_without_writing() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn diff_reports_diagnostics_without_edits() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let broken = directory.path().join("bad.py");
+    let stub = directory.path().join("api.pyi");
+    std::fs::write(&broken, "def broken(:\n")?;
+    std::fs::write(&stub, "def f(x: int = ...) -> None: ...\n")?;
+    let output = Command::new(binary())
+        .arg("--diff")
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("bad.py:1:12: NOD000 syntax error"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("api.pyi:1:16: NOD001"), "{stdout}");
+    Ok(())
+}
+
+#[test]
 fn fix_warns_about_callers_it_cannot_see() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

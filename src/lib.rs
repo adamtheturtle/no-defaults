@@ -4121,6 +4121,15 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 for decorator in &function.decorator_list {
                     self.visit_decorator(decorator);
                 }
+                // Type parameters, parameter defaults and annotations, and
+                // the return annotation are evaluated outside the body too.
+                if let Some(type_params) = &function.type_params {
+                    self.visit_type_params(type_params);
+                }
+                self.visit_parameters(&function.parameters);
+                if let Some(returns) = &function.returns {
+                    self.visit_annotation(returns);
+                }
                 let receiver = (self.class_scope_depths.last() == Some(&self.scopes.len())
                     && method_receiver(function, &self.aliases) != Receiver::None)
                     .then(|| {
@@ -4137,13 +4146,6 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 collect_bindings(&function.body, self.path, self.known, &mut local);
                 self.bindings.push(local);
                 self.scopes.push(BoundNames::of_function(function));
-                if let Some(type_params) = &function.type_params {
-                    self.visit_type_params(type_params);
-                }
-                self.visit_parameters(&function.parameters);
-                if let Some(returns) = &function.returns {
-                    self.visit_annotation(returns);
-                }
                 self.visit_body(&function.body);
                 self.scopes.pop();
                 self.bindings.pop();
@@ -6161,6 +6163,17 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "def target(value):\n    return lambda function: function\n\n@target(value=1)\ndef decorated():\n    target = 5\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn function_annotations_use_the_enclosing_scope() -> Result<(), String> {
+        let source = "def target(value=1):\n    return int\n\ndef decorated(item: target()):\n    target = 5\n";
+        assert_eq!(
+            fixed(source)?,
+            "def target(value):\n    return int\n\ndef decorated(item: target(value=1)):\n    target = 5\n"
         );
         assert!(skipped_reasons(source)?.is_empty());
         Ok(())

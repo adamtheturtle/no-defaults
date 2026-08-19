@@ -2686,3 +2686,22 @@ fn a_try_else_import_is_exclusive_to_the_success_path() -> Result<(), Box<dyn st
     assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
     Ok(())
 }
+
+#[test]
+fn type_checking_only_dataclass_fields_are_not_constructor_parameters(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\nfrom typing import TYPE_CHECKING\n\n@dataclass\nclass C:\n    if TYPE_CHECKING:\n        ghost: int = 1\n    value: int = 2\n\nC()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "from dataclasses import dataclass\nfrom typing import TYPE_CHECKING\n\n@dataclass\nclass C:\n    if TYPE_CHECKING:\n        ghost: int = 1\n    value: int\n\nC(value=2)\n"
+    );
+    Ok(())
+}

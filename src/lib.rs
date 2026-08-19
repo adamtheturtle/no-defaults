@@ -2745,6 +2745,18 @@ impl Checker<'_> {
         self.conditional_depth -= 1;
     }
 
+    /// Whether a test is the `TYPE_CHECKING` guard, whose block a type checker
+    /// reads but the interpreter never runs.
+    fn is_type_checking(&self, expression: &Expr) -> bool {
+        match expression {
+            Expr::Name(name) => self.aliases.type_checking.contains(name.id.as_str()),
+            Expr::Attribute(attribute) if attribute.attr.as_str() == "TYPE_CHECKING" => {
+                matches!(attribute.value.as_ref(), Expr::Name(module) if matches!(module.id.as_str(), "typing" | "typing_extensions") || self.aliases.typing_modules.contains(module.id.as_str()))
+            }
+            _ => false,
+        }
+    }
+
     fn visit_conditional<'a>(&mut self, branch: &'a ast::StmtIf)
     where
         Self: Visitor<'a>,
@@ -2757,6 +2769,17 @@ impl Checker<'_> {
         );
         let mut uncertain = false;
         for (test, body) in clauses {
+            if test.is_some_and(|test| self.is_type_checking(test)) {
+                // The block does not run, so an annotation in it declares
+                // nothing the constructor takes. The imports in it still bind
+                // the names the rest of the file is written against, so the
+                // body is walked with field collection off rather than
+                // skipped, and a later clause still runs.
+                let fields = self.scope.fields.take();
+                self.visit_body(body);
+                self.scope.fields = fields;
+                continue;
+            }
             let truth = test.map_or(Truthiness::True, |test| {
                 Truthiness::from_expr(test, |_| false)
             });
@@ -3599,6 +3622,7 @@ struct Aliases {
     typing_modules: BTreeSet<String>,
     abc_modules: BTreeSet<String>,
     structural_bases: BTreeSet<String>,
+    type_checking: BTreeSet<String>,
     kw_only_markers: BTreeSet<String>,
 }
 
@@ -3661,6 +3685,9 @@ impl Aliases {
         for alias in &import.names {
             if alias.name.as_str() == "ClassVar" {
                 self.class_vars
+                    .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
+            } else if alias.name.as_str() == "TYPE_CHECKING" {
+                self.type_checking
                     .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
             } else if matches!(alias.name.as_str(), "Generic" | "Protocol") {
                 self.structural_bases

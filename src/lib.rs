@@ -2265,6 +2265,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         Inherited::Known(shape) => (shape.fields.clone(), shape.removed.clone()),
                         Inherited::Nothing | Inherited::Unknown => (Vec::new(), Vec::new()),
                     };
+                    if let Inherited::Known(shape) = &inherited {
+                        self.scope.kept_default = shape.kept_default;
+                    }
                     self.classes.push(ClassCollector {
                         name: class.name.to_string(),
                         style,
@@ -2289,6 +2292,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                             fields: collector.fields.clone(),
                             removed: collector.removed.clone(),
                             complete: !collector.inherits,
+                            kept_default: self.scope.kept_default,
                         };
                         match self.shapes.entry(collector.name.clone()) {
                             Entry::Vacant(entry) => {
@@ -2405,6 +2409,9 @@ struct Shape {
     removed: Vec<Removed>,
     /// Whether this class's own constructor is fully known.
     complete: bool,
+    /// Whether its positional fields end in a retained default, which forces a
+    /// subclass's positional fields to retain their defaults too.
+    kept_default: bool,
 }
 
 fn inherited_fields(
@@ -5340,6 +5347,24 @@ mod tests {
                       @dataclass\nclass Child(Parent):\n    b: int = 2\n\n\nChild()\n";
         assert!(fixed(source)?.contains("Child(a=1, b=2)"));
         Ok(())
+    }
+
+    #[test]
+    fn a_subclass_keeps_defaults_after_a_retained_base_default() {
+        let source = "@dataclass\nclass Base:\n    a: int = 1  # noqa: NOD001\n\n\n@dataclass\nclass Child(Base):\n    b: int = 2\n\n\nChild()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert_eq!(checked.diagnostics[0].line, 8);
+        assert_eq!(checked.diagnostics[0].fix, None);
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

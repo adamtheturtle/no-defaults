@@ -4042,10 +4042,30 @@ impl Rewriter<'_> {
                 return;
             }
         };
-        if arguments.is_empty() {
+        if arguments.positional.is_empty() && arguments.keywords.is_empty() {
             return;
         }
-        let arguments = arguments.join(", ");
+        if !arguments.positional.is_empty() && !call.arguments.keywords.is_empty() {
+            let positional = arguments.positional.join(", ");
+            self.edits.push(Edit {
+                range: TextRange::empty(call.arguments.keywords[0].start()),
+                replacement: format!("{positional}, "),
+            });
+            if arguments.keywords.is_empty() {
+                return;
+            }
+        }
+        let arguments = if call.arguments.keywords.is_empty() {
+            arguments
+                .positional
+                .iter()
+                .chain(&arguments.keywords)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            arguments.keywords.join(", ")
+        };
         let last = call
             .arguments
             .args
@@ -4077,7 +4097,7 @@ fn missing_arguments(
     call: &ast::Arguments,
     signature: &Signature,
     bound: usize,
-) -> Result<Vec<String>, String> {
+) -> Result<MissingArguments, String> {
     if call
         .args
         .iter()
@@ -4115,9 +4135,9 @@ fn missing_arguments(
             ));
         };
         if slot.is_some_and(|slot| slot < signature.positional_only) {
-            // A positional-only argument can only be appended when it fills the
-            // very next slot and no keyword argument precedes it.
-            if !call.keywords.is_empty() || slot != Some(bound + positional + appended.len()) {
+            // A positional-only argument must fill the very next positional
+            // slot; it can be inserted before any existing keywords.
+            if slot != Some(bound + positional + appended.len()) {
                 return Err(format!(
                     "`{}` is positional-only and cannot be appended to this call",
                     removed.parameter
@@ -4128,11 +4148,10 @@ fn missing_arguments(
             keywords.push(format!("{}={}", removed.parameter, value));
         }
     }
-    appended.extend(keywords);
     // Python allows a bare generator expression as an argument only when it is
     // the sole one, so nothing can follow it. A call that needs nothing added
     // is not affected, so it is not worth a warning.
-    if !appended.is_empty()
+    if (!appended.is_empty() || !keywords.is_empty())
         && call.args.iter().any(
             |argument| matches!(argument, Expr::Generator(generator) if !generator.parenthesized),
         )
@@ -4143,7 +4162,15 @@ fn missing_arguments(
                 .to_owned(),
         );
     }
-    Ok(appended)
+    Ok(MissingArguments {
+        positional: appended,
+        keywords,
+    })
+}
+
+struct MissingArguments {
+    positional: Vec<String>,
+    keywords: Vec<String>,
 }
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
@@ -5908,13 +5935,10 @@ mod tests {
     }
 
     #[test]
-    fn a_positional_only_argument_is_never_appended_after_a_keyword() -> Result<(), String> {
+    fn a_positional_only_argument_is_inserted_before_a_keyword() -> Result<(), String> {
         assert_eq!(
-            skipped_reasons("def f(a=1, /, *, b=2): pass\nf(b=3)\n")?
-                .first()
-                .map(String::as_str),
-            Some("`a` is positional-only and cannot be appended to this call"),
-            "appending `1` after `b=3` would not parse"
+            fixed("def f(a=1, /, *, b=2): pass\nf(b=3)\n")?,
+            "def f(a, /, *, b): pass\nf(1, b=3)\n"
         );
         Ok(())
     }

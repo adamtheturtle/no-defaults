@@ -2739,7 +2739,13 @@ impl Checker<'_> {
             let fix = if (self.scope.class_body
                 && matches!(
                     function.name.as_str(),
-                    "__call__" | "__enter__" | "__exit__" | "__aenter__" | "__aexit__" | "__iter__"
+                    "__call__"
+                        | "__enter__"
+                        | "__exit__"
+                        | "__aenter__"
+                        | "__aexit__"
+                        | "__iter__"
+                        | "__next__"
                 ))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
@@ -6822,6 +6828,24 @@ mod tests {
     fn iterator_defaults_are_retained_for_protocol_calls() {
         let source =
             "class C:\n    def __iter__(self, extra=None):\n        return iter(())\n\niter(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn next_defaults_are_retained_for_protocol_calls() {
+        let source =
+            "class C:\n    def __next__(self, extra=None):\n        return 1\n\nnext(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

@@ -1150,6 +1150,11 @@ impl<'a> Visitor<'a> for ReexportCollector<'_> {
                             // The public alias exposes the source symbol even
                             // when its defining name is private.
                             self.reexports.names.insert(alias.name.to_string());
+                            if import.level > 0 && import.module.is_none() {
+                                // `from . import _api as public` exposes the
+                                // imported module and therefore its contents.
+                                self.reexports.wildcard = true;
+                            }
                         }
                     }
                 }
@@ -4733,6 +4738,19 @@ mod tests {
         collect_reexports(&path, &mut reexports)?;
         assert!(reexports.covers("public"));
         assert!(reexports.covers("_hidden"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_public_module_alias_exposes_its_contents() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(&path, "from . import _api as public\n")
+            .map_err(|error| error.to_string())?;
+        let mut reexports = Reexports::default();
+        collect_reexports(&path, &mut reexports)?;
+        assert!(reexports.wildcard);
+        assert!(reexports.covers("anything_in_the_module"));
         Ok(())
     }
 

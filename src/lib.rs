@@ -3220,9 +3220,10 @@ fn has_dataclass_decorator(class: &ast::StmtClassDef, aliases: &Aliases) -> bool
 
 /// Whether the decorator leaves the class with a generated `__init__`.
 fn generates_init(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
-    let defines_init = class.body.iter().any(
-        |statement| matches!(statement, Stmt::FunctionDef(function) if function.name.as_str() == "__init__"),
-    );
+    // `dataclasses` checks the completed class namespace, not just method
+    // definitions. An assignment, import, or nested definition under this
+    // name suppresses generation just as `def __init__` does.
+    let defines_init = BoundNames::of_body(&class.body).names.contains("__init__");
     !defines_init
         && !class.decorator_list.iter().any(|decorator| {
             let Expr::Call(call) = &decorator.expression else {
@@ -6368,6 +6369,23 @@ mod tests {
             )
         );
         Ok(())
+    }
+
+    #[test]
+    fn an_assignment_based_dataclass_init_suppresses_constructor_generation() {
+        let source = "from dataclasses import dataclass\n\ndef initialize(self):\n    self.value = 5\n\n@dataclass\nclass C:\n    value: int = 1\n    __init__ = initialize\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

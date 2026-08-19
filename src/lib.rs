@@ -3776,13 +3776,7 @@ fn collect_bindings(
                 collect_conditional_bindings(branch, importer, known, bindings);
             }
             Stmt::Try(block) => {
-                collect_bindings(&block.body, importer, known, bindings);
-                for handler in &block.handlers {
-                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                    collect_bindings(&handler.body, importer, known, bindings);
-                }
-                collect_bindings(&block.orelse, importer, known, bindings);
-                collect_bindings(&block.finalbody, importer, known, bindings);
+                collect_try_bindings(block, importer, known, bindings);
             }
             Stmt::For(loop_) => {
                 collect_bindings(&loop_.body, importer, known, bindings);
@@ -3793,6 +3787,43 @@ fn collect_bindings(
             _ => {}
         }
     }
+}
+
+fn collect_try_bindings(
+    block: &ast::StmtTry,
+    importer: &Path,
+    known: &BTreeSet<&Path>,
+    bindings: &mut BTreeMap<String, Binding>,
+) {
+    let initial = bindings.clone();
+    let mut success = initial.clone();
+    collect_bindings(&block.body, importer, known, &mut success);
+    collect_bindings(&block.orelse, importer, known, &mut success);
+    let mut outcomes = vec![success];
+    for handler in &block.handlers {
+        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+        let mut outcome = initial.clone();
+        collect_bindings(&handler.body, importer, known, &mut outcome);
+        outcomes.push(outcome);
+    }
+    for outcome in &mut outcomes {
+        collect_bindings(&block.finalbody, importer, known, outcome);
+    }
+    retain_common_bindings(bindings, &outcomes, initial);
+}
+
+fn retain_common_bindings(
+    bindings: &mut BTreeMap<String, Binding>,
+    outcomes: &[BTreeMap<String, Binding>],
+    fallback: BTreeMap<String, Binding>,
+) {
+    *bindings = outcomes.first().cloned().unwrap_or(fallback);
+    bindings.retain(|name, binding| {
+        outcomes
+            .iter()
+            .skip(1)
+            .all(|path| path.get(name) == Some(binding))
+    });
 }
 
 /// Keep a binding after an `if` only when every runtime path agrees on it.
@@ -3838,13 +3869,7 @@ fn collect_conditional_bindings(
     if let Some(path) = fallthrough {
         outcomes.push(path);
     }
-    *bindings = outcomes.first().cloned().unwrap_or(initial);
-    bindings.retain(|name, binding| {
-        outcomes
-            .iter()
-            .skip(1)
-            .all(|path| path.get(name) == Some(binding))
-    });
+    retain_common_bindings(bindings, &outcomes, initial);
 }
 
 /// The names a function or class body binds.

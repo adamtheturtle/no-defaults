@@ -2715,6 +2715,8 @@ impl Checker<'_> {
         // after it to keep its own. A keyword-only field is exempt, since
         // `dataclasses` moves it past the `*` where order does not constrain it.
         let fix = if !self.class_constructs.last().copied().unwrap_or(true)
+            || (style == FieldStyle::Base
+                && pydantic_field_has_validation_alias(value, &self.aliases))
             || (self.scope.kept_default && !kw_only)
         {
             None
@@ -3332,6 +3334,24 @@ fn field_excluded_from_init(value: &Expr, aliases: &Aliases) -> bool {
                     Truthiness::False | Truthiness::Falsey | Truthiness::None
                 )
         })
+}
+
+/// Whether Pydantic accepts a name other than the Python field name when
+/// validating constructor input. Without evaluating model configuration, the
+/// original field default is safer than inserting a keyword that may fail.
+fn pydantic_field_has_validation_alias(value: &Expr, aliases: &Aliases) -> bool {
+    let Some((call, FieldCall::Pydantic)) = field_call(value, aliases) else {
+        return false;
+    };
+    call.arguments.keywords.iter().any(|keyword| {
+        keyword.arg.as_ref().is_some_and(|name| {
+            matches!(name.as_str(), "alias" | "validation_alias")
+                && !matches!(
+                    Truthiness::from_expr(&keyword.value, |_| false),
+                    Truthiness::None
+                )
+        })
+    })
 }
 
 fn is_class_var(statement: &Stmt, aliases: &Aliases) -> bool {
@@ -5027,6 +5047,23 @@ mod tests {
             false,
         );
         assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn a_pydantic_validation_alias_prevents_an_unsafe_call_rewrite() {
+        let source = "from pydantic import BaseModel, Field\n\nclass C(BaseModel):\n    value: int = Field(1, alias=\"external\")\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

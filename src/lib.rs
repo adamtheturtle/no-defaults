@@ -3285,10 +3285,12 @@ impl BoundNames {
         }
     }
 
-    fn comprehensions(&mut self, generators: &[ast::Comprehension]) {
+    fn of_comprehension(generators: &[ast::Comprehension]) -> Self {
+        let mut collector = Self::default();
         for generator in generators {
-            self.bind(&generator.target);
+            collector.bind(&generator.target);
         }
+        collector
     }
 
     /// The names bound anywhere inside a function, including its parameters.
@@ -3399,10 +3401,6 @@ impl<'a> Visitor<'a> for BoundNames {
             // As with a nested `def`, a lambda's parameters belong to the
             // lambda, and the rewriter pushes a scope for it.
             Expr::Lambda(_) => return,
-            Expr::ListComp(comprehension) => self.comprehensions(&comprehension.generators),
-            Expr::SetComp(comprehension) => self.comprehensions(&comprehension.generators),
-            Expr::DictComp(comprehension) => self.comprehensions(&comprehension.generators),
-            Expr::Generator(comprehension) => self.comprehensions(&comprehension.generators),
             _ => {}
         }
         walk_expr(self, expression);
@@ -3828,6 +3826,19 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
     }
 
     fn visit_expr(&mut self, expression: &'a Expr) {
+        let comprehension = match expression {
+            Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),
+            Expr::SetComp(comprehension) => Some(comprehension.generators.as_slice()),
+            Expr::DictComp(comprehension) => Some(comprehension.generators.as_slice()),
+            Expr::Generator(comprehension) => Some(comprehension.generators.as_slice()),
+            _ => None,
+        };
+        if let Some(generators) = comprehension {
+            self.scopes.push(BoundNames::of_comprehension(generators));
+            walk_expr(self, expression);
+            self.scopes.pop();
+            return;
+        }
         match expression {
             Expr::Call(call) => {
                 self.called.insert((call.func.start(), call.func.end()));
@@ -5615,7 +5626,6 @@ mod tests {
             "import connect",
             "from os import path as connect",
             "class connect: pass",
-            "[connect for connect in []]",
             "if (connect := open): pass",
         ] {
             let source =
@@ -5655,6 +5665,20 @@ mod tests {
             "def outer():\n    def inner(value):\n        return value\n    return inner(value=1)\n"
         );
         assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn comprehension_targets_shadow_only_inside_the_comprehension() -> Result<(), String> {
+        let source = "def target(value=1): return value\n\ndef run():\n    [target() for target in [lambda: 5]]\n    return target()\n";
+        assert_eq!(
+            fixed(source)?,
+            "def target(value): return value\n\ndef run():\n    [target() for target in [lambda: 5]]\n    return target(value=1)\n"
+        );
+        assert_eq!(
+            skipped_reasons(source)?,
+            ["this call cannot be tied to the definition that was fixed"]
+        );
         Ok(())
     }
 

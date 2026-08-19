@@ -332,30 +332,44 @@ impl Definitions {
     }
 
     fn method(&self, file: &Path, class: &str, name: &str) -> Option<&Signature> {
-        fn inherited<'a>(
-            definitions: &'a Definitions,
-            file: &Path,
-            class: &str,
-            name: &str,
-            seen: &mut BTreeSet<String>,
-        ) -> Option<&'a Signature> {
-            if !seen.insert(class.to_owned()) {
-                return None;
-            }
-            if let Some(method) = definitions
-                .methods
-                .get(&(file.to_path_buf(), class.to_owned()))
-                .and_then(|methods| methods.get(name))
-            {
-                return method.as_ref();
-            }
-            definitions
-                .bases
-                .get(&(file.to_path_buf(), class.to_owned()))?
-                .iter()
-                .find_map(|base| inherited(definitions, file, base, name, seen))
+        self.inherited(file, class, name, &mut BTreeSet::new())
+    }
+
+    /// The method a zero-argument `super()` call reaches.
+    ///
+    /// Python starts that lookup after the class the call appears in, so a
+    /// method the class itself defines is never what `super().name(...)`
+    /// calls, even when it is the one `--fix` changed.
+    fn super_method(&self, file: &Path, class: &str, name: &str) -> Option<&Signature> {
+        let mut seen = BTreeSet::new();
+        seen.insert(class.to_owned());
+        self.bases
+            .get(&(file.to_path_buf(), class.to_owned()))?
+            .iter()
+            .find_map(|base| self.inherited(file, base, name, &mut seen))
+    }
+
+    fn inherited(
+        &self,
+        file: &Path,
+        class: &str,
+        name: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> Option<&Signature> {
+        if !seen.insert(class.to_owned()) {
+            return None;
         }
-        inherited(self, file, class, name, &mut BTreeSet::new())
+        if let Some(method) = self
+            .methods
+            .get(&(file.to_path_buf(), class.to_owned()))
+            .and_then(|methods| methods.get(name))
+        {
+            return method.as_ref();
+        }
+        self.bases
+            .get(&(file.to_path_buf(), class.to_owned()))?
+            .iter()
+            .find_map(|base| self.inherited(file, base, name, seen))
     }
 }
 
@@ -1793,16 +1807,29 @@ fn copy_extended_attributes(source: &Path, destination: &std::fs::File) -> Resul
                 source.display()
             )
         })?;
-        if let Some(value) = value {
-            destination.set_xattr(&name, &value).map_err(|error| {
-                format!(
-                    "could not preserve extended attribute {name:?} while fixing {}: {error}",
-                    source.display()
-                )
-            })?;
+        let Some(value) = value else { continue };
+        if let Err(error) = destination.set_xattr(&name, &value) {
+            if system_owned_attribute(&error) {
+                continue;
+            }
+            return Err(format!(
+                "could not preserve extended attribute {name:?} while fixing {}: {error}",
+                source.display()
+            ));
         }
     }
     Ok(())
+}
+
+/// Whether an extended attribute is the system's to write rather than ours.
+///
+/// macOS keeps names such as `com.apple.macl` and `com.apple.provenance` on
+/// ordinary files and refuses to let a user process write them. Treating that
+/// refusal as fatal would abandon the whole fix run over an attribute the fix
+/// never touches, leaving the project unfixed.
+#[cfg(target_os = "macos")]
+fn system_owned_attribute(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -4479,7 +4506,10 @@ impl Rewriter<'_> {
     ///
     /// `self` and `cls` name the enclosing class; `Client` names a class of
     /// this file; and `api.Client` names one of an imported module.
-    fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool)> {
+    /// The class a receiver names, whether it was reached through an instance,
+    /// and whether it was reached through a zero-argument `super()`, whose
+    /// lookup starts after the class the call appears in.
+    fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
         if let Expr::Call(call) = receiver {
             if call.arguments.args.is_empty()
                 && call.arguments.keywords.is_empty()
@@ -4490,6 +4520,7 @@ impl Rewriter<'_> {
                     self.physical.to_path_buf(),
                     self.classes.last()?.clone(),
                     true,
+                    true,
                 ));
             }
         }
@@ -4499,6 +4530,7 @@ impl Rewriter<'_> {
                     self.physical.to_path_buf(),
                     self.classes.last()?.clone(),
                     true,
+                    false,
                 ));
             }
             if self
@@ -4510,9 +4542,16 @@ impl Rewriter<'_> {
             }
             return match self.binding(name.id.as_str()) {
                 // `from api import Client` names a class of another file.
-                Some(Binding::Symbol(file, symbol)) => Some((file.clone(), symbol.clone(), false)),
+                Some(Binding::Symbol(file, symbol)) => {
+                    Some((file.clone(), symbol.clone(), false, false))
+                }
                 Some(Binding::Module(_)) => None,
-                None => Some((self.physical.to_path_buf(), name.id.to_string(), false)),
+                None => Some((
+                    self.physical.to_path_buf(),
+                    name.id.to_string(),
+                    false,
+                    false,
+                )),
             };
         }
         let Expr::Attribute(attribute) = receiver else {
@@ -4520,7 +4559,7 @@ impl Rewriter<'_> {
         };
         let dotted = dotted_name(&attribute.value)?;
         match self.binding(&dotted)? {
-            Binding::Module(file) => Some((file.clone(), attribute.attr.to_string(), false)),
+            Binding::Module(file) => Some((file.clone(), attribute.attr.to_string(), false, false)),
             Binding::Symbol(..) => None,
         }
     }
@@ -4558,13 +4597,17 @@ impl Rewriter<'_> {
             Expr::Attribute(attribute) => {
                 // A method's receiver type is only known when it is `self`,
                 // `cls`, or a class this file can name.
-                if let Some((file, class, through_instance)) =
+                if let Some((file, class, through_instance, through_super)) =
                     self.receiving_class(&attribute.value)
                 {
-                    if let Some(signature) =
+                    let found = if through_super {
+                        self.definitions
+                            .super_method(&file, &class, attribute.attr.as_str())
+                    } else {
                         self.definitions
                             .method(&file, &class, attribute.attr.as_str())
-                    {
+                    };
+                    if let Some(signature) = found {
                         let Callable::Method { receiver, .. } = &signature.kind else {
                             return None;
                         };
@@ -7269,6 +7312,18 @@ mod tests {
     }
 
     #[test]
+    fn super_skips_the_class_the_call_is_written_in() -> Result<(), String> {
+        // ``super().target()`` calls ``Base.target``, so it takes that
+        // method's removed default rather than the overriding one.
+        let source = "class Base:\n    def target(self, value=1): pass\n\nclass Child(Base):\n    def target(self, value=2): pass\n\n    def run(self):\n        return super().target()\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def target(self, value): pass\n\n    def run(self):\n        return super().target(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn inherited_methods_resolve_through_super() -> Result<(), String> {
         let source = "class Base:\n    def target(self, value=1): pass\n\nclass Child(Base):\n    def run(self):\n        return super().target()\n";
         assert_eq!(
@@ -7935,6 +7990,21 @@ mod tests {
             Some(value.to_vec())
         );
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attributes_the_system_owns_do_not_abort_a_fix() {
+        // macOS carries names such as `com.apple.macl` and
+        // `com.apple.provenance` on ordinary files and refuses to let a user
+        // process write them. Abandoning the run over one would leave the
+        // whole project unfixed.
+        assert!(system_owned_attribute(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!system_owned_attribute(&std::io::Error::from(
+            std::io::ErrorKind::StorageFull
+        )));
     }
 
     #[cfg(target_os = "macos")]

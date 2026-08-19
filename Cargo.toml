@@ -33,6 +33,9 @@ tempfile = "3"
 toml = "1"
 unicode-width = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+xattr = "1.6"
+
 [dev-dependencies]
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
 

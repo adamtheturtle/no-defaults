@@ -1039,6 +1039,31 @@ fn an_unresolved_later_import_invalidates_an_earlier_binding(
 }
 
 #[test]
+fn reassigning_an_imported_module_invalidates_its_binding() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(
+        &caller,
+        "import api\n\nclass Other:\n    @staticmethod\n    def target(): return 5\n\napi = Other()\napi.target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        std::fs::read_to_string(caller)?.ends_with("api = Other()\napi.target()\n"),
+        "the call through the reassigned receiver must stay unchanged"
+    );
+    assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
+    Ok(())
+}
+
+#[test]
 fn a_single_component_import_resolves_only_at_the_importers_root(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

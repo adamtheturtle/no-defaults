@@ -1868,7 +1868,9 @@ fn collect_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
             for entry in WalkBuilder::new(path).standard_filters(true).build() {
                 let entry =
                     entry.map_err(|error| format!("could not walk {}: {error}", path.display()))?;
-                if entry.file_type().is_some_and(|kind| kind.is_file()) && is_python(entry.path()) {
+                // `Path::is_file` follows a file symlink even though the walk
+                // deliberately does not follow directory symlinks.
+                if entry.path().is_file() && is_python(entry.path()) {
                     files.push(entry.into_path());
                 }
             }

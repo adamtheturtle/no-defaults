@@ -854,6 +854,29 @@ fn a_symlink_and_its_target_are_one_file() -> Result<(), Box<dyn std::error::Err
 
 #[cfg(unix)]
 #[test]
+fn a_directory_walk_checks_symlinked_python_files() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let tree = directory.path().join("tree");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        directory.path().join("real.py"),
+        "def target(value=1): pass\n",
+    )?;
+    std::os::unix::fs::symlink("../real.py", tree.join("linked.py"))?;
+
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&tree)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("linked.py:1:18: NOD001"), "{stdout}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn fixing_a_symlink_writes_through_to_its_target() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let real = directory.path().join("real.py");

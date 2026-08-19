@@ -3205,8 +3205,9 @@ fn rewrite_calls(
         source,
         definitions,
         aliases,
-        bindings,
+        bindings: vec![bindings],
         invalidated_bindings: BTreeSet::new(),
+        known,
         classes: Vec::new(),
         class_scope_depths: Vec::new(),
         implicit_receivers: Vec::new(),
@@ -3289,10 +3290,6 @@ fn collect_bindings(
                     bindings.insert(bound, binding);
                 }
             }
-            Stmt::FunctionDef(function) => {
-                collect_bindings(&function.body, importer, known, bindings);
-            }
-            Stmt::ClassDef(class) => collect_bindings(&class.body, importer, known, bindings),
             Stmt::If(branch) => {
                 collect_bindings(&branch.body, importer, known, bindings);
                 for clause in &branch.elif_else_clauses {
@@ -3308,6 +3305,8 @@ fn collect_bindings(
                 collect_bindings(&block.orelse, importer, known, bindings);
                 collect_bindings(&block.finalbody, importer, known, bindings);
             }
+            // Definitions introduce lexical scopes whose imports are collected
+            // separately when the rewriter enters them.
             _ => {}
         }
     }
@@ -3527,9 +3526,10 @@ struct Rewriter<'a> {
     definitions: &'a Definitions,
     aliases: Aliases,
     /// What each imported name in this file refers to.
-    bindings: BTreeMap<String, Binding>,
+    bindings: Vec<BTreeMap<String, Binding>>,
     /// Imported module-scope names replaced by an assignment already visited.
     invalidated_bindings: BTreeSet<String>,
+    known: &'a BTreeSet<&'a Path>,
     /// The class bodies being walked, so `self.method(...)` can be resolved.
     classes: Vec<String>,
     /// Scope-stack depth immediately inside each class body, distinguishing a
@@ -3562,6 +3562,16 @@ impl Rewriter<'_> {
                 .contains(name)
                 .then(|| scope.functions.contains(name))
         })
+    }
+
+    fn binding(&self, name: &str) -> Option<&Binding> {
+        for (index, bindings) in self.bindings.iter().enumerate().rev() {
+            if let Some(binding) = bindings.get(name) {
+                return (!(index == 0 && self.invalidated_bindings.contains(name)))
+                    .then_some(binding);
+            }
+        }
+        None
     }
 
     fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
@@ -3623,7 +3633,7 @@ impl Rewriter<'_> {
             {
                 return None;
             }
-            return match self.bindings.get(name.id.as_str()) {
+            return match self.binding(name.id.as_str()) {
                 // `from api import Client` names a class of another file.
                 Some(Binding::Symbol(file, symbol)) => Some((file.clone(), symbol.clone(), false)),
                 Some(Binding::Module(_)) => None,
@@ -3634,7 +3644,7 @@ impl Rewriter<'_> {
             return None;
         };
         let dotted = dotted_name(&attribute.value)?;
-        match self.bindings.get(&dotted)? {
+        match self.binding(&dotted)? {
             Binding::Module(file) => Some((file.clone(), attribute.attr.to_string(), false)),
             Binding::Symbol(..) => None,
         }
@@ -3656,7 +3666,7 @@ impl Rewriter<'_> {
             )),
             Expr::Name(name) if self.nested_function(name.id.as_str()) == Some(false) => None,
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
-            Expr::Name(name) => match self.bindings.get(name.id.as_str()) {
+            Expr::Name(name) => match self.binding(name.id.as_str()) {
                 Some(Binding::Symbol(file, symbol)) => Some((
                     self.definitions.symbols.get(file)?.get(symbol)?.as_ref()?,
                     0,
@@ -3701,10 +3711,7 @@ impl Rewriter<'_> {
                     }
                 }
                 let dotted = dotted_name(&attribute.value)?;
-                if self.invalidated_bindings.contains(&dotted) {
-                    return None;
-                }
-                let Some(Binding::Module(file)) = self.bindings.get(&dotted) else {
+                let Some(Binding::Module(file)) = self.binding(&dotted) else {
                     return None;
                 };
                 Some((
@@ -3908,9 +3915,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     })
                     .flatten();
                 self.implicit_receivers.push(receiver);
+                let mut local = BTreeMap::new();
+                collect_bindings(&function.body, self.path, self.known, &mut local);
+                self.bindings.push(local);
                 self.scopes.push(BoundNames::of_function(function));
                 walk_stmt(self, statement);
                 self.scopes.pop();
+                self.bindings.pop();
                 self.implicit_receivers.pop();
             }
             _ => walk_stmt(self, statement),

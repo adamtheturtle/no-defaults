@@ -1039,6 +1039,30 @@ fn an_unresolved_later_import_invalidates_an_earlier_binding(
 }
 
 #[test]
+fn fix_updates_calls_reached_through_an_unaliased_dotted_import(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    std::fs::write(package.join("__init__.py"), "")?;
+    let api = package.join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&caller, "import pkg.api\n\npkg.api.target()\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import pkg.api\n\npkg.api.target(value=1)\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn reassigning_an_imported_module_invalidates_its_binding() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

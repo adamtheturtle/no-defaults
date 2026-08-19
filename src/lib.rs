@@ -2691,15 +2691,16 @@ fn field_says_kw_only(value: &Expr, aliases: &Aliases) -> Option<bool> {
         .find_map(|keyword| keyword_is(keyword, "kw_only"))
 }
 
-/// The boolean a keyword argument was given, when it is named `name` and its
-/// value is written as a literal.
+/// The truth value a keyword argument was given, when it is named `name` and
+/// its value has constant truthiness.
 fn keyword_is(keyword: &ast::Keyword, name: &str) -> Option<bool> {
     if keyword.arg.as_ref()?.as_str() != name {
         return None;
     }
-    match &keyword.value {
-        Expr::BooleanLiteral(literal) => Some(literal.value),
-        _ => None,
+    match Truthiness::from_expr(&keyword.value, |_| false) {
+        Truthiness::True | Truthiness::Truthy => Some(true),
+        Truthiness::False | Truthiness::Falsey | Truthiness::None => Some(false),
+        Truthiness::Unknown => None,
     }
 }
 
@@ -5643,6 +5644,16 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "@dataclass\nclass C:\n    a: int = field(kw_only=True)\n    b: int\n\n\nC(5, a=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_truthy_non_boolean_kw_only_option_is_honoured() -> Result<(), String> {
+        let source = "@dataclass\nclass C:\n    first: int = field(default=1, kw_only=1)\n    second: int = 2\n\n\nC(5)\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass\nclass C:\n    first: int = field(kw_only=1)\n    second: int\n\n\nC(5, first=1)\n"
         );
         Ok(())
     }

@@ -2244,6 +2244,7 @@ fn check_source(
         lines: LineIndex::new(source),
         classes: Vec::new(),
         class_constructs: Vec::new(),
+        class_deletions: Vec::new(),
         signatures: Vec::new(),
         skipped: Vec::new(),
         directives,
@@ -2527,6 +2528,7 @@ struct Checker<'a> {
     lines: LineIndex,
     classes: Vec<ClassCollector>,
     class_constructs: Vec<bool>,
+    class_deletions: Vec<BTreeSet<String>>,
     signatures: Vec<Signature>,
     skipped: Vec<Skipped>,
     directives: Vec<Directive>,
@@ -2635,6 +2637,19 @@ impl Checker<'_> {
                 }
             }
             _ => Inherited::Unknown,
+        }
+    }
+
+    /// Record what a class contributes to a subclass's constructor. A name two
+    /// classes in one scope share resolves to neither.
+    fn record_shape(&mut self, name: String, shape: Shape) {
+        match self.shapes.entry(name) {
+            Entry::Vacant(entry) => {
+                entry.insert(Some(shape));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
         }
     }
 
@@ -3136,7 +3151,12 @@ impl Checker<'_> {
         // As in a signature, a field that keeps its default forces every field
         // after it to keep its own. A keyword-only field is exempt, since
         // `dataclasses` moves it past the `*` where order does not constrain it.
-        let fix = if self.conditional_depth > 0
+        let deleted_later = self
+            .class_deletions
+            .last()
+            .is_some_and(|deleted| deleted.contains(name.id.as_str()));
+        let fix = if deleted_later
+            || self.conditional_depth > 0
             || !constructs
             || !self.class_constructs.last().copied().unwrap_or(true)
             || (style == FieldStyle::Base
@@ -3252,6 +3272,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 };
                 self.class_constructs
                     .push(class_constructs_safely(class, &self.aliases));
+                self.class_deletions.push(deleted_names(&class.body));
                 if self.collect_signatures {
                     let inherited = self.inherited_fields(class, style);
                     // A base of this file's own contributes its fields ahead of
@@ -3287,6 +3308,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
                 self.record_base_field_class(class.name.as_str(), style);
+                self.class_deletions.pop();
                 self.class_constructs.pop();
                 let collector = self
                     .collect_signatures
@@ -3303,14 +3325,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                             complete: !collector.inherits,
                             kept_default: self.scope.kept_default,
                         };
-                        match self.shapes.entry(shape_name) {
-                            Entry::Vacant(entry) => {
-                                entry.insert(Some(shape));
-                            }
-                            Entry::Occupied(mut entry) => {
-                                entry.insert(None);
-                            }
-                        }
+                        self.record_shape(shape_name, shape);
                     }
                     if collector.style.is_some()
                         && collector.constructs
@@ -4545,6 +4560,31 @@ fn collect_star_bindings(
 /// A nested `def` or `class` is a scope of its own, and the rewriter pushes one
 /// for it on the way in, so what it binds is left to it. Only its own name is
 /// taken, because that is what the body being collected binds.
+fn deleted_names(body: &[Stmt]) -> BTreeSet<String> {
+    #[derive(Default)]
+    struct Collector(BTreeSet<String>);
+
+    impl<'a> Visitor<'a> for Collector {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            match statement {
+                Stmt::Delete(delete) => {
+                    let mut bound = BoundNames::default();
+                    for target in &delete.targets {
+                        bound.bind(target);
+                    }
+                    self.0.extend(bound.names);
+                }
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                _ => walk_stmt(self, statement),
+            }
+        }
+    }
+
+    let mut collector = Collector::default();
+    collector.visit_body(body);
+    collector.0
+}
+
 #[derive(Default)]
 struct BoundNames {
     names: BTreeSet<String>,

@@ -410,7 +410,7 @@ fn run() -> Result<bool, String> {
     if fixing && !diagnostics.is_empty() {
         return apply_fixes(&cli, &files, &diagnostics, signatures, skipped);
     }
-    report_diagnostics(&diagnostics, cli.output_format)?;
+    report_diagnostics(&diagnostics, cli.output_format, true)?;
     Ok(!diagnostics.is_empty())
 }
 
@@ -453,7 +453,7 @@ fn apply_fixes(
             .filter(|diagnostic| diagnostic.fix.is_none() || unfixed.contains(&diagnostic.path))
             .cloned()
             .collect::<Vec<_>>();
-        report_diagnostics(&remaining, cli.output_format)?;
+        report_diagnostics(&remaining, cli.output_format, true)?;
         warn_about_skipped_calls(&call_sites.skipped);
         return Ok(true);
     }
@@ -461,10 +461,12 @@ fn apply_fixes(
     // A syntax error carries no fix, and a file whose result would not have
     // parsed was left as it was, so both are still there afterwards and the
     // run has to say so rather than claim everything was fixed.
-    let remaining = diagnostics
+    let remaining_diagnostics = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.fix.is_none() || unfixed.contains(&diagnostic.path))
-        .count();
+        .cloned()
+        .collect::<Vec<_>>();
+    let remaining = remaining_diagnostics.len();
     let summary = format!(
         "Found {} error{} ({} fixed, {remaining} remaining).",
         diagnostics.len(),
@@ -476,10 +478,13 @@ fn apply_fixes(
         // on stdout would make the JSON unparseable, so it joins the warnings
         // on stderr rather than being dropped.
         OutputFormat::Json | OutputFormat::Github => {
-            report_diagnostics(diagnostics, cli.output_format)?;
+            report_diagnostics(diagnostics, cli.output_format, true)?;
             eprintln!("{summary}");
         }
-        OutputFormat::Full | OutputFormat::Concise => println!("{summary}"),
+        OutputFormat::Full | OutputFormat::Concise => {
+            report_diagnostics(&remaining_diagnostics, cli.output_format, false)?;
+            println!("{summary}");
+        }
     }
     report_call_sites(
         diagnostics,
@@ -773,7 +778,11 @@ impl SourceLines {
     }
 }
 
-fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Result<(), String> {
+fn report_diagnostics(
+    diagnostics: &[Diagnostic],
+    format: OutputFormat,
+    include_summary: bool,
+) -> Result<(), String> {
     match format {
         OutputFormat::Full => {
             // Diagnostics are sorted by path, so one file at a time is read
@@ -856,7 +865,7 @@ fn report_diagnostics(diagnostics: &[Diagnostic], format: OutputFormat) -> Resul
             return Ok(());
         }
     }
-    if !diagnostics.is_empty() {
+    if include_summary && !diagnostics.is_empty() {
         println!(
             "Found {} error{}.",
             diagnostics.len(),

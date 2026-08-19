@@ -754,12 +754,37 @@ fn a_syntax_error_does_not_stop_the_rest_being_fixed() -> Result<(), Box<dyn std
         stdout.contains("Found 2 errors (1 fixed, 1 remaining)."),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("bad.py:1:12: NOD000 syntax error"),
+        "{stdout}"
+    );
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         std::fs::read_to_string(&good)?,
         "def f(x): pass\n\nf(x=1)\n"
     );
     assert_eq!(std::fs::read_to_string(&bad)?, "def broken(:\n");
+    Ok(())
+}
+
+#[test]
+fn text_fix_reports_an_unfixable_stub_default() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let stub = directory.path().join("api.pyi");
+    std::fs::write(&stub, "def f(x: int = ...) -> None: ...\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&stub)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("api.pyi:1:16: NOD001"), "{stdout}");
+    assert!(
+        stdout.contains("Found 1 error (0 fixed, 1 remaining)."),
+        "{stdout}"
+    );
     Ok(())
 }
 

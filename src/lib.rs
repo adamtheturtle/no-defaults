@@ -1371,6 +1371,41 @@ fn has_multiple_hard_links(_: &std::fs::Metadata) -> bool {
     false
 }
 
+#[cfg(target_os = "macos")]
+fn copy_extended_attributes(source: &Path, destination: &std::fs::File) -> Result<(), String> {
+    use xattr::FileExt;
+
+    let attributes = xattr::list(source).map_err(|error| {
+        format!(
+            "could not inspect extended attributes on {} before fixing: {error}",
+            source.display()
+        )
+    })?;
+    for name in attributes {
+        let value = xattr::get(source, &name).map_err(|error| {
+            format!(
+                "could not read extended attribute {name:?} on {} before fixing: {error}",
+                source.display()
+            )
+        })?;
+        if let Some(value) = value {
+            destination.set_xattr(&name, &value).map_err(|error| {
+                format!(
+                    "could not preserve extended attribute {name:?} while fixing {}: {error}",
+                    source.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+fn copy_extended_attributes(_: &Path, _: &std::fs::File) -> Result<(), String> {
+    Ok(())
+}
+
 fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Result<(), String> {
     let mut prepared = Vec::with_capacity(changes.len());
     for (path, (_, fixed)) in changes {
@@ -1431,6 +1466,7 @@ fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Resul
                     path.display()
                 )
             })?;
+        copy_extended_attributes(&path, temporary.as_file())?;
         prepared.push((path, temporary));
     }
     // Nothing reaches its destination until every file has been inspected and
@@ -6118,6 +6154,30 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&alias).map_err(|error| error.to_string())?,
             original
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn atomic_fixes_preserve_extended_attributes() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let source = directory.path().join("source.py");
+        let original = "def example(value=1): pass\n";
+        let attribute = "com.example.no-defaults-test";
+        let value = b"kept metadata";
+        std::fs::write(&source, original).map_err(|error| error.to_string())?;
+        xattr::set(&source, attribute, value).map_err(|error| error.to_string())?;
+        let changes = BTreeMap::from([(
+            source.clone(),
+            (original.to_owned(), "def example(value): pass\n".to_owned()),
+        )]);
+
+        write_fixes_atomically(changes)?;
+
+        assert_eq!(
+            xattr::get(&source, attribute).map_err(|error| error.to_string())?,
+            Some(value.to_vec())
         );
         Ok(())
     }

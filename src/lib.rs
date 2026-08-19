@@ -1266,6 +1266,18 @@ fn merge_deletions(mut ranges: Vec<TextRange>) -> Vec<TextRange> {
     merged
 }
 
+#[cfg(unix)]
+fn has_multiple_hard_links(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn has_multiple_hard_links(_: &std::fs::Metadata) -> bool {
+    false
+}
+
 fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Result<(), String> {
     let mut prepared = Vec::with_capacity(changes.len());
     for (path, (_, fixed)) in changes {
@@ -1283,14 +1295,22 @@ fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Resul
             fixed
         };
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let permissions = std::fs::metadata(&path)
-            .map_err(|error| {
-                format!(
-                    "could not inspect {} before fixing: {error}",
-                    path.display()
-                )
-            })?
-            .permissions();
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            format!(
+                "could not inspect {} before fixing: {error}",
+                path.display()
+            )
+        })?;
+        // Replacing one directory entry would silently detach it from every
+        // other name for the same inode. Without knowing all those names, the
+        // only safe atomic operation is to leave the linked file untouched.
+        if has_multiple_hard_links(&metadata) {
+            return Err(format!(
+                "refusing to fix hard-linked file {} because atomic replacement would break its links",
+                path.display()
+            ));
+        }
+        let permissions = metadata.permissions();
         let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
             format!(
                 "could not create temporary file beside {}: {error}",
@@ -5634,6 +5654,37 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(first).map_err(|error| error.to_string())?,
             "def first(value=1): pass\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_fixes_refuse_to_split_hard_links() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let source = directory.path().join("source.py");
+        let alias = directory.path().join("alias.py");
+        let original = "def example(value=1): pass\n";
+        std::fs::write(&source, original).map_err(|error| error.to_string())?;
+        std::fs::hard_link(&source, &alias).map_err(|error| error.to_string())?;
+        let changes = BTreeMap::from([(
+            source.clone(),
+            (original.to_owned(), "def example(value): pass\n".to_owned()),
+        )]);
+
+        let error = match write_fixes_atomically(changes) {
+            Ok(()) => return Err("hard links must be refused".to_owned()),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("hard-linked file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&source).map_err(|error| error.to_string())?,
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(&alias).map_err(|error| error.to_string())?,
+            original
         );
         Ok(())
     }

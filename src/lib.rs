@@ -2692,7 +2692,10 @@ fn field_excluded_from_init(value: &Expr, aliases: &Aliases) -> bool {
                 .arg
                 .as_ref()
                 .is_some_and(|name| name.as_str() == "init")
-                && matches!(&keyword.value, Expr::BooleanLiteral(literal) if !literal.value)
+                && matches!(
+                    Truthiness::from_expr(&keyword.value, |_| false),
+                    Truthiness::False | Truthiness::Falsey | Truthiness::None
+                )
         })
 }
 
@@ -5692,6 +5695,15 @@ mod tests {
                 "@dataclass\nclass C:\n    x: int = 1\n    y: int = field(default=5, init=False)\n\n\nC()\n"
             )?,
             "@dataclass\nclass C:\n    x: int\n    y: int = field(init=False)\n\n\nC(x=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_with_a_falsey_init_option_is_not_passed() -> Result<(), String> {
+        assert_eq!(
+            fixed("@dataclass\nclass C:\n    value: int = field(default=1, init=0)\n\n\nC()\n")?,
+            "@dataclass\nclass C:\n    value: int = field(init=0)\n\n\nC()\n"
         );
         Ok(())
     }

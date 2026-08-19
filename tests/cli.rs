@@ -2170,3 +2170,22 @@ fn custom_qualified_protocol_bases_are_not_treated_as_structural(
     assert!(stderr.contains("inherits fields"), "{stderr}");
     Ok(())
 }
+
+#[test]
+fn custom_field_functions_are_not_treated_as_dataclasses_field(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\n\ndef field(*, default):\n    return default\n\n@dataclass\nclass C:\n    value: int = field(default=1)\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("def field(*, default):"), "{fixed}");
+    assert!(fixed.contains("value: int\n"), "{fixed}");
+    assert!(!fixed.contains("value: int = field()"), "{fixed}");
+    Ok(())
+}

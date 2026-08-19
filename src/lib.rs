@@ -2674,6 +2674,15 @@ impl Checker<'_> {
         }
     }
 
+    fn visit_uncertain<'a>(&mut self, statement: &'a Stmt)
+    where
+        Self: Visitor<'a>,
+    {
+        self.conditional_depth += 1;
+        walk_stmt(self, statement);
+        self.conditional_depth -= 1;
+    }
+
     fn visit_conditional<'a>(&mut self, branch: &'a ast::StmtIf)
     where
         Self: Visitor<'a>,
@@ -3192,6 +3201,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
             Stmt::If(branch) => self.visit_conditional(branch),
+            Stmt::Try(_) => self.visit_uncertain(statement),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
             Stmt::ClassDef(class) => {

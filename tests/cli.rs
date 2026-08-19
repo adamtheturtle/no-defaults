@@ -723,6 +723,28 @@ fn the_caret_lands_under_a_default_on_a_non_ascii_line() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn full_output_carets_account_for_tabs_and_wide_characters(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("display.py");
+    std::fs::write(
+        &path,
+        "class C:\n\tdef target(value=1): ...\n\ndef target(界=1): ...\n",
+    )?;
+    let output = Command::new(binary()).arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    let caret_lines = stdout
+        .lines()
+        .filter(|line| line.contains('^'))
+        .collect::<Vec<_>>();
+    assert_eq!(caret_lines.len(), 2, "{stdout}");
+    assert_eq!(caret_lines[0], format!("  | {}^", " ".repeat(21)));
+    assert_eq!(caret_lines[1], format!("  | {}^", " ".repeat(14)));
+    Ok(())
+}
+
+#[test]
 fn a_byte_order_mark_does_not_shift_the_first_line() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("bom.py");

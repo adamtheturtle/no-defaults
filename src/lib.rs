@@ -3224,7 +3224,19 @@ fn generates_init(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
     // definitions. An assignment, import, or nested definition under this
     // name suppresses generation just as `def __init__` does.
     let defines_init = BoundNames::of_body(&class.body).names.contains("__init__");
+    // An explicit metaclass controls construction before the generated
+    // initializer is reached. Its `__call__` signature is not recoverable
+    // from this class body, so field arguments cannot safely be added.
+    let has_metaclass = class.arguments.as_deref().is_some_and(|arguments| {
+        arguments.keywords.iter().any(|keyword| {
+            keyword
+                .arg
+                .as_ref()
+                .is_some_and(|name| name.as_str() == "metaclass")
+        })
+    });
     !defines_init
+        && !has_metaclass
         && !class.decorator_list.iter().any(|decorator| {
             let Expr::Call(call) = &decorator.expression else {
                 return false;
@@ -6374,6 +6386,23 @@ mod tests {
     #[test]
     fn an_assignment_based_dataclass_init_suppresses_constructor_generation() {
         let source = "from dataclasses import dataclass\n\ndef initialize(self):\n    self.value = 5\n\n@dataclass\nclass C:\n    value: int = 1\n    __init__ = initialize\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_dataclass_with_a_metaclass_has_no_assumed_call_signature() {
+        let source = "from dataclasses import dataclass\n\nclass Meta(type):\n    def __call__(cls):\n        return 5\n\n@dataclass\nclass C(metaclass=Meta):\n    value: int = 1\n\nC()\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

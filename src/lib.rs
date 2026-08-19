@@ -2262,7 +2262,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         style,
                         inherits: matches!(inherited, Inherited::Unknown),
                         constructs: generates_init(class, &self.aliases),
-                        kw_only: decorator_says_kw_only(class),
+                        kw_only: decorator_says_kw_only(class, &self.aliases),
                         fields,
                         removed,
                     });
@@ -2636,11 +2636,14 @@ fn generates_init(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
 
 /// Whether the decorator says `kw_only=True`, making every field of the class
 /// keyword-only in the generated constructor.
-fn decorator_says_kw_only(class: &ast::StmtClassDef) -> bool {
+fn decorator_says_kw_only(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
     class.decorator_list.iter().any(|decorator| {
         let Expr::Call(call) = &decorator.expression else {
             return false;
         };
+        if matched_name(&call.func, aliases) != Some("dataclass") {
+            return false;
+        }
         call.arguments
             .keywords
             .iter()
@@ -5601,6 +5604,16 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "@dataclass(init=0)\nclass C:\n    value: int\n\n\nC()\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unrelated_kw_only_decorator_does_not_change_dataclass_calls() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\ndef marker(**options):\n    return lambda cls: cls\n\n@marker(kw_only=True)\n@dataclass\nclass C:\n    first: int = 1\n    second: int = 2\n\n\nC(5)\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\n\ndef marker(**options):\n    return lambda cls: cls\n\n@marker(kw_only=True)\n@dataclass\nclass C:\n    first: int\n    second: int\n\n\nC(5, second=2)\n"
         );
         Ok(())
     }

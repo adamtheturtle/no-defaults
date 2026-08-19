@@ -1205,6 +1205,32 @@ fn reassigning_an_imported_symbol_invalidates_its_binding() -> Result<(), Box<dy
 }
 
 #[test]
+fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let other = directory.path().join("other.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&other, "def target(): return 5\n")?;
+    std::fs::write(
+        &caller,
+        "import other as api\n\ndef load():\n    import api\n    return api.target()\n\napi.target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import other as api\n\ndef load():\n    import api\n    return api.target(value=1)\n\napi.target()\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_single_component_import_resolves_only_at_the_importers_root(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

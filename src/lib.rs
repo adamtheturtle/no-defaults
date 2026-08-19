@@ -401,6 +401,9 @@ pub fn main() -> ExitCode {
 
 fn run() -> Result<bool, String> {
     let cli = Cli::parse();
+    if cli.diff && matches!(cli.output_format, OutputFormat::Json | OutputFormat::Github) {
+        return Err("--diff cannot be combined with a machine-readable --output-format".to_owned());
+    }
     let files = collect_files(&cli.paths)?;
     let settings = settings_for_files(&files, cli.private_only, cli.respect_reexports)?;
     if cli.show_settings {

@@ -106,6 +106,24 @@ fn defaults_on_implicit_method_receivers_are_not_reinserted(
 }
 
 #[test]
+fn aliased_classmethod_decorators_receive_the_class_implicitly(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from builtins import classmethod as cm\n\nclass C:\n    @cm\n    def parse(cls, value=1):\n        return value\n\nC.parse(5)\n",
+    )?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "from builtins import classmethod as cm\n\nclass C:\n    @cm\n    def parse(cls, value):\n        return value\n\nC.parse(5)\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

@@ -5919,6 +5919,14 @@ mod tests {
     }
 
     #[test]
+    fn file_level_noqa_accepts_a_following_explanation() -> Result<(), String> {
+        let source = "# ruff: noqa  # generated file\ndef target(value=1): pass\n";
+        assert!(messages(source, false).is_empty());
+        assert_eq!(fixed(source)?, source);
+        Ok(())
+    }
+
+    #[test]
     fn recognizes_private_modules_and_packages() {
         let private =
             |path: &str| is_private_module(Path::new(path), Path::new(""), &Reexports::default());

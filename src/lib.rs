@@ -4116,6 +4116,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.classes.pop();
             }
             Stmt::FunctionDef(function) => {
+                // Decorators run while the function object is being created,
+                // before names local to its body exist.
+                for decorator in &function.decorator_list {
+                    self.visit_decorator(decorator);
+                }
                 let receiver = (self.class_scope_depths.last() == Some(&self.scopes.len())
                     && method_receiver(function, &self.aliases) != Receiver::None)
                     .then(|| {
@@ -4132,7 +4137,14 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 collect_bindings(&function.body, self.path, self.known, &mut local);
                 self.bindings.push(local);
                 self.scopes.push(BoundNames::of_function(function));
-                walk_stmt(self, statement);
+                if let Some(type_params) = &function.type_params {
+                    self.visit_type_params(type_params);
+                }
+                self.visit_parameters(&function.parameters);
+                if let Some(returns) = &function.returns {
+                    self.visit_annotation(returns);
+                }
+                self.visit_body(&function.body);
                 self.scopes.pop();
                 self.bindings.pop();
                 self.implicit_receivers.pop();
@@ -6138,6 +6150,17 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "def outer():\n    def inner(value):\n        return value\n    return inner(value=1)\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn function_decorators_use_the_enclosing_scope() -> Result<(), String> {
+        let source = "def target(value=1):\n    return lambda function: function\n\n@target()\ndef decorated():\n    target = 5\n";
+        assert_eq!(
+            fixed(source)?,
+            "def target(value):\n    return lambda function: function\n\n@target(value=1)\ndef decorated():\n    target = 5\n"
         );
         assert!(skipped_reasons(source)?.is_empty());
         Ok(())

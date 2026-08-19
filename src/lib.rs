@@ -2771,6 +2771,7 @@ impl Checker<'_> {
                         | "__setitem__"
                         | "__delitem__"
                         | "__missing__"
+                        | "__contains__"
                 ))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
@@ -7028,6 +7029,23 @@ mod tests {
     #[test]
     fn missing_key_defaults_are_retained_for_protocol_calls() {
         let source = "class C(dict):\n    def __missing__(self, key, extra=None):\n        return key\n\nC()[0]\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn contains_defaults_are_retained_for_protocol_calls() {
+        let source = "class C:\n    def __contains__(self, item, extra=None):\n        return False\n\n0 in C()\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

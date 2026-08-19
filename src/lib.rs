@@ -2731,7 +2731,7 @@ impl Checker<'_> {
             let fix = if (self.scope.class_body
                 && matches!(
                     function.name.as_str(),
-                    "__call__" | "__enter__" | "__exit__" | "__aenter__" | "__aexit__"
+                    "__call__" | "__enter__" | "__exit__" | "__aenter__" | "__aexit__" | "__iter__"
                 ))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
@@ -6787,6 +6787,24 @@ mod tests {
     #[test]
     fn async_context_manager_exit_defaults_are_retained_for_implicit_calls() {
         let source = "class C:\n    async def __aenter__(self):\n        return self\n\n    async def __aexit__(self, kind, error, traceback, extra=None):\n        return False\n\nasync def main():\n    async with C():\n        pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn iterator_defaults_are_retained_for_protocol_calls() {
+        let source =
+            "class C:\n    def __iter__(self, extra=None):\n        return iter(())\n\niter(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

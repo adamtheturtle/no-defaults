@@ -124,6 +124,31 @@ fn aliased_classmethod_decorators_receive_the_class_implicitly(
 }
 
 #[test]
+fn try_and_handler_imports_remain_conditional() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    std::fs::write(
+        directory.path().join("fallback.py"),
+        "def target(): return 5\n",
+    )?;
+    let caller = directory.path().join("case.py");
+    let source = "try:\n    import api as module\nexcept ImportError:\n    import fallback as module\n\nmodule.target()\n";
+    std::fs::write(&caller, source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(caller)?, source);
+    assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

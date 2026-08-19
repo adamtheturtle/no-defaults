@@ -464,6 +464,31 @@ fn respect_reexports_leaves_publicly_reexported_defaults_alone(
 }
 
 #[test]
+fn imports_in_false_branches_are_not_reexports() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("package");
+    std::fs::create_dir_all(&package)?;
+    std::fs::write(
+        directory.path().join("pyproject.toml"),
+        "[tool.no_defaults]\nprivate_only = true\nrespect_reexports = true\n",
+    )?;
+    std::fs::write(
+        package.join("__init__.py"),
+        "if False:\n    from ._api import target\n",
+    )?;
+    std::fs::write(package.join("_api.py"), "def target(value=1): pass\n")?;
+
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stdout)?.contains("function `target`"));
+    Ok(())
+}
+
+#[test]
 fn without_respect_reexports_a_private_module_is_checked_whole(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = reexporting_project(false)?;

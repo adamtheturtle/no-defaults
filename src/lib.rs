@@ -1152,6 +1152,34 @@ struct TargetReexportCollector<'a> {
 }
 
 impl TargetReexportCollector<'_> {
+    fn collect_conditional(&mut self, branch: &ast::StmtIf) {
+        let clauses = std::iter::once((Some(branch.test.as_ref()), branch.body.as_slice())).chain(
+            branch
+                .elif_else_clauses
+                .iter()
+                .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
+        );
+        for (test, body) in clauses {
+            let truth = test.map_or(Truthiness::True, |test| {
+                Truthiness::from_expr(test, |_| false)
+            });
+            match truth {
+                Truthiness::False | Truthiness::Falsey | Truthiness::None => {}
+                Truthiness::True | Truthiness::Truthy => {
+                    for statement in body {
+                        self.visit_stmt(statement);
+                    }
+                    return;
+                }
+                Truthiness::Unknown => {
+                    for statement in body {
+                        self.visit_stmt(statement);
+                    }
+                }
+            }
+        }
+    }
+
     fn module_path(&self, module: &str, level: u32) -> PathBuf {
         let mut path = if level > 0 {
             let mut path = self.init.parent().unwrap_or(Path::new("")).to_path_buf();
@@ -1261,6 +1289,7 @@ impl<'a> Visitor<'a> for TargetReexportCollector<'_> {
             Stmt::AugAssign(assign) if is_dunder_all(&assign.target) => {
                 self.collect_all(&assign.value, false);
             }
+            Stmt::If(branch) => self.collect_conditional(branch),
             Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
             _ => walk_stmt(self, statement),
         }

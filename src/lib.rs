@@ -3639,6 +3639,10 @@ fn collect_bindings(
                 collect_bindings(&block.orelse, importer, known, bindings);
                 collect_bindings(&block.finalbody, importer, known, bindings);
             }
+            Stmt::For(loop_) => {
+                collect_bindings(&loop_.body, importer, known, bindings);
+                collect_bindings(&loop_.orelse, importer, known, bindings);
+            }
             // Definitions introduce lexical scopes whose imports are collected
             // separately when the rewriter enters them.
             _ => {}

@@ -211,6 +211,19 @@ fn unpacked_field_options_keep_defaults_out_of_constructor_fixes(
 }
 
 #[test]
+fn unpacked_dataclass_options_keep_field_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "from dataclasses import dataclass\n\nOPTIONS = {\"init\": False}\n\n@dataclass(**OPTIONS)\nclass C:\n    value: int = 1\n\nC()\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}
+
+#[test]
 fn function_defaults_resolve_before_body_bindings() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

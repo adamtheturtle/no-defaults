@@ -39,6 +39,30 @@ fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::
 }
 
 #[test]
+fn non_utf8_source_does_not_abort_other_files() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let latin1 = directory.path().join("latin1.py");
+    let utf8 = directory.path().join("utf8.py");
+    std::fs::write(
+        &latin1,
+        b"# coding: latin-1\ndef target(caf\xe9=1): return caf\xe9\n",
+    )?;
+    std::fs::write(&utf8, "def visible(value=1): pass\n")?;
+
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("latin1.py:1:1: NOD000"), "{stdout}");
+    assert!(stdout.contains("utf8.py:1:19: NOD001"), "{stdout}");
+    assert!(String::from_utf8(output.stderr)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn unused_noqa_is_reported_and_fixed() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

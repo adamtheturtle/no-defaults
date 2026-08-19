@@ -3539,6 +3539,7 @@ struct BoundNames {
     names: BTreeSet<String>,
     globals: BTreeSet<String>,
     functions: BTreeSet<String>,
+    classes: BTreeSet<String>,
 }
 
 impl BoundNames {
@@ -3586,6 +3587,7 @@ impl BoundNames {
         for name in &self.globals {
             self.names.remove(name);
             self.functions.remove(name);
+            self.classes.remove(name);
         }
         self
     }
@@ -3639,6 +3641,7 @@ impl<'a> Visitor<'a> for BoundNames {
             }
             Stmt::ClassDef(class) => {
                 self.names.insert(class.name.to_string());
+                self.classes.insert(class.name.to_string());
                 return;
             }
             Stmt::Import(import) => {
@@ -3763,14 +3766,14 @@ struct Rewriter<'a> {
 }
 
 impl Rewriter<'_> {
-    /// Whether the nearest lexical binding for `name` is a nested function.
+    /// Whether the nearest lexical binding for `name` is a nested callable.
     /// `None` means no enclosing scope binds it at all.
-    fn nested_function(&self, name: &str) -> Option<bool> {
+    fn nested_callable(&self, name: &str) -> Option<bool> {
         self.scopes.iter().rev().find_map(|scope| {
             scope
                 .names
                 .contains(name)
-                .then(|| scope.functions.contains(name))
+                .then(|| scope.functions.contains(name) || scope.classes.contains(name))
         })
     }
 
@@ -3866,7 +3869,7 @@ impl Rewriter<'_> {
         match expression {
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
-            Expr::Name(name) if self.nested_function(name.id.as_str()) == Some(true) => Some((
+            Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => Some((
                 self.definitions
                     .symbols
                     .get(self.path)?
@@ -3874,8 +3877,8 @@ impl Rewriter<'_> {
                     .as_ref()?,
                 0,
             )),
-            Expr::Name(name) if self.nested_function(name.id.as_str()) == Some(false) => None,
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
+            Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false) => None,
             Expr::Name(name) => match self.binding(name.id.as_str()) {
                 Some(Binding::Symbol(file, symbol)) => Some((
                     self.definitions.symbols.get(file)?.get(symbol)?.as_ref()?,
@@ -6098,7 +6101,6 @@ mod tests {
             "with open(\"f\") as connect: pass",
             "import connect",
             "from os import path as connect",
-            "class connect: pass",
             "if (connect := open): pass",
         ] {
             let source =
@@ -6152,6 +6154,17 @@ mod tests {
             skipped_reasons(source)?,
             ["this call cannot be tied to the definition that was fixed"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn calls_to_a_nested_dataclass_receive_removed_defaults() -> Result<(), String> {
+        let source = "def outer():\n    @dataclass\n    class Inner:\n        value: int = 1\n    return Inner()\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer():\n    @dataclass\n    class Inner:\n        value: int\n    return Inner(value=1)\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
         Ok(())
     }
 

@@ -2769,6 +2769,7 @@ impl Checker<'_> {
                         | "__length_hint__"
                         | "__getitem__"
                         | "__setitem__"
+                        | "__delitem__"
                 ))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
@@ -6991,6 +6992,24 @@ mod tests {
     #[test]
     fn setitem_defaults_are_retained_for_protocol_calls() {
         let source = "class C:\n    def __setitem__(self, key, value, extra=None):\n        pass\n\nC()[0] = 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn delitem_defaults_are_retained_for_protocol_calls() {
+        let source =
+            "class C:\n    def __delitem__(self, key, extra=None):\n        pass\n\ndel C()[0]\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

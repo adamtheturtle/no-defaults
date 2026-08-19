@@ -2265,3 +2265,22 @@ fn a_local_basemodel_does_not_activate_the_pydantic_default(
     assert!(output.stdout.is_empty());
     Ok(())
 }
+
+#[test]
+fn rebinding_a_dataclass_alias_invalidates_the_import() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass as dc\n\ndef dc(cls):\n    return cls\n\n@dc\nclass C:\n    value: int = 1\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    Ok(())
+}

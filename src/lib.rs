@@ -2662,7 +2662,9 @@ impl Checker<'_> {
         let Expr::Name(name) = &*assign.target else {
             return;
         };
-        if is_class_var(statement, &self.aliases) {
+        if is_class_var(statement, &self.aliases)
+            || is_pydantic_private_attr(assign.value.as_deref(), &self.aliases)
+        {
             return;
         }
         // A `_: KW_ONLY` marker is not a field, so it takes no place in the
@@ -3359,6 +3361,15 @@ fn is_class_var(statement: &Stmt, aliases: &Aliases) -> bool {
         return false;
     };
     annotates_class_var(&assign.annotation, aliases)
+}
+
+/// `PrivateAttr` initializes per-instance private state but does not declare a
+/// model field or constructor parameter.
+fn is_pydantic_private_attr(value: Option<&Expr>, aliases: &Aliases) -> bool {
+    let Some(Expr::Call(call)) = value else {
+        return false;
+    };
+    matched_name(&call.func, aliases) == Some("PrivateAttr")
 }
 
 /// Whether an annotation names `ClassVar`, bare, qualified, or quoted.
@@ -4781,6 +4792,15 @@ mod tests {
                 "class field `y` has a default factory",
             ]
         );
+    }
+
+    #[test]
+    fn pydantic_private_attribute_defaults_are_not_model_fields() {
+        assert!(messages(
+            "from pydantic import BaseModel, PrivateAttr\n\nclass C(BaseModel):\n    _value: int = PrivateAttr(default=1)\n",
+            false,
+        )
+        .is_empty());
     }
 
     #[test]

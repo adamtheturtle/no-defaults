@@ -149,6 +149,30 @@ fn try_and_handler_imports_remain_conditional() -> Result<(), Box<dyn std::error
 }
 
 #[test]
+fn diff_rejects_machine_readable_output_formats() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def target(value=1): pass\n")?;
+
+    for format in ["json", "github"] {
+        let output = Command::new(binary())
+            .arg("--diff")
+            .arg("--output-format")
+            .arg(format)
+            .arg(&path)
+            .output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("--diff cannot be combined with a machine-readable --output-format"),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

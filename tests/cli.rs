@@ -1505,3 +1505,25 @@ fn conditional_imports_are_not_resolved_by_traversal_order(
     assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
     Ok(())
 }
+
+#[test]
+fn imports_inside_module_loops_resolve_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "for _ in [0]:\n    import api\n\napi.target()\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "for _ in [0]:\n    import api\n\napi.target(value=1)\n"
+    );
+    Ok(())
+}

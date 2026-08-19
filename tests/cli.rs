@@ -67,6 +67,30 @@ fn dataclass_aliases_imported_in_module_loops_are_recognized(
 }
 
 #[test]
+fn show_settings_rejects_mutating_modes() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def target(value=1): pass\n")?;
+
+    for mode in ["--fix", "--diff"] {
+        let output = Command::new(binary())
+            .arg("--show-settings")
+            .arg(mode)
+            .arg(&path)
+            .output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("cannot be used with"), "{stderr}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "def target(value=1): pass\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn later_dataclass_alias_imports_do_not_change_earlier_classes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

@@ -2320,3 +2320,25 @@ fn later_class_methods_do_not_shadow_earlier_calls() -> Result<(), Box<dyn std::
     );
     Ok(())
 }
+
+#[test]
+fn later_class_imports_do_not_shadow_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(directory.path().join("api.py"), "def target(): return 5\n")?;
+    let path = directory.path().join("case.py");
+    std::fs::write(
+        &path,
+        "def target(value=1):\n    return value\n\nclass C:\n    before = target()\n    from api import target\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "def target(value):\n    return value\n\nclass C:\n    before = target(value=1)\n    from api import target\n"
+    );
+    Ok(())
+}

@@ -1682,6 +1682,28 @@ fn copy_extended_attributes(_: &Path, _: &std::fs::File) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn copy_acl(source: &Path, destination: &Path) -> Result<(), String> {
+    let entries = exacl::getfacl(source, None).map_err(|error| {
+        format!(
+            "could not inspect the access-control list on {} before fixing: {error}",
+            source.display()
+        )
+    })?;
+    exacl::setfacl(&[destination], &entries, None).map_err(|error| {
+        format!(
+            "could not preserve the access-control list while fixing {}: {error}",
+            source.display()
+        )
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+fn copy_acl(_: &Path, _: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Result<(), String> {
     let mut prepared = Vec::with_capacity(changes.len());
     for (path, (_, fixed)) in changes {
@@ -1743,6 +1765,7 @@ fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Resul
                 )
             })?;
         copy_extended_attributes(&path, temporary.as_file())?;
+        copy_acl(&path, temporary.path())?;
         prepared.push((path, temporary));
     }
     // Nothing reaches its destination until every file has been inspected and
@@ -7048,6 +7071,29 @@ mod tests {
             xattr::get(&source, attribute).map_err(|error| error.to_string())?,
             Some(value.to_vec())
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn atomic_fixes_preserve_access_control_lists() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let source = directory.path().join("source.py");
+        let original = "def example(value=1): pass\n";
+        std::fs::write(&source, original).map_err(|error| error.to_string())?;
+        let user = std::env::var("USER").map_err(|error| error.to_string())?;
+        let entries = [exacl::AclEntry::allow_user(&user, exacl::Perm::READ, None)];
+        exacl::setfacl(&[&source], &entries, None).map_err(|error| error.to_string())?;
+        let before = exacl::getfacl(&source, None).map_err(|error| error.to_string())?;
+        let changes = BTreeMap::from([(
+            source.clone(),
+            (original.to_owned(), "def example(value): pass\n".to_owned()),
+        )]);
+
+        write_fixes_atomically(changes)?;
+
+        let after = exacl::getfacl(&source, None).map_err(|error| error.to_string())?;
+        assert_eq!(after, before);
         Ok(())
     }
 

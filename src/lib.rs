@@ -2998,6 +2998,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__bool__"
             | "__str__"
             | "__repr__"
+            | "__bytes__"
     )
 }
 
@@ -7230,6 +7231,24 @@ mod tests {
     fn repr_defaults_are_retained_for_protocol_calls() {
         let source =
             "class C:\n    def __repr__(self, extra=None):\n        return 'C'\n\nrepr(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn bytes_defaults_are_retained_for_protocol_calls() {
+        let source =
+            "class C:\n    def __bytes__(self, extra=None):\n        return b'C'\n\nbytes(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

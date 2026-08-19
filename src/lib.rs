@@ -3005,6 +3005,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__int__"
             | "__float__"
             | "__complex__"
+            | "__round__"
     )
 }
 
@@ -7360,6 +7361,24 @@ mod tests {
     fn complex_defaults_are_retained_for_protocol_calls() {
         let source =
             "class C:\n    def __complex__(self, extra=None):\n        return 1j\n\ncomplex(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn round_defaults_are_retained_for_protocol_calls() {
+        let source =
+            "class C:\n    def __round__(self, ndigits=None):\n        return 1\n\nround(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

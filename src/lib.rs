@@ -11,8 +11,8 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use ruff_python_ast::helpers::Truthiness;
 use ruff_python_ast::token::{TokenKind, Tokens};
-use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{self as ast, Expr, Stmt};
+use ruff_python_ast::visitor::{walk_expr, walk_pattern, walk_stmt, Visitor};
+use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
 use ruff_python_parser::{parse_expression, parse_module};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use serde::{Deserialize, Serialize};
@@ -3410,6 +3410,28 @@ impl<'a> Visitor<'a> for BoundNames {
         }
         walk_expr(self, expression);
     }
+
+    fn visit_pattern(&mut self, pattern: &'a Pattern) {
+        match pattern {
+            Pattern::MatchMapping(mapping) => {
+                if let Some(name) = &mapping.rest {
+                    self.names.insert(name.to_string());
+                }
+            }
+            Pattern::MatchStar(star) => {
+                if let Some(name) = &star.name {
+                    self.names.insert(name.to_string());
+                }
+            }
+            Pattern::MatchAs(as_pattern) => {
+                if let Some(name) = &as_pattern.name {
+                    self.names.insert(name.to_string());
+                }
+            }
+            _ => {}
+        }
+        walk_pattern(self, pattern);
+    }
 }
 
 /// The dotted name an expression spells, for `a`, `a.b`, and `a.b.c`.
@@ -5564,6 +5586,26 @@ mod tests {
             fixed(source)?,
             "def target(value): return value\n\ndef run():\n    global target\n    result = target(value=1)\n    target = lambda: 2\n    return result\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pattern_capture_names_shadow_fixed_functions() -> Result<(), String> {
+        for pattern in [
+            "target",
+            "[first, *target]",
+            "{'value': first, **target}",
+            "[first] as target",
+        ] {
+            let source = format!(
+                "def target(value=1): return value\n\ndef run(candidate):\n    match candidate:\n        case {pattern}:\n            pass\n    return target()\n"
+            );
+            assert_eq!(
+                skipped_reasons(&source)?.first().map(String::as_str),
+                Some("this call cannot be tied to the definition that was fixed"),
+                "{pattern}"
+            );
+        }
         Ok(())
     }
 

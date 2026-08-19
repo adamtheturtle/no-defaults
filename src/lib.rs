@@ -1968,8 +1968,7 @@ fn check_source(
     {
         return Checked::default();
     }
-    let mut aliases = Aliases::default();
-    aliases.collect(parsed.suite());
+    let aliases = Aliases::default();
     let module_bindings = BoundNames::of_body(parsed.suite()).names;
     let mut local_classes = BTreeSet::new();
     collect_class_names(parsed.suite(), &mut local_classes);
@@ -2327,6 +2326,27 @@ struct ClassCollector {
 }
 
 impl Checker<'_> {
+    fn visit_function_statement<'a>(
+        &mut self,
+        function: &'a ast::StmtFunctionDef,
+        statement: &'a Stmt,
+    ) where
+        Self: Visitor<'a>,
+    {
+        self.check_function(function);
+        let outer = self.scope;
+        let outer_aliases = self.aliases.clone();
+        self.scope = Scope {
+            private: self.encloses_private(function.name.as_str(), outer),
+            fields: None,
+            class_body: false,
+            kept_default: false,
+        };
+        walk_stmt(self, statement);
+        self.aliases = outer_aliases;
+        self.scope = outer;
+    }
+
     /// Whether the rule applies to something with no name of its own, such as
     /// a lambda. It takes the privacy of the scope holding it.
     fn enabled_unnamed(&self) -> bool {
@@ -2682,22 +2702,16 @@ impl Checker<'_> {
 impl<'a> Visitor<'a> for Checker<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
-            Stmt::FunctionDef(function) => {
-                self.check_function(function);
-                let outer = self.scope;
-                self.scope = Scope {
-                    private: self.encloses_private(function.name.as_str(), outer),
-                    // Annotated assignments in a method body are locals, not
-                    // fields, so field detection stops at the function boundary.
-                    fields: None,
-                    class_body: false,
-                    kept_default: false,
-                };
+            Stmt::Import(_) | Stmt::ImportFrom(_) => {
+                self.aliases.collect(std::slice::from_ref(statement));
                 walk_stmt(self, statement);
-                self.scope = outer;
+            }
+            Stmt::FunctionDef(function) => {
+                self.visit_function_statement(function, statement);
             }
             Stmt::ClassDef(class) => {
                 let outer = self.scope;
+                let outer_aliases = self.aliases.clone();
                 let old_header = self.header;
                 // As with a `def` line, the name locates the `class` line a
                 // directive covering every field sits on.
@@ -2784,6 +2798,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     }
                 }
                 self.header = old_header;
+                self.aliases = outer_aliases;
                 self.scope = outer;
             }
             _ => {
@@ -2948,7 +2963,7 @@ fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
 /// leave `@dc` unrecognised and the whole class unchecked.
 /// `None` against a local name marks one the file bound to more than one
 /// member, which makes it resolve to neither.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Aliases {
     renamed: BTreeMap<String, Option<String>>,
     dataclasses_members: BTreeSet<String>,

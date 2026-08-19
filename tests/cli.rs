@@ -2360,3 +2360,22 @@ fn instance_receivers_need_not_be_named_self() -> Result<(), Box<dyn std::error:
     );
     Ok(())
 }
+
+#[test]
+fn methods_on_freshly_constructed_instances_are_resolved() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "class C:\n    def fetch(self, value=1):\n        return value\n\nC().fetch()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "class C:\n    def fetch(self, value):\n        return value\n\nC().fetch(value=1)\n"
+    );
+    Ok(())
+}

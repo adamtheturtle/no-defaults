@@ -2642,3 +2642,22 @@ fn a_sole_field_default_with_a_trailing_comma_is_fixed() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[test]
+fn a_sole_pydantic_field_default_with_a_trailing_comma_is_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from pydantic import BaseModel, Field\n\nclass C(BaseModel):\n    value: int = Field(1,)\n\nC()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "from pydantic import BaseModel, Field\n\nclass C(BaseModel):\n    value: int = Field()\n\nC(value=1)\n"
+    );
+    Ok(())
+}

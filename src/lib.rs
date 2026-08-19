@@ -306,6 +306,8 @@ struct Definitions {
     /// Imported names in checked files, used to follow package re-exports to
     /// the file that owns a callable's signature.
     bindings: BTreeMap<(PathBuf, String), Binding>,
+    /// Direct same-file base classes for method lookup.
+    bases: BTreeMap<(PathBuf, String), Vec<String>>,
     /// Every name a fixed callable goes by, so a call that cannot be resolved
     /// to one can still be reported rather than silently left behind.
     names: BTreeSet<String>,
@@ -331,6 +333,33 @@ impl Definitions {
             file.clone_from(next_file);
             name.clone_from(next_name);
         }
+    }
+
+    fn method(&self, file: &Path, class: &str, name: &str) -> Option<&Signature> {
+        fn inherited<'a>(
+            definitions: &'a Definitions,
+            file: &Path,
+            class: &str,
+            name: &str,
+            seen: &mut BTreeSet<String>,
+        ) -> Option<&'a Signature> {
+            if !seen.insert(class.to_owned()) {
+                return None;
+            }
+            if let Some(method) = definitions
+                .methods
+                .get(&(file.to_path_buf(), class.to_owned()))
+                .and_then(|methods| methods.get(name))
+            {
+                return method.as_ref();
+            }
+            definitions
+                .bases
+                .get(&(file.to_path_buf(), class.to_owned()))?
+                .iter()
+                .find_map(|base| inherited(definitions, file, base, name, seen))
+        }
+        inherited(self, file, class, name, &mut BTreeSet::new())
     }
 }
 
@@ -637,6 +666,23 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                 .into_iter()
                 .map(|(name, binding)| ((path.clone(), name), binding)),
         );
+        for statement in parsed.suite() {
+            let Stmt::ClassDef(class) = statement else {
+                continue;
+            };
+            let bases = class
+                .arguments
+                .iter()
+                .flat_map(|arguments| arguments.args.iter())
+                .filter_map(|base| match base {
+                    Expr::Name(name) => Some(name.id.to_string()),
+                    _ => None,
+                })
+                .collect();
+            definitions
+                .bases
+                .insert((path.clone(), class.name.to_string()), bases);
+        }
     }
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()
@@ -4300,13 +4346,10 @@ impl Rewriter<'_> {
                 if let Some((file, class, through_instance)) =
                     self.receiving_class(&attribute.value)
                 {
-                    if let Some(method) = self
-                        .definitions
-                        .methods
-                        .get(&(file, class))
-                        .and_then(|methods| methods.get(attribute.attr.as_str()))
+                    if let Some(signature) =
+                        self.definitions
+                            .method(&file, &class, attribute.attr.as_str())
                     {
-                        let signature = method.as_ref()?;
                         let Callable::Method { receiver, .. } = &signature.kind else {
                             return None;
                         };
@@ -6615,6 +6658,16 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "def classmethod(function):\n    return function\n\nclass C:\n    @classmethod\n    def parse(self, value): pass\n\nC.parse(C(), value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_methods_resolve_through_self() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): pass\n\nclass Child(Base):\n    def run(self):\n        return self.target()\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return self.target(value=1)\n"
         );
         Ok(())
     }

@@ -2462,14 +2462,21 @@ fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
 /// `None` against a local name marks one the file bound to more than one
 /// member, which makes it resolve to neither.
 #[derive(Debug, Default)]
-struct Aliases(BTreeMap<String, Option<String>>);
+struct Aliases {
+    renamed: BTreeMap<String, Option<String>>,
+    dataclasses_members: BTreeSet<String>,
+    dataclasses_modules: BTreeSet<String>,
+}
 
 impl Aliases {
     /// The `dataclasses` or `pydantic` member `name` was imported as, or `name`
     /// itself when the file did not rename anything to it, or renamed more
     /// than one thing to it.
     fn resolve<'a>(&'a self, name: &'a str) -> &'a str {
-        self.0.get(name).and_then(Option::as_deref).unwrap_or(name)
+        self.renamed
+            .get(name)
+            .and_then(Option::as_deref)
+            .unwrap_or(name)
     }
 
     /// Collect the renaming imports of a module, including those nested in an
@@ -2477,6 +2484,18 @@ impl Aliases {
     fn collect(&mut self, statements: &[Stmt]) {
         for statement in statements {
             match statement {
+                Stmt::Import(import) => {
+                    for alias in &import.names {
+                        if alias.name.as_str() == "dataclasses" {
+                            self.dataclasses_modules.insert(
+                                alias
+                                    .asname
+                                    .as_ref()
+                                    .map_or_else(|| "dataclasses".to_owned(), ToString::to_string),
+                            );
+                        }
+                    }
+                }
                 Stmt::ImportFrom(import) => {
                     let carries_fields = import.module.as_ref().is_some_and(|module| {
                         matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
@@ -2485,10 +2504,16 @@ impl Aliases {
                         continue;
                     }
                     for alias in &import.names {
+                        let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                        if import.module.as_ref().is_some_and(|module| {
+                            module.as_str() == "dataclasses" && alias.name.as_str() == "MISSING"
+                        }) {
+                            self.dataclasses_members.insert(local.clone());
+                        }
                         let Some(local) = &alias.asname else {
                             continue;
                         };
-                        match self.0.entry(local.to_string()) {
+                        match self.renamed.entry(local.to_string()) {
                             Entry::Vacant(entry) => {
                                 entry.insert(Some(alias.name.to_string()));
                             }
@@ -2736,6 +2761,9 @@ fn field_default(
         return Some(plain());
     };
     if let Some(first) = call.arguments.args.first() {
+        if style == FieldCall::Dataclasses && is_dataclasses_missing(first, aliases) {
+            return None;
+        }
         // `x: int = Field(...)` is pydantic's way of writing a field with no
         // default at all, so there is nothing to report or remove.
         if style == FieldCall::Pydantic && first.is_ellipsis_literal_expr() {
@@ -2766,6 +2794,9 @@ fn field_default(
                 .as_ref()
                 .is_some_and(|name| matches!(name.as_str(), "default" | "default_factory"))
         })?;
+    if style == FieldCall::Dataclasses && is_dataclasses_missing(&keyword.value, aliases) {
+        return None;
+    }
     // `Field(default=...)` says required just as `Field(...)` does.
     if style == FieldCall::Pydantic && keyword.value.is_ellipsis_literal_expr() {
         return None;
@@ -2796,6 +2827,16 @@ fn field_default(
                 .map(Ranged::range),
         ),
     })
+}
+
+fn is_dataclasses_missing(expression: &Expr, aliases: &Aliases) -> bool {
+    match expression {
+        Expr::Name(name) => aliases.dataclasses_members.contains(name.id.as_str()),
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "MISSING" => {
+            matches!(attribute.value.as_ref(), Expr::Name(name) if aliases.dataclasses_modules.contains(name.id.as_str()))
+        }
+        _ => false,
+    }
 }
 
 fn argument_removal_range(
@@ -3997,6 +4038,24 @@ mod tests {
     fn an_ellipsis_is_still_a_dataclass_default() {
         let found = messages("@dataclass\nclass C:\n x: int = field(...)\n", false);
         assert_eq!(found, ["dataclass field `x` has a default"]);
+    }
+
+    #[test]
+    fn dataclasses_missing_means_a_field_has_no_default() {
+        let found = messages(
+            "from dataclasses import MISSING, dataclass, field\nimport dataclasses as dc\n\n@dataclass\nclass C:\n    a: int = field(default=MISSING)\n    b: int = field(default_factory=dc.MISSING)\n",
+            false,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn unrelated_missing_names_are_still_defaults() {
+        let found = messages(
+            "from dataclasses import dataclass, field\nimport elsewhere\nMISSING = object()\n\n@dataclass\nclass C:\n    a: int = field(default=MISSING)\n    b: int = field(default=elsewhere.MISSING)\n",
+            false,
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
     }
 
     #[test]

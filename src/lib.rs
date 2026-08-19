@@ -3024,6 +3024,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__floordiv__"
             | "__mod__"
             | "__divmod__"
+            | "__pow__"
     )
 }
 
@@ -7703,6 +7704,23 @@ mod tests {
     #[test]
     fn divmod_defaults_are_retained_for_protocol_calls() {
         let source = "class C:\n    def __divmod__(self, other, extra=None):\n        return self, other\n\ndivmod(C(), C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn power_defaults_are_retained_for_protocol_calls() {
+        let source = "class C:\n    def __pow__(self, exponent, modulus=None):\n        return self\n\npow(C(), 2)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

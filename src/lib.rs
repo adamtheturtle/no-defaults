@@ -2641,6 +2641,8 @@ struct Aliases {
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
     builtins_modules: BTreeSet<String>,
+    class_vars: BTreeSet<String>,
+    typing_modules: BTreeSet<String>,
 }
 
 impl Aliases {
@@ -2676,6 +2678,22 @@ impl Aliases {
         }
     }
 
+    fn collect_typing_members(&mut self, import: &ast::StmtImportFrom) {
+        if !import
+            .module
+            .as_ref()
+            .is_some_and(|module| matches!(module.as_str(), "typing" | "typing_extensions"))
+        {
+            return;
+        }
+        for alias in &import.names {
+            if alias.name.as_str() == "ClassVar" {
+                self.class_vars
+                    .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
+            }
+        }
+    }
+
     /// Collect the renaming imports visible in one lexical scope, including
     /// those nested in control-flow blocks but not nested definitions.
     fn collect(&mut self, statements: &[Stmt]) {
@@ -2697,25 +2715,18 @@ impl Aliases {
                                     .as_ref()
                                     .map_or_else(|| "builtins".to_owned(), ToString::to_string),
                             );
+                        } else if matches!(alias.name.as_str(), "typing" | "typing_extensions") {
+                            self.typing_modules.insert(
+                                alias
+                                    .asname
+                                    .as_ref()
+                                    .map_or_else(|| alias.name.to_string(), ToString::to_string),
+                            );
                         }
                     }
                 }
                 Stmt::ImportFrom(import) => {
-                    let typing = import.module.as_ref().is_some_and(|module| {
-                        matches!(module.as_str(), "typing" | "typing_extensions")
-                    });
-                    if typing {
-                        for alias in &import.names {
-                            if alias.name.as_str() != "ClassVar" {
-                                continue;
-                            }
-                            let Some(local) = &alias.asname else {
-                                continue;
-                            };
-                            self.renamed
-                                .insert(local.to_string(), Some("ClassVar".to_owned()));
-                        }
-                    }
+                    self.collect_typing_members(import);
                     self.collect_builtin_members(import);
                     let carries_fields = import.module.as_ref().is_some_and(|module| {
                         matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
@@ -2934,8 +2945,10 @@ fn is_class_var(statement: &Stmt, aliases: &Aliases) -> bool {
 /// `x: "ClassVar[int]" = 1` really is a class variable rather than a field.
 fn annotates_class_var(annotation: &Expr, aliases: &Aliases) -> bool {
     match annotation {
-        Expr::Name(name) => aliases.resolve(name.id.as_str()) == "ClassVar",
-        Expr::Attribute(attribute) => attribute.attr.as_str() == "ClassVar",
+        Expr::Name(name) => aliases.class_vars.contains(name.id.as_str()),
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "ClassVar" => {
+            matches!(attribute.value.as_ref(), Expr::Name(name) if aliases.typing_modules.contains(name.id.as_str()))
+        }
         Expr::Subscript(subscript) => annotates_class_var(&subscript.value, aliases),
         // Quoted annotations are only one level deep: the contents of
         // `"ClassVar[int]"` are an expression, not another string. Surrounding
@@ -4182,7 +4195,7 @@ mod tests {
     #[test]
     fn detects_dataclass_defaults_but_not_class_vars() {
         let found = messages(
-            "@dataclass\nclass C:\n x: int = 1\n y: list = field(default_factory=list)\n z: ClassVar[int] = 2\n no_default: int = field()\n",
+            "from typing import ClassVar\n\n@dataclass\nclass C:\n x: int = 1\n y: list = field(default_factory=list)\n z: ClassVar[int] = 2\n no_default: int = field()\n",
             false,
         );
         assert_eq!(found.len(), 2);
@@ -4485,7 +4498,7 @@ mod tests {
     #[test]
     fn class_level_assignments_that_declare_no_field_are_left_alone() {
         let found = messages(
-            "class Job(BaseModel):\n model_config = ConfigDict(frozen=True)\n kind: ClassVar[str] = \"job\"\n def build(self) -> None:\n  seen: set[str] = set()\n",
+            "from typing import ClassVar\n\nclass Job(BaseModel):\n model_config = ConfigDict(frozen=True)\n kind: ClassVar[str] = \"job\"\n def build(self) -> None:\n  seen: set[str] = set()\n",
             false,
         );
         assert!(found.is_empty(), "{found:?}");
@@ -4528,7 +4541,7 @@ mod tests {
     #[test]
     fn quoted_class_var_annotations_are_not_fields() {
         let found = messages(
-            "@dataclass\nclass C:\n a: \"ClassVar[int]\" = 1\n b: \"typing.ClassVar[int]\" = 2\n c: 'ClassVar' = 3\n d: \"  ClassVar[int]  \" = 4\n",
+            "from typing import ClassVar\nimport typing\n\n@dataclass\nclass C:\n a: \"ClassVar[int]\" = 1\n b: \"typing.ClassVar[int]\" = 2\n c: 'ClassVar' = 3\n d: \"  ClassVar[int]  \" = 4\n",
             false,
         );
         assert!(found.is_empty(), "{found:?}");
@@ -4541,6 +4554,15 @@ mod tests {
             false,
         );
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_user_defined_class_var_name_is_an_ordinary_field() {
+        let found = messages(
+            "from dataclasses import dataclass\n\nclass ClassVar:\n    def __class_getitem__(cls, item): return cls\n\n@dataclass\nclass C:\n    value: ClassVar[int] = 1\n",
+            false,
+        );
+        assert_eq!(found, ["dataclass field `value` has a default"]);
     }
 
     #[test]

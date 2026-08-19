@@ -2853,6 +2853,7 @@ struct Aliases {
     builtins_modules: BTreeSet<String>,
     class_vars: BTreeSet<String>,
     typing_modules: BTreeSet<String>,
+    kw_only_markers: BTreeSet<String>,
 }
 
 impl Aliases {
@@ -2950,6 +2951,11 @@ impl Aliases {
                             module.as_str() == "dataclasses" && alias.name.as_str() == "MISSING"
                         }) {
                             self.dataclasses_members.insert(local.clone());
+                        }
+                        if import.module.as_ref().is_some_and(|module| {
+                            module.as_str() == "dataclasses" && alias.name.as_str() == "KW_ONLY"
+                        }) {
+                            self.kw_only_markers.insert(local.clone());
                         }
                         let Some(local) = &alias.asname else {
                             continue;
@@ -3120,7 +3126,13 @@ fn keyword_is(keyword: &ast::Keyword, name: &str) -> Option<bool> {
 
 /// Whether an annotation is the `KW_ONLY` marker, which declares no field.
 fn annotates_kw_only(annotation: &Expr, aliases: &Aliases) -> bool {
-    matched_name(annotation, aliases) == Some("KW_ONLY")
+    match annotation {
+        Expr::Name(name) => aliases.kw_only_markers.contains(name.id.as_str()),
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "KW_ONLY" => {
+            matches!(attribute.value.as_ref(), Expr::Name(name) if aliases.dataclasses_modules.contains(name.id.as_str()))
+        }
+        _ => false,
+    }
 }
 
 /// Whether a field is declared `init=False`, which keeps it out of the
@@ -4801,6 +4813,16 @@ mod tests {
             false,
         );
         assert_eq!(found, ["dataclass field `value` has a default"]);
+    }
+
+    #[test]
+    fn a_user_defined_kw_only_name_is_an_ordinary_field() -> Result<(), String> {
+        let source = "class KW_ONLY: pass\n\n@dataclass\nclass C:\n    marker: KW_ONLY\n    value: int = 1\n\nC(5, 6)\n";
+        assert_eq!(
+            fixed(source)?,
+            "class KW_ONLY: pass\n\n@dataclass\nclass C:\n    marker: KW_ONLY\n    value: int\n\nC(5, 6)\n"
+        );
+        Ok(())
     }
 
     #[test]
@@ -6584,8 +6606,8 @@ mod tests {
     #[test]
     fn a_keyword_only_field_is_not_constrained_by_order() -> Result<(), String> {
         assert_eq!(
-            stub_fixed("@dataclass\nclass C:\n    a: int = ...\n    _: KW_ONLY\n    b: int = 5\n")?,
-            "@dataclass\nclass C:\n    a: int = ...\n    _: KW_ONLY\n    b: int\n"
+            stub_fixed("from dataclasses import KW_ONLY\n\n@dataclass\nclass C:\n    a: int = ...\n    _: KW_ONLY\n    b: int = 5\n")?,
+            "from dataclasses import KW_ONLY\n\n@dataclass\nclass C:\n    a: int = ...\n    _: KW_ONLY\n    b: int\n"
         );
         assert_eq!(
             stub_fixed("@dataclass(kw_only=True)\nclass C:\n    a: int = ...\n    b: int = 5\n")?,
@@ -6763,11 +6785,10 @@ mod tests {
 
     #[test]
     fn a_kw_only_marker_makes_the_fields_after_it_keyword_only() -> Result<(), String> {
-        let source =
-            "@dataclass\nclass E:\n    a: int = 1\n    _: KW_ONLY\n    b: int = 2\n\n\nE()\n";
+        let source = "from dataclasses import KW_ONLY\n\n@dataclass\nclass E:\n    a: int = 1\n    _: KW_ONLY\n    b: int = 2\n\n\nE()\n";
         assert_eq!(
             fixed(source)?,
-            "@dataclass\nclass E:\n    a: int\n    _: KW_ONLY\n    b: int\n\n\nE(a=1, b=2)\n"
+            "from dataclasses import KW_ONLY\n\n@dataclass\nclass E:\n    a: int\n    _: KW_ONLY\n    b: int\n\n\nE(a=1, b=2)\n"
         );
         Ok(())
     }
@@ -6866,8 +6887,8 @@ mod tests {
         // `_: KW_ONLY` declares no field, so it must not consume the slot that
         // tells whether `b` was already supplied positionally.
         assert_eq!(
-            fixed("@dataclass\nclass C:\n    a: int\n    _: KW_ONLY\n    b: int = 2\n\n\nC(1)\n")?,
-            "@dataclass\nclass C:\n    a: int\n    _: KW_ONLY\n    b: int\n\n\nC(1, b=2)\n"
+            fixed("from dataclasses import KW_ONLY\n\n@dataclass\nclass C:\n    a: int\n    _: KW_ONLY\n    b: int = 2\n\n\nC(1)\n")?,
+            "from dataclasses import KW_ONLY\n\n@dataclass\nclass C:\n    a: int\n    _: KW_ONLY\n    b: int\n\n\nC(1, b=2)\n"
         );
         Ok(())
     }

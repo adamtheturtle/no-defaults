@@ -190,7 +190,7 @@ struct PerFileEnforcement {
     enforcement: Enforcement,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Diagnostic {
     path: PathBuf,
     line: usize,
@@ -447,6 +447,12 @@ fn apply_fixes(
     let changes = fixed_sources(call_sites.edits, &mut updated, &mut unfixed)?;
     if cli.diff {
         print_diffs(&changes);
+        let remaining = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.fix.is_none() || unfixed.contains(&diagnostic.path))
+            .cloned()
+            .collect::<Vec<_>>();
+        report_diagnostics(&remaining, cli.output_format)?;
         warn_about_skipped_calls(&call_sites.skipped);
         return Ok(true);
     }

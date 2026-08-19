@@ -1266,23 +1266,28 @@ impl TargetReexportCollector<'_> {
     }
 
     fn collect_assignment_export(&mut self, assign: &ast::StmtAssign) {
-        let [target] = assign.targets.as_slice() else {
-            return;
+        let alias = match assign.value.as_ref() {
+            Expr::Attribute(attribute) => match attribute.value.as_ref() {
+                Expr::Name(module)
+                    if self.imports.iter().any(|(name, export)| {
+                        name == module.id.as_str() && matches!(export, TargetExport::Module)
+                    }) =>
+                {
+                    Some(attribute.attr.to_string())
+                }
+                _ => None,
+            },
+            _ => None,
         };
-        let (Expr::Name(bound), Expr::Attribute(attribute)) = (target, assign.value.as_ref())
-        else {
-            return;
-        };
-        let Expr::Name(module) = attribute.value.as_ref() else {
-            return;
-        };
-        if self.imports.iter().any(|(name, export)| {
-            name == module.id.as_str() && matches!(export, TargetExport::Module)
-        }) {
-            self.imports.push((
-                bound.id.to_string(),
-                TargetExport::Symbol(attribute.attr.to_string()),
-            ));
+        for target in &assign.targets {
+            let Expr::Name(bound) = target else {
+                continue;
+            };
+            self.imports.retain(|(name, _)| name != bound.id.as_str());
+            if let Some(symbol) = &alias {
+                self.imports
+                    .push((bound.id.to_string(), TargetExport::Symbol(symbol.clone())));
+            }
         }
     }
 

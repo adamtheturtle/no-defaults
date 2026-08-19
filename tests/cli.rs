@@ -1180,6 +1180,31 @@ fn reassigning_an_imported_module_invalidates_its_binding() -> Result<(), Box<dy
 }
 
 #[test]
+fn reassigning_an_imported_symbol_invalidates_its_binding() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(
+        &caller,
+        "from api import target\n\ntarget = lambda: 5\ntarget()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        std::fs::read_to_string(caller)?.ends_with("target = lambda: 5\ntarget()\n"),
+        "the call through the reassigned symbol must stay unchanged"
+    );
+    assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
+    Ok(())
+}
+
+#[test]
 fn a_single_component_import_resolves_only_at_the_importers_root(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

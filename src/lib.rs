@@ -3637,6 +3637,7 @@ impl Rewriter<'_> {
                 0,
             )),
             Expr::Name(name) if self.nested_function(name.id.as_str()) == Some(false) => None,
+            Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
             Expr::Name(name) => match self.bindings.get(name.id.as_str()) {
                 Some(Binding::Symbol(file, symbol)) => Some((
                     self.definitions.symbols.get(file)?.get(symbol)?.as_ref()?,

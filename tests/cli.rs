@@ -2462,3 +2462,22 @@ fn package_attributes_take_precedence_over_same_named_submodules(
     );
     Ok(())
 }
+
+#[test]
+fn dataclass_fields_in_false_branches_are_not_constructor_parameters(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    if False:\n        ghost: int = 1\n    value: int = 2\n\nC()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    if False:\n        ghost: int = 1\n    value: int\n\nC(value=2)\n"
+    );
+    Ok(())
+}

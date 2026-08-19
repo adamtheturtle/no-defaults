@@ -3114,7 +3114,10 @@ fn collect_bindings(
 /// for it on the way in, so what it binds is left to it. Only its own name is
 /// taken, because that is what the body being collected binds.
 #[derive(Default)]
-struct BoundNames(BTreeSet<String>);
+struct BoundNames {
+    names: BTreeSet<String>,
+    globals: BTreeSet<String>,
+}
 
 impl BoundNames {
     /// Collect the names an assignment target binds. An attribute or subscript
@@ -3122,7 +3125,7 @@ impl BoundNames {
     fn bind(&mut self, target: &Expr) {
         match target {
             Expr::Name(name) => {
-                self.0.insert(name.id.to_string());
+                self.names.insert(name.id.to_string());
             }
             Expr::Tuple(tuple) => tuple.elts.iter().for_each(|element| self.bind(element)),
             Expr::List(list) => list.elts.iter().for_each(|element| self.bind(element)),
@@ -3138,13 +3141,13 @@ impl BoundNames {
             .chain(&parameters.args)
             .chain(&parameters.kwonlyargs)
         {
-            self.0.insert(parameter.parameter.name.to_string());
+            self.names.insert(parameter.parameter.name.to_string());
         }
         for parameter in [&parameters.vararg, &parameters.kwarg]
             .into_iter()
             .flatten()
         {
-            self.0.insert(parameter.name.to_string());
+            self.names.insert(parameter.name.to_string());
         }
     }
 
@@ -3161,7 +3164,11 @@ impl BoundNames {
         for statement in &function.body {
             collector.visit_stmt(statement);
         }
-        collector.0
+        collector
+            .names
+            .difference(&collector.globals)
+            .cloned()
+            .collect()
     }
 
     fn of_body(body: &[Stmt]) -> BTreeSet<String> {
@@ -3169,7 +3176,11 @@ impl BoundNames {
         for statement in body {
             collector.visit_stmt(statement);
         }
-        collector.0
+        collector
+            .names
+            .difference(&collector.globals)
+            .cloned()
+            .collect()
     }
 
     fn of_lambda(lambda: &ast::ExprLambda) -> BTreeSet<String> {
@@ -3177,7 +3188,7 @@ impl BoundNames {
         if let Some(parameters) = &lambda.parameters {
             collector.parameters(parameters);
         }
-        collector.0
+        collector.names
     }
 }
 
@@ -3198,11 +3209,11 @@ impl<'a> Visitor<'a> for BoundNames {
             // A nested scope binds its own name here and everything else
             // inside itself, so it is not descended into.
             Stmt::FunctionDef(function) => {
-                self.0.insert(function.name.to_string());
+                self.names.insert(function.name.to_string());
                 return;
             }
             Stmt::ClassDef(class) => {
-                self.0.insert(class.name.to_string());
+                self.names.insert(class.name.to_string());
                 return;
             }
             Stmt::Import(import) => {
@@ -3218,7 +3229,7 @@ impl<'a> Visitor<'a> for BoundNames {
                         },
                         ToString::to_string,
                     );
-                    self.0.insert(bound);
+                    self.names.insert(bound);
                 }
             }
             Stmt::ImportFrom(import) => {
@@ -3227,16 +3238,20 @@ impl<'a> Visitor<'a> for BoundNames {
                         .asname
                         .as_ref()
                         .map_or_else(|| alias.name.to_string(), ToString::to_string);
-                    self.0.insert(bound);
+                    self.names.insert(bound);
                 }
             }
             Stmt::Try(block) => {
                 for handler in &block.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
                     if let Some(name) = &handler.name {
-                        self.0.insert(name.to_string());
+                        self.names.insert(name.to_string());
                     }
                 }
+            }
+            Stmt::Global(global) => {
+                self.globals
+                    .extend(global.names.iter().map(ToString::to_string));
             }
             _ => {}
         }
@@ -5247,6 +5262,16 @@ mod tests {
                 "this call cannot be tied to the definition that was fixed",
                 "this call cannot be tied to the definition that was fixed"
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_global_declaration_keeps_the_module_binding_visible() -> Result<(), String> {
+        let source = "def target(value=1): return value\n\ndef run():\n    global target\n    result = target()\n    target = lambda: 2\n    return result\n";
+        assert_eq!(
+            fixed(source)?,
+            "def target(value): return value\n\ndef run():\n    global target\n    result = target(value=1)\n    target = lambda: 2\n    return result\n"
         );
         Ok(())
     }

@@ -4117,6 +4117,11 @@ fn collect_bindings(
             Stmt::With(block) => {
                 collect_bindings(&block.body, importer, known, bindings);
             }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_bindings(&case.body, importer, known, bindings);
+                }
+            }
             // Definitions introduce lexical scopes whose imports are collected
             // separately when the rewriter enters them.
             _ => {}

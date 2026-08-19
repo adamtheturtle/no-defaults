@@ -278,6 +278,32 @@ fn a_shadowed_object_base_is_not_treated_as_builtin() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn double_leading_underscore_names_are_private_but_dunders_are_not(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        directory.path().join("pyproject.toml"),
+        "[tool.no_defaults]\nprivate_only = true\n",
+    )?;
+    std::fs::write(
+        &path,
+        "def __secret(value=1): pass\ndef __protocol__(value=2): pass\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("function `__secret`"), "{stdout}");
+    assert!(!stdout.contains("function `__protocol__`"), "{stdout}");
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

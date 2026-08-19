@@ -3017,7 +3017,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
 }
 
 fn is_private(name: &str) -> bool {
-    name.starts_with('_') && !name.starts_with("__")
+    name.starts_with('_') && !(name.starts_with("__") && name.ends_with("__"))
 }
 
 /// Whether the file's own path keeps everything in it out of the public API.

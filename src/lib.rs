@@ -1908,6 +1908,16 @@ fn check_source(
     let module_bindings = BoundNames::of_body(parsed.suite()).names;
     let mut local_classes = BTreeSet::new();
     collect_class_names(parsed.suite(), &mut local_classes);
+    let mut function_names = BTreeSet::new();
+    let mut repeated_functions = BTreeSet::new();
+    for statement in parsed.suite() {
+        if let Stmt::FunctionDef(function) = statement {
+            let name = function.name.to_string();
+            if !function_names.insert(name.clone()) {
+                repeated_functions.insert(name);
+            }
+        }
+    }
     let mut checker = Checker {
         path,
         source,
@@ -1917,6 +1927,7 @@ fn check_source(
         aliases,
         module_bindings,
         local_classes,
+        repeated_functions,
         shapes: BTreeMap::new(),
         scope: Scope {
             private: is_private_module(path, project_root, reexports),
@@ -2163,6 +2174,9 @@ struct Checker<'a> {
     /// The class names the file defines, so a base written `Protocol` that is
     /// one of them is not mistaken for the typing construct.
     local_classes: BTreeSet<String>,
+    /// Module-level functions defined more than once cannot share one safe
+    /// call-site signature, so their defaults are reported but retained.
+    repeated_functions: BTreeSet<String>,
     /// What each field-carrying class of this file's own contributes to a
     /// subclass's constructor, by the name it was defined under.
     shapes: BTreeMap<String, Option<Shape>>,
@@ -2442,7 +2456,9 @@ impl Checker<'_> {
                 continue;
             };
             let range = TextRange::new(parameter.parameter.end(), default.end());
-            let fix = if positional && kept {
+            let fix = if self.repeated_functions.contains(function.name.as_str())
+                || (positional && kept)
+            {
                 None
             } else {
                 self.fixable(default, range)
@@ -6218,6 +6234,26 @@ mod tests {
         );
         assert!(skipped_reasons(source)?.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn repeated_function_definitions_keep_their_defaults() {
+        let source = "def target(value=1): pass\ntarget()\n\ndef target(value=2): pass\ntarget()\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.fix.is_none()));
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

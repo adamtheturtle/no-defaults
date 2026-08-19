@@ -1926,6 +1926,7 @@ fn check_source(
         collect_signatures: signatures,
         lines: LineIndex::new(source),
         classes: Vec::new(),
+        class_constructs: Vec::new(),
         signatures: Vec::new(),
         skipped: Vec::new(),
         directives,
@@ -2178,6 +2179,7 @@ struct Checker<'a> {
     /// rescan the file from the top.
     lines: LineIndex,
     classes: Vec<ClassCollector>,
+    class_constructs: Vec<bool>,
     signatures: Vec<Signature>,
     skipped: Vec<Skipped>,
     directives: Vec<Directive>,
@@ -2553,7 +2555,9 @@ impl Checker<'_> {
         // As in a signature, a field that keeps its default forces every field
         // after it to keep its own. A keyword-only field is exempt, since
         // `dataclasses` moves it past the `*` where order does not constrain it.
-        let fix = if self.scope.kept_default && !kw_only {
+        let fix = if !self.class_constructs.last().copied().unwrap_or(true)
+            || (self.scope.kept_default && !kw_only)
+        {
             None
         } else {
             self.fixable(value, default.fix)
@@ -2609,6 +2613,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     // written here.
                     kept_default: false,
                 };
+                self.class_constructs
+                    .push(generates_init(class, &self.aliases));
                 if self.collect_signatures {
                     let inherited = inherited_fields(
                         class,
@@ -2639,6 +2645,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     });
                 }
                 walk_stmt(self, statement);
+                self.class_constructs.pop();
                 if let Some(collector) = self
                     .collect_signatures
                     .then(|| self.classes.pop())
@@ -6756,13 +6763,19 @@ mod tests {
     }
 
     #[test]
-    fn a_falsey_dataclass_init_option_disables_call_site_updates() -> Result<(), String> {
+    fn a_falsey_dataclass_init_option_keeps_field_defaults() {
         let source = "@dataclass(init=0)\nclass C:\n    value: int = 1\n\n\nC()\n";
-        assert_eq!(
-            fixed(source)?,
-            "@dataclass(init=0)\nclass C:\n    value: int\n\n\nC()\n"
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
         );
-        Ok(())
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
     }
 
     #[test]
@@ -6887,13 +6900,20 @@ mod tests {
     }
 
     #[test]
-    fn a_class_without_a_generated_constructor_is_left_alone() -> Result<(), String> {
+    fn a_class_without_a_generated_constructor_keeps_defaults() {
         let source = "@dataclass(init=False)\nclass C:\n    x: int = 1\n\n\nC()\n";
-        assert_eq!(
-            fixed(source)?,
-            "@dataclass(init=False)\nclass C:\n    x: int\n\n\nC()\n"
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
         );
-        Ok(())
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]
@@ -6907,13 +6927,19 @@ mod tests {
     }
 
     #[test]
-    fn a_dataclass_with_an_explicit_initializer_keeps_its_calls() -> Result<(), String> {
+    fn a_dataclass_with_an_explicit_initializer_keeps_field_defaults() {
         let source = "@dataclass\nclass C:\n    value: int = 1\n\n    def __init__(self):\n        self.value = 5\n\n\nC()\n";
-        assert_eq!(
-            fixed(source)?,
-            "@dataclass\nclass C:\n    value: int\n\n    def __init__(self):\n        self.value = 5\n\n\nC()\n"
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
         );
-        Ok(())
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
     }
 
     #[test]

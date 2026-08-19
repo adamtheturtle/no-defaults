@@ -1265,6 +1265,27 @@ impl TargetReexportCollector<'_> {
         }
     }
 
+    fn collect_assignment_export(&mut self, assign: &ast::StmtAssign) {
+        let [target] = assign.targets.as_slice() else {
+            return;
+        };
+        let (Expr::Name(bound), Expr::Attribute(attribute)) = (target, assign.value.as_ref())
+        else {
+            return;
+        };
+        let Expr::Name(module) = attribute.value.as_ref() else {
+            return;
+        };
+        if self.imports.iter().any(|(name, export)| {
+            name == module.id.as_str() && matches!(export, TargetExport::Module)
+        }) {
+            self.imports.push((
+                bound.id.to_string(),
+                TargetExport::Symbol(attribute.attr.to_string()),
+            ));
+        }
+    }
+
     fn module_path(&self, module: &str, level: u32) -> PathBuf {
         let mut path = if level > 0 {
             let mut path = self.init.parent().unwrap_or(Path::new("")).to_path_buf();
@@ -1376,6 +1397,7 @@ impl<'a> Visitor<'a> for TargetReexportCollector<'_> {
             Stmt::Assign(assign) if assign.targets.iter().any(is_dunder_all) => {
                 self.collect_all(&assign.value, true);
             }
+            Stmt::Assign(assign) => self.collect_assignment_export(assign),
             Stmt::AnnAssign(assign) if is_dunder_all(&assign.target) => {
                 if let Some(value) = assign.value.as_deref() {
                     self.collect_all(value, true);

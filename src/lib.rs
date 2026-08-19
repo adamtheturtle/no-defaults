@@ -2543,6 +2543,7 @@ struct Aliases {
     dataclasses_members: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
     staticmethods: BTreeSet<String>,
+    classmethods: BTreeSet<String>,
     builtins_modules: BTreeSet<String>,
 }
 
@@ -2555,6 +2556,28 @@ impl Aliases {
             .get(name)
             .and_then(Option::as_deref)
             .unwrap_or(name)
+    }
+
+    fn collect_builtin_members(&mut self, import: &ast::StmtImportFrom) {
+        if import
+            .module
+            .as_ref()
+            .is_none_or(|module| module.as_str() != "builtins")
+        {
+            return;
+        }
+        for alias in &import.names {
+            let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+            match alias.name.as_str() {
+                "staticmethod" => {
+                    self.staticmethods.insert(local);
+                }
+                "classmethod" => {
+                    self.classmethods.insert(local);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Collect the renaming imports visible in one lexical scope, including
@@ -2597,19 +2620,7 @@ impl Aliases {
                                 .insert(local.to_string(), Some("ClassVar".to_owned()));
                         }
                     }
-                    if import
-                        .module
-                        .as_ref()
-                        .is_some_and(|module| module.as_str() == "builtins")
-                    {
-                        for alias in &import.names {
-                            if alias.name.as_str() == "staticmethod" {
-                                self.staticmethods.insert(
-                                    alias.asname.as_ref().unwrap_or(&alias.name).to_string(),
-                                );
-                            }
-                        }
-                    }
+                    self.collect_builtin_members(import);
                     let carries_fields = import.module.as_ref().is_some_and(|module| {
                         matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
                     });
@@ -2996,11 +3007,14 @@ fn method_receiver(function: &ast::StmtFunctionDef, aliases: &Aliases) -> Receiv
         }
         _ => false,
     };
-    let decorated = |wanted: &str| {
-        function
-            .decorator_list
-            .iter()
-            .any(|decorator| matches!(&decorator.expression, Expr::Name(name) if name.id == wanted))
+    let is_classmethod = |expression: &Expr| match expression {
+        Expr::Name(name) => {
+            name.id.as_str() == "classmethod" || aliases.classmethods.contains(name.id.as_str())
+        }
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "classmethod" => {
+            matches!(attribute.value.as_ref(), Expr::Name(name) if aliases.builtins_modules.contains(name.id.as_str()))
+        }
+        _ => false,
     };
     if function
         .decorator_list
@@ -3008,7 +3022,11 @@ fn method_receiver(function: &ast::StmtFunctionDef, aliases: &Aliases) -> Receiv
         .any(|decorator| is_staticmethod(&decorator.expression))
     {
         Receiver::None
-    } else if decorated("classmethod") {
+    } else if function
+        .decorator_list
+        .iter()
+        .any(|decorator| is_classmethod(&decorator.expression))
+    {
         Receiver::Class
     } else {
         Receiver::Instance
@@ -3073,10 +3091,13 @@ fn rewrite_calls(
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
     let mut bindings = BTreeMap::new();
     collect_bindings(parsed.suite(), path, known, &mut bindings);
+    let mut aliases = Aliases::default();
+    aliases.collect(parsed.suite());
     let mut rewriter = Rewriter {
         path,
         source,
         definitions,
+        aliases,
         bindings,
         invalidated_bindings: BTreeSet::new(),
         classes: Vec::new(),
@@ -3379,6 +3400,7 @@ struct Rewriter<'a> {
     path: &'a Path,
     source: &'a str,
     definitions: &'a Definitions,
+    aliases: Aliases,
     /// What each imported name in this file refers to.
     bindings: BTreeMap<String, Binding>,
     /// Imported module-scope names replaced by an assignment already visited.
@@ -3737,7 +3759,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             }
             Stmt::FunctionDef(function) => {
                 let receiver = (!self.classes.is_empty()
-                    && method_receiver(function) != Receiver::None)
+                    && method_receiver(function, &self.aliases) != Receiver::None)
                     .then(|| {
                         function
                             .parameters
@@ -5411,6 +5433,16 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "import builtins\nfrom builtins import staticmethod as static\n\nclass C:\n    @builtins.staticmethod\n    def parse(value): return value\n\n    @static\n    def load(value): return value\n\n    def run(self):\n        return self.parse(5), self.load(6)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn qualified_and_aliased_classmethods_receive_the_class_argument() -> Result<(), String> {
+        let source = "import builtins\nfrom builtins import classmethod as class_method\n\nclass C:\n    @builtins.classmethod\n    def parse(cls, value=1): return value\n\n    @class_method\n    def load(cls, value=2): return value\n\n\nC.parse(5)\nC.load(6)\n";
+        assert_eq!(
+            fixed(source)?,
+            "import builtins\nfrom builtins import classmethod as class_method\n\nclass C:\n    @builtins.classmethod\n    def parse(cls, value): return value\n\n    @class_method\n    def load(cls, value): return value\n\n\nC.parse(5)\nC.load(6)\n"
         );
         Ok(())
     }

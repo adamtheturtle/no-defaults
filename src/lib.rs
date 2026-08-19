@@ -17,6 +17,7 @@ use ruff_python_parser::{parse_expression, parse_module};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
+use unicode_width::UnicodeWidthChar as _;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Forbid defaults in Python functions and dataclasses")]
@@ -781,6 +782,21 @@ impl SourceLines {
     }
 }
 
+fn caret_padding(line: &str, character_column: usize, gutter_width: usize) -> String {
+    let mut terminal_column = gutter_width + 3;
+    let mut padding = String::new();
+    for character in line.chars().take(character_column.saturating_sub(1)) {
+        let width = if character == '\t' {
+            8 - terminal_column % 8
+        } else {
+            character.width().unwrap_or(0)
+        };
+        padding.extend(std::iter::repeat_n(' ', width));
+        terminal_column += width;
+    }
+    padding
+}
+
 fn report_diagnostics(
     diagnostics: &[Diagnostic],
     format: OutputFormat,
@@ -813,15 +829,10 @@ fn report_diagnostics(
                     continue;
                 };
                 let width = diagnostic.line.to_string().len();
+                let padding = caret_padding(line, diagnostic.column, width);
                 println!("{space:width$} |", space = "", width = width);
                 println!("{} | {}", diagnostic.line, line);
-                println!(
-                    "{space:width$} | {caret:>column$}",
-                    space = "",
-                    caret = "^",
-                    width = width,
-                    column = diagnostic.column
-                );
+                println!("{space:width$} | {padding}^", space = "", width = width);
                 println!("{space:width$} |", space = "", width = width);
             }
         }

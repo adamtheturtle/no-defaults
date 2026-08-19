@@ -3230,7 +3230,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
             Stmt::If(branch) => self.visit_conditional(branch),
-            Stmt::Try(_) => self.visit_uncertain(statement),
+            Stmt::Try(_) | Stmt::Match(_) => self.visit_uncertain(statement),
             Stmt::For(loop_) => self.visit_loop(loop_, statement),
             Stmt::While(loop_) => self.visit_while(loop_, statement),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),

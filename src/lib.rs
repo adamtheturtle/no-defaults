@@ -3536,6 +3536,13 @@ impl Rewriter<'_> {
             if self.implicit_receivers.last().and_then(Option::as_deref) == Some(name.id.as_str()) {
                 return Some((self.path.to_path_buf(), self.classes.last()?.clone(), true));
             }
+            if self
+                .scopes
+                .iter()
+                .any(|scope| scope.names.contains(name.id.as_str()))
+            {
+                return None;
+            }
             return match self.bindings.get(name.id.as_str()) {
                 // `from api import Client` names a class of another file.
                 Some(Binding::Symbol(file, symbol)) => Some((file.clone(), symbol.clone(), false)),
@@ -5526,6 +5533,16 @@ mod tests {
     #[test]
     fn a_staticmethod_parameter_named_self_is_not_an_implicit_receiver() -> Result<(), String> {
         let source = "class C:\n    def fetch(self, value=1): return value\n\n    @staticmethod\n    def run(self):\n        return self.fetch()\n";
+        assert_eq!(
+            skipped_reasons(source)?.first().map(String::as_str),
+            Some("this call cannot be tied to the definition that was fixed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_shadowed_class_name_is_not_a_known_receiver() -> Result<(), String> {
+        let source = "class Client:\n    @staticmethod\n    def build(value=1): return value\n\ndef run(Client):\n    return Client.build()\n";
         assert_eq!(
             skipped_reasons(source)?.first().map(String::as_str),
             Some("this call cannot be tied to the definition that was fixed")

@@ -3784,6 +3784,7 @@ fn rewrite_calls(
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
     let mut bindings = BTreeMap::new();
     collect_bindings(parsed.suite(), path, known, &mut bindings);
+    collect_star_bindings(parsed.suite(), path, known, definitions, &mut bindings);
     let mut aliases = Aliases::default();
     aliases.collect(parsed.suite());
     let mut rewriter = Rewriter {
@@ -3975,6 +3976,50 @@ fn collect_conditional_bindings(
         outcomes.push(path);
     }
     retain_common_bindings(bindings, &outcomes, initial);
+}
+
+/// Expand star imports only for public fixed callables whose defining checked
+/// module is known. Other imported names are irrelevant to call rewriting.
+fn collect_star_bindings(
+    suite: &[Stmt],
+    importer: &Path,
+    known: &BTreeSet<&Path>,
+    definitions: &Definitions,
+    bindings: &mut BTreeMap<String, Binding>,
+) {
+    for statement in suite {
+        match statement {
+            Stmt::ImportFrom(import)
+                if import.names.iter().any(|alias| alias.name.as_str() == "*") =>
+            {
+                let module = import.module.as_ref().map_or("", ast::Identifier::as_str);
+                let Some(file) = resolve_module(module, import.level, importer, known) else {
+                    continue;
+                };
+                if let Some(symbols) = definitions.symbols.get(&file) {
+                    for name in symbols.keys().filter(|name| !name.starts_with('_')) {
+                        bindings.insert(name.clone(), Binding::Symbol(file.clone(), name.clone()));
+                    }
+                }
+            }
+            Stmt::If(branch) => {
+                collect_star_bindings(&branch.body, importer, known, definitions, bindings);
+                for clause in &branch.elif_else_clauses {
+                    collect_star_bindings(&clause.body, importer, known, definitions, bindings);
+                }
+            }
+            Stmt::Try(block) => {
+                collect_star_bindings(&block.body, importer, known, definitions, bindings);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_star_bindings(&handler.body, importer, known, definitions, bindings);
+                }
+                collect_star_bindings(&block.orelse, importer, known, definitions, bindings);
+                collect_star_bindings(&block.finalbody, importer, known, definitions, bindings);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The names a function or class body binds.

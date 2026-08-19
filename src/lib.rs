@@ -2614,6 +2614,12 @@ impl Checker<'_> {
         self.scope = outer;
     }
 
+    fn is_stub(&self) -> bool {
+        self.path
+            .extension()
+            .is_some_and(|extension| extension == "pyi")
+    }
+
     /// Whether the rule applies to something with no name of its own, such as
     /// a lambda. It takes the privacy of the scope holding it.
     fn enabled_unnamed(&self) -> bool {
@@ -2764,7 +2770,7 @@ impl Checker<'_> {
                 continue;
             };
             let range = TextRange::new(parameter.parameter.end(), default.end());
-            let fix = if positional && kept {
+            let fix = if self.is_stub() || (positional && kept) {
                 None
             } else {
                 self.fixable(default, range)
@@ -2845,6 +2851,7 @@ impl Checker<'_> {
             };
             let range = TextRange::new(parameter.parameter.end(), default.end());
             let fix = if unknown_decorator
+                || self.is_stub()
                 || (self.scope.class_body && implicitly_called_method(function.name.as_str()))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
@@ -8620,8 +8627,8 @@ mod tests {
         );
         assert_eq!(
             stub_fixed("def f(x: int = 1, y: int = ...) -> None: ...\n")?,
-            "def f(x: int, y: int = ...) -> None: ...\n",
-            "a default before the kept one is still removed"
+            "def f(x: int = 1, y: int = ...) -> None: ...\n",
+            "stub defaults describe optional parameters and stay intact"
         );
         Ok(())
     }
@@ -8648,7 +8655,7 @@ mod tests {
         // Everything after the `*` may take a default or not, in any order.
         assert_eq!(
             stub_fixed("def f(x: int = ..., *, y: int = 5) -> None: ...\n")?,
-            "def f(x: int = ..., *, y: int) -> None: ...\n"
+            "def f(x: int = ..., *, y: int = 5) -> None: ...\n"
         );
         Ok(())
     }

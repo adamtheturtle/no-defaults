@@ -3019,6 +3019,7 @@ fn rewrite_calls(
         source,
         definitions,
         bindings,
+        invalidated_bindings: BTreeSet::new(),
         classes: Vec::new(),
         called: BTreeSet::new(),
         scopes: Vec::new(),
@@ -3318,6 +3319,8 @@ struct Rewriter<'a> {
     definitions: &'a Definitions,
     /// What each imported name in this file refers to.
     bindings: BTreeMap<String, Binding>,
+    /// Imported module-scope names replaced by an assignment already visited.
+    invalidated_bindings: BTreeSet<String>,
     /// The class bodies being walked, so `self.method(...)` can be resolved.
     classes: Vec<String>,
     /// Ranges of the expressions being called, so that the same expression is
@@ -3462,6 +3465,9 @@ impl Rewriter<'_> {
                     }
                 }
                 let dotted = dotted_name(&attribute.value)?;
+                if self.invalidated_bindings.contains(&dotted) {
+                    return None;
+                }
                 let Some(Binding::Module(file)) = self.bindings.get(&dotted) else {
                     return None;
                 };
@@ -3622,6 +3628,28 @@ fn missing_arguments(
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
+            Stmt::Assign(assign) if self.scopes.is_empty() => {
+                // The right-hand side still sees the imported binding; the
+                // assignment replaces it only after that expression runs.
+                walk_stmt(self, statement);
+                let mut names = BoundNames::default();
+                for target in &assign.targets {
+                    names.bind(target);
+                }
+                self.invalidated_bindings.extend(names.names);
+            }
+            Stmt::AnnAssign(assign) if self.scopes.is_empty() => {
+                walk_stmt(self, statement);
+                let mut names = BoundNames::default();
+                names.bind(&assign.target);
+                self.invalidated_bindings.extend(names.names);
+            }
+            Stmt::AugAssign(assign) if self.scopes.is_empty() => {
+                walk_stmt(self, statement);
+                let mut names = BoundNames::default();
+                names.bind(&assign.target);
+                self.invalidated_bindings.extend(names.names);
+            }
             Stmt::ClassDef(class) => {
                 self.classes.push(class.name.to_string());
                 self.scopes.push(BoundNames::of_body(&class.body));

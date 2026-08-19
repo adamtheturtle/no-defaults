@@ -2260,7 +2260,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         name: class.name.to_string(),
                         style,
                         inherits: matches!(inherited, Inherited::Unknown),
-                        constructs: generates_init(class),
+                        constructs: generates_init(class, &self.aliases),
                         kw_only: decorator_says_kw_only(class),
                         fields,
                         removed,
@@ -2612,11 +2612,14 @@ fn has_dataclass_decorator(class: &ast::StmtClassDef, aliases: &Aliases) -> bool
 }
 
 /// Whether the decorator leaves the class with a generated `__init__`.
-fn generates_init(class: &ast::StmtClassDef) -> bool {
+fn generates_init(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
     !class.decorator_list.iter().any(|decorator| {
         let Expr::Call(call) = &decorator.expression else {
             return false;
         };
+        if matched_name(&call.func, aliases) != Some("dataclass") {
+            return false;
+        }
         call.arguments.keywords.iter().any(|keyword| {
             keyword
                 .arg
@@ -5696,6 +5699,16 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "@dataclass(init=False)\nclass C:\n    x: int\n\n\nC()\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unrelated_init_decorator_does_not_disable_dataclass_call_edits() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\ndef marker(**options):\n    return lambda cls: cls\n\n@marker(init=False)\n@dataclass\nclass C:\n    value: int = 1\n\n\nC()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\n\ndef marker(**options):\n    return lambda cls: cls\n\n@marker(init=False)\n@dataclass\nclass C:\n    value: int\n\n\nC(value=1)\n"
         );
         Ok(())
     }

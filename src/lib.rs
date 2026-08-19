@@ -1584,7 +1584,7 @@ fn check_source(
     }
     let mut aliases = Aliases::default();
     aliases.collect(parsed.suite());
-    let module_bindings = BoundNames::of_body(parsed.suite());
+    let module_bindings = BoundNames::of_body(parsed.suite()).names;
     let mut local_classes = BTreeSet::new();
     collect_class_names(parsed.suite(), &mut local_classes);
     let mut checker = Checker {
@@ -3152,6 +3152,7 @@ fn collect_bindings(
 struct BoundNames {
     names: BTreeSet<String>,
     globals: BTreeSet<String>,
+    functions: BTreeSet<String>,
 }
 
 impl BoundNames {
@@ -3193,37 +3194,37 @@ impl BoundNames {
     }
 
     /// The names bound anywhere inside a function, including its parameters.
-    fn of_function(function: &ast::StmtFunctionDef) -> BTreeSet<String> {
+    fn finish(mut self) -> Self {
+        for name in &self.globals {
+            self.names.remove(name);
+            self.functions.remove(name);
+        }
+        self
+    }
+
+    fn of_function(function: &ast::StmtFunctionDef) -> Self {
         let mut collector = Self::default();
         collector.parameters(&function.parameters);
         for statement in &function.body {
             collector.visit_stmt(statement);
         }
-        collector
-            .names
-            .difference(&collector.globals)
-            .cloned()
-            .collect()
+        collector.finish()
     }
 
-    fn of_body(body: &[Stmt]) -> BTreeSet<String> {
+    fn of_body(body: &[Stmt]) -> Self {
         let mut collector = Self::default();
         for statement in body {
             collector.visit_stmt(statement);
         }
-        collector
-            .names
-            .difference(&collector.globals)
-            .cloned()
-            .collect()
+        collector.finish()
     }
 
-    fn of_lambda(lambda: &ast::ExprLambda) -> BTreeSet<String> {
+    fn of_lambda(lambda: &ast::ExprLambda) -> Self {
         let mut collector = Self::default();
         if let Some(parameters) = &lambda.parameters {
             collector.parameters(parameters);
         }
-        collector.names
+        collector
     }
 }
 
@@ -3245,6 +3246,7 @@ impl<'a> Visitor<'a> for BoundNames {
             // inside itself, so it is not descended into.
             Stmt::FunctionDef(function) => {
                 self.names.insert(function.name.to_string());
+                self.functions.insert(function.name.to_string());
                 return;
             }
             Stmt::ClassDef(class) => {
@@ -3341,7 +3343,7 @@ struct Rewriter<'a> {
     /// The names bound by each enclosing function, class, and lambda scope. A
     /// name bound in one of them shadows a module-level definition, so a call
     /// to it does not go where the definition went.
-    scopes: Vec<BTreeSet<String>>,
+    scopes: Vec<BoundNames>,
     /// Where each line of `source` starts, for the same reason the checker
     /// keeps one.
     lines: LineIndex,
@@ -3350,10 +3352,15 @@ struct Rewriter<'a> {
 }
 
 impl Rewriter<'_> {
-    /// Whether an enclosing function, class, or lambda binds `name`, so a call
-    /// to it does not reach a definition of the same name elsewhere.
-    fn shadowed(&self, name: &str) -> bool {
-        self.scopes.iter().any(|scope| scope.contains(name))
+    /// Whether the nearest lexical binding for `name` is a nested function.
+    /// `None` means no enclosing scope binds it at all.
+    fn nested_function(&self, name: &str) -> Option<bool> {
+        self.scopes.iter().rev().find_map(|scope| {
+            scope
+                .names
+                .contains(name)
+                .then(|| scope.functions.contains(name))
+        })
     }
 
     fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
@@ -3431,7 +3438,15 @@ impl Rewriter<'_> {
         match expression {
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
-            Expr::Name(name) if self.shadowed(name.id.as_str()) => None,
+            Expr::Name(name) if self.nested_function(name.id.as_str()) == Some(true) => Some((
+                self.definitions
+                    .symbols
+                    .get(self.path)?
+                    .get(name.id.as_str())?
+                    .as_ref()?,
+                0,
+            )),
+            Expr::Name(name) if self.nested_function(name.id.as_str()) == Some(false) => None,
             Expr::Name(name) => match self.bindings.get(name.id.as_str()) {
                 Some(Binding::Symbol(file, symbol)) => Some((
                     self.definitions.symbols.get(file)?.get(symbol)?.as_ref()?,
@@ -5397,7 +5412,6 @@ mod tests {
             "with open(\"f\") as connect: pass",
             "import connect",
             "from os import path as connect",
-            "def connect(): pass",
             "class connect: pass",
             "[connect for connect in []]",
             "if (connect := open): pass",
@@ -5425,6 +5439,18 @@ mod tests {
             "def connect(host, timeout):\n    pass\n\n\n\
              def outer():\n    def inner(connect):\n        return connect\n    \
              connect(\"h\", timeout=30)\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn calls_to_a_nested_function_receive_removed_defaults() -> Result<(), String> {
+        let source =
+            "def outer():\n    def inner(value=1):\n        return value\n    return inner()\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer():\n    def inner(value):\n        return value\n    return inner(value=1)\n"
         );
         assert!(skipped_reasons(source)?.is_empty());
         Ok(())

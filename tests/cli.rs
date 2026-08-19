@@ -355,6 +355,24 @@ fn full_diagnostics_escape_terminal_control_characters() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn custom_field_calls_are_removed_whole_instead_of_surgically_edited(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\n\ndef field(**kwargs):\n    return 7\n\n@dataclass\nclass C:\n    value: int = field(default=1, metadata=2)\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("value: int\n"), "{fixed}");
+    assert!(!fixed.contains("field(metadata=2)"), "{fixed}");
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

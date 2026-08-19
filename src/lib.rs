@@ -2765,6 +2765,7 @@ impl Checker<'_> {
                         | "__next__"
                         | "__aiter__"
                         | "__anext__"
+                        | "__len__"
                 ))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
@@ -6918,6 +6919,23 @@ mod tests {
     #[test]
     fn async_next_defaults_are_retained_for_protocol_calls() {
         let source = "class C:\n    def __aiter__(self):\n        return self\n\n    async def __anext__(self, extra=None):\n        raise StopAsyncIteration\n\nasync def main():\n    async for _ in C():\n        pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn length_defaults_are_retained_for_protocol_calls() {
+        let source = "class C:\n    def __len__(self, extra=None):\n        return 0\n\nlen(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

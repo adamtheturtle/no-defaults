@@ -2623,24 +2623,28 @@ fn has_dataclass_decorator(class: &ast::StmtClassDef, aliases: &Aliases) -> bool
 
 /// Whether the decorator leaves the class with a generated `__init__`.
 fn generates_init(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
-    !class.decorator_list.iter().any(|decorator| {
-        let Expr::Call(call) = &decorator.expression else {
-            return false;
-        };
-        if matched_name(&call.func, aliases) != Some("dataclass") {
-            return false;
-        }
-        call.arguments.keywords.iter().any(|keyword| {
-            keyword
-                .arg
-                .as_ref()
-                .is_some_and(|name| name.as_str() == "init")
-                && matches!(
-                    Truthiness::from_expr(&keyword.value, |_| false),
-                    Truthiness::False | Truthiness::Falsey | Truthiness::None
-                )
+    let defines_init = class.body.iter().any(
+        |statement| matches!(statement, Stmt::FunctionDef(function) if function.name.as_str() == "__init__"),
+    );
+    !defines_init
+        && !class.decorator_list.iter().any(|decorator| {
+            let Expr::Call(call) = &decorator.expression else {
+                return false;
+            };
+            if matched_name(&call.func, aliases) != Some("dataclass") {
+                return false;
+            }
+            call.arguments.keywords.iter().any(|keyword| {
+                keyword
+                    .arg
+                    .as_ref()
+                    .is_some_and(|name| name.as_str() == "init")
+                    && matches!(
+                        Truthiness::from_expr(&keyword.value, |_| false),
+                        Truthiness::False | Truthiness::Falsey | Truthiness::None
+                    )
+            })
         })
-    })
 }
 
 /// Whether the decorator says `kw_only=True`, making every field of the class
@@ -5732,6 +5736,16 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "from dataclasses import dataclass\n\ndef marker(**options):\n    return lambda cls: cls\n\n@marker(init=False)\n@dataclass\nclass C:\n    value: int\n\n\nC(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dataclass_with_an_explicit_initializer_keeps_its_calls() -> Result<(), String> {
+        let source = "@dataclass\nclass C:\n    value: int = 1\n\n    def __init__(self):\n        self.value = 5\n\n\nC()\n";
+        assert_eq!(
+            fixed(source)?,
+            "@dataclass\nclass C:\n    value: int\n\n    def __init__(self):\n        self.value = 5\n\n\nC()\n"
         );
         Ok(())
     }

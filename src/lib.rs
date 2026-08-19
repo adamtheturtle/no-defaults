@@ -175,6 +175,8 @@ struct Reexports {
     /// cannot be listed without resolving the module, so every name counts as
     /// re-exported.
     wildcard: bool,
+    /// Whether this target module itself is reachable through a package import.
+    module: bool,
     names: BTreeSet<String>,
 }
 
@@ -962,7 +964,7 @@ fn settings_for_files(
         .map_err(|error| error.to_string())?;
     let mut directory_cache: BTreeMap<PathBuf, Option<PathBuf>> = BTreeMap::new();
     let mut config_cache: BTreeMap<PathBuf, LoadedConfig> = BTreeMap::new();
-    let mut reexport_cache: BTreeMap<PathBuf, PackageReexports> = BTreeMap::new();
+    let mut reexport_cache: BTreeMap<(PathBuf, PathBuf), PackageReexports> = BTreeMap::new();
     let fallback_field_bases = Arc::new(FieldBases::new(&default_field_base_classes()));
     let fallback_overrides = Arc::new(Vec::new());
     let mut settings = Vec::with_capacity(files.len());
@@ -993,7 +995,7 @@ fn settings_for_files(
         let reexports = if respect_reexports && private_only == Some(true) {
             let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
             let directory = resolved.parent().unwrap_or(Path::new("."));
-            package_reexports(directory, &loaded.root, &mut reexport_cache)?.names
+            package_reexports(directory, &resolved, &loaded.root, &mut reexport_cache)?.names
         } else {
             Arc::new(Reexports::default())
         };
@@ -1035,27 +1037,32 @@ struct PackageReexports {
 /// which puts it back within reach.
 fn package_reexports(
     directory: &Path,
+    target: &Path,
     root: &Path,
-    cache: &mut BTreeMap<PathBuf, PackageReexports>,
+    cache: &mut BTreeMap<(PathBuf, PathBuf), PackageReexports>,
 ) -> Result<PackageReexports, String> {
-    if let Some(cached) = cache.get(directory) {
+    let key = (directory.to_path_buf(), target.to_path_buf());
+    if let Some(cached) = cache.get(&key) {
         return Ok(cached.clone());
     }
     let init = package_init(directory);
     let climbs = directory != root && (directory.starts_with(root) || init.is_some());
     let inherited = match directory.parent().filter(|_| climbs) {
-        Some(parent) => package_reexports(parent, root, cache)?,
+        Some(parent) => package_reexports(parent, target, root, cache)?,
         None => PackageReexports::default(),
     };
     let name = directory.file_name().unwrap_or_default().to_string_lossy();
     // The directory the walk stops at is not reached by an import, so its own
     // name says nothing about what is inside it.
-    let sealed =
-        inherited.sealed || (climbs && is_private(&name) && !inherited.names.covers(&name));
+    let sealed = inherited.sealed
+        || (climbs
+            && is_private(&name)
+            && !inherited.names.module
+            && !inherited.names.covers(&name));
     let package = match init {
         Some(init) if !sealed => {
             let mut names = (*inherited.names).clone();
-            collect_reexports(&init, &mut names)?;
+            collect_reexports_for_target(&init, target, root, &mut names)?;
             PackageReexports {
                 names: Arc::new(names),
                 sealed,
@@ -1066,7 +1073,7 @@ fn package_reexports(
             sealed,
         },
     };
-    cache.insert(directory.to_path_buf(), package.clone());
+    cache.insert(key, package.clone());
     Ok(package)
 }
 
@@ -1079,6 +1086,7 @@ fn package_init(directory: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+#[cfg(test)]
 fn collect_reexports(path: &Path, reexports: &mut Reexports) -> Result<(), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -1096,14 +1104,179 @@ fn collect_reexports(path: &Path, reexports: &mut Reexports) -> Result<(), Strin
     Ok(())
 }
 
+#[derive(Debug)]
+enum TargetExport {
+    Symbol(String),
+    Module,
+    Wildcard,
+}
+
+struct TargetReexportCollector<'a> {
+    init: &'a Path,
+    target: PathBuf,
+    root: &'a Path,
+    imports: Vec<(String, TargetExport)>,
+    all_names: BTreeSet<String>,
+}
+
+impl TargetReexportCollector<'_> {
+    fn module_path(&self, module: &str, level: u32) -> PathBuf {
+        let mut path = if level > 0 {
+            let mut path = self.init.parent().unwrap_or(Path::new("")).to_path_buf();
+            for _ in 1..level {
+                path.pop();
+            }
+            path
+        } else {
+            self.root.to_path_buf()
+        };
+        for part in module.split('.').filter(|part| !part.is_empty()) {
+            path.push(part);
+        }
+        path
+    }
+
+    fn is_target_module(&self, module: &Path) -> bool {
+        self.target == module
+    }
+
+    fn target_is_inside(&self, module: &Path) -> bool {
+        self.target == module || (module.is_dir() && self.target.starts_with(module))
+    }
+
+    fn collect_all(&mut self, value: &Expr, replace: bool) {
+        if replace {
+            self.all_names.clear();
+        }
+        let elements = match value {
+            Expr::List(list) => &list.elts,
+            Expr::Tuple(tuple) => &tuple.elts,
+            _ => return,
+        };
+        for element in elements {
+            if let Expr::StringLiteral(string) = element {
+                self.all_names.insert(string.value.to_string());
+            }
+        }
+    }
+
+    fn finish(self, reexports: &mut Reexports) {
+        for (bound, export) in self.imports {
+            match export {
+                TargetExport::Symbol(name) => {
+                    if !is_private(&bound) || self.all_names.contains(&bound) {
+                        reexports.names.insert(name);
+                    }
+                }
+                // Importing a module makes every attribute on it reachable
+                // through the package, even when that module segment itself
+                // starts with an underscore.
+                TargetExport::Module => reexports.module = true,
+                TargetExport::Wildcard => reexports.wildcard = true,
+            }
+        }
+    }
+}
+
+impl<'a> Visitor<'a> for TargetReexportCollector<'_> {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        match statement {
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let module = self.module_path(alias.name.as_str(), 0);
+                    if self.target_is_inside(&module) {
+                        let bound = alias.asname.as_ref().map_or_else(
+                            || alias.name.split('.').next().unwrap_or_default().to_owned(),
+                            ToString::to_string,
+                        );
+                        self.imports.push((bound, TargetExport::Module));
+                    }
+                }
+            }
+            Stmt::ImportFrom(import) => {
+                let module = import.module.as_ref().map_or("", ast::Identifier::as_str);
+                let origin = self.module_path(module, import.level);
+                for alias in &import.names {
+                    if alias.name.as_str() == "*" {
+                        if self.is_target_module(&origin) {
+                            self.imports.push(("*".to_owned(), TargetExport::Wildcard));
+                        }
+                        continue;
+                    }
+                    let bound = alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| alias.name.to_string(), ToString::to_string);
+                    if self.is_target_module(&origin) {
+                        self.imports
+                            .push((bound, TargetExport::Symbol(alias.name.to_string())));
+                        continue;
+                    }
+                    let submodule = origin.join(alias.name.as_str());
+                    if self.target_is_inside(&submodule) {
+                        self.imports.push((bound, TargetExport::Module));
+                    }
+                }
+            }
+            Stmt::Assign(assign) if assign.targets.iter().any(is_dunder_all) => {
+                self.collect_all(&assign.value, true);
+            }
+            Stmt::AnnAssign(assign) if is_dunder_all(&assign.target) => {
+                if let Some(value) = assign.value.as_deref() {
+                    self.collect_all(value, true);
+                }
+            }
+            Stmt::AugAssign(assign) if is_dunder_all(&assign.target) => {
+                self.collect_all(&assign.value, false);
+            }
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => walk_stmt(self, statement),
+        }
+    }
+}
+
+fn source_module_path(path: &Path) -> PathBuf {
+    if path.file_stem().is_some_and(|stem| stem == "__init__") {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else {
+        path.with_extension("")
+    }
+}
+
+fn collect_reexports_for_target(
+    init: &Path,
+    target: &Path,
+    root: &Path,
+    reexports: &mut Reexports,
+) -> Result<(), String> {
+    let source = std::fs::read_to_string(init)
+        .map_err(|error| format!("could not read {}: {error}", init.display()))?;
+    let parsed = parse_module(&source)
+        .map_err(|error| format!("could not parse {}: {error}", init.display()))?;
+    let mut collector = TargetReexportCollector {
+        init,
+        target: source_module_path(target),
+        root,
+        imports: Vec::new(),
+        all_names: BTreeSet::new(),
+    };
+    for statement in parsed.suite() {
+        collector.visit_stmt(statement);
+    }
+    collector.finish(reexports);
+    Ok(())
+}
+
 /// Gathers what an `__init__.py` binds: imported names, and the strings of a
 /// literal `__all__`.
+#[cfg(test)]
 struct ReexportCollector<'a> {
     reexports: &'a mut Reexports,
     bindings: BTreeSet<String>,
     all_names: BTreeSet<String>,
 }
 
+#[cfg(test)]
 impl ReexportCollector<'_> {
     /// Add the entries of an `__all__` that is written out as a list or tuple
     /// of string literals. One computed from a call or another module's
@@ -1135,6 +1308,7 @@ fn is_dunder_all(target: &Expr) -> bool {
     matches!(target, Expr::Name(name) if name.id.as_str() == "__all__")
 }
 
+#[cfg(test)]
 impl<'a> Visitor<'a> for ReexportCollector<'_> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
@@ -2549,7 +2723,7 @@ fn is_private_module(path: &Path, project_root: &Path, reexports: &Reexports) ->
             .strip_suffix(".py")
             .or_else(|| component.strip_suffix(".pyi"))
             .unwrap_or(&component);
-        is_private(name) && !reexports.covers(name)
+        is_private(name) && !reexports.module && !reexports.covers(name)
     })
 }
 
@@ -4660,6 +4834,7 @@ mod tests {
     fn private_module_messages(source: &str, reexported: &[&str]) -> Vec<String> {
         let reexports = Reexports {
             wildcard: false,
+            module: false,
             names: reexported.iter().map(|name| (*name).to_owned()).collect(),
         };
         check_source(
@@ -4721,6 +4896,7 @@ mod tests {
     fn a_directive_on_a_reexported_signature_becomes_unused() {
         let reexports = Reexports {
             wildcard: false,
+            module: false,
             names: BTreeSet::from(["upload".to_owned()]),
         };
         let found = check_source(
@@ -4744,6 +4920,7 @@ mod tests {
     fn a_wildcard_reexport_makes_every_name_public() {
         let reexports = Reexports {
             wildcard: true,
+            module: false,
             names: BTreeSet::new(),
         };
         let found = check_source(
@@ -4766,7 +4943,7 @@ mod tests {
         std::fs::create_dir_all(&internal).map_err(|error| error.to_string())?;
         std::fs::write(
             root.join("__init__.py"),
-            "import os\nfrom ._internal import upload as send\nJob = object()\n__all__ = [\"send\", \"Job\"]\n",
+            "import os\nfrom . import _internal as internal\nfrom ._internal import upload as send\nJob = object()\n__all__ = [\"send\", \"Job\"]\n",
         )
         .map_err(|error| error.to_string())?;
         std::fs::write(
@@ -4774,15 +4951,11 @@ mod tests {
             "from ._upload import buried\n",
         )
         .map_err(|error| error.to_string())?;
-        let reexports = package_reexports(&internal, directory.path(), &mut BTreeMap::new())?.names;
-        assert!(reexports.covers("send"));
-        assert!(reexports.covers("Job"));
-        assert!(reexports.covers("os"));
-        assert!(
-            !reexports.covers("buried"),
-            "a private package re-exports nothing to the outside"
-        );
-        assert!(!reexports.wildcard);
+        let target = internal.join("_upload.py");
+        let reexports =
+            package_reexports(&internal, &target, directory.path(), &mut BTreeMap::new())?.names;
+        assert!(reexports.covers("buried"));
+        assert!(reexports.module);
         Ok(())
     }
 
@@ -4796,6 +4969,14 @@ mod tests {
         collect_reexports(&path, &mut reexports)?;
         assert!(reexports.covers("public"));
         assert!(reexports.covers("_hidden"));
+        let mut targeted = Reexports::default();
+        collect_reexports_for_target(
+            &path,
+            &directory.path().join("_api.py"),
+            directory.path(),
+            &mut targeted,
+        )?;
+        assert!(targeted.covers("_hidden"));
         Ok(())
     }
 
@@ -4809,6 +4990,30 @@ mod tests {
         collect_reexports(&path, &mut reexports)?;
         assert!(reexports.wildcard);
         assert!(reexports.covers("anything_in_the_module"));
+        std::fs::create_dir(directory.path().join("_api")).map_err(|error| error.to_string())?;
+        let mut targeted = Reexports::default();
+        collect_reexports_for_target(
+            &path,
+            &directory.path().join("_api/member.py"),
+            directory.path(),
+            &mut targeted,
+        )?;
+        assert!(targeted.module);
+        Ok(())
+    }
+
+    #[test]
+    fn reexports_are_tied_to_their_source_module() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        let sub = package.join("sub");
+        std::fs::create_dir_all(&sub).map_err(|error| error.to_string())?;
+        std::fs::write(package.join("__init__.py"), "from .other import upload\n")
+            .map_err(|error| error.to_string())?;
+        let target = sub.join("_api.py");
+        let reexports =
+            package_reexports(&sub, &target, directory.path(), &mut BTreeMap::new())?.names;
+        assert!(!reexports.covers("upload"));
         Ok(())
     }
 
@@ -4869,9 +5074,14 @@ mod tests {
         std::fs::write(root.join("__init__.py"), "from ._upload import *\n")
             .map_err(|error| error.to_string())?;
         assert!(
-            package_reexports(&root, directory.path(), &mut BTreeMap::new())?
-                .names
-                .wildcard
+            package_reexports(
+                &root,
+                &root.join("_upload.py"),
+                directory.path(),
+                &mut BTreeMap::new(),
+            )?
+            .names
+            .wildcard
         );
         Ok(())
     }
@@ -4883,8 +5093,11 @@ mod tests {
         let internal = root.join("_internal");
         let deeper = internal.join("deeper");
         std::fs::create_dir_all(&deeper).map_err(|error| error.to_string())?;
-        std::fs::write(root.join("__init__.py"), "from . import _internal\n")
-            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            root.join("__init__.py"),
+            "from . import _internal as internal\n",
+        )
+        .map_err(|error| error.to_string())?;
         std::fs::write(
             internal.join("__init__.py"),
             "from ._upload import reachable\n",
@@ -4893,8 +5106,13 @@ mod tests {
         std::fs::write(deeper.join("__init__.py"), "from ._mod import deep\n")
             .map_err(|error| error.to_string())?;
         let mut cache = BTreeMap::new();
-        let reexports = package_reexports(&deeper, directory.path(), &mut cache)?.names;
-        assert!(reexports.covers("reachable"));
+        let reexports = package_reexports(
+            &deeper,
+            &deeper.join("_mod.py"),
+            directory.path(),
+            &mut cache,
+        )?
+        .names;
         assert!(reexports.covers("deep"));
         // Each directory in the chain answered once, for the ancestors as well
         // as for the directory that asked: the three packages and the root the
@@ -4913,7 +5131,13 @@ mod tests {
         std::fs::create_dir_all(&data).map_err(|error| error.to_string())?;
         std::fs::write(root.join("__init__.py"), "from .data._mod import upload\n")
             .map_err(|error| error.to_string())?;
-        let reexports = package_reexports(&data, directory.path(), &mut BTreeMap::new())?.names;
+        let reexports = package_reexports(
+            &data,
+            &data.join("_mod.py"),
+            directory.path(),
+            &mut BTreeMap::new(),
+        )?
+        .names;
         assert!(reexports.covers("upload"));
         Ok(())
     }
@@ -4932,7 +5156,13 @@ mod tests {
         .map_err(|error| error.to_string())?;
         std::fs::write(package.join("__init__.py"), "from ._upload import near\n")
             .map_err(|error| error.to_string())?;
-        let reexports = package_reexports(&package, &root, &mut BTreeMap::new())?.names;
+        let reexports = package_reexports(
+            &package,
+            &package.join("_upload.py"),
+            &root,
+            &mut BTreeMap::new(),
+        )?
+        .names;
         assert!(reexports.covers("near"));
         assert!(!reexports.covers("far"));
         Ok(())
@@ -4950,9 +5180,13 @@ mod tests {
         std::fs::write(internal.join("__init__.py"), "").map_err(|error| error.to_string())?;
         std::fs::write(deeper.join("__init__.py"), "from ._mod import buried\n")
             .map_err(|error| error.to_string())?;
-        let package = package_reexports(&deeper, directory.path(), &mut BTreeMap::new())?;
+        let package = package_reexports(
+            &deeper,
+            &deeper.join("_mod.py"),
+            directory.path(),
+            &mut BTreeMap::new(),
+        )?;
         assert!(package.sealed);
-        assert!(package.names.covers("shown"));
         assert!(
             !package.names.covers("buried"),
             "a public package inside a private one is still out of reach"
@@ -4970,16 +5204,29 @@ mod tests {
             "from . import _upload\nfrom ._upload import upload\n",
         )
         .map_err(|error| error.to_string())?;
-        let reexports = package_reexports(&root, directory.path(), &mut BTreeMap::new())?.names;
+        let reexports = package_reexports(
+            &root,
+            &root.join("_upload.pyi"),
+            directory.path(),
+            &mut BTreeMap::new(),
+        )?
+        .names;
         assert!(reexports.covers("upload"));
         assert!(
             !is_private_module(Path::new("package/_upload.pyi"), Path::new(""), &reexports),
-            "a stub's extension must not hide the module name"
+            "the initializer imports the module itself as well as one symbol"
         );
+        let other = package_reexports(
+            &root,
+            &root.join("_other.pyi"),
+            directory.path(),
+            &mut BTreeMap::new(),
+        )?
+        .names;
         assert!(is_private_module(
             Path::new("package/_other.pyi"),
             Path::new(""),
-            &reexports
+            &other
         ));
         Ok(())
     }
@@ -4987,8 +5234,13 @@ mod tests {
     #[test]
     fn a_file_outside_a_package_has_no_reexports() -> Result<(), String> {
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let reexports =
-            package_reexports(directory.path(), directory.path(), &mut BTreeMap::new())?.names;
+        let reexports = package_reexports(
+            directory.path(),
+            &directory.path().join("file.py"),
+            directory.path(),
+            &mut BTreeMap::new(),
+        )?
+        .names;
         assert!(reexports.names.is_empty());
         assert!(!reexports.wildcard);
         Ok(())

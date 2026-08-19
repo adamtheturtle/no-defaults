@@ -1261,6 +1261,16 @@ impl TargetReexportCollector<'_> {
         }
     }
 
+    fn delete(&mut self, target: &Expr) {
+        let mut deleted = BoundNames::default();
+        deleted.bind(target);
+        self.imports
+            .retain(|(bound, _)| !deleted.names.contains(bound));
+        if deleted.names.contains("__all__") {
+            self.all_names.clear();
+        }
+    }
+
     fn finish(self, reexports: &mut Reexports) {
         for (bound, export) in self.imports {
             match export {
@@ -1329,6 +1339,11 @@ impl<'a> Visitor<'a> for TargetReexportCollector<'_> {
             }
             Stmt::AugAssign(assign) if is_dunder_all(&assign.target) => {
                 self.collect_all(&assign.value, false);
+            }
+            Stmt::Delete(delete) => {
+                for target in &delete.targets {
+                    self.delete(target);
+                }
             }
             Stmt::If(branch) => self.collect_conditional(branch),
             Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
@@ -5431,6 +5446,23 @@ mod tests {
             &mut targeted,
         )?;
         assert!(targeted.covers("_hidden"));
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_an_imported_name_removes_its_reexport() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(&path, "from ._api import public\ndel public\n")
+            .map_err(|error| error.to_string())?;
+        let mut reexports = Reexports::default();
+        collect_reexports_for_target(
+            &path,
+            &directory.path().join("_api.py"),
+            directory.path(),
+            &mut reexports,
+        )?;
+        assert!(!reexports.covers("public"));
         Ok(())
     }
 

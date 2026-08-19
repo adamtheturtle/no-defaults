@@ -2162,7 +2162,7 @@ impl Checker<'_> {
             kind: match self.classes.last() {
                 Some(class) if self.scope.class_body => Callable::Method {
                     class: class.name.clone(),
-                    receiver: method_receiver(function),
+                    receiver: method_receiver(function, &self.aliases),
                 },
                 _ => Callable::Function,
             },
@@ -2522,6 +2522,8 @@ struct Aliases {
     renamed: BTreeMap<String, Option<String>>,
     dataclasses_members: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
+    staticmethods: BTreeSet<String>,
+    builtins_modules: BTreeSet<String>,
 }
 
 impl Aliases {
@@ -2549,6 +2551,13 @@ impl Aliases {
                                     .as_ref()
                                     .map_or_else(|| "dataclasses".to_owned(), ToString::to_string),
                             );
+                        } else if alias.name.as_str() == "builtins" {
+                            self.builtins_modules.insert(
+                                alias
+                                    .asname
+                                    .as_ref()
+                                    .map_or_else(|| "builtins".to_owned(), ToString::to_string),
+                            );
                         }
                     }
                 }
@@ -2566,6 +2575,19 @@ impl Aliases {
                             };
                             self.renamed
                                 .insert(local.to_string(), Some("ClassVar".to_owned()));
+                        }
+                    }
+                    if import
+                        .module
+                        .as_ref()
+                        .is_some_and(|module| module.as_str() == "builtins")
+                    {
+                        for alias in &import.names {
+                            if alias.name.as_str() == "staticmethod" {
+                                self.staticmethods.insert(
+                                    alias.asname.as_ref().unwrap_or(&alias.name).to_string(),
+                                );
+                            }
                         }
                     }
                     let carries_fields = import.module.as_ref().is_some_and(|module| {
@@ -2940,14 +2962,27 @@ fn argument_removal_range(
 }
 
 /// What a method is given ahead of its written arguments, from its decorators.
-fn method_receiver(function: &ast::StmtFunctionDef) -> Receiver {
+fn method_receiver(function: &ast::StmtFunctionDef, aliases: &Aliases) -> Receiver {
+    let is_staticmethod = |expression: &Expr| match expression {
+        Expr::Name(name) => {
+            name.id.as_str() == "staticmethod" || aliases.staticmethods.contains(name.id.as_str())
+        }
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "staticmethod" => {
+            matches!(attribute.value.as_ref(), Expr::Name(name) if aliases.builtins_modules.contains(name.id.as_str()))
+        }
+        _ => false,
+    };
     let decorated = |wanted: &str| {
         function
             .decorator_list
             .iter()
             .any(|decorator| matches!(&decorator.expression, Expr::Name(name) if name.id == wanted))
     };
-    if decorated("staticmethod") {
+    if function
+        .decorator_list
+        .iter()
+        .any(|decorator| is_staticmethod(&decorator.expression))
+    {
         Receiver::None
     } else if decorated("classmethod") {
         Receiver::Class
@@ -5283,6 +5318,16 @@ mod tests {
              def use(self):\n        self.build(kind=1)\n        self.make(mode=2)\n        \
              self.fetch(\"u\", verify=3)\n\n\nC.build(kind=1)\nC.make(mode=2)\n\
              C.fetch(None, \"u\", verify=3)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn qualified_and_aliased_staticmethods_receive_no_implicit_argument() -> Result<(), String> {
+        let source = "import builtins\nfrom builtins import staticmethod as static\n\nclass C:\n    @builtins.staticmethod\n    def parse(value=1): return value\n\n    @static\n    def load(value=2): return value\n\n    def run(self):\n        return self.parse(5), self.load(6)\n";
+        assert_eq!(
+            fixed(source)?,
+            "import builtins\nfrom builtins import staticmethod as static\n\nclass C:\n    @builtins.staticmethod\n    def parse(value): return value\n\n    @static\n    def load(value): return value\n\n    def run(self):\n        return self.parse(5), self.load(6)\n"
         );
         Ok(())
     }

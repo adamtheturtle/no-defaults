@@ -1105,9 +1105,9 @@ impl<'a> Visitor<'a> for ReexportCollector<'_> {
             Stmt::AugAssign(assign) if is_dunder_all(&assign.target) => {
                 self.collect_all(&assign.value);
             }
-            // Imports and `__all__` inside a function bind local names, not
-            // attributes of the package module.
-            Stmt::FunctionDef(_) => {}
+            // Imports and `__all__` inside a function or class bind local
+            // names or class attributes, not attributes of the package module.
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
             // Imports guarded by `try` or `if TYPE_CHECKING` re-export just as
             // much as ones at the top level.
             _ => walk_stmt(self, statement),
@@ -4400,6 +4400,22 @@ mod tests {
         std::fs::write(
             &path,
             "def load():\n    from ._api import public\n    __all__ = ['also_local']\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let mut reexports = Reexports::default();
+        collect_reexports(&path, &mut reexports)?;
+        assert!(reexports.names.is_empty());
+        assert!(!reexports.wildcard);
+        Ok(())
+    }
+
+    #[test]
+    fn initializer_class_imports_are_not_reexports() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(
+            &path,
+            "class Loader:\n    from ._api import public\n    __all__ = ['class_attribute']\n",
         )
         .map_err(|error| error.to_string())?;
         let mut reexports = Reexports::default();

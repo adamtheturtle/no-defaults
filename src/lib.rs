@@ -148,10 +148,6 @@ impl FieldBases {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.names.is_empty()
-    }
-
     fn matches(&self, base: &Expr, aliases: &Aliases) -> bool {
         match base {
             Expr::Name(name) => self.names.contains(aliases.resolve(name.id.as_str())),
@@ -2142,6 +2138,7 @@ fn check_source(
         module_bindings,
         local_classes: BTreeSet::new(),
         repeated_functions,
+        base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
         scope: Scope {
             private: is_private_module(path, project_root, reexports),
@@ -2411,6 +2408,9 @@ struct Checker<'a> {
     /// Module-level functions defined more than once cannot share one safe
     /// call-site signature, so their defaults are reported but retained.
     repeated_functions: BTreeSet<String>,
+    /// Classes already visited in this scope that carry fields through a
+    /// configured base, so their local subclasses carry fields too.
+    base_field_classes: BTreeSet<String>,
     /// What each field-carrying class of this file's own contributes to a
     /// subclass's constructor, by the name it was defined under.
     shapes: BTreeMap<String, Option<Shape>>,
@@ -2498,6 +2498,23 @@ impl Checker<'_> {
     {
         self.aliases.collect(std::slice::from_ref(statement));
         walk_stmt(self, statement);
+    }
+
+    fn class_field_style(&self, class: &ast::StmtClassDef) -> Option<FieldStyle> {
+        field_style(
+            class,
+            self.field_bases,
+            &self.aliases,
+            &self.base_field_classes,
+        )
+    }
+
+    fn record_base_field_class(&mut self, name: &str, style: Option<FieldStyle>) {
+        if style == Some(FieldStyle::Base) {
+            self.base_field_classes.insert(name.to_owned());
+        } else {
+            self.base_field_classes.remove(name);
+        }
     }
 
     fn visit_function_statement<'a>(
@@ -2909,7 +2926,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // As with a `def` line, the name locates the `class` line a
                 // directive covering every field sits on.
                 self.header = Some(line_start(self.source, class.name.start()));
-                let style = field_style(class, self.field_bases, &self.aliases);
+                let style = self.class_field_style(class);
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
                     fields: style,
@@ -2957,6 +2974,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // how this class's bases were resolved.
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
+                self.record_base_field_class(class.name.as_str(), style);
                 self.class_constructs.pop();
                 if let Some(collector) = self
                     .collect_signatures
@@ -3054,11 +3072,16 @@ fn field_style(
     class: &ast::StmtClassDef,
     bases: &FieldBases,
     aliases: &Aliases,
+    base_field_classes: &BTreeSet<String>,
 ) -> Option<FieldStyle> {
     if has_dataclass_decorator(class, aliases) {
         return Some(FieldStyle::Dataclass);
     }
-    (!bases.is_empty() && class_bases(class).any(|base| bases.matches(base, aliases)))
+    class_bases(class)
+        .any(|base| {
+            bases.matches(base, aliases)
+                || matches!(base, Expr::Name(name) if base_field_classes.contains(name.id.as_str()))
+        })
         .then_some(FieldStyle::Base)
 }
 
@@ -5488,6 +5511,20 @@ mod tests {
     fn a_model_subclass_is_left_alone() {
         let found = messages("class Sub(Job):\n x: int = 1\n", false);
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_known_local_model_subclass_carries_fields() {
+        assert_eq!(
+            messages(
+                "from pydantic import BaseModel\n\nclass Parent(BaseModel):\n    first: int = 1\n\nclass Child(Parent):\n    second: int = 2\n",
+                false,
+            ),
+            [
+                "class field `first` has a default",
+                "class field `second` has a default",
+            ]
+        );
     }
 
     #[test]

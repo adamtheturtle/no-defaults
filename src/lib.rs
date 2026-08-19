@@ -2109,8 +2109,24 @@ fn noqa_marker(body: &str) -> Option<usize> {
     };
     body.match_indices("noqa")
         .find(|(index, _)| {
-            boundary(body[..*index].chars().next_back())
-                && boundary(body[index + "noqa".len()..].chars().next())
+            if !boundary(body[..*index].chars().next_back())
+                || !boundary(body[index + "noqa".len()..].chars().next())
+            {
+                return false;
+            }
+            let rest = &body[index + "noqa".len()..];
+            let segment_end = next_segment(rest).unwrap_or(rest.len());
+            let segment = rest[..segment_end].trim();
+            if segment.is_empty() {
+                return true;
+            }
+            segment.strip_prefix(':').is_some_and(|codes| {
+                codes.split(',').any(|part| {
+                    part.split_whitespace()
+                        .next()
+                        .is_some_and(|code| code.eq_ignore_ascii_case("NOD001"))
+                })
+            })
         })
         .map(|(index, _)| index)
 }
@@ -5930,6 +5946,10 @@ mod tests {
             codes("def a(x=1): pass  # type: ignore  # noqa: E501\n"),
             ["NOD001"],
             "a code list that omits this rule still suppresses nothing"
+        );
+        assert!(
+            codes("def a(x=1): pass  # noqa: E501  # noqa: NOD001\n").is_empty(),
+            "a later noqa segment can select this rule"
         );
         assert_eq!(
             codes("def a(x=1): pass  # see noqattention\n"),

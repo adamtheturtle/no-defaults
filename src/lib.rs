@@ -4176,8 +4176,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             }
             Expr::Name(_) | Expr::Attribute(_) => self.check_reference(expression),
             Expr::Lambda(lambda) => {
+                if let Some(parameters) = &lambda.parameters {
+                    self.visit_parameters(parameters);
+                }
                 self.scopes.push(BoundNames::of_lambda(lambda));
-                walk_expr(self, expression);
+                self.visit_expr(&lambda.body);
                 self.scopes.pop();
                 return;
             }
@@ -6174,6 +6177,17 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "def target(value):\n    return int\n\ndef decorated(item: target(value=1)):\n    target = 5\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn lambda_defaults_use_the_enclosing_scope() -> Result<(), String> {
+        let source = "def target(value=1):\n    return 5\n\nhandler = lambda target=target(): target  # noqa: NOD001\n";
+        assert_eq!(
+            fixed(source)?,
+            "def target(value):\n    return 5\n\nhandler = lambda target=target(value=1): target  # noqa: NOD001\n"
         );
         assert!(skipped_reasons(source)?.is_empty());
         Ok(())

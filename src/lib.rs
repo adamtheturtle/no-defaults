@@ -2804,6 +2804,23 @@ impl Checker<'_> {
         let enclosing = self.header;
         self.header = Some(line_start(self.source, function.name.start()));
         let mut removed = Vec::new();
+        let known_descriptor = |expression: &Expr| match expression {
+            Expr::Name(name) => {
+                matches!(name.id.as_str(), "staticmethod" | "classmethod")
+                    || self.aliases.staticmethods.contains(name.id.as_str())
+                    || self.aliases.classmethods.contains(name.id.as_str())
+            }
+            Expr::Attribute(attribute)
+                if matches!(attribute.attr.as_str(), "staticmethod" | "classmethod") =>
+            {
+                matches!(attribute.value.as_ref(), Expr::Name(name) if self.aliases.builtins_modules.contains(name.id.as_str()))
+            }
+            _ => false,
+        };
+        let unknown_decorator = function
+            .decorator_list
+            .iter()
+            .any(|decorator| !known_descriptor(&decorator.expression));
         // A parameter without a default cannot follow one with a default, so
         // once a default has to stay, every positional default after it stays
         // too. Keyword-only parameters sit after the `*`, where order does not
@@ -2827,7 +2844,8 @@ impl Checker<'_> {
                 continue;
             };
             let range = TextRange::new(parameter.parameter.end(), default.end());
-            let fix = if (self.scope.class_body && implicitly_called_method(function.name.as_str()))
+            let fix = if unknown_decorator
+                || (self.scope.class_body && implicitly_called_method(function.name.as_str()))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
             {
@@ -8157,6 +8175,23 @@ mod tests {
             .diagnostics
             .iter()
             .all(|diagnostic| diagnostic.fix.is_none()));
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn decorated_functions_keep_defaults_when_the_signature_may_change() {
+        let source = "def replace(function):\n    return lambda: 5\n\n@replace\ndef target(value=1): pass\n\ntarget()\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
     }
 

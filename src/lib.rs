@@ -2142,7 +2142,7 @@ fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
     let ruff = alone.then(|| file_level_prefix(&lower, "ruff")).flatten();
     let (file_level, rest) = if let Some((rest, _)) = flake8 {
         // A `# flake8: noqa` with anything appended is not a directive.
-        (rest.is_empty(), None)
+        (rest.trim().is_empty(), None)
     } else if let Some((rest, consumed)) = ruff {
         (true, Some((rest, body_start + consumed)))
     } else {
@@ -5902,6 +5902,7 @@ mod tests {
         assert_eq!(codes("# ruff: noqa: E501\ndef f(x=1): pass\n"), ["NOD001"]);
         assert!(codes("# ruff: noqa\ndef f(x=1): pass\n").is_empty());
         assert!(codes("# flake8: noqa\ndef f(x=1): pass\n").is_empty());
+        assert!(codes("# flake8: noqa   \ndef f(x=1): pass\n").is_empty());
     }
 
     #[test]

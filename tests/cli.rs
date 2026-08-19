@@ -1645,7 +1645,6 @@ fn from_package_reexports_resolve_to_the_defining_module() -> Result<(), Box<dyn
     )?;
     let caller = directory.path().join("caller.py");
     std::fs::write(&caller, "from pkg import target\ntarget()\n")?;
-
     let output = Command::new(binary())
         .arg("--fix")
         .arg(directory.path())
@@ -1680,6 +1679,34 @@ fn package_attributes_resolve_to_the_reexported_definition(
     assert_eq!(
         std::fs::read_to_string(caller)?,
         "import pkg\npkg.target(value=1)\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn packages_take_precedence_over_same_named_modules() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("dupe");
+    std::fs::create_dir(&package)?;
+    std::fs::write(
+        directory.path().join("dupe.py"),
+        "def target(value=1): return value\n",
+    )?;
+    std::fs::write(
+        package.join("__init__.py"),
+        "def target(value=5): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "import dupe\ndupe.target()\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import dupe\ndupe.target(value=5)\n"
     );
     Ok(())
 }

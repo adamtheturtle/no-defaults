@@ -699,15 +699,7 @@ fn resolve_module(
         for part in &parts {
             directory.push(part);
         }
-        for candidate in [
-            directory.with_extension("py"),
-            directory.join("__init__.py"),
-        ] {
-            if known.contains(candidate.as_path()) {
-                return Some(candidate);
-            }
-        }
-        return None;
+        return module_candidate(&directory, known);
     }
     if parts.is_empty() {
         return None;
@@ -730,16 +722,11 @@ fn resolve_module(
                 for part in &parts {
                     candidate.push(part);
                 }
-                for candidate in [
-                    candidate.with_extension("py"),
-                    candidate.join("__init__.py"),
-                ] {
-                    if known.contains(candidate.as_path()) {
-                        if found.as_ref().is_some_and(|first| *first != candidate) {
-                            return None;
-                        }
-                        found = Some(candidate);
+                if let Some(candidate) = module_candidate(&candidate, known) {
+                    if found.as_ref().is_some_and(|first| *first != candidate) {
+                        return None;
                     }
+                    found = Some(candidate);
                 }
             }
             if !directory.pop() {
@@ -768,8 +755,8 @@ fn resolve_module(
         components.len() >= suffix.len() && components[components.len() - suffix.len()..] == *suffix
     };
     for last in [
-        format!("{}.py", parts[parts.len() - 1]),
         "__init__.py".to_owned(),
+        format!("{}.py", parts[parts.len() - 1]),
     ] {
         let mut suffix: Vec<String> = parts.iter().map(|part| (*part).to_owned()).collect();
         if last == "__init__.py" {
@@ -813,6 +800,14 @@ fn resolve_from_pythonpath(parts: &[&str], known: &BTreeSet<&Path>) -> Option<Pa
         }
     }
     found
+}
+
+/// Resolve one importable path, matching Python's preference for a package
+/// directory over a same-named source module in the same search location.
+fn module_candidate(base: &Path, known: &BTreeSet<&Path>) -> Option<PathBuf> {
+    [base.join("__init__.py"), base.with_extension("py")]
+        .into_iter()
+        .find(|candidate| known.contains(candidate.as_path()))
 }
 
 #[derive(Serialize)]

@@ -2601,7 +2601,8 @@ impl Checker<'_> {
                 continue;
             };
             let range = TextRange::new(parameter.parameter.end(), default.end());
-            let fix = if self.repeated_functions.contains(function.name.as_str())
+            let fix = if (self.scope.class_body && function.name.as_str() == "__call__")
+                || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
             {
                 None
@@ -6464,6 +6465,23 @@ mod tests {
             "`client` could be anything, so its `fetch` is not known to be this one"
         );
         Ok(())
+    }
+
+    #[test]
+    fn callable_instance_defaults_are_retained_without_instance_analysis() {
+        let source = "class Callable:\n    def __call__(self, value=1):\n        return value\n\ntarget = Callable()\ntarget()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

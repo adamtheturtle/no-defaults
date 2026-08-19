@@ -2829,7 +2829,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     kept_default: false,
                 };
                 self.class_constructs
-                    .push(generates_init(class, &self.aliases));
+                    .push(class_constructs_safely(class, &self.aliases));
                 if self.collect_signatures {
                     let inherited = inherited_fields(
                         class,
@@ -3304,6 +3304,16 @@ fn has_dataclass_decorator(class: &ast::StmtClassDef, aliases: &Aliases) -> bool
         };
         matched_name(expression, aliases) == Some("dataclass")
     })
+}
+
+fn class_defaults_are_fixable(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
+    !class.decorator_list.iter().any(|decorator| {
+        matches!(&decorator.expression, Expr::Name(name) if aliases.resolve(name.id.as_str()) != "dataclass")
+    })
+}
+
+fn class_constructs_safely(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
+    generates_init(class, aliases) && class_defaults_are_fixable(class, aliases)
 }
 
 /// Whether the decorator leaves the class with a generated `__init__`.
@@ -6959,6 +6969,23 @@ mod tests {
         );
         assert!(skipped_reasons(source)?.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn decorator_replaced_dataclasses_keep_their_field_defaults() {
+        let source = "def replace(cls):\n    return lambda: 5\n\n@replace\n@dataclass\nclass C:\n    value: int = 1\n\nC()\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

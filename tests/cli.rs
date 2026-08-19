@@ -1710,3 +1710,24 @@ fn packages_take_precedence_over_same_named_modules() -> Result<(), Box<dyn std:
     );
     Ok(())
 }
+
+#[test]
+fn star_imported_functions_have_their_calls_updated() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "from api import *\ntarget()\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import *\ntarget(value=1)\n"
+    );
+    Ok(())
+}

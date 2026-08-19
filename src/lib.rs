@@ -2657,7 +2657,8 @@ impl Checker<'_> {
                 continue;
             };
             let range = TextRange::new(parameter.parameter.end(), default.end());
-            let fix = if (self.scope.class_body && function.name.as_str() == "__call__")
+            let fix = if (self.scope.class_body
+                && matches!(function.name.as_str(), "__call__" | "__enter__"))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
             {
@@ -6487,6 +6488,23 @@ mod tests {
              C.fetch(None, \"u\", verify=3)\n"
         );
         Ok(())
+    }
+
+    #[test]
+    fn context_manager_enter_defaults_are_retained_for_implicit_calls() {
+        let source = "class C:\n    def __enter__(self, value=1):\n        return value\n\n    def __exit__(self, kind, error, traceback):\n        pass\n\nwith C() as value:\n    assert value == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

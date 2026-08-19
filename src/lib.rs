@@ -3104,8 +3104,6 @@ fn factory_call_text(factory: &Expr, module_bindings: &BTreeSet<String>) -> Opti
         "list" => Some("[]".to_owned()),
         "dict" => Some("{}".to_owned()),
         "tuple" => Some("()".to_owned()),
-        "set" => Some("set()".to_owned()),
-        "frozenset" => Some("frozenset()".to_owned()),
         _ => None,
     }
 }
@@ -5389,6 +5387,19 @@ mod tests {
         let reasons = skipped_reasons(source)?;
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("is not a literal"));
+        Ok(())
+    }
+
+    #[test]
+    fn named_container_factories_are_not_looked_up_in_callers() -> Result<(), String> {
+        for factory in ["set", "frozenset"] {
+            let source = format!(
+                "@dataclass\nclass C:\n    value: object = field(default_factory={factory})\n\nC()\n"
+            );
+            let reasons = skipped_reasons(&source)?;
+            assert_eq!(reasons.len(), 1, "{factory}");
+            assert!(reasons[0].contains("is not a literal"), "{factory}");
+        }
         Ok(())
     }
 

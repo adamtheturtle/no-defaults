@@ -3029,6 +3029,7 @@ fn rewrite_calls(
         bindings,
         invalidated_bindings: BTreeSet::new(),
         classes: Vec::new(),
+        implicit_receivers: Vec::new(),
         called: BTreeSet::new(),
         scopes: Vec::new(),
         lines: LineIndex::new(source),
@@ -3331,6 +3332,9 @@ struct Rewriter<'a> {
     invalidated_bindings: BTreeSet<String>,
     /// The class bodies being walked, so `self.method(...)` can be resolved.
     classes: Vec<String>,
+    /// The implicit receiver name of each enclosing function. Static methods
+    /// and module functions contribute `None`.
+    implicit_receivers: Vec<Option<String>>,
     /// Ranges of the expressions being called, so that the same expression is
     /// not later mistaken for a reference that never calls the function.
     called: BTreeSet<(TextSize, TextSize)>,
@@ -3401,7 +3405,7 @@ impl Rewriter<'_> {
     /// this file; and `api.Client` names one of an imported module.
     fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool)> {
         if let Expr::Name(name) = receiver {
-            if matches!(name.id.as_str(), "self" | "cls") {
+            if self.implicit_receivers.last().and_then(Option::as_deref) == Some(name.id.as_str()) {
                 return Some((self.path.to_path_buf(), self.classes.last()?.clone(), true));
             }
             return match self.bindings.get(name.id.as_str()) {
@@ -3666,9 +3670,22 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.classes.pop();
             }
             Stmt::FunctionDef(function) => {
+                let receiver = (!self.classes.is_empty()
+                    && method_receiver(function) != Receiver::None)
+                    .then(|| {
+                        function
+                            .parameters
+                            .posonlyargs
+                            .first()
+                            .or_else(|| function.parameters.args.first())
+                            .map(|parameter| parameter.parameter.name.to_string())
+                    })
+                    .flatten();
+                self.implicit_receivers.push(receiver);
                 self.scopes.push(BoundNames::of_function(function));
                 walk_stmt(self, statement);
                 self.scopes.pop();
+                self.implicit_receivers.pop();
             }
             _ => walk_stmt(self, statement),
         }
@@ -5305,6 +5322,16 @@ mod tests {
             .map(String::as_str),
             Some("this call cannot be tied to the definition that was fixed"),
             "`client` could be anything, so its `fetch` is not known to be this one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_staticmethod_parameter_named_self_is_not_an_implicit_receiver() -> Result<(), String> {
+        let source = "class C:\n    def fetch(self, value=1): return value\n\n    @staticmethod\n    def run(self):\n        return self.fetch()\n";
+        assert_eq!(
+            skipped_reasons(source)?.first().map(String::as_str),
+            Some("this call cannot be tied to the definition that was fixed")
         );
         Ok(())
     }

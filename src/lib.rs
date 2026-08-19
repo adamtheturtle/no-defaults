@@ -2053,6 +2053,9 @@ fn parse_directive(source: &str, hash: usize) -> Option<Directive> {
     if rest.trim().is_empty() {
         return Some(blanket());
     }
+    if next_segment(rest).is_some_and(|offset| rest[..offset].trim().is_empty()) {
+        return Some(blanket());
+    }
     let codes_start = rest_start + rest.len() - rest.trim_start().len();
     let codes = rest.trim_start().strip_prefix(':')?;
     let tokens = code_tokens(codes, codes_start + 1);
@@ -5396,6 +5399,14 @@ mod tests {
         );
         assert_eq!(found.len(), 1);
         assert!(found[0].contains("function `c`"));
+    }
+
+    #[test]
+    fn blanket_noqa_accepts_a_following_explanation() -> Result<(), String> {
+        let source = "def target(value=1): pass  # noqa  # compatibility\n";
+        assert!(messages(source, false).is_empty());
+        assert_eq!(fixed(source)?, source);
+        Ok(())
     }
 
     #[test]

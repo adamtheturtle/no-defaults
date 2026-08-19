@@ -248,6 +248,23 @@ fn unpacked_kw_only_field_options_do_not_produce_constructor_arguments(
 }
 
 #[test]
+fn a_shadowed_object_base_is_not_treated_as_builtin() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\n\nclass Base:\n    inherited: int = 1\n\nobject = Base\n\n@dataclass\nclass C(object):\n    own: int = 2\n\nC()\n",
+    )?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("own: int\n"), "{fixed}");
+    assert!(fixed.ends_with("C()\n"), "{fixed}");
+    assert!(String::from_utf8(output.stderr)?.contains("inherits fields"));
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

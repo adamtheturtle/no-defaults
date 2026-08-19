@@ -2492,6 +2492,14 @@ struct ClassCollector {
 }
 
 impl Checker<'_> {
+    fn visit_import_statement<'a>(&mut self, statement: &'a Stmt)
+    where
+        Self: Visitor<'a>,
+    {
+        self.aliases.collect(std::slice::from_ref(statement));
+        walk_stmt(self, statement);
+    }
+
     fn visit_function_statement<'a>(
         &mut self,
         function: &'a ast::StmtFunctionDef,
@@ -2881,10 +2889,7 @@ impl Checker<'_> {
 impl<'a> Visitor<'a> for Checker<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
-            Stmt::Import(_) | Stmt::ImportFrom(_) => {
-                self.aliases.collect(std::slice::from_ref(statement));
-                walk_stmt(self, statement);
-            }
+            Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => {
                 self.visit_function_statement(function, statement);
             }
@@ -2914,6 +2919,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         self.field_bases,
                         &self.aliases,
                         &self.local_classes,
+                        &self.module_bindings,
                         &self.shapes,
                     );
                     // A base of this file's own contributes its fields ahead of
@@ -3086,10 +3092,11 @@ fn inherited_fields(
     bases: &FieldBases,
     aliases: &Aliases,
     local: &BTreeSet<String>,
+    module_bindings: &BTreeSet<String>,
     shapes: &BTreeMap<String, Option<Shape>>,
 ) -> Inherited {
     let carrying: Vec<&Expr> = class_bases(class)
-        .filter(|base| !carries_no_fields(base, aliases, local))
+        .filter(|base| !carries_no_fields(base, aliases, local, module_bindings))
         // The base that made the class carry fields contributes none itself.
         .filter(|base| !(matches!(style, Some(FieldStyle::Base)) && bases.matches(base, aliases)))
         .collect();
@@ -3118,7 +3125,12 @@ fn inherited_fields(
 /// own body and its constructor is known from the file that defines it. Without
 /// this a generic dataclass could never have its call sites updated, however
 /// the project is laid out — the safe path was never escaped.
-fn carries_no_fields(base: &Expr, aliases: &Aliases, local: &BTreeSet<String>) -> bool {
+fn carries_no_fields(
+    base: &Expr,
+    aliases: &Aliases,
+    local: &BTreeSet<String>,
+    module_bindings: &BTreeSet<String>,
+) -> bool {
     let base = match base {
         Expr::Subscript(subscript) => &*subscript.value,
         expression => expression,
@@ -3126,7 +3138,12 @@ fn carries_no_fields(base: &Expr, aliases: &Aliases, local: &BTreeSet<String>) -
     match base {
         // A class the file defines under one of these names is that class, not
         // the typing construct, and may carry fields of its own.
-        Expr::Name(name) if local.contains(name.id.as_str()) => false,
+        Expr::Name(name)
+            if local.contains(name.id.as_str())
+                || (name.id.as_str() == "object" && module_bindings.contains("object")) =>
+        {
+            false
+        }
         Expr::Name(name) => {
             aliases.structural_bases.contains(name.id.as_str())
                 || matches!(name.id.as_str(), "Generic" | "Protocol" | "ABC" | "object")

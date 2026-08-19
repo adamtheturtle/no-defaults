@@ -341,6 +341,20 @@ fn metaclass_keyword_calls_resolve_before_class_body_bindings(
 }
 
 #[test]
+fn full_diagnostics_escape_terminal_control_characters() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def target(value=1): pass  # \u{1b}[31mred\n")?;
+
+    let output = Command::new(binary()).arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(stdout.contains(r"\u{1b}[31mred"), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

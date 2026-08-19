@@ -173,6 +173,20 @@ fn diff_rejects_machine_readable_output_formats() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn unpacked_field_options_keep_defaults_out_of_constructor_fixes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "from dataclasses import dataclass, field\n\n@dataclass\nclass C:\n    value: int = field(default=1, **{\"init\": False})\n\nC()\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

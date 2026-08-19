@@ -3477,14 +3477,13 @@ fn field_excluded_from_init(value: &Expr, aliases: &Aliases) -> bool {
     };
     matched_name(&call.func, aliases) == Some("field")
         && call.arguments.keywords.iter().any(|keyword| {
-            keyword
-                .arg
-                .as_ref()
-                .is_some_and(|name| name.as_str() == "init")
-                && matches!(
-                    Truthiness::from_expr(&keyword.value, |_| false),
-                    Truthiness::False | Truthiness::Falsey | Truthiness::None
-                )
+            keyword.arg.as_ref().is_none_or(|name| {
+                name.as_str() == "init"
+                    && matches!(
+                        Truthiness::from_expr(&keyword.value, |_| false),
+                        Truthiness::False | Truthiness::Falsey | Truthiness::None
+                    )
+            })
         })
 }
 

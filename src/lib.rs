@@ -3060,12 +3060,12 @@ fn collect_bindings(
             Stmt::Import(import) => {
                 for alias in &import.names {
                     let module = alias.name.as_str();
-                    // Without an alias, `import a.b` binds `a`, and only a
-                    // single-component import gives a usable module name.
+                    // The binding table is keyed by the expression prefix a
+                    // call uses. Although `import a.b` binds `a`, the imported
+                    // module is reached through the full `a.b` expression.
                     let bound = match alias.asname.as_ref() {
                         Some(name) => name.to_string(),
-                        None if !module.contains('.') => module.to_owned(),
-                        None => continue,
+                        None => module.to_owned(),
                     };
                     if let Some(file) = resolve_module(module, 0, importer, known) {
                         bindings.insert(bound, Binding::Module(file));

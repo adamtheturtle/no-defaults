@@ -2198,16 +2198,15 @@ impl Checker<'_> {
         } else {
             self.fixable(value, default.fix)
         };
-        if fix.is_none() && !kw_only {
-            self.scope.kept_default = true;
-        }
-        if self.report_with(
+        let was_removed = self.report_with(
             value.start(),
             format!("{} `{}` has a {}", style.noun(), name.id, default.kind),
             fix,
-        ) && self.collect_signatures
-            && constructs
-        {
+        );
+        if !kw_only && !was_removed {
+            self.scope.kept_default = true;
+        }
+        if was_removed && self.collect_signatures && constructs {
             if let Some(class) = self.classes.last_mut() {
                 class.removed.push(Removed {
                     parameter: name.id.to_string(),
@@ -5507,6 +5506,23 @@ mod tests {
             "a field before the kept one is still fixed"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_suppressed_dataclass_field_protects_later_fields() {
+        let source = "@dataclass\nclass C:\n    a: int = 1  # noqa: NOD001\n    b: int = 2\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert_eq!(checked.diagnostics[0].line, 4);
+        assert_eq!(checked.diagnostics[0].fix, None);
     }
 
     #[test]

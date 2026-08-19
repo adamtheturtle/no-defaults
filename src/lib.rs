@@ -2485,7 +2485,7 @@ impl Checker<'_> {
             kind: match self.classes.last() {
                 Some(class) if self.scope.class_body => Callable::Method {
                     class: class.name.clone(),
-                    receiver: method_receiver(function, &self.aliases),
+                    receiver: method_receiver(function, &self.aliases, &self.module_bindings),
                 },
                 _ => Callable::Function,
             },
@@ -3316,10 +3316,15 @@ fn argument_removal_range(
 }
 
 /// What a method is given ahead of its written arguments, from its decorators.
-fn method_receiver(function: &ast::StmtFunctionDef, aliases: &Aliases) -> Receiver {
+fn method_receiver(
+    function: &ast::StmtFunctionDef,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> Receiver {
     let is_staticmethod = |expression: &Expr| match expression {
         Expr::Name(name) => {
-            name.id.as_str() == "staticmethod" || aliases.staticmethods.contains(name.id.as_str())
+            (name.id.as_str() == "staticmethod" && !module_bindings.contains("staticmethod"))
+                || aliases.staticmethods.contains(name.id.as_str())
         }
         Expr::Attribute(attribute) if attribute.attr.as_str() == "staticmethod" => {
             matches!(attribute.value.as_ref(), Expr::Name(name) if aliases.builtins_modules.contains(name.id.as_str()))
@@ -3415,6 +3420,7 @@ fn rewrite_calls(
         source,
         definitions,
         aliases,
+        module_bindings: BoundNames::of_body(parsed.suite()).names,
         bindings: vec![bindings],
         invalidated_bindings: BTreeSet::new(),
         known,
@@ -3738,6 +3744,7 @@ struct Rewriter<'a> {
     source: &'a str,
     definitions: &'a Definitions,
     aliases: Aliases,
+    module_bindings: BTreeSet<String>,
     /// What each imported name in this file refers to.
     bindings: Vec<BTreeMap<String, Binding>>,
     /// Imported module-scope names replaced by an assignment already visited.
@@ -4131,7 +4138,8 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_annotation(returns);
                 }
                 let receiver = (self.class_scope_depths.last() == Some(&self.scopes.len())
-                    && method_receiver(function, &self.aliases) != Receiver::None)
+                    && method_receiver(function, &self.aliases, &self.module_bindings)
+                        != Receiver::None)
                     .then(|| {
                         function
                             .parameters
@@ -5966,6 +5974,16 @@ mod tests {
              def use(self):\n        self.build(kind=1)\n        self.make(mode=2)\n        \
              self.fetch(\"u\", verify=3)\n\n\nC.build(kind=1)\nC.make(mode=2)\n\
              C.fetch(None, \"u\", verify=3)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_user_defined_staticmethod_name_is_not_a_descriptor() -> Result<(), String> {
+        let source = "def staticmethod(function):\n    return function\n\nclass C:\n    @staticmethod\n    def parse(self, value=1): pass\n\n    def run(self):\n        return self.parse(5)\n";
+        assert_eq!(
+            fixed(source)?,
+            "def staticmethod(function):\n    return function\n\nclass C:\n    @staticmethod\n    def parse(self, value): pass\n\n    def run(self):\n        return self.parse(5)\n"
         );
         Ok(())
     }

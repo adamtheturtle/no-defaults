@@ -3510,7 +3510,8 @@ fn method_receiver(
     };
     let is_classmethod = |expression: &Expr| match expression {
         Expr::Name(name) => {
-            name.id.as_str() == "classmethod" || aliases.classmethods.contains(name.id.as_str())
+            (name.id.as_str() == "classmethod" && !module_bindings.contains("classmethod"))
+                || aliases.classmethods.contains(name.id.as_str())
         }
         Expr::Attribute(attribute) if attribute.attr.as_str() == "classmethod" => {
             matches!(attribute.value.as_ref(), Expr::Name(name) if aliases.builtins_modules.contains(name.id.as_str()))
@@ -6272,6 +6273,16 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "def staticmethod(function):\n    return function\n\nclass C:\n    @staticmethod\n    def parse(self, value): pass\n\n    def run(self):\n        return self.parse(5)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_user_defined_classmethod_name_is_not_a_descriptor() -> Result<(), String> {
+        let source = "def classmethod(function):\n    return function\n\nclass C:\n    @classmethod\n    def parse(self, value=1): pass\n\nC.parse(C())\n";
+        assert_eq!(
+            fixed(source)?,
+            "def classmethod(function):\n    return function\n\nclass C:\n    @classmethod\n    def parse(self, value): pass\n\nC.parse(C(), value=1)\n"
         );
         Ok(())
     }

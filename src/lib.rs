@@ -671,6 +671,9 @@ fn resolve_module(
     if parts.is_empty() {
         return None;
     }
+    if let Some(found) = resolve_from_pythonpath(&parts, known) {
+        return Some(found);
+    }
     // Whichever directory is on `sys.path`, a top-level import from this file
     // resolves at or above the file itself, so those are the roots to try —
     // and none of them can reach sideways into another subtree. A directory
@@ -740,6 +743,35 @@ fn resolve_module(
         }
     }
     None
+}
+
+/// Resolve a module against explicit import roots before inferring roots from
+/// the checked tree. These roots are authoritative even when a one-component
+/// module lives below a directory that otherwise looks like a package.
+fn resolve_from_pythonpath(parts: &[&str], known: &BTreeSet<&Path>) -> Option<PathBuf> {
+    let python_path = std::env::var_os("PYTHONPATH")?;
+    let mut found = None;
+    for root in std::env::split_paths(&python_path) {
+        let mut base = root;
+        for part in parts {
+            base.push(part);
+        }
+        for candidate in [base.join("__init__.py"), base.with_extension("py")] {
+            let candidate = if known.contains(candidate.as_path()) {
+                candidate
+            } else {
+                std::fs::canonicalize(&candidate).unwrap_or(candidate)
+            };
+            if known.contains(candidate.as_path()) {
+                if found.as_ref().is_some_and(|first| *first != candidate) {
+                    return None;
+                }
+                found = Some(candidate);
+                break;
+            }
+        }
+    }
+    found
 }
 
 #[derive(Serialize)]

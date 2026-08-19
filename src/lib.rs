@@ -2920,13 +2920,13 @@ fn method_receiver(function: &ast::StmtFunctionDef) -> Receiver {
 /// `Path.cwd()` depends on names the caller may not have imported, and copying
 /// it would change what the call means, so those are left to the reader.
 fn literal_text(expression: &Expr, source: &str) -> Option<String> {
-    is_literal(expression).then(|| {
+    is_repeatable_literal(expression).then(|| {
         source[expression.range().start().to_usize()..expression.range().end().to_usize()]
             .to_owned()
     })
 }
 
-fn is_literal(expression: &Expr) -> bool {
+fn is_repeatable_literal(expression: &Expr) -> bool {
     match expression {
         Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
@@ -2934,14 +2934,9 @@ fn is_literal(expression: &Expr) -> bool {
         | Expr::BooleanLiteral(_)
         | Expr::NoneLiteral(_)
         | Expr::EllipsisLiteral(_) => true,
-        Expr::UnaryOp(unary) => is_literal(&unary.operand),
-        Expr::Tuple(tuple) => tuple.elts.iter().all(is_literal),
-        Expr::List(list) => list.elts.iter().all(is_literal),
-        Expr::Set(set) => set.elts.iter().all(is_literal),
-        Expr::Dict(dict) => dict
-            .items
-            .iter()
-            .all(|item| item.key.as_ref().is_some_and(is_literal) && is_literal(&item.value)),
+        Expr::UnaryOp(unary) => is_repeatable_literal(&unary.operand),
+        // This includes container literals: each evaluation creates a new
+        // object, unlike the single default object created at definition time.
         _ => false,
     }
 }
@@ -5077,6 +5072,17 @@ mod tests {
             .len(),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn container_defaults_are_not_recreated_at_call_sites() -> Result<(), String> {
+        let source = "def with_list(value=[]): pass\ndef with_dict(value={}): pass\ndef with_set(value={1}): pass\ndef with_tuple(value=(1, 2)): pass\n\nwith_list()\nwith_dict()\nwith_set()\nwith_tuple()\n";
+        let reasons = skipped_reasons(source)?;
+        assert_eq!(reasons.len(), 4);
+        assert!(reasons
+            .iter()
+            .all(|reason| reason.contains("is not a literal")));
         Ok(())
     }
 

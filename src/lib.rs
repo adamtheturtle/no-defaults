@@ -2094,18 +2094,18 @@ impl Checker<'_> {
             } else {
                 self.fixable(default, range)
             };
-            if positional && fix.is_none() {
-                kept = true;
-            }
-            if self.report_with(
+            let was_removed = self.report_with(
                 default.start(),
                 format!(
                     "parameter `{}` of function `{}` has a default",
                     parameter.parameter.name, function.name
                 ),
                 fix,
-            ) && self.collect_signatures
-            {
+            );
+            if positional && !was_removed {
+                kept = true;
+            }
+            if was_removed && self.collect_signatures {
                 removed.push(Removed {
                     parameter: parameter.parameter.name.to_string(),
                     value: literal_text(default, self.source),
@@ -5447,6 +5447,23 @@ mod tests {
             "a default before the kept one is still removed"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_suppressed_positional_default_protects_later_defaults() {
+        let source = "def f(\n    a=1,  # noqa: NOD001\n    b=2,\n):\n    pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert_eq!(checked.diagnostics[0].line, 3);
+        assert_eq!(checked.diagnostics[0].fix, None);
     }
 
     #[test]

@@ -2189,3 +2189,23 @@ fn custom_field_functions_are_not_treated_as_dataclasses_field(
     assert!(!fixed.contains("value: int = field()"), "{fixed}");
     Ok(())
 }
+
+#[test]
+fn custom_dataclass_decorators_do_not_enable_field_diagnostics(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "def dataclass(cls):\n    return cls\n\n@dataclass\nclass C:\n    value: int = 1\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    Ok(())
+}

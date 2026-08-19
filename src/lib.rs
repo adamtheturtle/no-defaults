@@ -2621,6 +2621,7 @@ impl Checker<'_> {
             self.field_bases,
             &self.aliases,
             &self.base_field_classes,
+            &self.module_bindings,
         )
     }
 
@@ -3253,8 +3254,9 @@ fn field_style(
     bases: &FieldBases,
     aliases: &Aliases,
     base_field_classes: &BTreeSet<String>,
+    module_bindings: &BTreeSet<String>,
 ) -> Option<FieldStyle> {
-    if has_dataclass_decorator(class, aliases) {
+    if has_dataclass_decorator(class, aliases, module_bindings) {
         return Some(FieldStyle::Dataclass);
     }
     class_bases(class)
@@ -3380,6 +3382,7 @@ struct Aliases {
     renamed: BTreeMap<String, Option<String>>,
     dataclasses_members: BTreeSet<String>,
     dataclass_fields: BTreeSet<String>,
+    dataclass_decorators: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
@@ -3464,42 +3467,45 @@ impl Aliases {
 
     /// Collect the renaming imports visible in one lexical scope, including
     /// those nested in control-flow blocks but not nested definitions.
+    /// The names a plain `import` binds for the modules whose members matter.
+    fn collect_module_aliases(&mut self, import: &ast::StmtImport) {
+        for alias in &import.names {
+            if alias.name.as_str() == "dataclasses" {
+                self.dataclasses_modules.insert(
+                    alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| "dataclasses".to_owned(), ToString::to_string),
+                );
+            } else if alias.name.as_str() == "builtins" {
+                self.builtins_modules.insert(
+                    alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| "builtins".to_owned(), ToString::to_string),
+                );
+            } else if matches!(alias.name.as_str(), "typing" | "typing_extensions") {
+                self.typing_modules.insert(
+                    alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| alias.name.to_string(), ToString::to_string),
+                );
+            } else if alias.name.as_str() == "abc" {
+                self.abc_modules.insert(
+                    alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| "abc".to_owned(), ToString::to_string),
+                );
+            }
+        }
+    }
+
     fn collect(&mut self, statements: &[Stmt]) {
         for statement in statements {
             match statement {
-                Stmt::Import(import) => {
-                    for alias in &import.names {
-                        if alias.name.as_str() == "dataclasses" {
-                            self.dataclasses_modules.insert(
-                                alias
-                                    .asname
-                                    .as_ref()
-                                    .map_or_else(|| "dataclasses".to_owned(), ToString::to_string),
-                            );
-                        } else if alias.name.as_str() == "builtins" {
-                            self.builtins_modules.insert(
-                                alias
-                                    .asname
-                                    .as_ref()
-                                    .map_or_else(|| "builtins".to_owned(), ToString::to_string),
-                            );
-                        } else if matches!(alias.name.as_str(), "typing" | "typing_extensions") {
-                            self.typing_modules.insert(
-                                alias
-                                    .asname
-                                    .as_ref()
-                                    .map_or_else(|| alias.name.to_string(), ToString::to_string),
-                            );
-                        } else if alias.name.as_str() == "abc" {
-                            self.abc_modules.insert(
-                                alias
-                                    .asname
-                                    .as_ref()
-                                    .map_or_else(|| "abc".to_owned(), ToString::to_string),
-                            );
-                        }
-                    }
-                }
+                Stmt::Import(import) => self.collect_module_aliases(import),
                 Stmt::ImportFrom(import) => {
                     self.collect_typing_members(import);
                     self.collect_builtin_members(import);
@@ -3518,6 +3524,9 @@ impl Aliases {
                         let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                         if dataclasses && alias.name.as_str() == "field" {
                             self.dataclass_fields.insert(local.clone());
+                        }
+                        if dataclasses && alias.name.as_str() == "dataclass" {
+                            self.dataclass_decorators.insert(local.clone());
                         }
                         if dataclasses && alias.name.as_str() == "MISSING" {
                             self.dataclasses_members.insert(local.clone());
@@ -3582,13 +3591,33 @@ fn matched_name<'a>(expression: &'a Expr, aliases: &'a Aliases) -> Option<&'a st
     }
 }
 
-fn has_dataclass_decorator(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
+fn has_dataclass_decorator(
+    class: &ast::StmtClassDef,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> bool {
     class.decorator_list.iter().any(|decorator| {
         let expression = match &decorator.expression {
             Expr::Call(call) => &*call.func,
             expression => expression,
         };
-        matched_name(expression, aliases) == Some("dataclass")
+        if matched_name(expression, aliases) != Some("dataclass") {
+            return false;
+        }
+        match expression {
+            Expr::Name(name) => {
+                !module_bindings.contains(name.id.as_str())
+                    || aliases.dataclass_decorators.contains(name.id.as_str())
+            }
+            Expr::Attribute(attribute) => match attribute.value.as_ref() {
+                Expr::Name(module) => {
+                    !module_bindings.contains(module.id.as_str())
+                        || aliases.dataclasses_modules.contains(module.id.as_str())
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     })
 }
 
@@ -5599,9 +5628,9 @@ mod tests {
                 "from elsewhere import thing as dataclass\n\n@dataclass\nclass C:\n    x: int = 1\n",
                 false
             )
-            .len()
-                == 1,
-            "a bare `dataclass` is still matched by name, as it always was"
+            .is_empty(),
+            "the name is bound to an import of something else, so it is not \
+             the decorator"
         );
         assert!(
             messages(

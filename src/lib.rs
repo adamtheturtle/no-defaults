@@ -267,7 +267,7 @@ impl Callable {
 }
 
 /// What a name in a file refers to, as far as the import statements say.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Binding {
     /// A module, so `name.attribute(...)` resolves into that file.
     Module(PathBuf),
@@ -3501,10 +3501,7 @@ fn collect_bindings(
                 }
             }
             Stmt::If(branch) => {
-                collect_bindings(&branch.body, importer, known, bindings);
-                for clause in &branch.elif_else_clauses {
-                    collect_bindings(&clause.body, importer, known, bindings);
-                }
+                collect_conditional_bindings(branch, importer, known, bindings);
             }
             Stmt::Try(block) => {
                 collect_bindings(&block.body, importer, known, bindings);
@@ -3520,6 +3517,58 @@ fn collect_bindings(
             _ => {}
         }
     }
+}
+
+/// Keep a binding after an `if` only when every runtime path agrees on it.
+fn collect_conditional_bindings(
+    branch: &ast::StmtIf,
+    importer: &Path,
+    known: &BTreeSet<&Path>,
+    bindings: &mut BTreeMap<String, Binding>,
+) {
+    let initial = bindings.clone();
+    let mut fallthrough = Some(initial.clone());
+    let mut outcomes = Vec::new();
+    let clauses = std::iter::once((Some(branch.test.as_ref()), branch.body.as_slice())).chain(
+        branch
+            .elif_else_clauses
+            .iter()
+            .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
+    );
+    for (test, body) in clauses {
+        let Some(base) = fallthrough.take() else {
+            break;
+        };
+        let truth = test.map_or(Truthiness::True, |test| {
+            Truthiness::from_expr(test, |_| false)
+        });
+        match truth {
+            Truthiness::True | Truthiness::Truthy => {
+                let mut path = base;
+                collect_bindings(body, importer, known, &mut path);
+                outcomes.push(path);
+            }
+            Truthiness::False | Truthiness::Falsey | Truthiness::None => {
+                fallthrough = Some(base);
+            }
+            Truthiness::Unknown => {
+                let mut path = base.clone();
+                collect_bindings(body, importer, known, &mut path);
+                outcomes.push(path);
+                fallthrough = Some(base);
+            }
+        }
+    }
+    if let Some(path) = fallthrough {
+        outcomes.push(path);
+    }
+    *bindings = outcomes.first().cloned().unwrap_or(initial);
+    bindings.retain(|name, binding| {
+        outcomes
+            .iter()
+            .skip(1)
+            .all(|path| path.get(name) == Some(binding))
+    });
 }
 
 /// The names a function or class body binds.

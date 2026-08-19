@@ -1409,3 +1409,29 @@ fn skipped_calls_are_reported_even_with_nothing_removed() -> Result<(), Box<dyn 
     assert!(stderr.contains("is not a literal"), "{stderr}");
     Ok(())
 }
+
+#[test]
+fn conditional_imports_are_not_resolved_by_traversal_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    std::fs::write(
+        directory.path().join("other.py"),
+        "def target(): return 5\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    let source = "flag = True\nif flag:\n    import api as module\nelse:\n    import other as module\n\nmodule.target()\n";
+    std::fs::write(&caller, source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(caller)?, source);
+    assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
+    Ok(())
+}

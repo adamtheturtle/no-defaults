@@ -623,19 +623,44 @@ fn report_call_sites(
 /// A call resolves only when the calling file's own imports say it refers to
 /// the file that was fixed. A bare name match is not enough: a project with its
 /// own `connect` must not have `socket.connect` rewritten.
+/// The physical path of each checked file, by the spelling it was collected
+/// under.
+///
+/// A file named through a symlink and the file it points at are one module, so
+/// resolution and the definition index are keyed by the physical path. What is
+/// reported stays the spelling the file was collected under.
+fn physical_paths(files: &[PathBuf]) -> BTreeMap<&Path, PathBuf> {
+    files
+        .iter()
+        .map(|path| {
+            (
+                path.as_path(),
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()),
+            )
+        })
+        .collect()
+}
+
 fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<CallSites, String> {
+    let physical = physical_paths(files);
+    let physical_path = |path: &Path| -> PathBuf {
+        physical
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf())
+    };
     let mut definitions = Definitions::default();
     for signature in signatures {
         definitions.names.insert(signature.name.clone());
+        let defining = physical_path(&signature.path);
         let table = match &signature.kind {
             Callable::Method { class, .. } => definitions
                 .methods
-                .entry((signature.path.clone(), class.clone()))
+                .entry((defining, class.clone()))
                 .or_default(),
-            Callable::Function | Callable::Dataclass => definitions
-                .symbols
-                .entry(signature.path.clone())
-                .or_default(),
+            Callable::Function | Callable::Dataclass => {
+                definitions.symbols.entry(defining).or_default()
+            }
         };
         match table.entry(signature.name.clone()) {
             Entry::Vacant(entry) => {
@@ -650,7 +675,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
     if definitions.names.is_empty() {
         return Ok(call_sites);
     }
-    let known: BTreeSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+    let known: BTreeSet<&Path> = physical.values().map(PathBuf::as_path).collect();
     for path in files {
         let Ok(source) = read_source(path) else {
             continue;
@@ -658,12 +683,13 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let Ok(parsed) = parse_module(&source) else {
             continue;
         };
+        let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
-        collect_bindings(parsed.suite(), path, &known, &mut bindings);
+        collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
         definitions.bindings.extend(
             bindings
                 .into_iter()
-                .map(|(name, binding)| ((path.clone(), name), binding)),
+                .map(|(name, binding)| ((importer.clone(), name), binding)),
         );
         for statement in parsed.suite() {
             let Stmt::ClassDef(class) = statement else {
@@ -680,7 +706,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                 .collect();
             definitions
                 .bases
-                .insert((path.clone(), class.name.to_string()), bases);
+                .insert((importer.clone(), class.name.to_string()), bases);
         }
     }
     let results: Vec<Result<FileCallSites, String>> = files
@@ -695,7 +721,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
             // A file the parser rejects holds no calls this pass can see. It
             // is reported as a syntax error by the checker, so skipping it
             // here leaves the rest of the project fixable.
-            match rewrite_calls(path, &source, &definitions, &known) {
+            match rewrite_calls(path, &physical_path(path), &source, &definitions, &known) {
                 Ok(file) => Ok(file),
                 Err(_) if parse_module(&source).is_err() => Ok(FileCallSites::default()),
                 Err(error) => Err(error),
@@ -3862,6 +3888,7 @@ fn factory_call_text(factory: &Expr, module_bindings: &BTreeSet<String>) -> Opti
 /// build the edits that pass that default explicitly instead.
 fn rewrite_calls(
     path: &Path,
+    physical: &Path,
     source: &str,
     definitions: &Definitions,
     known: &BTreeSet<&Path>,
@@ -3872,6 +3899,7 @@ fn rewrite_calls(
     aliases.collect(parsed.suite());
     let mut rewriter = Rewriter {
         path,
+        physical,
         source,
         definitions,
         aliases,
@@ -4317,7 +4345,11 @@ fn dotted_name(expression: &Expr) -> Option<String> {
 }
 
 struct Rewriter<'a> {
+    /// The spelling the file was collected under, which is what it reports as.
     path: &'a Path,
+    /// The same file's physical path, which is what resolution and the
+    /// definition index are keyed by.
+    physical: &'a Path,
     source: &'a str,
     definitions: &'a Definitions,
     aliases: Aliases,
@@ -4425,12 +4457,20 @@ impl Rewriter<'_> {
                 && matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "super")
                 && self.implicit_receivers.last().is_some_and(Option::is_some)
             {
-                return Some((self.path.to_path_buf(), self.classes.last()?.clone(), true));
+                return Some((
+                    self.physical.to_path_buf(),
+                    self.classes.last()?.clone(),
+                    true,
+                ));
             }
         }
         if let Expr::Name(name) = receiver {
             if self.implicit_receivers.last().and_then(Option::as_deref) == Some(name.id.as_str()) {
-                return Some((self.path.to_path_buf(), self.classes.last()?.clone(), true));
+                return Some((
+                    self.physical.to_path_buf(),
+                    self.classes.last()?.clone(),
+                    true,
+                ));
             }
             if self
                 .scopes
@@ -4443,7 +4483,7 @@ impl Rewriter<'_> {
                 // `from api import Client` names a class of another file.
                 Some(Binding::Symbol(file, symbol)) => Some((file.clone(), symbol.clone(), false)),
                 Some(Binding::Module(_)) => None,
-                None => Some((self.path.to_path_buf(), name.id.to_string(), false)),
+                None => Some((self.physical.to_path_buf(), name.id.to_string(), false)),
             };
         }
         let Expr::Attribute(attribute) = receiver else {
@@ -4465,7 +4505,7 @@ impl Rewriter<'_> {
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => Some((
                 self.definitions
                     .symbols
-                    .get(self.path)?
+                    .get(self.physical)?
                     .get(name.id.as_str())?
                     .as_ref()?,
                 0,
@@ -4480,7 +4520,7 @@ impl Rewriter<'_> {
                 None => Some((
                     self.definitions
                         .symbols
-                        .get(self.path)?
+                        .get(self.physical)?
                         .get(name.id.as_str())?
                         .as_ref()?,
                     0,
@@ -4766,13 +4806,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 if let Some(bindings) = self.bindings.last_mut() {
                     collect_bindings(
                         std::slice::from_ref(statement),
-                        self.path,
+                        self.physical,
                         self.known,
                         bindings,
                     );
                     collect_star_bindings(
                         std::slice::from_ref(statement),
-                        self.path,
+                        self.physical,
                         self.known,
                         self.definitions,
                         bindings,
@@ -4850,7 +4890,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     .flatten();
                 self.implicit_receivers.push(receiver);
                 let mut local = BTreeMap::new();
-                collect_bindings(&function.body, self.path, self.known, &mut local);
+                collect_bindings(&function.body, self.physical, self.known, &mut local);
                 self.bindings.push(local);
                 self.scopes.push(BoundNames::of_function(function));
                 self.visit_body(&function.body);

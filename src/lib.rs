@@ -2543,8 +2543,8 @@ impl Aliases {
             .unwrap_or(name)
     }
 
-    /// Collect the renaming imports of a module, including those nested in an
-    /// `if TYPE_CHECKING:` block or a function body.
+    /// Collect the renaming imports visible in one lexical scope, including
+    /// those nested in control-flow blocks but not nested definitions.
     fn collect(&mut self, statements: &[Stmt]) {
         for statement in statements {
             match statement {
@@ -2619,9 +2619,10 @@ impl Aliases {
                         self.collect(&handler.body);
                     }
                 }
-                Stmt::FunctionDef(function) => self.collect(&function.body),
                 Stmt::ClassDef(class) => self.collect(&class.body),
                 Stmt::With(block) => self.collect(&block.body),
+                // In particular, imports in a nested function are local to
+                // that function and cannot change names used by this scope.
                 _ => {}
             }
         }
@@ -4099,6 +4100,15 @@ mod tests {
             ["dataclass field `x` has a default"],
             "a called decorator resolves through its function"
         );
+    }
+
+    #[test]
+    fn a_function_local_dataclass_alias_does_not_escape() {
+        assert!(messages(
+            "def dc(cls): return cls\n\ndef load():\n    from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    value: int = 1\n",
+            false,
+        )
+        .is_empty());
     }
 
     #[test]

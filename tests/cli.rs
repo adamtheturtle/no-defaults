@@ -1011,6 +1011,34 @@ fn fix_updates_calls_reached_through_a_relative_import() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn an_unresolved_later_import_invalidates_an_earlier_binding(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(
+        &caller,
+        "import api\nimport external as api\n\napi.target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import api\nimport external as api\n\napi.target()\n"
+    );
+    assert!(
+        String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"),
+        "the unsafe call is surfaced rather than silently rewritten"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_single_component_import_resolves_only_at_the_importers_root(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

@@ -3059,6 +3059,11 @@ fn collect_bindings(
                     };
                     if let Some(file) = resolve_module(module, 0, importer, known) {
                         bindings.insert(bound, Binding::Module(file));
+                    } else {
+                        // The import still replaces the local name at runtime;
+                        // an earlier checked binding must not survive merely
+                        // because this target is outside the checked file set.
+                        bindings.remove(&bound);
                     }
                 }
             }

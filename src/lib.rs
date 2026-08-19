@@ -1576,6 +1576,7 @@ fn check_source(
     }
     let mut aliases = Aliases::default();
     aliases.collect(parsed.suite());
+    let module_bindings = BoundNames::of_body(parsed.suite());
     let mut local_classes = BTreeSet::new();
     collect_class_names(parsed.suite(), &mut local_classes);
     let mut checker = Checker {
@@ -1585,6 +1586,7 @@ fn check_source(
         reexports,
         field_bases,
         aliases,
+        module_bindings,
         local_classes,
         shapes: BTreeMap::new(),
         scope: Scope {
@@ -1832,6 +1834,9 @@ struct Checker<'a> {
     /// What the file's renaming imports bound to `dataclasses` and `pydantic`
     /// members, so an aliased `@dataclass` is still recognised.
     aliases: Aliases,
+    /// Names bound by the module itself, which therefore do not resolve to
+    /// same-named built-ins.
+    module_bindings: BTreeSet<String>,
     /// The class names the file defines, so a base written `Protocol` that is
     /// one of them is not mistaken for the typing construct.
     local_classes: BTreeSet<String>,
@@ -2210,9 +2215,13 @@ impl Checker<'_> {
         if !self.enabled(name.id.as_str()) {
             return;
         }
-        let Some(default) =
-            field_default(value, assign.annotation.end(), self.source, &self.aliases)
-        else {
+        let Some(default) = field_default(
+            value,
+            assign.annotation.end(),
+            self.source,
+            &self.aliases,
+            &self.module_bindings,
+        ) else {
             return;
         };
         // As in a signature, a field that keeps its default forces every field
@@ -2820,6 +2829,7 @@ fn field_default(
     annotation_end: TextSize,
     source: &str,
     aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
 ) -> Option<FieldDefault> {
     let plain = || FieldDefault {
         kind: "default",
@@ -2880,7 +2890,7 @@ fn field_default(
         "default"
     };
     let value = if factory {
-        factory_call_text(&keyword.value)
+        factory_call_text(&keyword.value, module_bindings)
     } else {
         literal_text(&keyword.value, source)
     };
@@ -2968,10 +2978,13 @@ fn is_repeatable_literal(expression: &Expr) -> bool {
 
 /// The value a `default_factory` produces, for factories whose result can be
 /// written as a literal. Any other factory is left alone.
-fn factory_call_text(factory: &Expr) -> Option<String> {
+fn factory_call_text(factory: &Expr, module_bindings: &BTreeSet<String>) -> Option<String> {
     let Expr::Name(name) = factory else {
         return None;
     };
+    if module_bindings.contains(name.id.as_str()) {
+        return None;
+    }
     match name.id.as_str() {
         "list" => Some("[]".to_owned()),
         "dict" => Some("{}".to_owned()),
@@ -5124,6 +5137,15 @@ mod tests {
         assert!(reasons
             .iter()
             .all(|reason| reason.contains("is not a literal")));
+        Ok(())
+    }
+
+    #[test]
+    fn a_shadowed_builtin_factory_is_not_synthesized() -> Result<(), String> {
+        let source = "from dataclasses import dataclass, field\n\ndef list():\n    return ('custom',)\n\n@dataclass\nclass C:\n    value: object = field(default_factory=list)\n\nC()\n";
+        let reasons = skipped_reasons(source)?;
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("is not a literal"));
         Ok(())
     }
 

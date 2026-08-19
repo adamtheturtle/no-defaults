@@ -152,13 +152,13 @@ impl FieldBases {
         self.names.is_empty()
     }
 
-    fn matches(&self, base: &Expr) -> bool {
+    fn matches(&self, base: &Expr, aliases: &Aliases) -> bool {
         match base {
-            Expr::Name(name) => self.names.contains(name.id.as_str()),
+            Expr::Name(name) => self.names.contains(aliases.resolve(name.id.as_str())),
             Expr::Attribute(attribute) => self.names.contains(attribute.attr.as_str()),
             // `class Job(BaseModel, Generic[T])` names its base through a
             // subscript, as a generic model does.
-            Expr::Subscript(subscript) => self.matches(&subscript.value),
+            Expr::Subscript(subscript) => self.matches(&subscript.value, aliases),
             _ => false,
         }
     }
@@ -2773,6 +2773,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         class,
                         style,
                         self.field_bases,
+                        &self.aliases,
                         &self.local_classes,
                         &self.shapes,
                     );
@@ -2899,7 +2900,7 @@ fn field_style(
     if has_dataclass_decorator(class, aliases) {
         return Some(FieldStyle::Dataclass);
     }
-    (!bases.is_empty() && class_bases(class).any(|base| bases.matches(base)))
+    (!bases.is_empty() && class_bases(class).any(|base| bases.matches(base, aliases)))
         .then_some(FieldStyle::Base)
 }
 
@@ -2939,13 +2940,14 @@ fn inherited_fields(
     class: &ast::StmtClassDef,
     style: Option<FieldStyle>,
     bases: &FieldBases,
+    aliases: &Aliases,
     local: &BTreeSet<String>,
     shapes: &BTreeMap<String, Option<Shape>>,
 ) -> Inherited {
     let carrying: Vec<&Expr> = class_bases(class)
         .filter(|base| !carries_no_fields(base, local))
         // The base that made the class carry fields contributes none itself.
-        .filter(|base| !(matches!(style, Some(FieldStyle::Base)) && bases.matches(base)))
+        .filter(|base| !(matches!(style, Some(FieldStyle::Base)) && bases.matches(base, aliases)))
         .collect();
     match carrying.as_slice() {
         [] => Inherited::Nothing,
@@ -4933,6 +4935,17 @@ mod tests {
             false,
         );
         assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn a_configured_field_base_is_resolved_through_an_import_alias() {
+        assert_eq!(
+            messages(
+                "from pydantic import BaseModel as Model\n\nclass C(Model):\n    value: int = 1\n",
+                false,
+            ),
+            ["class field `value` has a default"]
+        );
     }
 
     #[test]

@@ -1267,6 +1267,7 @@ fn merge_deletions(mut ranges: Vec<TextRange>) -> Vec<TextRange> {
 }
 
 fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Result<(), String> {
+    let mut prepared = Vec::with_capacity(changes.len());
     for (path, (_, fixed)) in changes {
         // `persist` replaces whatever sits at the path, so writing to a
         // symlink would leave a regular file where the link was and leave the
@@ -1317,6 +1318,13 @@ fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Resul
                     path.display()
                 )
             })?;
+        prepared.push((path, temporary));
+    }
+    // Nothing reaches its destination until every file has been inspected and
+    // its complete replacement has been created, synced, and configured. An
+    // operational error during preparation therefore leaves the whole project
+    // untouched instead of applying an arbitrary prefix of the changes.
+    for (path, temporary) in prepared {
         temporary.persist(&path).map_err(|error| {
             format!(
                 "could not atomically replace {}: {}",
@@ -5598,6 +5606,36 @@ mod tests {
         write_fixes_atomically(fixed_sources(edits, &mut updated, &mut unfixed)?)?;
         assert!(unfixed.is_empty(), "the result must parse");
         std::fs::read_to_string(&path).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_late_preflight_failure_writes_none_of_the_project() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let first = directory.path().join("a.py");
+        let missing = directory.path().join("z/missing.py");
+        std::fs::write(&first, "def first(value=1): pass\n").map_err(|error| error.to_string())?;
+        let changes = BTreeMap::from([
+            (
+                first.clone(),
+                (
+                    "def first(value=1): pass\n".to_owned(),
+                    "def first(value): pass\n".to_owned(),
+                ),
+            ),
+            (
+                missing,
+                (
+                    "def last(value=2): pass\n".to_owned(),
+                    "def last(value): pass\n".to_owned(),
+                ),
+            ),
+        ]);
+        assert!(write_fixes_atomically(changes).is_err());
+        assert_eq!(
+            std::fs::read_to_string(first).map_err(|error| error.to_string())?,
+            "def first(value=1): pass\n"
+        );
+        Ok(())
     }
 
     #[test]

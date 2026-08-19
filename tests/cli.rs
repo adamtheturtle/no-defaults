@@ -87,6 +87,25 @@ fn later_dataclass_alias_imports_do_not_change_earlier_classes(
 }
 
 #[test]
+fn defaults_on_implicit_method_receivers_are_not_reinserted(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "class C:\n    @classmethod\n    def make(cls=None):\n        return cls\n\nC.make()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "class C:\n    @classmethod\n    def make(cls):\n        return cls\n\nC.make()\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

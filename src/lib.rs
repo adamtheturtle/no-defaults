@@ -4295,6 +4295,9 @@ fn missing_arguments(
             .positional
             .iter()
             .position(|parameter| *parameter == removed.parameter);
+        if slot.is_some_and(|slot| slot < bound) {
+            continue;
+        }
         if slot.is_some_and(|slot| slot >= bound && slot - bound < positional) {
             continue;
         }

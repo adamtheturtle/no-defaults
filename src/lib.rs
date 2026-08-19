@@ -3284,7 +3284,8 @@ impl Checker<'_> {
 fn implicitly_called_method(name: &str) -> bool {
     matches!(
         name,
-        "__call__"
+        "__init_subclass__"
+            | "__call__"
             | "__enter__"
             | "__exit__"
             | "__aenter__"
@@ -8556,6 +8557,23 @@ mod tests {
     #[test]
     fn property_getter_defaults_are_retained_for_descriptor_calls() {
         let source = "class C:\n    @property\n    def value(self, fallback=1):\n        return fallback\n\nC().value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn init_subclass_defaults_are_retained_for_implicit_calls() {
+        let source = "class Base:\n    def __init_subclass__(cls, flag=1):\n        cls.flag = flag\n\nclass Child(Base):\n    pass\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

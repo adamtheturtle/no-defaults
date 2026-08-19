@@ -4408,6 +4408,53 @@ impl Rewriter<'_> {
             replacement,
         });
     }
+
+    /// Rewrite a bare decorator as an explicit one-argument wrapper when its
+    /// implicit application relies on defaults removed from the decorator.
+    fn check_bare_decorator(&mut self, expression: &Expr) {
+        let name = match expression {
+            Expr::Name(name) => name.id.as_str(),
+            Expr::Attribute(attribute) => attribute.attr.as_str(),
+            _ => return,
+        };
+        let Some((signature, bound)) = self.resolve(expression) else {
+            if self.definitions.names.contains(name) {
+                self.skip(
+                    expression.start(),
+                    name,
+                    "this decorator cannot be tied to the definition that was fixed".to_owned(),
+                );
+            }
+            return;
+        };
+        if !signature.kind.is_function() {
+            return;
+        }
+        let arguments = match missing_arguments_for(signature, bound, 1, &[]) {
+            Ok(arguments) => arguments,
+            Err(reason) => {
+                self.skip(expression.start(), name, reason);
+                return;
+            }
+        };
+        if arguments.positional.is_empty() && arguments.keywords.is_empty() {
+            return;
+        }
+        let supplied = arguments
+            .positional
+            .iter()
+            .chain(&arguments.keywords)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let original = &self.source[expression.start().to_usize()..expression.end().to_usize()];
+        self.edits.push(Edit {
+            range: expression.range(),
+            replacement: format!(
+                "lambda __no_defaults_decorated: {original}(__no_defaults_decorated, {supplied})"
+            ),
+        });
+    }
 }
 
 /// The arguments a call must gain to keep meaning what it meant before the
@@ -4427,12 +4474,35 @@ fn missing_arguments(
             "the call unpacks `*` or `**` arguments, so its arguments are not known".to_owned(),
         );
     }
-    let positional = call.args.len();
     let named: Vec<&str> = call
         .keywords
         .iter()
         .filter_map(|keyword| keyword.arg.as_ref().map(ast::Identifier::as_str))
         .collect();
+    let found = missing_arguments_for(signature, bound, call.args.len(), &named)?;
+    // Python allows a bare generator expression as an argument only when it is
+    // the sole one, so nothing can follow it. A call that needs nothing added
+    // is not affected, so it is not worth a warning.
+    if (!found.positional.is_empty() || !found.keywords.is_empty())
+        && call.args.iter().any(
+            |argument| matches!(argument, Expr::Generator(generator) if !generator.parenthesized),
+        )
+    {
+        return Err(
+            "the call's argument is a bare generator expression, which Python allows only \
+             when it is the only one"
+                .to_owned(),
+        );
+    }
+    Ok(found)
+}
+
+fn missing_arguments_for(
+    signature: &Signature,
+    bound: usize,
+    positional: usize,
+    named: &[&str],
+) -> Result<MissingArguments, String> {
     let mut appended: Vec<String> = Vec::new();
     let mut keywords: Vec<String> = Vec::new();
     for removed in &signature.removed {
@@ -4470,20 +4540,6 @@ fn missing_arguments(
             keywords.push(format!("{}={}", removed.parameter, value));
         }
     }
-    // Python allows a bare generator expression as an argument only when it is
-    // the sole one, so nothing can follow it. A call that needs nothing added
-    // is not affected, so it is not worth a warning.
-    if (!appended.is_empty() || !keywords.is_empty())
-        && call.args.iter().any(
-            |argument| matches!(argument, Expr::Generator(generator) if !generator.parenthesized),
-        )
-    {
-        return Err(
-            "the call's argument is a bare generator expression, which Python allows only \
-             when it is the only one"
-                .to_owned(),
-        );
-    }
     Ok(MissingArguments {
         positional: appended,
         keywords,
@@ -4496,6 +4552,15 @@ struct MissingArguments {
 }
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
+    fn visit_decorator(&mut self, decorator: &'a ast::Decorator) {
+        if matches!(decorator.expression, Expr::Name(_) | Expr::Attribute(_)) {
+            self.called
+                .insert((decorator.expression.start(), decorator.expression.end()));
+            self.check_bare_decorator(&decorator.expression);
+        }
+        self.visit_expr(&decorator.expression);
+    }
+
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
             Stmt::Assign(assign) if self.scopes.is_empty() => {
@@ -6423,16 +6488,18 @@ mod tests {
     }
 
     #[test]
-    fn a_function_named_without_being_called_is_reported() -> Result<(), String> {
+    fn a_bare_decorator_gets_its_removed_default() -> Result<(), String> {
         assert_eq!(
-            skipped_reasons("def deco(cls=None): return cls\n\n\n@deco\ndef f(): pass\n")?
-                .first()
-                .map(String::as_str),
-            Some(
-                "it is named here without being called, so the removed default cannot be supplied"
-            ),
-            "a bare decorator calls the function with no argument list to add to"
+            fixed(
+                "def decorate(function, flag=1):\n    function.flag = flag\n    return function\n\n@decorate\ndef target():\n    pass\n"
+            )?,
+            "def decorate(function, flag):\n    function.flag = flag\n    return function\n\n@lambda __no_defaults_decorated: decorate(__no_defaults_decorated, flag=1)\ndef target():\n    pass\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_callback_named_without_being_called_is_reported() -> Result<(), String> {
         assert_eq!(
             skipped_reasons("def cb(x=1): return x\nrun(cb)\n")?.len(),
             1,

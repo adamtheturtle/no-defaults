@@ -4163,14 +4163,7 @@ impl Rewriter<'_> {
                 let Some(Binding::Module(file)) = self.binding(&dotted) else {
                     return None;
                 };
-                Some((
-                    self.definitions
-                        .symbols
-                        .get(file)?
-                        .get(attribute.attr.as_str())?
-                        .as_ref()?,
-                    0,
-                ))
+                Some((self.definitions.symbol(file, attribute.attr.as_str())?, 0))
             }
             _ => None,
         }

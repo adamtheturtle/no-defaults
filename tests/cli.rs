@@ -1591,3 +1591,29 @@ fn from_package_reexports_resolve_to_the_defining_module() -> Result<(), Box<dyn
     );
     Ok(())
 }
+
+#[test]
+fn package_attributes_resolve_to_the_reexported_definition(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    std::fs::write(package.join("__init__.py"), "from .api import target\n")?;
+    std::fs::write(
+        package.join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "import pkg\npkg.target()\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import pkg\npkg.target(value=1)\n"
+    );
+    Ok(())
+}

@@ -2767,6 +2767,7 @@ impl Checker<'_> {
                         | "__anext__"
                         | "__len__"
                         | "__length_hint__"
+                        | "__getitem__"
                 ))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
@@ -6954,6 +6955,24 @@ mod tests {
     #[test]
     fn length_hint_defaults_are_retained_for_protocol_calls() {
         let source = "import operator\n\nclass C:\n    def __length_hint__(self, extra=None):\n        return 7\n\nassert operator.length_hint(C()) == 7\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn getitem_defaults_are_retained_for_protocol_calls() {
+        let source =
+            "class C:\n    def __getitem__(self, key, extra=None):\n        return key\n\nC()[0]\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

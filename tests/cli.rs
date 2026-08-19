@@ -1861,3 +1861,32 @@ fn star_imported_functions_have_their_calls_updated() -> Result<(), Box<dyn std:
     );
     Ok(())
 }
+
+#[test]
+fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    std::fs::write(
+        directory.path().join("other.py"),
+        "def target(): return 5\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &caller,
+        "import api as module\nmodule.target()\nimport other as module\nmodule.target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import api as module\nmodule.target(value=1)\nimport other as module\nmodule.target()\n"
+    );
+    Ok(())
+}

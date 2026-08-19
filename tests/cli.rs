@@ -1,7 +1,22 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_no-defaults")
+}
+
+#[test]
+fn a_closed_stdout_pipe_is_a_normal_termination() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let violations = "def f(value=1): pass\n".repeat(10_000);
+    std::fs::write(&path, violations)?;
+    let mut child = Command::new(binary())
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    drop(child.stdout.take());
+    assert_eq!(child.wait()?.code(), Some(0));
+    Ok(())
 }
 
 #[test]

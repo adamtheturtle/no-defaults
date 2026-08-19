@@ -1283,6 +1283,30 @@ fn a_single_component_import_at_the_importers_root_still_resolves(
 }
 
 #[test]
+fn pythonpath_resolves_a_single_component_import_from_a_package_directory(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    let api = package.join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&caller, "import api\napi.target()\n")?;
+
+    let output = Command::new(binary())
+        .env("PYTHONPATH", &package)
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import api\napi.target(value=1)\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_dotted_import_still_reaches_another_source_root() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let package = directory.path().join("src").join("pkg");

@@ -1396,6 +1396,7 @@ fn copy_extended_attributes(source: &Path, destination: &std::fs::File) -> Resul
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
 fn copy_extended_attributes(_: &Path, _: &std::fs::File) -> Result<(), String> {
     Ok(())
 }

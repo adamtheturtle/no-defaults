@@ -20,6 +20,34 @@ fn a_closed_stdout_pipe_is_a_normal_termination() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn bare_carriage_returns_are_line_endings() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "def first(value=1): pass\rdef second(value=2): pass\r",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("example.py:1:17: NOD001"), "{stdout}");
+    assert!(stdout.contains("example.py:2:18: NOD001"), "{stdout}");
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "def first(value): pass\rdef second(value): pass\r"
+    );
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

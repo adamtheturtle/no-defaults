@@ -3454,6 +3454,14 @@ fn annotates_kw_only(annotation: &Expr, aliases: &Aliases) -> bool {
         Expr::Attribute(attribute) if attribute.attr.as_str() == "KW_ONLY" => {
             matches!(attribute.value.as_ref(), Expr::Name(name) if aliases.dataclasses_modules.contains(name.id.as_str()))
         }
+        Expr::StringLiteral(literal) => {
+            parse_expression(literal.value.to_str().trim()).is_ok_and(|parsed| {
+                match parsed.expr() {
+                    Expr::StringLiteral(_) => false,
+                    expression => annotates_kw_only(expression, aliases),
+                }
+            })
+        }
         _ => false,
     }
 }
@@ -5182,6 +5190,16 @@ mod tests {
             ["dataclass field `z` has a default"],
             "the marker itself is not a field"
         );
+    }
+
+    #[test]
+    fn a_quoted_kw_only_marker_still_declares_no_field() -> Result<(), String> {
+        let source = "from dataclasses import dataclass, KW_ONLY\n\n@dataclass\nclass C:\n    _: \"KW_ONLY\"\n    first: int = ...\n    second: int = 2\n";
+        assert_eq!(
+            stub_fixed(source)?,
+            "from dataclasses import dataclass, KW_ONLY\n\n@dataclass\nclass C:\n    _: \"KW_ONLY\"\n    first: int = ...\n    second: int\n"
+        );
+        Ok(())
     }
 
     #[test]

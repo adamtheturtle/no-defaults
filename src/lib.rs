@@ -975,6 +975,21 @@ fn caret_padding(line: &str, character_column: usize, gutter_width: usize) -> St
     padding
 }
 
+fn escaped_source_line(line: &str) -> String {
+    line.chars()
+        .flat_map(|character| {
+            // A tab is laid out by `caret_padding`, which follows tab stops,
+            // so it stays as it is. Every other control character would move
+            // the cursor or colour what follows, and is written out instead.
+            if character.is_control() && character != '\t' {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
 fn report_diagnostics(
     diagnostics: &[Diagnostic],
     format: OutputFormat,
@@ -1007,9 +1022,15 @@ fn report_diagnostics(
                     continue;
                 };
                 let width = diagnostic.line.to_string().len();
-                let padding = caret_padding(line, diagnostic.column, width);
+                let escaped = escaped_source_line(line);
+                let prefix = line
+                    .chars()
+                    .take(diagnostic.column.saturating_sub(1))
+                    .collect::<String>();
+                let escaped_column = escaped_source_line(&prefix).chars().count() + 1;
+                let padding = caret_padding(&escaped, escaped_column, width);
                 println!("{space:width$} |", space = "", width = width);
-                println!("{} | {}", diagnostic.line, line);
+                println!("{} | {escaped}", diagnostic.line);
                 println!("{space:width$} | {padding}^", space = "", width = width);
                 println!("{space:width$} |", space = "", width = width);
             }

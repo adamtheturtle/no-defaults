@@ -146,6 +146,8 @@ fn diff_previews_without_writing() -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new(binary()).arg("--diff").arg(&path).output()?;
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains("--- a//"), "{stdout}");
+    assert!(!stdout.contains("+++ b//"), "{stdout}");
     assert!(stdout.contains("-def f(value=1): pass"));
     assert!(stdout.contains("+def f(value): pass"));
     assert_eq!(std::fs::read_to_string(path)?, "def f(value=1): pass\n");

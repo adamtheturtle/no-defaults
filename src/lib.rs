@@ -1693,12 +1693,16 @@ fn write_fixes_atomically(changes: BTreeMap<PathBuf, (String, String)>) -> Resul
 
 fn print_diffs(changes: &BTreeMap<PathBuf, (String, String)>) {
     for (path, (source, fixed)) in changes {
+        // Unified diff prefixes describe a synthetic tree, so an absolute
+        // path must lose its root separator before it is placed below `a/`
+        // or `b/`. Otherwise Unix paths become the malformed `a//...`.
+        let path = path.to_string_lossy();
+        let path = path.trim_start_matches(['/', '\\']);
         print!(
             "{}",
-            TextDiff::from_lines(source, fixed).unified_diff().header(
-                &format!("a/{}", path.display()),
-                &format!("b/{}", path.display())
-            )
+            TextDiff::from_lines(source, fixed)
+                .unified_diff()
+                .header(&format!("a/{path}"), &format!("b/{path}"))
         );
     }
 }

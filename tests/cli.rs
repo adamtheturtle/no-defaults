@@ -2481,3 +2481,17 @@ fn dataclass_fields_in_false_branches_are_not_constructor_parameters(
     );
     Ok(())
 }
+
+#[test]
+fn mutually_exclusive_dataclass_fields_are_not_combined() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "from dataclasses import dataclass\n\nflag = True\n@dataclass\nclass C:\n    if flag:\n        first: int = 1\n    else:\n        second: int = 2\n\nC()\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}

@@ -2234,6 +2234,7 @@ fn check_source(
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
         lexical_scope: Vec::new(),
+        conditional_depth: 0,
         scope: Scope {
             private: is_private_module(path, project_root, reexports),
             ..Scope::default()
@@ -2511,6 +2512,8 @@ struct Checker<'a> {
     /// Enclosing definitions, used to keep same-named nested class shapes
     /// separate from classes in other lexical scopes.
     lexical_scope: Vec<String>,
+    /// Unknown control-flow branches do not describe one reliable constructor.
+    conditional_depth: usize,
     scope: Scope,
     /// Start of the `def` or `class` line that owns the violations being
     /// reported, so one directive there can cover every parameter of a
@@ -2681,6 +2684,7 @@ impl Checker<'_> {
                 .iter()
                 .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
         );
+        let mut uncertain = false;
         for (test, body) in clauses {
             let truth = test.map_or(Truthiness::True, |test| {
                 Truthiness::from_expr(test, |_| false)
@@ -2688,10 +2692,21 @@ impl Checker<'_> {
             match truth {
                 Truthiness::False | Truthiness::Falsey | Truthiness::None => {}
                 Truthiness::True | Truthiness::Truthy => {
+                    if uncertain {
+                        self.conditional_depth += 1;
+                    }
                     self.visit_body(body);
+                    if uncertain {
+                        self.conditional_depth -= 1;
+                    }
                     return;
                 }
-                Truthiness::Unknown => self.visit_body(body),
+                Truthiness::Unknown => {
+                    uncertain = true;
+                    self.conditional_depth += 1;
+                    self.visit_body(body);
+                    self.conditional_depth -= 1;
+                }
             }
         }
     }
@@ -3058,7 +3073,7 @@ impl Checker<'_> {
             // Every other field that the constructor takes positionally counts
             // towards the order, even one without a default or one this run is
             // not enforcing. A keyword-only field holds no position.
-            else if constructs && !kw_only {
+            else if constructs && !kw_only && self.conditional_depth == 0 {
                 class.fields.push(name.id.to_string());
             }
         }
@@ -3083,7 +3098,8 @@ impl Checker<'_> {
         // As in a signature, a field that keeps its default forces every field
         // after it to keep its own. A keyword-only field is exempt, since
         // `dataclasses` moves it past the `*` where order does not constrain it.
-        let fix = if !constructs
+        let fix = if self.conditional_depth > 0
+            || !constructs
             || !self.class_constructs.last().copied().unwrap_or(true)
             || (style == FieldStyle::Base
                 && pydantic_field_has_validation_alias(value, &self.aliases, &self.module_bindings))

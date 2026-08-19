@@ -4362,6 +4362,15 @@ impl Rewriter<'_> {
     /// `self` and `cls` name the enclosing class; `Client` names a class of
     /// this file; and `api.Client` names one of an imported module.
     fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool)> {
+        if let Expr::Call(call) = receiver {
+            if call.arguments.args.is_empty()
+                && call.arguments.keywords.is_empty()
+                && matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "super")
+                && self.implicit_receivers.last().is_some_and(Option::is_some)
+            {
+                return Some((self.path.to_path_buf(), self.classes.last()?.clone(), true));
+            }
+        }
         if let Expr::Name(name) = receiver {
             if self.implicit_receivers.last().and_then(Option::as_deref) == Some(name.id.as_str()) {
                 return Some((self.path.to_path_buf(), self.classes.last()?.clone(), true));
@@ -6818,6 +6827,16 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return self.target(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_methods_resolve_through_super() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): pass\n\nclass Child(Base):\n    def run(self):\n        return super().target()\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return super().target(value=1)\n"
         );
         Ok(())
     }

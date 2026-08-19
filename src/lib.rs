@@ -51,7 +51,7 @@ struct Cli {
     output_format: OutputFormat,
 
     /// Show the effective settings for each supplied file and exit.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["fix", "diff"])]
     show_settings: bool,
 }
 

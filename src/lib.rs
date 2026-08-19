@@ -4107,10 +4107,21 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.invalidated_bindings.extend(names.names);
             }
             Stmt::ClassDef(class) => {
+                // The class header is evaluated before its local namespace is
+                // populated, so body bindings cannot shadow header calls.
+                for decorator in &class.decorator_list {
+                    self.visit_decorator(decorator);
+                }
+                if let Some(type_params) = &class.type_params {
+                    self.visit_type_params(type_params);
+                }
+                if let Some(arguments) = &class.arguments {
+                    self.visit_arguments(arguments);
+                }
                 self.classes.push(class.name.to_string());
                 self.scopes.push(BoundNames::of_body(&class.body));
                 self.class_scope_depths.push(self.scopes.len());
-                walk_stmt(self, statement);
+                self.visit_body(&class.body);
                 self.class_scope_depths.pop();
                 self.scopes.pop();
                 self.classes.pop();
@@ -6188,6 +6199,17 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "def target(value):\n    return 5\n\nhandler = lambda target=target(value=1): target  # noqa: NOD001\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn class_headers_use_the_enclosing_scope() -> Result<(), String> {
+        let source = "def target(value=1):\n    return lambda cls: cls\n\n@target()\nclass C:\n    target = 5\n";
+        assert_eq!(
+            fixed(source)?,
+            "def target(value):\n    return lambda cls: cls\n\n@target(value=1)\nclass C:\n    target = 5\n"
         );
         assert!(skipped_reasons(source)?.is_empty());
         Ok(())

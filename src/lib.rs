@@ -1391,15 +1391,13 @@ fn collect_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
             }
             files.push(path.clone());
         } else if path.is_dir() {
-            files.extend(
-                WalkBuilder::new(path)
-                    .standard_filters(true)
-                    .build()
-                    .filter_map(Result::ok)
-                    .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-                    .map(ignore::DirEntry::into_path)
-                    .filter(|entry| is_python(entry)),
-            );
+            for entry in WalkBuilder::new(path).standard_filters(true).build() {
+                let entry =
+                    entry.map_err(|error| format!("could not walk {}: {error}", path.display()))?;
+                if entry.file_type().is_some_and(|kind| kind.is_file()) && is_python(entry.path()) {
+                    files.push(entry.into_path());
+                }
+            }
         } else {
             return Err(format!("path does not exist: {}", path.display()));
         }

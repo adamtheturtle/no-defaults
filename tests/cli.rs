@@ -577,6 +577,26 @@ fn a_directory_walk_still_skips_files_that_are_not_python() -> Result<(), Box<dy
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn a_directory_walk_error_is_an_operational_failure() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir()?;
+    let locked = directory.path().join("locked");
+    std::fs::create_dir(&locked)?;
+    std::fs::write(locked.join("hidden.py"), "def f(value=1): pass\n")?;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))?;
+    let output = Command::new(binary()).arg(directory.path()).output();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))?;
+    let output = output?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("could not walk"), "{stderr}");
+    assert!(stderr.contains("locked"), "{stderr}");
+    Ok(())
+}
+
 #[test]
 fn one_file_named_twice_is_checked_once() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

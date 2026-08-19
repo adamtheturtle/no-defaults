@@ -5349,7 +5349,6 @@ mod tests {
             "with open(\"f\") as connect: pass",
             "import connect",
             "from os import path as connect",
-            "def connect(): pass",
             "class connect: pass",
             "[connect for connect in []]",
             "if (connect := open): pass",

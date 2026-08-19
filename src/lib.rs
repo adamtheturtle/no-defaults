@@ -4274,10 +4274,15 @@ fn collect_bindings(
                     };
                     let submodule = dotted
                         .and_then(|dotted| resolve_module(&dotted, import.level, importer, known));
-                    let binding = match (submodule, &parent) {
-                        (Some(file), _) => Binding::Module(file),
-                        (None, Some(file)) => Binding::Symbol(file.clone(), name.to_owned()),
-                        (None, None) => continue,
+                    let package_member = parent
+                        .as_ref()
+                        .filter(|file| source_binds_name(file, name))
+                        .cloned();
+                    let binding = match (package_member, submodule, &parent) {
+                        (Some(file), _, _) => Binding::Symbol(file, name.to_owned()),
+                        (None, Some(file), _) => Binding::Module(file),
+                        (None, None, Some(file)) => Binding::Symbol(file.clone(), name.to_owned()),
+                        (None, None, None) => continue,
                     };
                     bindings.insert(bound, binding);
                 }
@@ -4346,6 +4351,13 @@ fn retain_common_bindings(
             .skip(1)
             .all(|path| path.get(name) == Some(binding))
     });
+}
+
+fn source_binds_name(path: &Path, name: &str) -> bool {
+    read_source(path)
+        .ok()
+        .and_then(|source| parse_module(&source).ok())
+        .is_some_and(|parsed| BoundNames::of_body(parsed.suite()).names.contains(name))
 }
 
 /// Keep a binding after an `if` only when every runtime path agrees on it.

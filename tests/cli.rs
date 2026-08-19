@@ -2436,3 +2436,29 @@ fn nested_classes_have_qualified_method_identities() -> Result<(), Box<dyn std::
     assert!(fixed.ends_with("C().fetch(value=2)\n"), "{fixed}");
     Ok(())
 }
+
+#[test]
+fn package_attributes_take_precedence_over_same_named_submodules(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    std::fs::write(
+        package.join("__init__.py"),
+        "def api(value=1): return value\n",
+    )?;
+    std::fs::write(package.join("api.py"), "def other(): return 5\n")?;
+    let caller = directory.path().join("case.py");
+    std::fs::write(&caller, "from pkg import api\napi()\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from pkg import api\napi(value=1)\n"
+    );
+    Ok(())
+}

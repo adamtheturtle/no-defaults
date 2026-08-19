@@ -158,6 +158,25 @@ impl FieldBases {
             _ => false,
         }
     }
+
+    fn matches_unshadowed(
+        &self,
+        base: &Expr,
+        aliases: &Aliases,
+        local_classes: &BTreeSet<String>,
+    ) -> bool {
+        if let Expr::Name(name) = base {
+            if local_classes.contains(name.id.as_str())
+                && !self
+                    .configured
+                    .iter()
+                    .any(|configured| configured == name.id.as_str())
+            {
+                return false;
+            }
+        }
+        self.matches(base, aliases)
+    }
 }
 
 /// The names that a package's `__init__.py` files make part of its public API.
@@ -2622,6 +2641,7 @@ impl Checker<'_> {
             &self.aliases,
             &self.base_field_classes,
             &self.module_bindings,
+            &self.local_classes,
         )
     }
 
@@ -3255,13 +3275,14 @@ fn field_style(
     aliases: &Aliases,
     base_field_classes: &BTreeSet<String>,
     module_bindings: &BTreeSet<String>,
+    local_classes: &BTreeSet<String>,
 ) -> Option<FieldStyle> {
     if has_dataclass_decorator(class, aliases, module_bindings) {
         return Some(FieldStyle::Dataclass);
     }
     class_bases(class)
         .any(|base| {
-            bases.matches(base, aliases)
+            bases.matches_unshadowed(base, aliases, local_classes)
                 || matches!(base, Expr::Name(name) if base_field_classes.contains(name.id.as_str()))
         })
         .then_some(FieldStyle::Base)

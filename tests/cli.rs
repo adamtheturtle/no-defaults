@@ -2227,3 +2227,23 @@ fn custom_dataclass_decorators_do_not_enable_field_diagnostics(
     assert!(output.stdout.is_empty());
     Ok(())
 }
+
+#[test]
+fn a_local_basemodel_does_not_activate_the_pydantic_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "class BaseModel:\n    pass\n\nclass C(BaseModel):\n    value: int = 1\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    Ok(())
+}

@@ -2819,7 +2819,8 @@ impl Checker<'_> {
         // As in a signature, a field that keeps its default forces every field
         // after it to keep its own. A keyword-only field is exempt, since
         // `dataclasses` moves it past the `*` where order does not constrain it.
-        let fix = if !self.class_constructs.last().copied().unwrap_or(true)
+        let fix = if !constructs
+            || !self.class_constructs.last().copied().unwrap_or(true)
             || (style == FieldStyle::Base
                 && pydantic_field_has_validation_alias(value, &self.aliases))
             || (self.scope.kept_default && !kw_only)
@@ -7713,25 +7714,39 @@ mod tests {
     }
 
     #[test]
-    fn a_field_kept_out_of_the_constructor_is_not_passed() -> Result<(), String> {
+    fn a_field_kept_out_of_the_constructor_keeps_its_default() {
         // `init=False` keeps the field out of `__init__`, so naming it in a
-        // call would raise `TypeError: unexpected keyword argument`.
-        assert_eq!(
-            fixed(
-                "@dataclass\nclass C:\n    x: int = 1\n    y: int = field(default=5, init=False)\n\n\nC()\n"
-            )?,
-            "@dataclass\nclass C:\n    x: int\n    y: int = field(init=False)\n\n\nC(x=1)\n"
+        // call would raise `TypeError`, while deleting it loses the attribute.
+        let source = "@dataclass\nclass C:\n    x: int = 1\n    y: int = field(default=5, init=False)\n\n\nC()\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
         );
-        Ok(())
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_some());
+        assert!(checked.diagnostics[1].fix.is_none());
     }
 
     #[test]
-    fn a_field_with_a_falsey_init_option_is_not_passed() -> Result<(), String> {
-        assert_eq!(
-            fixed("@dataclass\nclass C:\n    value: int = field(default=1, init=0)\n\n\nC()\n")?,
-            "@dataclass\nclass C:\n    value: int = field(init=0)\n\n\nC()\n"
+    fn a_field_with_a_falsey_init_option_keeps_its_default() {
+        let source = "@dataclass\nclass C:\n    value: int = field(default=1, init=0)\n\n\nC()\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
         );
-        Ok(())
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

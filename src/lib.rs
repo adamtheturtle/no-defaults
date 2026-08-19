@@ -2596,6 +2596,18 @@ struct ClassCollector {
     removed: Vec<Removed>,
 }
 
+impl ClassCollector {
+    fn normalize_repeated_fields(&mut self) {
+        let mut fields = BTreeSet::new();
+        self.fields.retain(|field| fields.insert(field.clone()));
+        let mut removed = BTreeSet::new();
+        self.removed.reverse();
+        self.removed
+            .retain(|item| removed.insert(item.parameter.clone()));
+        self.removed.reverse();
+    }
+}
+
 impl Checker<'_> {
     fn visit_import_statement<'a>(&mut self, statement: &'a Stmt)
     where
@@ -3324,7 +3336,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     .collect_signatures
                     .then(|| self.classes.pop())
                     .flatten();
-                if let Some(collector) = collector {
+                if let Some(mut collector) = collector {
+                    collector.normalize_repeated_fields();
                     if collector.style.is_some() {
                         // Recorded whether or not anything was removed: a base
                         // contributes its field order either way. A name two

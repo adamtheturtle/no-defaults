@@ -1081,6 +1081,11 @@ impl<'a> Visitor<'a> for ReexportCollector<'_> {
                     } else {
                         let bound = alias.asname.as_ref().unwrap_or(&alias.name);
                         self.reexports.names.insert(bound.to_string());
+                        if alias.asname.is_some() && !is_private(bound.as_str()) {
+                            // The public alias exposes the source symbol even
+                            // when its defining name is private.
+                            self.reexports.names.insert(alias.name.to_string());
+                        }
                     }
                 }
             }
@@ -4417,6 +4422,19 @@ mod tests {
             "a private package re-exports nothing to the outside"
         );
         assert!(!reexports.wildcard);
+        Ok(())
+    }
+
+    #[test]
+    fn a_public_alias_covers_the_source_symbol() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(&path, "from ._api import _hidden as public\n")
+            .map_err(|error| error.to_string())?;
+        let mut reexports = Reexports::default();
+        collect_reexports(&path, &mut reexports)?;
+        assert!(reexports.covers("public"));
+        assert!(reexports.covers("_hidden"));
         Ok(())
     }
 

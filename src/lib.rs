@@ -2981,6 +2981,10 @@ impl Aliases {
                         self.collect(&handler.body);
                     }
                 }
+                Stmt::For(loop_) => {
+                    self.collect(&loop_.body);
+                    self.collect(&loop_.orelse);
+                }
                 Stmt::ClassDef(class) => self.collect(&class.body),
                 Stmt::With(block) => self.collect(&block.body),
                 // In particular, imports in a nested function are local to

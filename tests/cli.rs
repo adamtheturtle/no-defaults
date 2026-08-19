@@ -48,6 +48,25 @@ fn bare_carriage_returns_are_line_endings() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
+fn dataclass_aliases_imported_in_module_loops_are_recognized(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "for _ in [0]:\n    from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    value: int = 1\n\nC()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "for _ in [0]:\n    from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    value: int\n\nC(value=1)\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

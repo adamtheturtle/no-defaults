@@ -372,7 +372,7 @@ fn run() -> Result<bool, String> {
         return Ok(false);
     }
     let fixing = cli.fix || cli.diff;
-    let results: Vec<Result<Checked, String>> = files
+    let results: Vec<Checked> = files
         .par_iter()
         .zip(settings.par_iter())
         .map(|(path, setting)| {
@@ -380,9 +380,9 @@ fn run() -> Result<bool, String> {
             // its calls are still rewritten when a callable it uses is fixed
             // elsewhere. Exemption is about which definitions are checked, not
             // about leaving the file broken at runtime.
-            setting.private_only.map_or_else(
-                || Ok(Checked::default()),
-                |private_only| {
+            setting
+                .private_only
+                .map_or_else(Checked::default, |private_only| {
                     check_file(
                         path,
                         private_only,
@@ -391,15 +391,13 @@ fn run() -> Result<bool, String> {
                         &setting.field_bases,
                         fixing,
                     )
-                },
-            )
+                })
         })
         .collect();
     let mut diagnostics = Vec::new();
     let mut signatures = Vec::new();
     let mut skipped = Vec::new();
-    for result in results {
-        let checked = result?;
+    for checked in results {
         diagnostics.extend(checked.diagnostics);
         signatures.extend(checked.signatures);
         skipped.extend(checked.skipped);
@@ -599,7 +597,12 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()
         .map(|path| {
-            let source = read_source(path)?;
+            let Ok(source) = read_source(path) else {
+                // The checker has already emitted a per-file diagnostic for
+                // unreadable source. It cannot contain a safely rewritable
+                // call site in this pass, but it must not abort other files.
+                return Ok(FileCallSites::default());
+            };
             // A file the parser rejects holds no calls this pass can see. It
             // is reported as a syntax error by the checker, so skipping it
             // here leaves the rest of the project fixable.
@@ -1486,9 +1489,12 @@ fn check_file(
     reexports: &Reexports,
     field_bases: &FieldBases,
     signatures: bool,
-) -> Result<Checked, String> {
-    let source = read_source(path)?;
-    Ok(check_source(
+) -> Checked {
+    let source = match read_source(path) {
+        Ok(source) => source,
+        Err(error) => return source_error(path, error),
+    };
+    check_source(
         path,
         &source,
         private_only,
@@ -1496,7 +1502,23 @@ fn check_file(
         reexports,
         field_bases,
         signatures,
-    ))
+    )
+}
+
+/// The one diagnostic a source file that cannot be decoded or read produces.
+fn source_error(path: &Path, error: String) -> Checked {
+    Checked {
+        diagnostics: vec![Diagnostic {
+            path: path.to_path_buf(),
+            line: 1,
+            column: 1,
+            code: "NOD000",
+            message: error,
+            fix: None,
+        }],
+        signatures: Vec::new(),
+        skipped: Vec::new(),
+    }
 }
 
 /// The one diagnostic a file the parser rejects produces.
@@ -3777,7 +3799,7 @@ mod tests {
                 &Reexports::default(),
                 &default_bases(),
                 true,
-            )?;
+            );
             diagnostics.extend(checked.diagnostics);
             signatures.extend(checked.signatures);
             skipped.extend(checked.skipped);
@@ -3809,7 +3831,7 @@ mod tests {
                     &Reexports::default(),
                     &default_bases(),
                     false,
-                )?
+                )
                 .diagnostics
                 .is_empty(),
                 "{}",
@@ -4646,7 +4668,7 @@ mod tests {
                 &Reexports::default(),
                 &default_bases(),
                 false,
-            )?
+            )
             .diagnostics
             .len(),
             5
@@ -5419,7 +5441,7 @@ mod tests {
             &Reexports::default(),
             &default_bases(),
             true,
-        )?;
+        );
         let mut edits: BTreeMap<PathBuf, Vec<Edit>> = BTreeMap::new();
         for diagnostic in &checked.diagnostics {
             if let Some(range) = diagnostic.fix {

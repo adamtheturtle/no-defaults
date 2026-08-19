@@ -2950,7 +2950,7 @@ fn inherited_fields(
     shapes: &BTreeMap<String, Option<Shape>>,
 ) -> Inherited {
     let carrying: Vec<&Expr> = class_bases(class)
-        .filter(|base| !carries_no_fields(base, local))
+        .filter(|base| !carries_no_fields(base, aliases, local))
         // The base that made the class carry fields contributes none itself.
         .filter(|base| !(matches!(style, Some(FieldStyle::Base)) && bases.matches(base, aliases)))
         .collect();
@@ -2979,20 +2979,40 @@ fn inherited_fields(
 /// own body and its constructor is known from the file that defines it. Without
 /// this a generic dataclass could never have its call sites updated, however
 /// the project is laid out — the safe path was never escaped.
-fn carries_no_fields(base: &Expr, local: &BTreeSet<String>) -> bool {
+fn carries_no_fields(base: &Expr, aliases: &Aliases, local: &BTreeSet<String>) -> bool {
     let base = match base {
         Expr::Subscript(subscript) => &*subscript.value,
         expression => expression,
     };
-    let name = match base {
+    match base {
         // A class the file defines under one of these names is that class, not
         // the typing construct, and may carry fields of its own.
-        Expr::Name(name) if local.contains(name.id.as_str()) => return false,
-        Expr::Name(name) => name.id.as_str(),
-        Expr::Attribute(attribute) => attribute.attr.as_str(),
-        _ => return false,
-    };
-    matches!(name, "Generic" | "Protocol" | "ABC" | "object")
+        Expr::Name(name) if local.contains(name.id.as_str()) => false,
+        Expr::Name(name) => {
+            aliases.structural_bases.contains(name.id.as_str())
+                || matches!(name.id.as_str(), "Generic" | "Protocol" | "ABC" | "object")
+        }
+        Expr::Attribute(attribute) => {
+            let Expr::Name(module) = attribute.value.as_ref() else {
+                return false;
+            };
+            match attribute.attr.as_str() {
+                "Generic" | "Protocol" => {
+                    matches!(module.id.as_str(), "typing" | "typing_extensions")
+                        || aliases.typing_modules.contains(module.id.as_str())
+                }
+                "ABC" => {
+                    module.id.as_str() == "abc" || aliases.abc_modules.contains(module.id.as_str())
+                }
+                "object" => {
+                    module.id.as_str() == "builtins"
+                        || aliases.builtins_modules.contains(module.id.as_str())
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
@@ -3021,6 +3041,8 @@ struct Aliases {
     builtins_modules: BTreeSet<String>,
     class_vars: BTreeSet<String>,
     typing_modules: BTreeSet<String>,
+    abc_modules: BTreeSet<String>,
+    structural_bases: BTreeSet<String>,
     kw_only_markers: BTreeSet<String>,
 }
 
@@ -3052,6 +3074,9 @@ impl Aliases {
                 "classmethod" => {
                     self.classmethods.insert(local);
                 }
+                "object" => {
+                    self.structural_bases.insert(local);
+                }
                 _ => {}
             }
         }
@@ -3068,6 +3093,25 @@ impl Aliases {
         for alias in &import.names {
             if alias.name.as_str() == "ClassVar" {
                 self.class_vars
+                    .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
+            } else if matches!(alias.name.as_str(), "Generic" | "Protocol") {
+                self.structural_bases
+                    .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
+            }
+        }
+    }
+
+    fn collect_abc_members(&mut self, import: &ast::StmtImportFrom) {
+        if import
+            .module
+            .as_ref()
+            .is_none_or(|module| module.as_str() != "abc")
+        {
+            return;
+        }
+        for alias in &import.names {
+            if alias.name.as_str() == "ABC" {
+                self.structural_bases
                     .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
             }
         }
@@ -3101,12 +3145,20 @@ impl Aliases {
                                     .as_ref()
                                     .map_or_else(|| alias.name.to_string(), ToString::to_string),
                             );
+                        } else if alias.name.as_str() == "abc" {
+                            self.abc_modules.insert(
+                                alias
+                                    .asname
+                                    .as_ref()
+                                    .map_or_else(|| "abc".to_owned(), ToString::to_string),
+                            );
                         }
                     }
                 }
                 Stmt::ImportFrom(import) => {
                     self.collect_typing_members(import);
                     self.collect_builtin_members(import);
+                    self.collect_abc_members(import);
                     let carries_fields = import.module.as_ref().is_some_and(|module| {
                         matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
                     });
@@ -6453,6 +6505,21 @@ mod tests {
             fixed(source)?,
             "@dataclass\nclass Child(Parent):\n    b: int\n\n\nChild()\n"
         );
+        assert_eq!(
+            skipped_reasons(source)?.first().map(String::as_str),
+            Some(
+                "the dataclass inherits fields, so its constructor is not known from the file \
+                 that defines it"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_qualified_custom_generic_base_is_not_the_typing_construct() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\nclass helpers:\n    @dataclass\n    class Generic:\n        inherited: int = 1\n\n@dataclass\nclass C(helpers.Generic):\n    value: int = 2\n\nC()\n";
+        let updated = fixed(source)?;
+        assert!(updated.ends_with("\nC()\n"), "{updated}");
         assert_eq!(
             skipped_reasons(source)?.first().map(String::as_str),
             Some(

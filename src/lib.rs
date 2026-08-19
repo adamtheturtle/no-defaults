@@ -2773,6 +2773,7 @@ impl Checker<'_> {
                         | "__missing__"
                         | "__contains__"
                         | "__reversed__"
+                        | "__bool__"
                 ))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
@@ -7064,6 +7065,24 @@ mod tests {
     #[test]
     fn reversed_defaults_are_retained_for_protocol_calls() {
         let source = "class C:\n    def __reversed__(self, extra=None):\n        return iter(())\n\nreversed(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn bool_defaults_are_retained_for_protocol_calls() {
+        let source =
+            "class C:\n    def __bool__(self, extra=None):\n        return True\n\nbool(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

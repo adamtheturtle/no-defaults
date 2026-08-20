@@ -3021,6 +3021,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__mul__"
             | "__matmul__"
             | "__truediv__"
+            | "__floordiv__"
     )
 }
 
@@ -7649,6 +7650,23 @@ mod tests {
     #[test]
     fn true_division_defaults_are_retained_for_protocol_calls() {
         let source = "class C:\n    def __truediv__(self, other, extra=None):\n        return self\n\nC() / C()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn floor_division_defaults_are_retained_for_protocol_calls() {
+        let source = "class C:\n    def __floordiv__(self, other, extra=None):\n        return self\n\nC() // C()\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

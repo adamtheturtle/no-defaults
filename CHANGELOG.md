@@ -34,6 +34,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - `for _ in {}:` is recognised as a loop that never runs, alongside the empty tuple, list, and set. Its body no longer holds back defaults on later fields.
 - The word `noqa` in a note after an unrelated directive — `# noqa: E501  keep noqa` — no longer suppresses `NOD001`. A bare `noqa` counts only when it opens its own comment.
 - `Updated N call sites` counts calls rather than edits. A call that needed both a positional and a keyword insertion was counted twice.
+- A dataclass that inherits a metaclass from a base in the same file keeps its field defaults, as one naming `metaclass=` directly already did. A metaclass is inherited, and it controls construction before the generated initializer runs.
+- A dataclass defined under `if TYPE_CHECKING:` keeps its field defaults. The block does not run, so the class has no constructor at runtime and no call site the fixer can keep in step with it.
 
 ## 2.1.0 - 2026-08-07
 

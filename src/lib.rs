@@ -2261,6 +2261,7 @@ fn check_source(
         aliases,
         module_bindings,
         local_classes: BTreeSet::new(),
+        metaclass_classes: BTreeSet::new(),
         repeated_functions,
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
@@ -2540,6 +2541,10 @@ struct Checker<'a> {
     /// The class names the file defines, so a base written `Protocol` that is
     /// one of them is not mistaken for the typing construct.
     local_classes: BTreeSet<String>,
+    /// Same-file classes whose construction a metaclass controls, directly or
+    /// through a base. A metaclass is inherited, so a subclass is built by it
+    /// too even when it names no `metaclass=` of its own.
+    metaclass_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
     /// call-site signature, so their defaults are reported but retained.
     repeated_functions: BTreeSet<String>,
@@ -2797,6 +2802,22 @@ impl Checker<'_> {
         }
     }
 
+    fn class_constructs_safely(&self, class: &ast::StmtClassDef) -> bool {
+        class_constructs_safely(class, &self.aliases, &self.metaclass_classes)
+    }
+
+    fn generates_init(&self, class: &ast::StmtClassDef) -> bool {
+        generates_init(class, &self.aliases, &self.metaclass_classes)
+    }
+
+    /// Note that a metaclass builds this class, so a later subclass of it is
+    /// built by that metaclass too.
+    fn record_metaclass_construction(&mut self, class: &ast::StmtClassDef) {
+        if declares_metaclass(class) || inherits_metaclass(class, &self.metaclass_classes) {
+            self.metaclass_classes.insert(class.name.to_string());
+        }
+    }
+
     fn visit_conditional<'a>(&mut self, branch: &'a ast::StmtIf)
     where
         Self: Visitor<'a>,
@@ -2822,8 +2843,14 @@ impl Checker<'_> {
                 // the names the rest of the file is written against, so the
                 // body is walked with field collection off rather than
                 // skipped, and a later clause still runs.
+                //
+                // Nothing the block defines exists at runtime either, so a
+                // class written inside it has no live constructor to rewrite
+                // calls against. Its defaults are reported and left alone.
                 let fields = self.scope.fields.take();
+                self.conditional_depth += 1;
                 self.visit_body(body);
+                self.conditional_depth -= 1;
                 self.scope.fields = fields;
                 continue;
             }
@@ -3444,7 +3471,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     kept_default: false,
                 };
                 self.class_constructs
-                    .push(class_constructs_safely(class, &self.aliases));
+                    .push(self.class_constructs_safely(class));
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
                 self.method_aliases.push(class_method_aliases(class));
@@ -3467,7 +3494,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         qualified,
                         style,
                         inherits: matches!(inherited, Inherited::Unknown),
-                        constructs: generates_init(class, &self.aliases),
+                        constructs: self.generates_init(class),
                         kw_only: decorator_says_kw_only(class, &self.aliases),
                         fields,
                         removed,
@@ -3482,6 +3509,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // how this class's bases were resolved.
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
+                self.record_metaclass_construction(class);
                 self.record_base_field_class(class.name.as_str(), style);
                 self.leave_class();
                 let collector = self
@@ -3999,27 +4027,55 @@ fn class_defaults_are_fixable(class: &ast::StmtClassDef, aliases: &Aliases) -> b
     })
 }
 
-fn class_constructs_safely(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
-    generates_init(class, aliases) && class_defaults_are_fixable(class, aliases)
+fn class_constructs_safely(
+    class: &ast::StmtClassDef,
+    aliases: &Aliases,
+    metaclass_classes: &BTreeSet<String>,
+) -> bool {
+    generates_init(class, aliases, metaclass_classes) && class_defaults_are_fixable(class, aliases)
 }
 
-/// Whether the decorator leaves the class with a generated `__init__`.
-fn generates_init(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
-    // `dataclasses` checks the completed class namespace, not just method
-    // definitions. An assignment, import, or nested definition under this
-    // name suppresses generation just as `def __init__` does.
-    let defines_init = BoundNames::of_body(&class.body).names.contains("__init__");
-    // An explicit metaclass controls construction before the generated
-    // initializer is reached. Its `__call__` signature is not recoverable
-    // from this class body, so field arguments cannot safely be added.
-    let has_metaclass = class.arguments.as_deref().is_some_and(|arguments| {
+/// Whether a class names a metaclass of its own.
+fn declares_metaclass(class: &ast::StmtClassDef) -> bool {
+    class.arguments.as_deref().is_some_and(|arguments| {
         arguments.keywords.iter().any(|keyword| {
             keyword
                 .arg
                 .as_ref()
                 .is_some_and(|name| name.as_str() == "metaclass")
         })
-    });
+    })
+}
+
+/// Whether a class takes a metaclass from a base defined in the same file.
+fn inherits_metaclass(class: &ast::StmtClassDef, metaclass_classes: &BTreeSet<String>) -> bool {
+    class.arguments.as_deref().is_some_and(|arguments| {
+        arguments
+            .args
+            .iter()
+            .filter_map(|base| match base {
+                Expr::Name(name) => Some(name.id.as_str()),
+                _ => None,
+            })
+            .any(|base| metaclass_classes.contains(base))
+    })
+}
+
+/// Whether the decorator leaves the class with a generated `__init__`.
+fn generates_init(
+    class: &ast::StmtClassDef,
+    aliases: &Aliases,
+    metaclass_classes: &BTreeSet<String>,
+) -> bool {
+    // `dataclasses` checks the completed class namespace, not just method
+    // definitions. An assignment, import, or nested definition under this
+    // name suppresses generation just as `def __init__` does.
+    let defines_init = BoundNames::of_body(&class.body).names.contains("__init__");
+    // A metaclass controls construction before the generated initializer is
+    // reached. Its `__call__` signature is not recoverable from this class
+    // body, so field arguments cannot safely be added. A metaclass is
+    // inherited, so a base carrying one makes the subclass unsafe too.
+    let has_metaclass = declares_metaclass(class) || inherits_metaclass(class, metaclass_classes);
     !defines_init
         && !has_metaclass
         && !class.decorator_list.iter().any(|decorator| {
@@ -8878,6 +8934,43 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_dataclass_inheriting_a_metaclass_has_no_assumed_call_signature() {
+        // A metaclass is inherited, so `C` is built by `Meta` too even though
+        // it names no `metaclass=` of its own.
+        let source = "from dataclasses import dataclass\n\nclass Meta(type):\n    def __call__(cls):\n        return 5\n\nclass Base(metaclass=Meta):\n    pass\n\n@dataclass\nclass C(Base):\n    value: int = 1\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_dataclass_only_type_checkers_see_is_not_rewritten() {
+        // The block does not run, so the class has no constructor at runtime
+        // and no call for the fixer to keep in step with.
+        let source = "from typing import TYPE_CHECKING\nfrom dataclasses import dataclass\n\nif TYPE_CHECKING:\n    @dataclass\n    class C:\n        value: int = 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
     }
 
     #[test]

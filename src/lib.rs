@@ -258,6 +258,9 @@ enum Callable {
         class: String,
         receiver: Receiver,
     },
+    /// A normal class call reaches its `__init__` after Python creates and
+    /// supplies the instance.
+    Constructor,
     Dataclass,
 }
 
@@ -278,6 +281,10 @@ impl Callable {
     /// checks all the time, so those stay quiet.
     fn is_function(&self) -> bool {
         matches!(self, Self::Function | Self::Method { .. })
+    }
+
+    fn implicit_bound(&self) -> usize {
+        usize::from(matches!(self, Self::Constructor))
     }
 }
 
@@ -691,7 +698,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                 .methods
                 .entry((defining, class.clone()))
                 .or_default(),
-            Callable::Function | Callable::Dataclass => {
+            Callable::Function | Callable::Constructor | Callable::Dataclass => {
                 definitions.symbols.entry(defining).or_default()
             }
         };
@@ -3155,6 +3162,15 @@ impl Checker<'_> {
                     }));
             }
         }
+        if function.name.as_str() == "__init__" {
+            if let Callable::Method { class, .. } = &signature.kind {
+                self.signatures.push(Signature {
+                    name: class.clone(),
+                    kind: Callable::Constructor,
+                    ..signature.clone()
+                });
+            }
+        }
         self.signatures.push(signature);
     }
 
@@ -5152,29 +5168,32 @@ impl Rewriter<'_> {
         match expression {
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
-            Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => Some((
-                self.definitions
+            Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
+                let signature = self
+                    .definitions
                     .symbols
                     .get(self.physical)?
                     .get(name.id.as_str())?
-                    .as_ref()?,
-                0,
-            )),
+                    .as_ref()?;
+                Some((signature, signature.kind.implicit_bound()))
+            }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false) => None,
             Expr::Name(name) => match self.binding(name.id.as_str()) {
                 Some(Binding::Symbol(file, symbol)) => {
-                    Some((self.definitions.symbol(file, symbol)?, 0))
+                    let signature = self.definitions.symbol(file, symbol)?;
+                    Some((signature, signature.kind.implicit_bound()))
                 }
                 Some(Binding::Module(_)) => None,
-                None => Some((
-                    self.definitions
+                None => {
+                    let signature = self
+                        .definitions
                         .symbols
                         .get(self.physical)?
                         .get(name.id.as_str())?
-                        .as_ref()?,
-                    0,
-                )),
+                        .as_ref()?;
+                    Some((signature, signature.kind.implicit_bound()))
+                }
             },
             Expr::Attribute(attribute) => {
                 // A method's receiver type is only known when it is `self`,
@@ -5210,7 +5229,8 @@ impl Rewriter<'_> {
                 let Some(Binding::Module(file)) = self.binding(&dotted) else {
                     return None;
                 };
-                Some((self.definitions.symbol(file, attribute.attr.as_str())?, 0))
+                let signature = self.definitions.symbol(file, attribute.attr.as_str())?;
+                Some((signature, signature.kind.implicit_bound()))
             }
             _ => None,
         }
@@ -8490,6 +8510,17 @@ mod tests {
         assert_eq!(
             fixed(source)?,
             "class C:\n    def target(self, value):\n        return value\n    alias = target\n\nC().alias(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_normal_class_call_uses_its_init_signature() -> Result<(), String> {
+        let source =
+            "class C:\n    def __init__(self, value=1):\n        self.value = value\n\nC()\n";
+        assert_eq!(
+            fixed(source)?,
+            "class C:\n    def __init__(self, value):\n        self.value = value\n\nC(value=1)\n"
         );
         Ok(())
     }

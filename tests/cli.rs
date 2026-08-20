@@ -2038,3 +2038,29 @@ fn symlinked_definitions_use_the_real_module_path() -> Result<(), Box<dyn std::e
     );
     Ok(())
 }
+
+#[test]
+fn absolute_and_relative_inputs_share_module_roots() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&caller, "import api\napi.target()\n")?;
+
+    let output = Command::new(binary())
+        .current_dir(directory.path())
+        .arg("--fix")
+        .arg(&api)
+        .arg("caller.py")
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value): return value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import api\napi.target(value=1)\n"
+    );
+    Ok(())
+}

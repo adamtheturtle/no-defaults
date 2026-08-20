@@ -3008,6 +3008,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__round__"
             | "__trunc__"
             | "__floor__"
+            | "__ceil__"
     )
 }
 
@@ -7415,6 +7416,23 @@ mod tests {
     #[test]
     fn floor_defaults_are_retained_for_protocol_calls() {
         let source = "import math\n\nclass C:\n    def __floor__(self, extra=None):\n        return 1\n\nmath.floor(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn ceil_defaults_are_retained_for_protocol_calls() {
+        let source = "import math\n\nclass C:\n    def __ceil__(self, extra=None):\n        return 1\n\nmath.ceil(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

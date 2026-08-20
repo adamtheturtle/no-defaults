@@ -2661,3 +2661,28 @@ fn a_sole_pydantic_field_default_with_a_trailing_comma_is_fixed(
     );
     Ok(())
 }
+
+#[test]
+fn a_try_else_import_is_exclusive_to_the_success_path() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("after.py"),
+        "def target(): return 9\n",
+    )?;
+    std::fs::write(
+        directory.path().join("fallback.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("case.py");
+    let source = "try:\n    import missing_module\nexcept ImportError:\n    import fallback as module\nelse:\n    import after as module\n\nmodule.target()\n";
+    std::fs::write(&caller, source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(caller)?, source);
+    assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
+    Ok(())
+}

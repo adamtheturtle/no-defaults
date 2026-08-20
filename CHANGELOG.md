@@ -28,7 +28,6 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - `--fix` keeps a signature valid: a positional default is inserted ahead of the keywords it precedes, a lambda keeps its positional order, and a default that has to stay keeps the defaults after it.
 - A removed `default_factory` is not recreated at the call site when its value is a container, so callers do not start sharing one object.
 - A closed stdout pipe, a non-UTF-8 source file, and a directory that cannot be walked are each reported without aborting the run, `--diff` rejects the machine-readable output formats it cannot produce, and `--show-settings` rejects being combined with a mode that writes.
-
 - Defaults on the reflected (`__radd__`), augmented-assignment (`__iadd__`), and unary (`__neg__`, `__pos__`, `__abs__`, `__invert__`) operator methods are retained. Python reaches all of them through syntax rather than a written call, so `--fix` had nothing to add the removed default back to and could leave the operator raising `TypeError`.
 - A default on a lambda written in an `if` or `elif` test is reported and fixed again. Clause tests were walked for their truthiness but never checked.
 - `for _ in {}:` is recognised as a loop that never runs, alongside the empty tuple, list, and set. Its body no longer holds back defaults on later fields.
@@ -38,7 +37,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A dataclass defined under `if TYPE_CHECKING:` keeps its field defaults. The block does not run, so the class has no constructor at runtime and no call site the fixer can keep in step with it.
 - A call in a comprehension's leftmost iterable is updated again. Python evaluates that iterable before the loop targets exist, so a call there is the enclosing one and was being skipped as shadowed while its default was removed.
 - Rebinding a package name drops the dotted import under it. After `import pkg.api`, a later `pkg = …` left the `pkg.api` entry in place and calls through it were still rewritten as the original module's.
-- A module-level loop, `with`, or `except … as` target replaces an imported name, as an assignment to it already did. Calls through the name were still being rewritten as the import's.
+- A module-level loop or `with` target replaces an imported name, as an assignment to it already did. Calls through the name were still being rewritten as the import's. An `except … as` target does not: the name is deleted when the handler ends, and if the handler never runs the import still binds.
 - Two definitions of one name in different branches of an `if`, loop, `with`, `try`, or `match` keep their defaults, as two written side by side already did. Which one survives is not knowable, and `--fix` was stripping both while leaving the call as written.
 
 ## 2.1.0 - 2026-08-07

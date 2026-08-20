@@ -2857,10 +2857,14 @@ impl Checker<'_> {
     }
 
     /// Note that a metaclass builds this class, so a later subclass of it is
-    /// built by that metaclass too.
+    /// built by that metaclass too. A later redefinition without a metaclass
+    /// clears the name so a sibling that inherits the new class is not treated
+    /// as metaclass-built.
     fn record_metaclass_construction(&mut self, class: &ast::StmtClassDef) {
         if declares_metaclass(class) || inherits_metaclass(class, &self.metaclass_classes) {
             self.metaclass_classes.insert(class.name.to_string());
+        } else {
+            self.metaclass_classes.remove(class.name.as_str());
         }
     }
 
@@ -2936,6 +2940,7 @@ impl Checker<'_> {
         let outer = self.scope;
         let outer_aliases = self.aliases.clone();
         let outer_local_classes = self.local_classes.clone();
+        let outer_metaclass_classes = self.metaclass_classes.clone();
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
             fields: None,
@@ -2947,6 +2952,7 @@ impl Checker<'_> {
         self.lexical_scope.pop();
         self.aliases = outer_aliases;
         self.local_classes = outer_local_classes;
+        self.metaclass_classes = outer_metaclass_classes;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
@@ -3505,6 +3511,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer = self.scope;
                 let outer_aliases = self.aliases.clone();
                 let outer_local_classes = self.local_classes.clone();
+                let outer_metaclass_classes = self.metaclass_classes.clone();
                 let old_header = self.header;
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
@@ -3555,6 +3562,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // how this class's bases were resolved.
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
+                self.metaclass_classes = outer_metaclass_classes;
                 self.record_metaclass_construction(class);
                 self.record_base_field_class(class.name.as_str(), style);
                 self.leave_class();
@@ -5761,14 +5769,9 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
                 }
             }
         }
-        Stmt::Try(block) => {
-            for handler in &block.handlers {
-                let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                if let Some(name) = &handler.name {
-                    bound.names.insert(name.to_string());
-                }
-            }
-        }
+        // `except … as name` does not replace a module-level binding for later
+        // statements: the name is deleted when the handler ends, and if the
+        // handler never runs the prior binding is untouched.
         _ => {}
     }
     bound.names
@@ -5819,15 +5822,14 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             | Stmt::AugAssign(_)
             | Stmt::For(_)
             | Stmt::With(_)
-            | Stmt::Try(_)
                 if self.scopes.is_empty() =>
             {
                 // Every one of these binds a module-level name of its own — an
-                // assignment target, a loop or context-manager target, an
-                // `except … as` — and replaces whatever an import bound there.
-                // The statement is walked first: what it evaluates still sees
-                // the old binding, and a nested statement reaches this arm on
-                // its own rather than through the one holding it.
+                // assignment target, a loop target, or a context-manager
+                // target — and replaces whatever an import bound there. The
+                // statement is walked first: what it evaluates still sees the
+                // old binding, and a nested statement reaches this arm on its
+                // own rather than through the one holding it.
                 walk_stmt(self, statement);
                 self.invalidated_bindings.extend(rebound_names(statement));
             }
@@ -9088,6 +9090,45 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_redefined_base_without_a_metaclass_is_not_treated_as_metaclass_built() {
+        // An earlier `Base` that named a metaclass must not stick after a
+        // later plain `Base` takes its place.
+        let source = "from dataclasses import dataclass\n\nclass Meta(type):\n    def __call__(cls):\n        return 5\n\nclass Base(metaclass=Meta):\n    pass\n\nclass Base:\n    pass\n\n@dataclass\nclass C(Base):\n    value: int = 1\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+        assert_eq!(checked.signatures.len(), 1);
+    }
+
+    #[test]
+    fn a_metaclass_base_inside_a_function_does_not_leak() {
+        let source = "from dataclasses import dataclass\n\nclass Meta(type):\n    def __call__(cls):\n        return 5\n\ndef build():\n    class Base(metaclass=Meta):\n        pass\n\n@dataclass\nclass Base:\n    value: int = 1\n\n@dataclass\nclass C(Base):\n    extra: int = 2\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.fix.is_some()));
+        assert_eq!(checked.signatures.len(), 2);
     }
 
     #[test]

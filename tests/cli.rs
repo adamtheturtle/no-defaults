@@ -1625,14 +1625,14 @@ fn rebinding_a_package_name_drops_its_dotted_import() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// A loop, context-manager, or `except … as` target at module scope replaces
-/// what an import bound under that name.
+/// A loop or context-manager target at module scope replaces what an import
+/// bound under that name. An `except … as` target does not: the name is deleted
+/// when the handler ends, and if the handler never runs the import still binds.
 #[test]
 fn module_level_targets_replace_an_imported_name() -> Result<(), Box<dyn std::error::Error>> {
     for rebinding in [
         "for mod in [1]:\n    pass\n",
         "with open(\"f\") as mod:\n    pass\n",
-        "try:\n    pass\nexcept Exception as mod:\n    pass\n",
     ] {
         let directory = tempfile::tempdir()?;
         std::fs::write(
@@ -1650,6 +1650,32 @@ fn module_level_targets_replace_an_imported_name() -> Result<(), Box<dyn std::er
         assert_eq!(output.status.code(), Some(0));
         assert_eq!(std::fs::read_to_string(&caller)?, source, "{rebinding}");
     }
+    Ok(())
+}
+
+/// `except … as` does not replace a module-level import for later statements.
+#[test]
+fn except_as_does_not_replace_an_imported_name() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("mod.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &caller,
+        "import mod\n\ntry:\n    pass\nexcept Exception as mod:\n    pass\n\nmod.target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import mod\n\ntry:\n    pass\nexcept Exception as mod:\n    pass\n\nmod.target(value=1)\n"
+    );
     Ok(())
 }
 

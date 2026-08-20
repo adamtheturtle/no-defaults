@@ -2671,6 +2671,31 @@ impl Checker<'_> {
         }
     }
 
+    fn visit_conditional<'a>(&mut self, branch: &'a ast::StmtIf)
+    where
+        Self: Visitor<'a>,
+    {
+        let clauses = std::iter::once((Some(branch.test.as_ref()), branch.body.as_slice())).chain(
+            branch
+                .elif_else_clauses
+                .iter()
+                .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
+        );
+        for (test, body) in clauses {
+            let truth = test.map_or(Truthiness::True, |test| {
+                Truthiness::from_expr(test, |_| false)
+            });
+            match truth {
+                Truthiness::False | Truthiness::Falsey | Truthiness::None => {}
+                Truthiness::True | Truthiness::Truthy => {
+                    self.visit_body(body);
+                    return;
+                }
+                Truthiness::Unknown => self.visit_body(body),
+            }
+        }
+    }
+
     fn visit_function_statement<'a>(
         &mut self,
         function: &'a ast::StmtFunctionDef,
@@ -3150,6 +3175,7 @@ fn implicitly_called_method(name: &str) -> bool {
 impl<'a> Visitor<'a> for Checker<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
+            Stmt::If(branch) => self.visit_conditional(branch),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
             Stmt::ClassDef(class) => {

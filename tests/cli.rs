@@ -373,6 +373,24 @@ fn custom_field_calls_are_removed_whole_instead_of_surgically_edited(
 }
 
 #[test]
+fn custom_field_helpers_do_not_use_pydantic_argument_surgery(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from pydantic import BaseModel\n\ndef Field(**kwargs):\n    return 9\n\nclass C(BaseModel):\n    value: int = Field(default=1, note=2)\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("value: int\n"), "{fixed}");
+    assert!(!fixed.contains("Field(note=2)"), "{fixed}");
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

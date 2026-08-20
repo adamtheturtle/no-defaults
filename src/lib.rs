@@ -3404,7 +3404,9 @@ struct Aliases {
     dataclasses_members: BTreeSet<String>,
     dataclass_fields: BTreeSet<String>,
     dataclass_decorators: BTreeSet<String>,
+    pydantic_fields: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
+    pydantic_modules: BTreeSet<String>,
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
     builtins_modules: BTreeSet<String>,
@@ -3545,6 +3547,11 @@ impl Aliases {
                         let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                         if dataclasses && alias.name.as_str() == "field" {
                             self.dataclass_fields.insert(local.clone());
+                        }
+                        if import.module.as_ref().is_some_and(|module| {
+                            module.as_str() == "pydantic" && alias.name.as_str() == "Field"
+                        }) {
+                            self.pydantic_fields.insert(local.clone());
                         }
                         if dataclasses && alias.name.as_str() == "dataclass" {
                             self.dataclass_decorators.insert(local.clone());
@@ -3870,7 +3877,9 @@ fn field_call<'a>(
         "field" if is_dataclass_field(&call.func, aliases, module_bindings) => {
             Some((call, FieldCall::Dataclasses))
         }
-        "Field" => Some((call, FieldCall::Pydantic)),
+        "Field" if is_pydantic_field(&call.func, aliases, module_bindings) => {
+            Some((call, FieldCall::Pydantic))
+        }
         _ => None,
     }
 }
@@ -3892,6 +3901,27 @@ fn is_dataclass_field(
             Expr::Name(module) => {
                 !module_bindings.contains(module.id.as_str())
                     || aliases.dataclasses_modules.contains(module.id.as_str())
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn is_pydantic_field(
+    function: &Expr,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> bool {
+    match function {
+        Expr::Name(name) => {
+            !module_bindings.contains(name.id.as_str())
+                || aliases.pydantic_fields.contains(name.id.as_str())
+        }
+        Expr::Attribute(attribute) => match attribute.value.as_ref() {
+            Expr::Name(module) => {
+                !module_bindings.contains(module.id.as_str())
+                    || aliases.pydantic_modules.contains(module.id.as_str())
             }
             _ => false,
         },

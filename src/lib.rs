@@ -2691,6 +2691,18 @@ impl Checker<'_> {
         }
     }
 
+    fn visit_while<'a>(&mut self, loop_: &'a ast::StmtWhile, statement: &'a Stmt)
+    where
+        Self: Visitor<'a>,
+    {
+        match Truthiness::from_expr(&loop_.test, |_| false) {
+            Truthiness::False | Truthiness::Falsey | Truthiness::None => {
+                self.visit_body(&loop_.orelse);
+            }
+            _ => self.visit_uncertain(statement),
+        }
+    }
+
     fn visit_uncertain<'a>(&mut self, statement: &'a Stmt)
     where
         Self: Visitor<'a>,
@@ -3220,6 +3232,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::If(branch) => self.visit_conditional(branch),
             Stmt::Try(_) => self.visit_uncertain(statement),
             Stmt::For(loop_) => self.visit_loop(loop_, statement),
+            Stmt::While(loop_) => self.visit_while(loop_, statement),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
             Stmt::ClassDef(class) => {

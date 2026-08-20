@@ -2674,6 +2674,23 @@ impl Checker<'_> {
         }
     }
 
+    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, statement: &'a Stmt)
+    where
+        Self: Visitor<'a>,
+    {
+        let statically_empty = match loop_.iter.as_ref() {
+            Expr::Tuple(tuple) => tuple.elts.is_empty(),
+            Expr::List(list) => list.elts.is_empty(),
+            Expr::Set(set) => set.elts.is_empty(),
+            _ => false,
+        };
+        if statically_empty {
+            self.visit_body(&loop_.orelse);
+        } else {
+            self.visit_uncertain(statement);
+        }
+    }
+
     fn visit_uncertain<'a>(&mut self, statement: &'a Stmt)
     where
         Self: Visitor<'a>,
@@ -3202,6 +3219,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
         match statement {
             Stmt::If(branch) => self.visit_conditional(branch),
             Stmt::Try(_) => self.visit_uncertain(statement),
+            Stmt::For(loop_) => self.visit_loop(loop_, statement),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
             Stmt::ClassDef(class) => {

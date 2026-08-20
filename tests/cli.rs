@@ -2342,3 +2342,21 @@ fn later_class_imports_do_not_shadow_earlier_calls() -> Result<(), Box<dyn std::
     );
     Ok(())
 }
+
+#[test]
+fn instance_receivers_need_not_be_named_self() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "class C:\n    def fetch(self, value=1):\n        return value\n\n    def run(this):\n        return this.fetch()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "class C:\n    def fetch(self, value):\n        return value\n\n    def run(this):\n        return this.fetch(value=1)\n"
+    );
+    Ok(())
+}

@@ -3003,6 +3003,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__hash__"
             | "__index__"
             | "__int__"
+            | "__float__"
     )
 }
 
@@ -7322,6 +7323,24 @@ mod tests {
     #[test]
     fn int_defaults_are_retained_for_protocol_calls() {
         let source = "class C:\n    def __int__(self, extra=None):\n        return 1\n\nint(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn float_defaults_are_retained_for_protocol_calls() {
+        let source =
+            "class C:\n    def __float__(self, extra=None):\n        return 1.0\n\nfloat(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

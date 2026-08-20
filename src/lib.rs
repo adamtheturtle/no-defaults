@@ -5155,31 +5155,22 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     );
                 }
             }
-            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.in_class_scope() => {
+            Stmt::Import(_)
+            | Stmt::ImportFrom(_)
+            | Stmt::Assign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::AugAssign(_)
+                if self.in_class_scope() =>
+            {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
             }
-            Stmt::Assign(assign) if self.scopes.is_empty() => {
+            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.scopes.is_empty() => {
                 // The right-hand side still sees the imported binding; the
                 // assignment replaces it only after that expression runs.
                 walk_stmt(self, statement);
-                let mut names = BoundNames::default();
-                for target in &assign.targets {
-                    names.bind(target);
-                }
-                self.invalidated_bindings.extend(names.names);
-            }
-            Stmt::AnnAssign(assign) if self.scopes.is_empty() => {
-                walk_stmt(self, statement);
-                let mut names = BoundNames::default();
-                names.bind(&assign.target);
-                self.invalidated_bindings.extend(names.names);
-            }
-            Stmt::AugAssign(assign) if self.scopes.is_empty() => {
-                walk_stmt(self, statement);
-                let mut names = BoundNames::default();
-                names.bind(&assign.target);
-                self.invalidated_bindings.extend(names.names);
+                let bound = BoundNames::of_body(std::slice::from_ref(statement));
+                self.invalidated_bindings.extend(bound.names);
             }
             Stmt::ClassDef(class) => {
                 // The class header is evaluated before its local namespace is

@@ -2151,3 +2151,22 @@ fn nested_dataclass_names_do_not_pollute_module_inheritance(
     assert!(fixed.ends_with("Child(own=2)\n"), "{fixed}");
     Ok(())
 }
+
+#[test]
+fn custom_qualified_protocol_bases_are_not_treated_as_structural(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\n\nclass helpers:\n    class Protocol:\n        inherited: int = 1\n\n@dataclass\nclass C(helpers.Protocol):\n    own: int = 2\n\nC()\n",
+    )?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("own: int\n"), "{fixed}");
+    assert!(fixed.ends_with("C()\n"), "{fixed}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("inherits fields"), "{stderr}");
+    Ok(())
+}

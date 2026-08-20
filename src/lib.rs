@@ -303,6 +303,21 @@ enum Binding {
 struct Edit {
     range: TextRange,
     replacement: String,
+    /// The call this edit belongs to. One call can need both a positional and
+    /// a keyword insertion, at different offsets, and that is one updated call
+    /// site rather than two.
+    site: TextSize,
+}
+
+impl Edit {
+    /// A deletion, which stands alone and is never counted as a call site.
+    fn deletion(range: TextRange) -> Self {
+        Self {
+            range,
+            replacement: String::new(),
+            site: range.start(),
+        }
+    }
 }
 
 /// A call that could not be updated, and why.
@@ -533,10 +548,7 @@ fn apply_fixes(
             .edits
             .entry(diagnostic.path.clone())
             .or_default()
-            .push(Edit {
-                range,
-                replacement: String::new(),
-            });
+            .push(Edit::deletion(range));
     }
     let mut updated = 0;
     let mut unfixed = BTreeSet::new();
@@ -1770,13 +1782,14 @@ fn apply_edits(source: &str, edits: Vec<Edit>) -> (String, usize) {
             .iter()
             .any(|deletion| deletion.contains(edit.range.start()))
     });
-    let applied = insertions.len();
+    let applied = insertions
+        .iter()
+        .map(|edit| edit.site)
+        .collect::<BTreeSet<_>>()
+        .len();
     let mut edits: Vec<Edit> = insertions
         .into_iter()
-        .chain(deletions.into_iter().map(|range| Edit {
-            range,
-            replacement: String::new(),
-        }))
+        .chain(deletions.into_iter().map(Edit::deletion))
         .collect();
     edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start()));
     let mut fixed = source.to_owned();
@@ -2177,6 +2190,59 @@ fn source_error(path: &Path, error: String) -> Checked {
     }
 }
 
+/// Note every module-level name defined more than once as a function.
+///
+/// A block that still binds module-level names — a conditional, a loop, a
+/// `with`, a `try` — holds definitions that compete for the same name just as
+/// two definitions written side by side do. Only one of them survives, and
+/// which one is not knowable, so neither may have its defaults removed.
+fn collect_repeated_functions(
+    suite: &[Stmt],
+    seen: &mut BTreeSet<String>,
+    repeated: &mut BTreeSet<String>,
+) {
+    for statement in suite {
+        match statement {
+            Stmt::FunctionDef(function) => {
+                let name = function.name.to_string();
+                if !seen.insert(name.clone()) {
+                    repeated.insert(name);
+                }
+            }
+            Stmt::If(branch) => {
+                collect_repeated_functions(&branch.body, seen, repeated);
+                for clause in &branch.elif_else_clauses {
+                    collect_repeated_functions(&clause.body, seen, repeated);
+                }
+            }
+            Stmt::For(loop_statement) => {
+                collect_repeated_functions(&loop_statement.body, seen, repeated);
+                collect_repeated_functions(&loop_statement.orelse, seen, repeated);
+            }
+            Stmt::While(loop_statement) => {
+                collect_repeated_functions(&loop_statement.body, seen, repeated);
+                collect_repeated_functions(&loop_statement.orelse, seen, repeated);
+            }
+            Stmt::With(block) => collect_repeated_functions(&block.body, seen, repeated),
+            Stmt::Try(block) => {
+                collect_repeated_functions(&block.body, seen, repeated);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_repeated_functions(&handler.body, seen, repeated);
+                }
+                collect_repeated_functions(&block.orelse, seen, repeated);
+                collect_repeated_functions(&block.finalbody, seen, repeated);
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_repeated_functions(&case.body, seen, repeated);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The one diagnostic a file the parser rejects produces.
 ///
 /// It carries no fix: there is nothing to delete, and the file is left out of
@@ -2231,14 +2297,7 @@ fn check_source(
     let module_bindings = BoundNames::of_body(parsed.suite()).names;
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
-    for statement in parsed.suite() {
-        if let Stmt::FunctionDef(function) = statement {
-            let name = function.name.to_string();
-            if !function_names.insert(name.clone()) {
-                repeated_functions.insert(name);
-            }
-        }
-    }
+    collect_repeated_functions(parsed.suite(), &mut function_names, &mut repeated_functions);
     let mut checker = Checker {
         path,
         source,
@@ -2248,6 +2307,7 @@ fn check_source(
         aliases,
         module_bindings,
         local_classes: BTreeSet::new(),
+        metaclass_classes: BTreeSet::new(),
         repeated_functions,
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
@@ -2340,7 +2400,13 @@ fn noqa_marker(body: &str) -> Option<usize> {
             let segment_end = next_segment(rest).unwrap_or(rest.len());
             let segment = rest[..segment_end].trim();
             if segment.is_empty() {
-                return true;
+                // A bare `noqa` suppresses everything, so it only counts when
+                // it opens its own comment. Otherwise the word appearing in a
+                // note after an unrelated directive — `# noqa: E501  keep
+                // noqa` — would silence this rule.
+                let preceding = &body[..*index];
+                let segment_start = preceding.rfind('#').map_or(0, |offset| offset + 1);
+                return preceding[segment_start..].trim().is_empty();
             }
             segment.strip_prefix(':').is_some_and(|codes| {
                 codes.split(',').any(|part| {
@@ -2521,6 +2587,10 @@ struct Checker<'a> {
     /// The class names the file defines, so a base written `Protocol` that is
     /// one of them is not mistaken for the typing construct.
     local_classes: BTreeSet<String>,
+    /// Same-file classes whose construction a metaclass controls, directly or
+    /// through a base. A metaclass is inherited, so a subclass is built by it
+    /// too even when it names no `metaclass=` of its own.
+    metaclass_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
     /// call-site signature, so their defaults are reported but retained.
     repeated_functions: BTreeSet<String>,
@@ -2733,6 +2803,9 @@ impl Checker<'_> {
             Expr::Tuple(tuple) => tuple.elts.is_empty(),
             Expr::List(list) => list.elts.is_empty(),
             Expr::Set(set) => set.elts.is_empty(),
+            // `{}` is the empty mapping, and the only empty literal a set
+            // cannot be written as.
+            Expr::Dict(dict) => dict.items.is_empty(),
             _ => false,
         };
         if statically_empty {
@@ -2775,6 +2848,26 @@ impl Checker<'_> {
         }
     }
 
+    fn class_constructs_safely(&self, class: &ast::StmtClassDef) -> bool {
+        class_constructs_safely(class, &self.aliases, &self.metaclass_classes)
+    }
+
+    fn generates_init(&self, class: &ast::StmtClassDef) -> bool {
+        generates_init(class, &self.aliases, &self.metaclass_classes)
+    }
+
+    /// Note that a metaclass builds this class, so a later subclass of it is
+    /// built by that metaclass too. A later redefinition without a metaclass
+    /// clears the name so a sibling that inherits the new class is not treated
+    /// as metaclass-built.
+    fn record_metaclass_construction(&mut self, class: &ast::StmtClassDef) {
+        if declares_metaclass(class) || inherits_metaclass(class, &self.metaclass_classes) {
+            self.metaclass_classes.insert(class.name.to_string());
+        } else {
+            self.metaclass_classes.remove(class.name.as_str());
+        }
+    }
+
     fn visit_conditional<'a>(&mut self, branch: &'a ast::StmtIf)
     where
         Self: Visitor<'a>,
@@ -2787,14 +2880,27 @@ impl Checker<'_> {
         );
         let mut uncertain = false;
         for (test, body) in clauses {
+            // A clause's test is ordinary code that runs whenever the clause
+            // is reached, so a default written in it — on a lambda, say — is
+            // reported like any other. Tests after a statically true clause
+            // are never reached, and the loop returns before them.
+            if let Some(test) = test {
+                self.visit_expr(test);
+            }
             if test.is_some_and(|test| self.is_type_checking(test)) {
                 // The block does not run, so an annotation in it declares
                 // nothing the constructor takes. The imports in it still bind
                 // the names the rest of the file is written against, so the
                 // body is walked with field collection off rather than
                 // skipped, and a later clause still runs.
+                //
+                // Nothing the block defines exists at runtime either, so a
+                // class written inside it has no live constructor to rewrite
+                // calls against. Its defaults are reported and left alone.
                 let fields = self.scope.fields.take();
+                self.conditional_depth += 1;
                 self.visit_body(body);
+                self.conditional_depth -= 1;
                 self.scope.fields = fields;
                 continue;
             }
@@ -2834,6 +2940,7 @@ impl Checker<'_> {
         let outer = self.scope;
         let outer_aliases = self.aliases.clone();
         let outer_local_classes = self.local_classes.clone();
+        let outer_metaclass_classes = self.metaclass_classes.clone();
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
             fields: None,
@@ -2845,6 +2952,7 @@ impl Checker<'_> {
         self.lexical_scope.pop();
         self.aliases = outer_aliases;
         self.local_classes = outer_local_classes;
+        self.metaclass_classes = outer_metaclass_classes;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
@@ -3352,6 +3460,41 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__and__"
             | "__xor__"
             | "__or__"
+            // Reflected operands, which Python tries when the left operand's
+            // method is missing or returns `NotImplemented`.
+            | "__radd__"
+            | "__rsub__"
+            | "__rmul__"
+            | "__rmatmul__"
+            | "__rtruediv__"
+            | "__rfloordiv__"
+            | "__rmod__"
+            | "__rdivmod__"
+            | "__rpow__"
+            | "__rlshift__"
+            | "__rrshift__"
+            | "__rand__"
+            | "__rxor__"
+            | "__ror__"
+            // Augmented assignment, e.g. `total += item`.
+            | "__iadd__"
+            | "__isub__"
+            | "__imul__"
+            | "__imatmul__"
+            | "__itruediv__"
+            | "__ifloordiv__"
+            | "__imod__"
+            | "__ipow__"
+            | "__ilshift__"
+            | "__irshift__"
+            | "__iand__"
+            | "__ixor__"
+            | "__ior__"
+            // Unary operators and `abs()`.
+            | "__neg__"
+            | "__pos__"
+            | "__abs__"
+            | "__invert__"
     )
 }
 
@@ -3368,6 +3511,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer = self.scope;
                 let outer_aliases = self.aliases.clone();
                 let outer_local_classes = self.local_classes.clone();
+                let outer_metaclass_classes = self.metaclass_classes.clone();
                 let old_header = self.header;
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
@@ -3380,7 +3524,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     kept_default: false,
                 };
                 self.class_constructs
-                    .push(class_constructs_safely(class, &self.aliases));
+                    .push(self.class_constructs_safely(class));
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
                 self.method_aliases.push(class_method_aliases(class));
@@ -3403,7 +3547,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         qualified,
                         style,
                         inherits: matches!(inherited, Inherited::Unknown),
-                        constructs: generates_init(class, &self.aliases),
+                        constructs: self.generates_init(class),
                         kw_only: decorator_says_kw_only(class, &self.aliases),
                         fields,
                         removed,
@@ -3418,6 +3562,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // how this class's bases were resolved.
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
+                self.metaclass_classes = outer_metaclass_classes;
+                self.record_metaclass_construction(class);
                 self.record_base_field_class(class.name.as_str(), style);
                 self.leave_class();
                 let collector = self
@@ -3935,27 +4081,55 @@ fn class_defaults_are_fixable(class: &ast::StmtClassDef, aliases: &Aliases) -> b
     })
 }
 
-fn class_constructs_safely(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
-    generates_init(class, aliases) && class_defaults_are_fixable(class, aliases)
+fn class_constructs_safely(
+    class: &ast::StmtClassDef,
+    aliases: &Aliases,
+    metaclass_classes: &BTreeSet<String>,
+) -> bool {
+    generates_init(class, aliases, metaclass_classes) && class_defaults_are_fixable(class, aliases)
 }
 
-/// Whether the decorator leaves the class with a generated `__init__`.
-fn generates_init(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
-    // `dataclasses` checks the completed class namespace, not just method
-    // definitions. An assignment, import, or nested definition under this
-    // name suppresses generation just as `def __init__` does.
-    let defines_init = BoundNames::of_body(&class.body).names.contains("__init__");
-    // An explicit metaclass controls construction before the generated
-    // initializer is reached. Its `__call__` signature is not recoverable
-    // from this class body, so field arguments cannot safely be added.
-    let has_metaclass = class.arguments.as_deref().is_some_and(|arguments| {
+/// Whether a class names a metaclass of its own.
+fn declares_metaclass(class: &ast::StmtClassDef) -> bool {
+    class.arguments.as_deref().is_some_and(|arguments| {
         arguments.keywords.iter().any(|keyword| {
             keyword
                 .arg
                 .as_ref()
                 .is_some_and(|name| name.as_str() == "metaclass")
         })
-    });
+    })
+}
+
+/// Whether a class takes a metaclass from a base defined in the same file.
+fn inherits_metaclass(class: &ast::StmtClassDef, metaclass_classes: &BTreeSet<String>) -> bool {
+    class.arguments.as_deref().is_some_and(|arguments| {
+        arguments
+            .args
+            .iter()
+            .filter_map(|base| match base {
+                Expr::Name(name) => Some(name.id.as_str()),
+                _ => None,
+            })
+            .any(|base| metaclass_classes.contains(base))
+    })
+}
+
+/// Whether the decorator leaves the class with a generated `__init__`.
+fn generates_init(
+    class: &ast::StmtClassDef,
+    aliases: &Aliases,
+    metaclass_classes: &BTreeSet<String>,
+) -> bool {
+    // `dataclasses` checks the completed class namespace, not just method
+    // definitions. An assignment, import, or nested definition under this
+    // name suppresses generation just as `def __init__` does.
+    let defines_init = BoundNames::of_body(&class.body).names.contains("__init__");
+    // A metaclass controls construction before the generated initializer is
+    // reached. Its `__call__` signature is not recoverable from this class
+    // body, so field arguments cannot safely be added. A metaclass is
+    // inherited, so a base carrying one makes the subclass unsafe too.
+    let has_metaclass = declares_metaclass(class) || inherits_metaclass(class, metaclass_classes);
     !defines_init
         && !has_metaclass
         && !class.decorator_list.iter().any(|decorator| {
@@ -5098,11 +5272,20 @@ impl Rewriter<'_> {
     fn binding(&self, name: &str) -> Option<&Binding> {
         for (index, bindings) in self.bindings.iter().enumerate().rev() {
             if let Some(binding) = bindings.get(name) {
-                return (!(index == 0 && self.invalidated_bindings.contains(name)))
-                    .then_some(binding);
+                return (!(index == 0 && self.binding_is_replaced(name))).then_some(binding);
             }
         }
         None
+    }
+
+    /// Whether a module-scope import has been replaced by a later binding.
+    ///
+    /// `import pkg.api` is keyed by the whole dotted path, but Python binds
+    /// only `pkg`. Rebinding that one name replaces what every `pkg.…`
+    /// expression reaches, so the dotted entry goes with it.
+    fn binding_is_replaced(&self, name: &str) -> bool {
+        let head = name.split('.').next().unwrap_or(name);
+        self.invalidated_bindings.contains(name) || self.invalidated_bindings.contains(head)
     }
 
     fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
@@ -5342,6 +5525,7 @@ impl Rewriter<'_> {
             self.edits.push(Edit {
                 range: TextRange::empty(call.arguments.keywords[0].start()),
                 replacement: format!("{positional}, "),
+                site: call.start(),
             });
             if arguments.keywords.is_empty() {
                 return;
@@ -5379,7 +5563,48 @@ impl Rewriter<'_> {
         self.edits.push(Edit {
             range: TextRange::empty(offset),
             replacement,
+            site: call.start(),
         });
+    }
+
+    /// Walk a comprehension, giving its targets a scope of their own.
+    ///
+    /// The leftmost iterable is evaluated in the scope containing the
+    /// comprehension, so the targets do not shadow anything in it. Walking it
+    /// inside the comprehension's scope would skip a call whose name matches a
+    /// target, leaving that call unrewritten after its default was removed.
+    fn visit_comprehension<'a>(
+        &mut self,
+        expression: &'a Expr,
+        generators: &'a [ast::Comprehension],
+    ) where
+        Self: Visitor<'a>,
+    {
+        let Some((first, rest)) = generators.split_first() else {
+            return;
+        };
+        self.visit_expr(&first.iter);
+        self.scopes.push(BoundNames::of_comprehension(generators));
+        for generator in std::iter::once(first).chain(rest) {
+            if !std::ptr::eq(generator, first) {
+                self.visit_expr(&generator.iter);
+            }
+            self.visit_expr(&generator.target);
+            for condition in &generator.ifs {
+                self.visit_expr(condition);
+            }
+        }
+        match expression {
+            Expr::ListComp(comprehension) => self.visit_expr(&comprehension.elt),
+            Expr::SetComp(comprehension) => self.visit_expr(&comprehension.elt),
+            Expr::Generator(comprehension) => self.visit_expr(&comprehension.elt),
+            Expr::DictComp(comprehension) => {
+                self.visit_expr(&comprehension.key);
+                self.visit_expr(&comprehension.value);
+            }
+            _ => {}
+        }
+        self.scopes.pop();
     }
 
     /// Rewrite a bare decorator as an explicit one-argument wrapper when its
@@ -5426,6 +5651,7 @@ impl Rewriter<'_> {
             replacement: format!(
                 "lambda __no_defaults_decorated: {original}(__no_defaults_decorated, {supplied})"
             ),
+            site: expression.start(),
         });
     }
 }
@@ -5524,6 +5750,33 @@ struct MissingArguments {
     keywords: Vec<String>,
 }
 
+/// The names a statement binds itself, not counting what its body binds.
+///
+/// An import inside a loop is a new binding rather than a replacement of one,
+/// so only the statement's own targets replace what an earlier import bound.
+/// Statements in the body reach the same handling on their own.
+fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
+    let mut bound = BoundNames::default();
+    match statement {
+        Stmt::Assign(assign) => assign.targets.iter().for_each(|target| bound.bind(target)),
+        Stmt::AnnAssign(assign) => bound.bind(&assign.target),
+        Stmt::AugAssign(assign) => bound.bind(&assign.target),
+        Stmt::For(loop_statement) => bound.bind(&loop_statement.target),
+        Stmt::With(block) => {
+            for item in &block.items {
+                if let Some(target) = &item.optional_vars {
+                    bound.bind(target);
+                }
+            }
+        }
+        // `except … as name` does not replace a module-level binding for later
+        // statements: the name is deleted when the handler ends, and if the
+        // handler never runs the prior binding is untouched.
+        _ => {}
+    }
+    bound.names
+}
+
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_decorator(&mut self, decorator: &'a ast::Decorator) {
         if matches!(decorator.expression, Expr::Name(_) | Expr::Attribute(_)) {
@@ -5564,12 +5817,21 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
             }
-            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.scopes.is_empty() => {
-                // The right-hand side still sees the imported binding; the
-                // assignment replaces it only after that expression runs.
+            Stmt::Assign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::AugAssign(_)
+            | Stmt::For(_)
+            | Stmt::With(_)
+                if self.scopes.is_empty() =>
+            {
+                // Every one of these binds a module-level name of its own — an
+                // assignment target, a loop target, or a context-manager
+                // target — and replaces whatever an import bound there. The
+                // statement is walked first: what it evaluates still sees the
+                // old binding, and a nested statement reaches this arm on its
+                // own rather than through the one holding it.
                 walk_stmt(self, statement);
-                let bound = BoundNames::of_body(std::slice::from_ref(statement));
-                self.invalidated_bindings.extend(bound.names);
+                self.invalidated_bindings.extend(rebound_names(statement));
             }
             Stmt::ClassDef(class) => {
                 // The class header is evaluated before its local namespace is
@@ -5645,9 +5907,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             _ => None,
         };
         if let Some(generators) = comprehension {
-            self.scopes.push(BoundNames::of_comprehension(generators));
-            walk_expr(self, expression);
-            self.scopes.pop();
+            self.visit_comprehension(expression, generators);
             return;
         }
         match expression {
@@ -5867,10 +6127,7 @@ mod tests {
                 .edits
                 .entry(diagnostic.path.clone())
                 .or_default()
-                .push(Edit {
-                    range,
-                    replacement: String::new(),
-                });
+                .push(Edit::deletion(range));
         }
         let mut updated = 0;
         let mut unfixed = BTreeSet::new();
@@ -6878,6 +7135,20 @@ mod tests {
     }
 
     #[test]
+    fn the_word_noqa_in_a_note_is_not_a_directive() {
+        // The coded directive names another rule, so it does not apply here.
+        // The word in the note after it must not blanket this one.
+        let found = messages(
+            "def a(x=1): pass  # noqa: E501  keep noqa
+def b(x=1): pass  # type: ignore  # noqa
+",
+            false,
+        );
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("function `a`"));
+    }
+
+    #[test]
     fn blanket_noqa_accepts_a_following_explanation() -> Result<(), String> {
         let source = "def target(value=1): pass  # noqa  # compatibility\n";
         assert!(messages(source, false).is_empty());
@@ -7655,6 +7926,63 @@ mod tests {
     fn iterator_defaults_are_retained_for_protocol_calls() {
         let source =
             "class C:\n    def __iter__(self, extra=None):\n        return iter(())\n\niter(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn reflected_operator_defaults_are_retained_for_protocol_calls() {
+        // Python reaches `__radd__` through syntax, so there is no written
+        // call for the fixer to add the removed default back to.
+        let source = "class C:\n    def __radd__(self, other, extra=None):\n        return self\n\n1 + C()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn augmented_assignment_defaults_are_retained_for_protocol_calls() {
+        // Python reaches `__iadd__` through syntax, so there is no written
+        // call for the fixer to add the removed default back to.
+        let source = "class C:\n    def __iadd__(self, other, extra=None):\n        return self\n\ntotal = C()\ntotal += 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn unary_operator_defaults_are_retained_for_protocol_calls() {
+        // Python reaches `__neg__` through syntax, so there is no written
+        // call for the fixer to add the removed default back to.
+        let source = "class C:\n    def __neg__(self, extra=None):\n        return self\n\n-C()\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -8746,6 +9074,82 @@ mod tests {
     }
 
     #[test]
+    fn a_dataclass_inheriting_a_metaclass_has_no_assumed_call_signature() {
+        // A metaclass is inherited, so `C` is built by `Meta` too even though
+        // it names no `metaclass=` of its own.
+        let source = "from dataclasses import dataclass\n\nclass Meta(type):\n    def __call__(cls):\n        return 5\n\nclass Base(metaclass=Meta):\n    pass\n\n@dataclass\nclass C(Base):\n    value: int = 1\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_redefined_base_without_a_metaclass_is_not_treated_as_metaclass_built() {
+        // An earlier `Base` that named a metaclass must not stick after a
+        // later plain `Base` takes its place.
+        let source = "from dataclasses import dataclass\n\nclass Meta(type):\n    def __call__(cls):\n        return 5\n\nclass Base(metaclass=Meta):\n    pass\n\nclass Base:\n    pass\n\n@dataclass\nclass C(Base):\n    value: int = 1\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+        assert_eq!(checked.signatures.len(), 1);
+    }
+
+    #[test]
+    fn a_metaclass_base_inside_a_function_does_not_leak() {
+        let source = "from dataclasses import dataclass\n\nclass Meta(type):\n    def __call__(cls):\n        return 5\n\ndef build():\n    class Base(metaclass=Meta):\n        pass\n\n@dataclass\nclass Base:\n    value: int = 1\n\n@dataclass\nclass C(Base):\n    extra: int = 2\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.fix.is_some()));
+        assert_eq!(checked.signatures.len(), 2);
+    }
+
+    #[test]
+    fn a_dataclass_only_type_checkers_see_is_not_rewritten() {
+        // The block does not run, so the class has no constructor at runtime
+        // and no call for the fixer to keep in step with.
+        let source = "from typing import TYPE_CHECKING\nfrom dataclasses import dataclass\n\nif TYPE_CHECKING:\n    @dataclass\n    class C:\n        value: int = 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
     fn a_name_bound_in_an_enclosing_scope_is_not_the_fixed_function() -> Result<(), String> {
         let source = "def connect(host, timeout=30):\n    pass\n\n\n\
                       def wrapper(connect):\n    connect(\"h\")\n\n\n\
@@ -8800,6 +9204,31 @@ mod tests {
     }
 
     #[test]
+    fn a_lambda_default_in_a_condition_is_reported() {
+        // The test of an `if`, `elif`, or `while` is ordinary code that runs
+        // when the clause is reached.
+        for source in [
+            "if (lambda value=1: value)():\n    pass\n",
+            "if False:\n    pass\nelif (lambda value=1: value)():\n    pass\n",
+            "while (lambda value=1: value)():\n    break\n",
+        ] {
+            assert_eq!(messages(source, false).len(), 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_loop_over_an_empty_literal_never_runs() {
+        // `{}` is the empty mapping literal, and the only empty literal that
+        // cannot be written as a set, so it belongs with the others.
+        for empty in ["()", "[]", "set()", "{}"] {
+            let source = format!("for _ in {empty}:\n    def target(value=1): pass\n");
+            let found = messages(&source, false);
+            let expected: usize = usize::from(empty == "set()");
+            assert_eq!(found.len(), expected, "{empty}");
+        }
+    }
+
+    #[test]
     fn every_shape_that_binds_a_name_shadows_it() -> Result<(), String> {
         for binding in [
             "connect = open",
@@ -8847,6 +9276,28 @@ mod tests {
         );
         assert!(skipped_reasons(source)?.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn definitions_competing_across_branches_keep_their_defaults() {
+        // Which one survives is not knowable, so neither may lose a default
+        // while the call is left as written.
+        let source = "import os\n\nif os.environ:\n    def target(value=1): pass\nelse:\n    def target(value=2): pass\n\ntarget()\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.fix.is_none()));
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]
@@ -8946,6 +9397,19 @@ mod tests {
             skipped_reasons(source)?,
             ["this call cannot be tied to the definition that was fixed"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_comprehensions_leftmost_iterable_is_outside_its_scope() -> Result<(), String> {
+        // Python evaluates that iterable before the targets exist, so the
+        // call in it is the outer `target` and has to be kept in step.
+        let source = "def target(value=1): return value\n\nresult = [x for target in [target()] for x in [1]]\n";
+        assert_eq!(
+            fixed(source)?,
+            "def target(value): return value\n\nresult = [x for target in [target(value=1)] for x in [1]]\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
         Ok(())
     }
 
@@ -9171,10 +9635,7 @@ mod tests {
                 edits
                     .entry(diagnostic.path.clone())
                     .or_default()
-                    .push(Edit {
-                        range,
-                        replacement: String::new(),
-                    });
+                    .push(Edit::deletion(range));
             }
         }
         let mut updated = 0;
@@ -9453,17 +9914,17 @@ mod tests {
             (
                 broken.clone(),
                 // Delete the `)`, which cannot parse.
-                vec![Edit {
-                    range: TextRange::new(TextSize::new(9), TextSize::new(10)),
-                    replacement: String::new(),
-                }],
+                vec![Edit::deletion(TextRange::new(
+                    TextSize::new(9),
+                    TextSize::new(10),
+                ))],
             ),
             (
                 sound.clone(),
-                vec![Edit {
-                    range: TextRange::new(TextSize::new(7), TextSize::new(9)),
-                    replacement: String::new(),
-                }],
+                vec![Edit::deletion(TextRange::new(
+                    TextSize::new(7),
+                    TextSize::new(9),
+                ))],
             ),
         ]);
         let mut updated = 0;

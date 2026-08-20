@@ -1370,6 +1370,25 @@ fn a_syntax_error_is_reported_in_json() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// One call needing both a positional and a keyword insertion is one call
+/// site, not two.
+#[test]
+fn one_call_needing_two_insertions_counts_once() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    // `b` is positional-only, so it goes in ahead of the existing keyword,
+    // while `d` is appended after it.
+    std::fs::write(&path, "def f(a, b=1, /, *, c=2, d=3): pass\n\nf(1, c=9)\n")?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("Updated 1 call site."), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        "def f(a, b, /, *, c, d): pass\n\nf(1, 1, c=9, d=3)\n"
+    );
+    Ok(())
+}
+
 #[test]
 fn fixing_honours_the_json_output_format() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
@@ -1577,6 +1596,85 @@ fn fix_updates_calls_reached_through_an_unaliased_dotted_import(
     assert_eq!(
         std::fs::read_to_string(caller)?,
         "import pkg.api\n\npkg.api.target(value=1)\n"
+    );
+    Ok(())
+}
+
+/// `import pkg.api` binds only `pkg`, so replacing that name replaces what
+/// every `pkg.…` expression reaches.
+#[test]
+fn rebinding_a_package_name_drops_its_dotted_import() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    std::fs::write(package.join("__init__.py"), "")?;
+    std::fs::write(
+        package.join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    let source = "import pkg.api\n\npkg = object()\n\npkg.api.target()\n";
+    std::fs::write(&caller, source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(caller)?, source);
+    Ok(())
+}
+
+/// A loop or context-manager target at module scope replaces what an import
+/// bound under that name. An `except … as` target does not: the name is deleted
+/// when the handler ends, and if the handler never runs the import still binds.
+#[test]
+fn module_level_targets_replace_an_imported_name() -> Result<(), Box<dyn std::error::Error>> {
+    for rebinding in [
+        "for mod in [1]:\n    pass\n",
+        "with open(\"f\") as mod:\n    pass\n",
+    ] {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("mod.py"),
+            "def target(value=1): return value\n",
+        )?;
+        let caller = directory.path().join("caller.py");
+        let source = format!("import mod\n\n{rebinding}\nmod.target()\n");
+        std::fs::write(&caller, &source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(std::fs::read_to_string(&caller)?, source, "{rebinding}");
+    }
+    Ok(())
+}
+
+/// `except … as` does not replace a module-level import for later statements.
+#[test]
+fn except_as_does_not_replace_an_imported_name() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("mod.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &caller,
+        "import mod\n\ntry:\n    pass\nexcept Exception as mod:\n    pass\n\nmod.target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import mod\n\ntry:\n    pass\nexcept Exception as mod:\n    pass\n\nmod.target(value=1)\n"
     );
     Ok(())
 }

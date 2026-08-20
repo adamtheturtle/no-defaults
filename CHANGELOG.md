@@ -4,6 +4,31 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+### Added
+
+- `--fix` resolves call sites it previously left alone. A method reached through a constructed instance — `C().fetch()` — an alias bound in a class body, an inherited method reached through `self` or `super()`, and a normal class's `__init__` reached as `C(...)` are all rewritten now. So are calls through star imports, package attributes, unaliased dotted imports, namespace packages, and a `staticmethod` or `classmethod` reached through the binding it was imported under. A nested function or dataclass is resolved within the scope that holds it, and a class nested in another scope is told apart from a module-level class of the same name.
+- `PYTHONPATH` is used when resolving imports, so a project whose layout depends on it has its call sites updated. Where an explicit root and the importer's own directory name different files the import is ambiguous, and the call is reported rather than rewritten against a guess.
+- `--diff` lists the diagnostics it cannot fix, and `--fix` prints the ones that remain after writing, so neither mode implies everything was handled.
+- A `# noqa` may carry an explanation after a blanket directive and after a file-level one, and Flake8's whitespace forms are accepted.
+
+### Changed
+
+- A default on a parameter of an implicitly called method is reported but never removed. The interpreter is the caller, so there is no call site that could be given the argument back, and removing it changed behaviour. This covers the context manager, iterator and async iterator protocols, `__len__` and `__length_hint__`, subscription, `__contains__`, `__missing__`, `__reversed__`, the comparison, arithmetic, bitwise and matrix operators, `divmod` and `pow`, the `str`, `repr`, `bytes`, `format`, `hash`, `bool`, `index`, `int`, `float`, `complex` and `os.PathLike` conversions, `round`, `trunc`, `floor` and `ceil`, along with `__call__`, `__init_subclass__`, a dataclass's `__post_init__`, and a property getter.
+- Defaults in a `.pyi` stub are reported but retained. A stub describes a signature rather than supplying one, so removing the default there does not match what the implementation does.
+- A decorator that is not `dataclass` keeps the defaults of what it decorates, because it may replace the callable or the constructor that the rewritten call sites would target. This applies to a decorator on a function and on a class, and in every form it is written in: a bare name, a factory such as `@replace()`, and an attribute such as `@mod.replace`.
+- Whether a class carries fields is decided by what its names are bound to rather than by how they are spelled. A locally defined `dataclass`, `field` or `Field`, a `BaseModel` declared in the file, an aliased `ClassVar`, and a `KW_ONLY` marker reached through a `dataclasses` import are each resolved to the definition in force at that point, and a name rebound later stops standing for what it did before.
+- A class whose field list is not one reliable shape is left alone. Fields declared inside a conditional, a loop, a `try`, a `match` case, or an `if TYPE_CHECKING:` block do not describe the constructor the class ends up with, and a field that a later statement deletes or overwrites is not treated as settled. Imports in those blocks still bind the names the rest of the file is written against.
+- A name beginning with two underscores, other than a dunder, counts as private, and a Pydantic private attribute or an underscore-prefixed model attribute is not a field.
+
+### Fixed
+
+- A definition named through a symlink and one named through its target are one module, so a call is tied to the definition that was fixed rather than left behind. A directory walk follows symlinked Python files, a fix writes through to the target instead of replacing the link, and a hard-linked file is refused rather than silently detached from its other names. Two spellings of one path given on the command line are checked once.
+- Names are bound in statement order, so a call earlier in a file is resolved against what the name meant there. An import, a class-body assignment, a dataclass alias and a module-level rebinding no longer reach backwards over calls that precede them.
+- A diagnostic's quoted source line escapes control characters instead of passing them to the terminal, and its caret is placed by display width, so a tab or a wide character does not push it out of line.
+- `--fix` keeps a signature valid: a positional default is inserted ahead of the keywords it precedes, a lambda keeps its positional order, and a default that has to stay keeps the defaults after it.
+- A removed `default_factory` is not recreated at the call site when its value is a container, so callers do not start sharing one object.
+- A closed stdout pipe, a non-UTF-8 source file, and a directory that cannot be walked are each reported without aborting the run, `--diff` rejects the machine-readable output formats it cannot produce, and `--show-settings` rejects being combined with a mode that writes.
+
 ## 2.1.0 - 2026-08-07
 
 Anyone on 2.0.0 who uses `--fix` on a project containing `.pyi` stubs should upgrade: see the first entry under `### Fixed`.

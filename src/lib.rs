@@ -4673,6 +4673,35 @@ struct Rewriter<'a> {
 }
 
 impl Rewriter<'_> {
+    fn in_class_scope(&self) -> bool {
+        self.class_scope_depths.last() == Some(&self.scopes.len())
+    }
+
+    /// Bind in the class body what a statement in it binds, once that
+    /// statement has run: a class body binds in statement order.
+    fn bind_statement_in_class(&mut self, statement: &Stmt) {
+        if let Some(scope) = self.scopes.last_mut() {
+            let bound = BoundNames::of_body(std::slice::from_ref(statement));
+            scope.names.extend(bound.names);
+            scope.functions.extend(bound.functions);
+            scope.classes.extend(bound.classes);
+        }
+    }
+
+    fn bind_definition_in_class(&mut self, name: &str, is_class: bool) {
+        if !self.in_class_scope() {
+            return;
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.names.insert(name.to_owned());
+            if is_class {
+                scope.classes.insert(name.to_owned());
+            } else {
+                scope.functions.insert(name.to_owned());
+            }
+        }
+    }
+
     /// Whether the nearest lexical binding for `name` is a nested callable.
     /// `None` means no enclosing scope binds it at all.
     fn nested_callable(&self, name: &str) -> Option<bool> {
@@ -5126,6 +5155,10 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     );
                 }
             }
+            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.in_class_scope() => {
+                walk_stmt(self, statement);
+                self.bind_statement_in_class(statement);
+            }
             Stmt::Assign(assign) if self.scopes.is_empty() => {
                 // The right-hand side still sees the imported binding; the
                 // assignment replaces it only after that expression runs.
@@ -5161,12 +5194,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_arguments(arguments);
                 }
                 self.classes.push(class.name.to_string());
-                self.scopes.push(BoundNames::of_body(&class.body));
+                self.scopes.push(BoundNames::default());
                 self.class_scope_depths.push(self.scopes.len());
                 self.visit_body(&class.body);
                 self.class_scope_depths.pop();
                 self.scopes.pop();
                 self.classes.pop();
+                self.bind_definition_in_class(class.name.as_str(), true);
             }
             Stmt::FunctionDef(function) => {
                 // Decorators run while the function object is being created,
@@ -5204,6 +5238,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.scopes.pop();
                 self.bindings.pop();
                 self.implicit_receivers.pop();
+                self.bind_definition_in_class(function.name.as_str(), false);
             }
             _ => walk_stmt(self, statement),
         }
@@ -8422,7 +8457,12 @@ mod tests {
             fixed(source)?,
             "def target(value):\n    return lambda cls: cls\n\n@target(value=1)\nclass C:\n    target = 5\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        // The body's `target` is the enclosing name until the assignment
+        // binds it, exactly as at module scope, so naming it is reported.
+        assert_eq!(
+            skipped_reasons(source)?,
+            ["it is named here without being called, so the removed default cannot be supplied"]
+        );
         Ok(())
     }
 

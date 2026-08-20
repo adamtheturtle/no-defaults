@@ -2133,3 +2133,21 @@ fn imports_inside_exhaustive_match_cases_resolve_calls() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[test]
+fn nested_dataclass_names_do_not_pollute_module_inheritance(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\n\ndef factory():\n    @dataclass\n    class Base:\n        nested: int = 1\n\n@dataclass\nclass Base:\n    pass\n\n@dataclass\nclass Child(Base):\n    own: int = 2\n\nChild()\n",
+    )?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("nested: int\n"), "{fixed}");
+    assert!(fixed.contains("own: int\n"), "{fixed}");
+    assert!(fixed.ends_with("Child(own=2)\n"), "{fixed}");
+    Ok(())
+}

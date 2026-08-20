@@ -2214,6 +2214,7 @@ fn check_source(
         repeated_functions,
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
+        lexical_scope: Vec::new(),
         scope: Scope {
             private: is_private_module(path, project_root, reexports),
             ..Scope::default()
@@ -2488,6 +2489,9 @@ struct Checker<'a> {
     /// What each field-carrying class of this file's own contributes to a
     /// subclass's constructor, by the name it was defined under.
     shapes: BTreeMap<String, Option<Shape>>,
+    /// Enclosing definitions, used to keep same-named nested class shapes
+    /// separate from classes in other lexical scopes.
+    lexical_scope: Vec<String>,
     scope: Scope,
     /// Start of the `def` or `class` line that owns the violations being
     /// reported, so one directive there can cover every parameter of a
@@ -2574,6 +2578,43 @@ impl Checker<'_> {
         walk_stmt(self, statement);
     }
 
+    /// What a class's bases contribute to its constructor.
+    fn inherited_fields(&self, class: &ast::StmtClassDef, style: Option<FieldStyle>) -> Inherited {
+        let carrying: Vec<&Expr> = class_bases(class)
+            .filter(|base| {
+                !carries_no_fields(
+                    base,
+                    &self.aliases,
+                    &self.local_classes,
+                    &self.module_bindings,
+                )
+            })
+            // The base that made the class carry fields contributes none itself.
+            .filter(|base| {
+                !(matches!(style, Some(FieldStyle::Base))
+                    && self.field_bases.matches(base, &self.aliases))
+            })
+            .collect();
+        match carrying.as_slice() {
+            [] => Inherited::Nothing,
+            // `dataclasses` walks the reverse MRO to order the fields of several
+            // bases, and writing them in the wrong order is worse than not writing
+            // them, so one base is as far as this goes.
+            [Expr::Name(name)] => {
+                let qualified = qualified_class_name(&self.lexical_scope, name.id.as_str());
+                match self.shapes.get(&qualified) {
+                    // An unqualified name is the only form that can be tied to a
+                    // class of this file's own. A name two classes share resolves
+                    // to neither, and a base whose own constructor is unknown
+                    // makes this one unknown too.
+                    Some(Some(shape)) if shape.complete => Inherited::Known(shape.clone()),
+                    _ => Inherited::Unknown,
+                }
+            }
+            _ => Inherited::Unknown,
+        }
+    }
+
     fn class_field_style(&self, class: &ast::StmtClassDef) -> Option<FieldStyle> {
         field_style(
             class,
@@ -2608,7 +2649,9 @@ impl Checker<'_> {
             class_body: false,
             kept_default: false,
         };
+        self.lexical_scope.push(function.name.to_string());
         walk_stmt(self, statement);
+        self.lexical_scope.pop();
         self.aliases = outer_aliases;
         self.local_classes = outer_local_classes;
         self.scope = outer;
@@ -3062,16 +3105,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
-            Stmt::FunctionDef(function) => {
-                self.visit_function_statement(function, statement);
-            }
+            Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
             Stmt::ClassDef(class) => {
                 let outer = self.scope;
                 let outer_aliases = self.aliases.clone();
                 let outer_local_classes = self.local_classes.clone();
                 let old_header = self.header;
-                // As with a `def` line, the name locates the `class` line a
-                // directive covering every field sits on.
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
                 self.scope = Scope {
@@ -3085,15 +3124,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.class_constructs
                     .push(class_constructs_safely(class, &self.aliases));
                 if self.collect_signatures {
-                    let inherited = inherited_fields(
-                        class,
-                        style,
-                        self.field_bases,
-                        &self.aliases,
-                        &self.local_classes,
-                        &self.module_bindings,
-                        &self.shapes,
-                    );
+                    let inherited = self.inherited_fields(class, style);
                     // A base of this file's own contributes its fields ahead of
                     // the body's, which is where `dataclasses` puts them, and
                     // its removed defaults too: a subclass constructed with
@@ -3115,7 +3146,10 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         removed,
                     });
                 }
+                let shape_name = qualified_class_name(&self.lexical_scope, class.name.as_str());
+                self.lexical_scope.push(class.name.to_string());
                 walk_stmt(self, statement);
+                self.lexical_scope.pop();
                 // The class name becomes visible only after its body has
                 // executed. A later class with the same name must not change
                 // how this class's bases were resolved.
@@ -3123,11 +3157,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.local_classes.insert(class.name.to_string());
                 self.record_base_field_class(class.name.as_str(), style);
                 self.class_constructs.pop();
-                if let Some(collector) = self
+                let collector = self
                     .collect_signatures
                     .then(|| self.classes.pop())
-                    .flatten()
-                {
+                    .flatten();
+                if let Some(collector) = collector {
                     if collector.style.is_some() {
                         // Recorded whether or not anything was removed: a base
                         // contributes its field order either way. A name two
@@ -3138,7 +3172,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                             complete: !collector.inherits,
                             kept_default: self.scope.kept_default,
                         };
-                        match self.shapes.entry(collector.name.clone()) {
+                        match self.shapes.entry(shape_name) {
                             Entry::Vacant(entry) => {
                                 entry.insert(Some(shape));
                             }
@@ -3264,34 +3298,11 @@ struct Shape {
     kept_default: bool,
 }
 
-fn inherited_fields(
-    class: &ast::StmtClassDef,
-    style: Option<FieldStyle>,
-    bases: &FieldBases,
-    aliases: &Aliases,
-    local: &BTreeSet<String>,
-    module_bindings: &BTreeSet<String>,
-    shapes: &BTreeMap<String, Option<Shape>>,
-) -> Inherited {
-    let carrying: Vec<&Expr> = class_bases(class)
-        .filter(|base| !carries_no_fields(base, aliases, local, module_bindings))
-        // The base that made the class carry fields contributes none itself.
-        .filter(|base| !(matches!(style, Some(FieldStyle::Base)) && bases.matches(base, aliases)))
-        .collect();
-    match carrying.as_slice() {
-        [] => Inherited::Nothing,
-        // `dataclasses` walks the reverse MRO to order the fields of several
-        // bases, and writing them in the wrong order is worse than not writing
-        // them, so one base is as far as this goes.
-        [Expr::Name(name)] => match shapes.get(name.id.as_str()) {
-            // An unqualified name is the only form that can be tied to a class
-            // of this file's own. A name two classes share resolves to
-            // neither, and a base whose own constructor is unknown makes this
-            // one unknown too.
-            Some(Some(shape)) if shape.complete => Inherited::Known(shape.clone()),
-            _ => Inherited::Unknown,
-        },
-        _ => Inherited::Unknown,
+fn qualified_class_name(scope: &[String], name: &str) -> String {
+    if scope.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}.{name}", scope.join("."))
     }
 }
 
@@ -8420,8 +8431,10 @@ mod tests {
             "@dataclass\nclass A:\n    a: int = 1\n\n\n@dataclass\nclass B:\n    b: int = 2\n\n\n@dataclass\nclass C(A, B):\n    c: int = 3\n\n\nC()\n",
             // A base whose own constructor is unknown.
             "@dataclass\nclass Middle(Imported):\n    a: int = 1\n\n\n@dataclass\nclass Child(Middle):\n    b: int = 2\n\n\nChild()\n",
-            // A name two classes of this file share resolves to neither.
-            "@dataclass\nclass Parent:\n    a: int = 1\n\n\ndef later():\n    @dataclass\n    class Parent:\n        z: int = 9\n\n\n@dataclass\nclass Child(Parent):\n    b: int = 2\n\n\nChild()\n",
+            // A name two classes of this file share resolves to neither. They
+            // have to be in one scope to share it: a class nested in a
+            // function is not the module-level name of the same spelling.
+            "@dataclass\nclass Parent:\n    a: int = 1\n\n\n@dataclass\nclass Parent:\n    z: int = 9\n\n\n@dataclass\nclass Child(Parent):\n    b: int = 2\n\n\nChild()\n",
         ] {
             assert_eq!(
                 skipped_reasons(source)?.first().map(String::as_str),

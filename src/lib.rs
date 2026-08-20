@@ -815,9 +815,7 @@ fn resolve_module(
     if parts.is_empty() {
         return None;
     }
-    if let Some(found) = resolve_from_pythonpath(&parts, known) {
-        return Some(found);
-    }
+    let explicit = resolve_from_pythonpath(&parts, known);
     // Whichever directory is on `sys.path`, a top-level import from this file
     // resolves at or above the file itself, so those are the roots to try —
     // and none of them can reach sideways into another subtree. A directory
@@ -845,8 +843,17 @@ fn resolve_module(
             }
         }
     }
-    if found.is_some() {
-        return found;
+    // An import root given on `PYTHONPATH` is one more root that can answer,
+    // so it is held to the same rule. Python searches the entry script's
+    // directory ahead of `PYTHONPATH`, but which checked file is the entry
+    // script is not knowable, so neither root can be declared the winner:
+    // where the two name different files, the import resolves to nothing and
+    // the call is left alone rather than rewritten against the wrong
+    // definition.
+    match (explicit, found) {
+        (Some(explicit), Some(inferred)) if explicit != inferred => return None,
+        (Some(path), _) | (None, Some(path)) => return Some(path),
+        (None, None) => {}
     }
     // Elsewhere in the tree, a dotted import is still matched by path suffix,
     // because the import root of another source tree is not knowable. A
@@ -884,9 +891,13 @@ fn resolve_module(
     None
 }
 
-/// Resolve a module against explicit import roots before inferring roots from
-/// the checked tree. These roots are authoritative even when a one-component
-/// module lives below a directory that otherwise looks like a package.
+/// Resolve a module against the explicit import roots on `PYTHONPATH`.
+///
+/// These roots reach a one-component module even where it lives below a
+/// directory that otherwise looks like a package, which the roots inferred
+/// from the checked tree do not. They do not outrank those inferred roots: an
+/// import that both answer with different files is ambiguous, and the caller
+/// resolves it to nothing.
 fn resolve_from_pythonpath(parts: &[&str], known: &BTreeSet<&Path>) -> Option<PathBuf> {
     let python_path = std::env::var_os("PYTHONPATH")?;
     let mut found = None;

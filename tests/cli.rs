@@ -1756,6 +1756,43 @@ fn pythonpath_resolves_a_single_component_import_from_a_package_directory(
 }
 
 #[test]
+fn an_import_two_roots_disagree_about_is_left_alone() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let elsewhere = directory.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere)?;
+    // Both roots hold an `api`: the importer's own directory, and the one
+    // named on PYTHONPATH. Which of them Python would import depends on the
+    // entry script, so the call has to be left alone.
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    std::fs::write(
+        elsewhere.join("api.py"),
+        "def target(other=2): return other\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "import api\napi.target()\n")?;
+
+    let output = Command::new(binary())
+        .env("PYTHONPATH", &elsewhere)
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&caller)?,
+        "import api\napi.target()\n",
+        "neither definition can be shown to be the one that runs"
+    );
+    assert!(
+        String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"),
+        "the call is reported rather than silently skipped"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_dotted_import_still_reaches_another_source_root() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let package = directory.path().join("src").join("pkg");

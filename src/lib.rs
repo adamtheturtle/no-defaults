@@ -2653,6 +2653,23 @@ impl Checker<'_> {
         }
     }
 
+    fn invalidate_statement_aliases(&mut self, statement: &Stmt) {
+        let mut bound = BoundNames::default();
+        match statement {
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    bound.bind(target);
+                }
+            }
+            Stmt::AnnAssign(assign) => bound.bind(&assign.target),
+            Stmt::AugAssign(assign) => bound.bind(&assign.target),
+            _ => return,
+        }
+        for name in bound.names {
+            self.aliases.invalidate(&name);
+        }
+    }
+
     fn visit_function_statement<'a>(
         &mut self,
         function: &'a ast::StmtFunctionDef,
@@ -2675,6 +2692,7 @@ impl Checker<'_> {
         self.lexical_scope.pop();
         self.aliases = outer_aliases;
         self.local_classes = outer_local_classes;
+        self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
 
@@ -3218,6 +3236,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 }
                 self.header = old_header;
                 self.aliases = outer_aliases;
+                self.aliases.invalidate(class.name.as_str());
                 self.scope = outer;
             }
             _ => {
@@ -3225,6 +3244,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     self.check_field(style, statement);
                 }
                 walk_stmt(self, statement);
+                self.invalidate_statement_aliases(statement);
             }
         }
     }
@@ -3418,6 +3438,18 @@ struct Aliases {
 }
 
 impl Aliases {
+    fn invalidate(&mut self, name: &str) {
+        self.renamed.remove(name);
+        self.dataclasses_members.remove(name);
+        self.dataclasses_modules.remove(name);
+        self.staticmethods.remove(name);
+        self.classmethods.remove(name);
+        self.builtins_modules.remove(name);
+        self.class_vars.remove(name);
+        self.typing_modules.remove(name);
+        self.kw_only_markers.remove(name);
+    }
+
     /// The `dataclasses` or `pydantic` member `name` was imported as, or `name`
     /// itself when the file did not rename anything to it, or renamed more
     /// than one thing to it.

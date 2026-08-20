@@ -2400,3 +2400,22 @@ fn lambda_parameters_shadow_enclosing_method_receivers() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[test]
+fn aliased_staticmethod_decorators_have_no_implicit_receiver(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from builtins import staticmethod as sm\n\nclass C:\n    @sm\n    def parse(value=1):\n        return value\n\n    def run(self):\n        return self.parse(5)\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "from builtins import staticmethod as sm\n\nclass C:\n    @sm\n    def parse(value):\n        return value\n\n    def run(self):\n        return self.parse(5)\n"
+    );
+    Ok(())
+}

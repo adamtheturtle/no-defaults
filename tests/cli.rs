@@ -1409,20 +1409,13 @@ fn an_ellipsis_default_in_a_stub_is_reported_but_not_fixed(
     let output = Command::new(binary()).arg("--fix").arg(&stub).output()?;
     let stdout = String::from_utf8(output.stdout)?;
     assert!(
-        stdout.contains("Found 3 errors (1 fixed, 2 remaining)."),
+        stdout.contains("Found 3 errors (0 fixed, 3 remaining)."),
         "{stdout}"
     );
     assert_eq!(output.status.code(), Some(1));
-    // `= ...` is the convention for "has a default, unspecified here", so
-    // removing it would make the parameter required and stop the stub matching
-    // the implementation it describes. Only the real default goes.
-    assert_eq!(
-        std::fs::read_to_string(&stub)?,
-        "from typing import overload\n\n\
-         @overload\ndef f(x: int = ...) -> int: ...\n\
-         @overload\ndef f(x: str = ...) -> str: ...\n\
-         def g(y: int) -> int: ...\n"
-    );
+    // Every stub default describes an optional runtime parameter. None can be
+    // removed without changing the implementation the stub advertises.
+    assert_eq!(std::fs::read_to_string(&stub)?, source);
     Ok(())
 }
 

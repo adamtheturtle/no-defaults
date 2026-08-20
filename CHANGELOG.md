@@ -36,6 +36,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - `Updated N call sites` counts calls rather than edits. A call that needed both a positional and a keyword insertion was counted twice.
 - A dataclass that inherits a metaclass from a base in the same file keeps its field defaults, as one naming `metaclass=` directly already did. A metaclass is inherited, and it controls construction before the generated initializer runs.
 - A dataclass defined under `if TYPE_CHECKING:` keeps its field defaults. The block does not run, so the class has no constructor at runtime and no call site the fixer can keep in step with it.
+- A call in a comprehension's leftmost iterable is updated again. Python evaluates that iterable before the loop targets exist, so a call there is the enclosing one and was being skipped as shadowed while its default was removed.
+- Rebinding a package name drops the dotted import under it. After `import pkg.api`, a later `pkg = …` left the `pkg.api` entry in place and calls through it were still rewritten as the original module's.
 
 ## 2.1.0 - 2026-08-07
 

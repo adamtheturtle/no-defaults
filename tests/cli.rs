@@ -1600,6 +1600,31 @@ fn fix_updates_calls_reached_through_an_unaliased_dotted_import(
     Ok(())
 }
 
+/// `import pkg.api` binds only `pkg`, so replacing that name replaces what
+/// every `pkg.…` expression reaches.
+#[test]
+fn rebinding_a_package_name_drops_its_dotted_import() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    std::fs::write(package.join("__init__.py"), "")?;
+    std::fs::write(
+        package.join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    let source = "import pkg.api\n\npkg = object()\n\npkg.api.target()\n";
+    std::fs::write(&caller, source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(caller)?, source);
+    Ok(())
+}
+
 #[test]
 fn from_import_resolves_a_namespace_package_module() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

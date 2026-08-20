@@ -5218,11 +5218,20 @@ impl Rewriter<'_> {
     fn binding(&self, name: &str) -> Option<&Binding> {
         for (index, bindings) in self.bindings.iter().enumerate().rev() {
             if let Some(binding) = bindings.get(name) {
-                return (!(index == 0 && self.invalidated_bindings.contains(name)))
-                    .then_some(binding);
+                return (!(index == 0 && self.binding_is_replaced(name))).then_some(binding);
             }
         }
         None
+    }
+
+    /// Whether a module-scope import has been replaced by a later binding.
+    ///
+    /// `import pkg.api` is keyed by the whole dotted path, but Python binds
+    /// only `pkg`. Rebinding that one name replaces what every `pkg.…`
+    /// expression reaches, so the dotted entry goes with it.
+    fn binding_is_replaced(&self, name: &str) -> bool {
+        let head = name.split('.').next().unwrap_or(name);
+        self.invalidated_bindings.contains(name) || self.invalidated_bindings.contains(head)
     }
 
     fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
@@ -5504,6 +5513,46 @@ impl Rewriter<'_> {
         });
     }
 
+    /// Walk a comprehension, giving its targets a scope of their own.
+    ///
+    /// The leftmost iterable is evaluated in the scope containing the
+    /// comprehension, so the targets do not shadow anything in it. Walking it
+    /// inside the comprehension's scope would skip a call whose name matches a
+    /// target, leaving that call unrewritten after its default was removed.
+    fn visit_comprehension<'a>(
+        &mut self,
+        expression: &'a Expr,
+        generators: &'a [ast::Comprehension],
+    ) where
+        Self: Visitor<'a>,
+    {
+        let Some((first, rest)) = generators.split_first() else {
+            return;
+        };
+        self.visit_expr(&first.iter);
+        self.scopes.push(BoundNames::of_comprehension(generators));
+        for generator in std::iter::once(first).chain(rest) {
+            if !std::ptr::eq(generator, first) {
+                self.visit_expr(&generator.iter);
+            }
+            self.visit_expr(&generator.target);
+            for condition in &generator.ifs {
+                self.visit_expr(condition);
+            }
+        }
+        match expression {
+            Expr::ListComp(comprehension) => self.visit_expr(&comprehension.elt),
+            Expr::SetComp(comprehension) => self.visit_expr(&comprehension.elt),
+            Expr::Generator(comprehension) => self.visit_expr(&comprehension.elt),
+            Expr::DictComp(comprehension) => {
+                self.visit_expr(&comprehension.key);
+                self.visit_expr(&comprehension.value);
+            }
+            _ => {}
+        }
+        self.scopes.pop();
+    }
+
     /// Rewrite a bare decorator as an explicit one-argument wrapper when its
     /// implicit application relies on defaults removed from the decorator.
     fn check_bare_decorator(&mut self, expression: &Expr) {
@@ -5768,9 +5817,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             _ => None,
         };
         if let Some(generators) = comprehension {
-            self.scopes.push(BoundNames::of_comprehension(generators));
-            walk_expr(self, expression);
-            self.scopes.pop();
+            self.visit_comprehension(expression, generators);
             return;
         }
         match expression {
@@ -9199,6 +9246,19 @@ def b(x=1): pass  # type: ignore  # noqa
             skipped_reasons(source)?,
             ["this call cannot be tied to the definition that was fixed"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_comprehensions_leftmost_iterable_is_outside_its_scope() -> Result<(), String> {
+        // Python evaluates that iterable before the targets exist, so the
+        // call in it is the outer `target` and has to be kept in step.
+        let source = "def target(value=1): return value\n\nresult = [x for target in [target()] for x in [1]]\n";
+        assert_eq!(
+            fixed(source)?,
+            "def target(value): return value\n\nresult = [x for target in [target(value=1)] for x in [1]]\n"
+        );
+        assert!(skipped_reasons(source)?.is_empty());
         Ok(())
     }
 

@@ -29,6 +29,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A removed `default_factory` is not recreated at the call site when its value is a container, so callers do not start sharing one object.
 - A closed stdout pipe, a non-UTF-8 source file, and a directory that cannot be walked are each reported without aborting the run, `--diff` rejects the machine-readable output formats it cannot produce, and `--show-settings` rejects being combined with a mode that writes.
 
+- Defaults on the reflected (`__radd__`), augmented-assignment (`__iadd__`), and unary (`__neg__`, `__pos__`, `__abs__`, `__invert__`) operator methods are retained. Python reaches all of them through syntax rather than a written call, so `--fix` had nothing to add the removed default back to and could leave the operator raising `TypeError`.
+- A default on a lambda written in an `if` or `elif` test is reported and fixed again. Clause tests were walked for their truthiness but never checked.
+- `for _ in {}:` is recognised as a loop that never runs, alongside the empty tuple, list, and set. Its body no longer holds back defaults on later fields.
+- The word `noqa` in a note after an unrelated directive — `# noqa: E501  keep noqa` — no longer suppresses `NOD001`. A bare `noqa` counts only when it opens its own comment.
+- `Updated N call sites` counts calls rather than edits. A call that needed both a positional and a keyword insertion was counted twice.
+
 ## 2.1.0 - 2026-08-07
 
 Anyone on 2.0.0 who uses `--fix` on a project containing `.pyi` stubs should upgrade: see the first entry under `### Fixed`.

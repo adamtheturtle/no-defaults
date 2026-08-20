@@ -303,6 +303,21 @@ enum Binding {
 struct Edit {
     range: TextRange,
     replacement: String,
+    /// The call this edit belongs to. One call can need both a positional and
+    /// a keyword insertion, at different offsets, and that is one updated call
+    /// site rather than two.
+    site: TextSize,
+}
+
+impl Edit {
+    /// A deletion, which stands alone and is never counted as a call site.
+    fn deletion(range: TextRange) -> Self {
+        Self {
+            range,
+            replacement: String::new(),
+            site: range.start(),
+        }
+    }
 }
 
 /// A call that could not be updated, and why.
@@ -533,10 +548,7 @@ fn apply_fixes(
             .edits
             .entry(diagnostic.path.clone())
             .or_default()
-            .push(Edit {
-                range,
-                replacement: String::new(),
-            });
+            .push(Edit::deletion(range));
     }
     let mut updated = 0;
     let mut unfixed = BTreeSet::new();
@@ -1770,13 +1782,14 @@ fn apply_edits(source: &str, edits: Vec<Edit>) -> (String, usize) {
             .iter()
             .any(|deletion| deletion.contains(edit.range.start()))
     });
-    let applied = insertions.len();
+    let applied = insertions
+        .iter()
+        .map(|edit| edit.site)
+        .collect::<BTreeSet<_>>()
+        .len();
     let mut edits: Vec<Edit> = insertions
         .into_iter()
-        .chain(deletions.into_iter().map(|range| Edit {
-            range,
-            replacement: String::new(),
-        }))
+        .chain(deletions.into_iter().map(Edit::deletion))
         .collect();
     edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start()));
     let mut fixed = source.to_owned();
@@ -2340,7 +2353,13 @@ fn noqa_marker(body: &str) -> Option<usize> {
             let segment_end = next_segment(rest).unwrap_or(rest.len());
             let segment = rest[..segment_end].trim();
             if segment.is_empty() {
-                return true;
+                // A bare `noqa` suppresses everything, so it only counts when
+                // it opens its own comment. Otherwise the word appearing in a
+                // note after an unrelated directive — `# noqa: E501  keep
+                // noqa` — would silence this rule.
+                let preceding = &body[..*index];
+                let segment_start = preceding.rfind('#').map_or(0, |offset| offset + 1);
+                return preceding[segment_start..].trim().is_empty();
             }
             segment.strip_prefix(':').is_some_and(|codes| {
                 codes.split(',').any(|part| {
@@ -2733,6 +2752,9 @@ impl Checker<'_> {
             Expr::Tuple(tuple) => tuple.elts.is_empty(),
             Expr::List(list) => list.elts.is_empty(),
             Expr::Set(set) => set.elts.is_empty(),
+            // `{}` is the empty mapping, and the only empty literal a set
+            // cannot be written as.
+            Expr::Dict(dict) => dict.items.is_empty(),
             _ => false,
         };
         if statically_empty {
@@ -2787,6 +2809,13 @@ impl Checker<'_> {
         );
         let mut uncertain = false;
         for (test, body) in clauses {
+            // A clause's test is ordinary code that runs whenever the clause
+            // is reached, so a default written in it — on a lambda, say — is
+            // reported like any other. Tests after a statically true clause
+            // are never reached, and the loop returns before them.
+            if let Some(test) = test {
+                self.visit_expr(test);
+            }
             if test.is_some_and(|test| self.is_type_checking(test)) {
                 // The block does not run, so an annotation in it declares
                 // nothing the constructor takes. The imports in it still bind
@@ -3352,6 +3381,41 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__and__"
             | "__xor__"
             | "__or__"
+            // Reflected operands, which Python tries when the left operand's
+            // method is missing or returns `NotImplemented`.
+            | "__radd__"
+            | "__rsub__"
+            | "__rmul__"
+            | "__rmatmul__"
+            | "__rtruediv__"
+            | "__rfloordiv__"
+            | "__rmod__"
+            | "__rdivmod__"
+            | "__rpow__"
+            | "__rlshift__"
+            | "__rrshift__"
+            | "__rand__"
+            | "__rxor__"
+            | "__ror__"
+            // Augmented assignment, e.g. `total += item`.
+            | "__iadd__"
+            | "__isub__"
+            | "__imul__"
+            | "__imatmul__"
+            | "__itruediv__"
+            | "__ifloordiv__"
+            | "__imod__"
+            | "__ipow__"
+            | "__ilshift__"
+            | "__irshift__"
+            | "__iand__"
+            | "__ixor__"
+            | "__ior__"
+            // Unary operators and `abs()`.
+            | "__neg__"
+            | "__pos__"
+            | "__abs__"
+            | "__invert__"
     )
 }
 
@@ -5342,6 +5406,7 @@ impl Rewriter<'_> {
             self.edits.push(Edit {
                 range: TextRange::empty(call.arguments.keywords[0].start()),
                 replacement: format!("{positional}, "),
+                site: call.start(),
             });
             if arguments.keywords.is_empty() {
                 return;
@@ -5379,6 +5444,7 @@ impl Rewriter<'_> {
         self.edits.push(Edit {
             range: TextRange::empty(offset),
             replacement,
+            site: call.start(),
         });
     }
 
@@ -5426,6 +5492,7 @@ impl Rewriter<'_> {
             replacement: format!(
                 "lambda __no_defaults_decorated: {original}(__no_defaults_decorated, {supplied})"
             ),
+            site: expression.start(),
         });
     }
 }
@@ -5867,10 +5934,7 @@ mod tests {
                 .edits
                 .entry(diagnostic.path.clone())
                 .or_default()
-                .push(Edit {
-                    range,
-                    replacement: String::new(),
-                });
+                .push(Edit::deletion(range));
         }
         let mut updated = 0;
         let mut unfixed = BTreeSet::new();
@@ -6878,6 +6942,20 @@ mod tests {
     }
 
     #[test]
+    fn the_word_noqa_in_a_note_is_not_a_directive() {
+        // The coded directive names another rule, so it does not apply here.
+        // The word in the note after it must not blanket this one.
+        let found = messages(
+            "def a(x=1): pass  # noqa: E501  keep noqa
+def b(x=1): pass  # type: ignore  # noqa
+",
+            false,
+        );
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("function `a`"));
+    }
+
+    #[test]
     fn blanket_noqa_accepts_a_following_explanation() -> Result<(), String> {
         let source = "def target(value=1): pass  # noqa  # compatibility\n";
         assert!(messages(source, false).is_empty());
@@ -7655,6 +7733,63 @@ mod tests {
     fn iterator_defaults_are_retained_for_protocol_calls() {
         let source =
             "class C:\n    def __iter__(self, extra=None):\n        return iter(())\n\niter(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn reflected_operator_defaults_are_retained_for_protocol_calls() {
+        // Python reaches `__radd__` through syntax, so there is no written
+        // call for the fixer to add the removed default back to.
+        let source = "class C:\n    def __radd__(self, other, extra=None):\n        return self\n\n1 + C()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn augmented_assignment_defaults_are_retained_for_protocol_calls() {
+        // Python reaches `__iadd__` through syntax, so there is no written
+        // call for the fixer to add the removed default back to.
+        let source = "class C:\n    def __iadd__(self, other, extra=None):\n        return self\n\ntotal = C()\ntotal += 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn unary_operator_defaults_are_retained_for_protocol_calls() {
+        // Python reaches `__neg__` through syntax, so there is no written
+        // call for the fixer to add the removed default back to.
+        let source = "class C:\n    def __neg__(self, extra=None):\n        return self\n\n-C()\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -8800,6 +8935,31 @@ mod tests {
     }
 
     #[test]
+    fn a_lambda_default_in_a_condition_is_reported() {
+        // The test of an `if`, `elif`, or `while` is ordinary code that runs
+        // when the clause is reached.
+        for source in [
+            "if (lambda value=1: value)():\n    pass\n",
+            "if False:\n    pass\nelif (lambda value=1: value)():\n    pass\n",
+            "while (lambda value=1: value)():\n    break\n",
+        ] {
+            assert_eq!(messages(source, false).len(), 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_loop_over_an_empty_literal_never_runs() {
+        // `{}` is the empty mapping literal, and the only empty literal that
+        // cannot be written as a set, so it belongs with the others.
+        for empty in ["()", "[]", "set()", "{}"] {
+            let source = format!("for _ in {empty}:\n    def target(value=1): pass\n");
+            let found = messages(&source, false);
+            let expected: usize = usize::from(empty == "set()");
+            assert_eq!(found.len(), expected, "{empty}");
+        }
+    }
+
+    #[test]
     fn every_shape_that_binds_a_name_shadows_it() -> Result<(), String> {
         for binding in [
             "connect = open",
@@ -9171,10 +9331,7 @@ mod tests {
                 edits
                     .entry(diagnostic.path.clone())
                     .or_default()
-                    .push(Edit {
-                        range,
-                        replacement: String::new(),
-                    });
+                    .push(Edit::deletion(range));
             }
         }
         let mut updated = 0;
@@ -9453,17 +9610,17 @@ mod tests {
             (
                 broken.clone(),
                 // Delete the `)`, which cannot parse.
-                vec![Edit {
-                    range: TextRange::new(TextSize::new(9), TextSize::new(10)),
-                    replacement: String::new(),
-                }],
+                vec![Edit::deletion(TextRange::new(
+                    TextSize::new(9),
+                    TextSize::new(10),
+                ))],
             ),
             (
                 sound.clone(),
-                vec![Edit {
-                    range: TextRange::new(TextSize::new(7), TextSize::new(9)),
-                    replacement: String::new(),
-                }],
+                vec![Edit::deletion(TextRange::new(
+                    TextSize::new(7),
+                    TextSize::new(9),
+                ))],
             ),
         ]);
         let mut updated = 0;

@@ -1370,6 +1370,25 @@ fn a_syntax_error_is_reported_in_json() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// One call needing both a positional and a keyword insertion is one call
+/// site, not two.
+#[test]
+fn one_call_needing_two_insertions_counts_once() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    // `b` is positional-only, so it goes in ahead of the existing keyword,
+    // while `d` is appended after it.
+    std::fs::write(&path, "def f(a, b=1, /, *, c=2, d=3): pass\n\nf(1, c=9)\n")?;
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("Updated 1 call site."), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        "def f(a, b, /, *, c, d): pass\n\nf(1, 1, c=9, d=3)\n"
+    );
+    Ok(())
+}
+
 #[test]
 fn fixing_honours_the_json_output_format() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

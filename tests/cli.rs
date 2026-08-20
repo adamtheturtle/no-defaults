@@ -2302,3 +2302,21 @@ fn later_class_assignments_do_not_shadow_earlier_calls() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[test]
+fn later_class_methods_do_not_shadow_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "def target(value=1):\n    return value\n\nclass C:\n    before = target()\n\n    def target():\n        return 5\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "def target(value):\n    return value\n\nclass C:\n    before = target(value=1)\n\n    def target():\n        return 5\n"
+    );
+    Ok(())
+}

@@ -2419,3 +2419,20 @@ fn aliased_staticmethod_decorators_have_no_implicit_receiver(
     );
     Ok(())
 }
+
+#[test]
+fn nested_classes_have_qualified_method_identities() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "class Outer:\n    class C:\n        def fetch(self, value=1):\n            return value\n\n        def run(self):\n            return self.fetch()\n\nclass C:\n    def fetch(self, value=2):\n        return value\n\nC().fetch()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("return self.fetch(value=1)"), "{fixed}");
+    assert!(fixed.ends_with("C().fetch(value=2)\n"), "{fixed}");
+    Ok(())
+}

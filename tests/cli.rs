@@ -211,6 +211,19 @@ fn unpacked_field_options_keep_defaults_out_of_constructor_fixes(
 }
 
 #[test]
+fn field_defaults_needed_by_later_deletes_are_retained() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n    del value\n\nC(1)\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}
+
+#[test]
 fn unpacked_dataclass_options_keep_field_defaults() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

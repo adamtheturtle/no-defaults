@@ -3901,9 +3901,26 @@ fn has_dataclass_decorator(
     })
 }
 
+/// Whether the class's decorators leave the generated constructor in place.
+///
+/// Only `dataclass` itself is known to. Every other decorator is assumed to
+/// replace the class or install an `__init__` of its own, which is what makes
+/// removing a field default unsafe: the constructor the call sites are
+/// rewritten against would not be the one that runs.
+///
+/// The form the decorator is written in says nothing about what it does. A
+/// factory — `@replace()` — returns the callable that is applied, and an
+/// attribute — `@mod.replace` — is the same callable reached through its
+/// module, so both are judged exactly as a bare name is. This matches how a
+/// decorator on a function is treated, where anything but a known descriptor
+/// keeps the defaults.
 fn class_defaults_are_fixable(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
     !class.decorator_list.iter().any(|decorator| {
-        matches!(&decorator.expression, Expr::Name(name) if aliases.resolve(name.id.as_str()) != "dataclass")
+        let expression = match &decorator.expression {
+            Expr::Call(call) => &*call.func,
+            expression => expression,
+        };
+        matched_name(expression, aliases) != Some("dataclass")
     })
 }
 
@@ -9543,13 +9560,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unrelated_kw_only_decorator_does_not_change_dataclass_calls() -> Result<(), String> {
-        let source = "from dataclasses import dataclass\n\ndef marker(**options):\n    return lambda cls: cls\n\n@marker(kw_only=True)\n@dataclass\nclass C:\n    first: int = 1\n    second: int = 2\n\n\nC(5)\n";
-        assert_eq!(
-            fixed(source)?,
-            "from dataclasses import dataclass\n\ndef marker(**options):\n    return lambda cls: cls\n\n@marker(kw_only=True)\n@dataclass\nclass C:\n    first: int\n    second: int\n\n\nC(5, second=2)\n"
+    fn a_decorator_reached_through_a_module_keeps_defaults() {
+        let source = "import helpers\nfrom dataclasses import dataclass\n\n@helpers.marker\n@dataclass\nclass C:\n    first: int = 1\n    second: int = 2\n\n\nC(5)\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
         );
-        Ok(())
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics.iter().all(|item| item.fix.is_none()));
     }
 
     #[test]
@@ -9694,13 +9717,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unrelated_init_decorator_does_not_disable_dataclass_call_edits() -> Result<(), String> {
+    fn a_called_decorator_keeps_dataclass_field_defaults() {
+        // The factory is applied to the class, so what it returns is what
+        // `C()` constructs. That this one gives the class back unchanged is
+        // not visible from the decorator itself.
         let source = "from dataclasses import dataclass\n\ndef marker(**options):\n    return lambda cls: cls\n\n@marker(init=False)\n@dataclass\nclass C:\n    value: int = 1\n\n\nC()\n";
-        assert_eq!(
-            fixed(source)?,
-            "from dataclasses import dataclass\n\ndef marker(**options):\n    return lambda cls: cls\n\n@marker(init=False)\n@dataclass\nclass C:\n    value: int\n\n\nC(value=1)\n"
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
         );
-        Ok(())
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
     }
 
     #[test]

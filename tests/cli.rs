@@ -2109,3 +2109,27 @@ fn imports_inside_module_with_statements_resolve_calls() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[test]
+fn imports_inside_exhaustive_match_cases_resolve_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &caller,
+        "match value:\n    case _:\n        import api\n\napi.target()\n",
+    )?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "match value:\n    case _:\n        import api\n\napi.target(value=1)\n"
+    );
+    Ok(())
+}

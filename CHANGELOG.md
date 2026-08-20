@@ -38,6 +38,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A dataclass defined under `if TYPE_CHECKING:` keeps its field defaults. The block does not run, so the class has no constructor at runtime and no call site the fixer can keep in step with it.
 - A call in a comprehension's leftmost iterable is updated again. Python evaluates that iterable before the loop targets exist, so a call there is the enclosing one and was being skipped as shadowed while its default was removed.
 - Rebinding a package name drops the dotted import under it. After `import pkg.api`, a later `pkg = …` left the `pkg.api` entry in place and calls through it were still rewritten as the original module's.
+- A module-level loop, `with`, or `except … as` target replaces an imported name, as an assignment to it already did. Calls through the name were still being rewritten as the import's.
+- Two definitions of one name in different branches of an `if`, loop, `with`, `try`, or `match` keep their defaults, as two written side by side already did. Which one survives is not knowable, and `--fix` was stripping both while leaving the call as written.
 
 ## 2.1.0 - 2026-08-07
 

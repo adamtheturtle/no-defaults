@@ -2190,6 +2190,59 @@ fn source_error(path: &Path, error: String) -> Checked {
     }
 }
 
+/// Note every module-level name defined more than once as a function.
+///
+/// A block that still binds module-level names — a conditional, a loop, a
+/// `with`, a `try` — holds definitions that compete for the same name just as
+/// two definitions written side by side do. Only one of them survives, and
+/// which one is not knowable, so neither may have its defaults removed.
+fn collect_repeated_functions(
+    suite: &[Stmt],
+    seen: &mut BTreeSet<String>,
+    repeated: &mut BTreeSet<String>,
+) {
+    for statement in suite {
+        match statement {
+            Stmt::FunctionDef(function) => {
+                let name = function.name.to_string();
+                if !seen.insert(name.clone()) {
+                    repeated.insert(name);
+                }
+            }
+            Stmt::If(branch) => {
+                collect_repeated_functions(&branch.body, seen, repeated);
+                for clause in &branch.elif_else_clauses {
+                    collect_repeated_functions(&clause.body, seen, repeated);
+                }
+            }
+            Stmt::For(loop_statement) => {
+                collect_repeated_functions(&loop_statement.body, seen, repeated);
+                collect_repeated_functions(&loop_statement.orelse, seen, repeated);
+            }
+            Stmt::While(loop_statement) => {
+                collect_repeated_functions(&loop_statement.body, seen, repeated);
+                collect_repeated_functions(&loop_statement.orelse, seen, repeated);
+            }
+            Stmt::With(block) => collect_repeated_functions(&block.body, seen, repeated),
+            Stmt::Try(block) => {
+                collect_repeated_functions(&block.body, seen, repeated);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_repeated_functions(&handler.body, seen, repeated);
+                }
+                collect_repeated_functions(&block.orelse, seen, repeated);
+                collect_repeated_functions(&block.finalbody, seen, repeated);
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_repeated_functions(&case.body, seen, repeated);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The one diagnostic a file the parser rejects produces.
 ///
 /// It carries no fix: there is nothing to delete, and the file is left out of
@@ -2244,14 +2297,7 @@ fn check_source(
     let module_bindings = BoundNames::of_body(parsed.suite()).names;
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
-    for statement in parsed.suite() {
-        if let Stmt::FunctionDef(function) = statement {
-            let name = function.name.to_string();
-            if !function_names.insert(name.clone()) {
-                repeated_functions.insert(name);
-            }
-        }
-    }
+    collect_repeated_functions(parsed.suite(), &mut function_names, &mut repeated_functions);
     let mut checker = Checker {
         path,
         source,
@@ -5696,6 +5742,38 @@ struct MissingArguments {
     keywords: Vec<String>,
 }
 
+/// The names a statement binds itself, not counting what its body binds.
+///
+/// An import inside a loop is a new binding rather than a replacement of one,
+/// so only the statement's own targets replace what an earlier import bound.
+/// Statements in the body reach the same handling on their own.
+fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
+    let mut bound = BoundNames::default();
+    match statement {
+        Stmt::Assign(assign) => assign.targets.iter().for_each(|target| bound.bind(target)),
+        Stmt::AnnAssign(assign) => bound.bind(&assign.target),
+        Stmt::AugAssign(assign) => bound.bind(&assign.target),
+        Stmt::For(loop_statement) => bound.bind(&loop_statement.target),
+        Stmt::With(block) => {
+            for item in &block.items {
+                if let Some(target) = &item.optional_vars {
+                    bound.bind(target);
+                }
+            }
+        }
+        Stmt::Try(block) => {
+            for handler in &block.handlers {
+                let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                if let Some(name) = &handler.name {
+                    bound.names.insert(name.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    bound.names
+}
+
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_decorator(&mut self, decorator: &'a ast::Decorator) {
         if matches!(decorator.expression, Expr::Name(_) | Expr::Attribute(_)) {
@@ -5736,12 +5814,22 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
             }
-            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.scopes.is_empty() => {
-                // The right-hand side still sees the imported binding; the
-                // assignment replaces it only after that expression runs.
+            Stmt::Assign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::AugAssign(_)
+            | Stmt::For(_)
+            | Stmt::With(_)
+            | Stmt::Try(_)
+                if self.scopes.is_empty() =>
+            {
+                // Every one of these binds a module-level name of its own — an
+                // assignment target, a loop or context-manager target, an
+                // `except … as` — and replaces whatever an import bound there.
+                // The statement is walked first: what it evaluates still sees
+                // the old binding, and a nested statement reaches this arm on
+                // its own rather than through the one holding it.
                 walk_stmt(self, statement);
-                let bound = BoundNames::of_body(std::slice::from_ref(statement));
-                self.invalidated_bindings.extend(bound.names);
+                self.invalidated_bindings.extend(rebound_names(statement));
             }
             Stmt::ClassDef(class) => {
                 // The class header is evaluated before its local namespace is
@@ -9147,6 +9235,28 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert!(skipped_reasons(source)?.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn definitions_competing_across_branches_keep_their_defaults() {
+        // Which one survives is not knowable, so neither may lose a default
+        // while the call is left as written.
+        let source = "import os\n\nif os.environ:\n    def target(value=1): pass\nelse:\n    def target(value=2): pass\n\ntarget()\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.fix.is_none()));
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

@@ -2586,3 +2586,22 @@ fn field_defaults_overwritten_later_are_not_copied_to_calls(
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
+
+#[test]
+fn repeated_dataclass_fields_use_the_final_default_once() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n    value: int = 2\n\nC()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int\n    value: int\n\nC(value=2)\n"
+    );
+    Ok(())
+}

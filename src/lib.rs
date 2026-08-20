@@ -3010,6 +3010,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__floor__"
             | "__ceil__"
             | "__fspath__"
+            | "__lt__"
     )
 }
 
@@ -7451,6 +7452,23 @@ mod tests {
     #[test]
     fn fspath_defaults_are_retained_for_protocol_calls() {
         let source = "import os\n\nclass C:\n    def __fspath__(self, extra=None):\n        return '/tmp'\n\nos.fspath(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn less_than_defaults_are_retained_for_protocol_calls() {
+        let source = "class C:\n    def __lt__(self, other, extra=None):\n        return False\n\nC() < C()\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

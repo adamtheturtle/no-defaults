@@ -4787,6 +4787,19 @@ impl Rewriter<'_> {
                     true,
                 ));
             }
+            // `C().fetch()` calls a method on a fresh instance, so the
+            // receiver is the class the call constructs. Constructing an
+            // instance is not reaching through `super`.
+            let (file, class, through_instance, _) = self.receiving_class(&call.func)?;
+            if !through_instance
+                && self
+                    .definitions
+                    .methods
+                    .contains_key(&(file.clone(), class.clone()))
+            {
+                return Some((file, class, true, false));
+            }
+            return None;
         }
         if let Expr::Name(name) = receiver {
             if self.implicit_receivers.last().and_then(Option::as_deref) == Some(name.id.as_str()) {

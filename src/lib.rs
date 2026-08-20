@@ -2969,16 +2969,15 @@ impl Checker<'_> {
         let pseudo_field = annotates_kw_only(&assign.annotation, &self.aliases);
         // A field declared `init=False` is not a constructor parameter, so a
         // call must never be given it.
-        let constructs = assign
-            .value
-            .as_deref()
-            .is_none_or(|value| !field_excluded_from_init(value, &self.aliases));
+        let constructs = assign.value.as_deref().is_none_or(|value| {
+            !field_excluded_from_init(value, &self.aliases, &self.module_bindings)
+        });
         // `field(kw_only=...)` decides for one field, over whatever the
         // decorator or a marker said for the class.
         let kw_only = assign
             .value
             .as_deref()
-            .and_then(|value| field_says_kw_only(value, &self.aliases))
+            .and_then(|value| field_says_kw_only(value, &self.aliases, &self.module_bindings))
             .unwrap_or_else(|| self.classes.last().is_some_and(|class| class.kw_only));
         if let Some(class) = self.classes.last_mut() {
             if pseudo_field {
@@ -3015,7 +3014,7 @@ impl Checker<'_> {
         let fix = if !constructs
             || !self.class_constructs.last().copied().unwrap_or(true)
             || (style == FieldStyle::Base
-                && pydantic_field_has_validation_alias(value, &self.aliases))
+                && pydantic_field_has_validation_alias(value, &self.aliases, &self.module_bindings))
             || (self.scope.kept_default && !kw_only)
         {
             None
@@ -3380,6 +3379,7 @@ fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
 struct Aliases {
     renamed: BTreeMap<String, Option<String>>,
     dataclasses_members: BTreeSet<String>,
+    dataclass_fields: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
@@ -3510,16 +3510,19 @@ impl Aliases {
                     if !carries_fields {
                         continue;
                     }
+                    let dataclasses = import
+                        .module
+                        .as_ref()
+                        .is_some_and(|module| module.as_str() == "dataclasses");
                     for alias in &import.names {
                         let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
-                        if import.module.as_ref().is_some_and(|module| {
-                            module.as_str() == "dataclasses" && alias.name.as_str() == "MISSING"
-                        }) {
+                        if dataclasses && alias.name.as_str() == "field" {
+                            self.dataclass_fields.insert(local.clone());
+                        }
+                        if dataclasses && alias.name.as_str() == "MISSING" {
                             self.dataclasses_members.insert(local.clone());
                         }
-                        if import.module.as_ref().is_some_and(|module| {
-                            module.as_str() == "dataclasses" && alias.name.as_str() == "KW_ONLY"
-                        }) {
+                        if dataclasses && alias.name.as_str() == "KW_ONLY" {
                             self.kw_only_markers.insert(local.clone());
                         }
                         let Some(local) = &alias.asname else {
@@ -3656,11 +3659,15 @@ fn decorator_says_kw_only(class: &ast::StmtClassDef, aliases: &Aliases) -> bool 
 
 /// Whether a `field(...)` call says `kw_only=`, and what it said. `None` where
 /// it does not say, so the class-wide setting stands.
-fn field_says_kw_only(value: &Expr, aliases: &Aliases) -> Option<bool> {
+fn field_says_kw_only(
+    value: &Expr,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> Option<bool> {
     let Expr::Call(call) = value else {
         return None;
     };
-    if matched_name(&call.func, aliases) != Some("field") {
+    if !is_dataclass_field(&call.func, aliases, module_bindings) {
         return None;
     }
     call.arguments
@@ -3703,11 +3710,15 @@ fn annotates_kw_only(annotation: &Expr, aliases: &Aliases) -> bool {
 
 /// Whether a field is declared `init=False`, which keeps it out of the
 /// constructor even though it is still a field.
-fn field_excluded_from_init(value: &Expr, aliases: &Aliases) -> bool {
+fn field_excluded_from_init(
+    value: &Expr,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> bool {
     let Expr::Call(call) = value else {
         return false;
     };
-    matched_name(&call.func, aliases) == Some("field")
+    is_dataclass_field(&call.func, aliases, module_bindings)
         && call.arguments.keywords.iter().any(|keyword| {
             keyword.arg.as_ref().is_none_or(|name| {
                 name.as_str() == "init"
@@ -3722,8 +3733,12 @@ fn field_excluded_from_init(value: &Expr, aliases: &Aliases) -> bool {
 /// Whether Pydantic accepts a name other than the Python field name when
 /// validating constructor input. Without evaluating model configuration, the
 /// original field default is safer than inserting a keyword that may fail.
-fn pydantic_field_has_validation_alias(value: &Expr, aliases: &Aliases) -> bool {
-    let Some((call, FieldCall::Pydantic)) = field_call(value, aliases) else {
+fn pydantic_field_has_validation_alias(
+    value: &Expr,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> bool {
+    let Some((call, FieldCall::Pydantic)) = field_call(value, aliases, module_bindings) else {
         return false;
     };
     call.arguments.keywords.iter().any(|keyword| {
@@ -3793,14 +3808,44 @@ enum FieldCall {
 /// The call declaring a field's default, if the value is one. Recognised by
 /// name, as decorators are, so `field`, `dataclasses.field`, `Field`, and
 /// `pydantic.Field` all count.
-fn field_call<'a>(value: &'a Expr, aliases: &Aliases) -> Option<(&'a ast::ExprCall, FieldCall)> {
+fn field_call<'a>(
+    value: &'a Expr,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> Option<(&'a ast::ExprCall, FieldCall)> {
     let Expr::Call(call) = value else {
         return None;
     };
     match matched_name(&call.func, aliases)? {
-        "field" => Some((call, FieldCall::Dataclasses)),
+        "field" if is_dataclass_field(&call.func, aliases, module_bindings) => {
+            Some((call, FieldCall::Dataclasses))
+        }
         "Field" => Some((call, FieldCall::Pydantic)),
         _ => None,
+    }
+}
+
+fn is_dataclass_field(
+    function: &Expr,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> bool {
+    if matched_name(function, aliases) != Some("field") {
+        return false;
+    }
+    match function {
+        Expr::Name(name) => {
+            !module_bindings.contains(name.id.as_str())
+                || aliases.dataclass_fields.contains(name.id.as_str())
+        }
+        Expr::Attribute(attribute) => match attribute.value.as_ref() {
+            Expr::Name(module) => {
+                !module_bindings.contains(module.id.as_str())
+                    || aliases.dataclasses_modules.contains(module.id.as_str())
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -3823,7 +3868,7 @@ fn field_default(
         fix: TextRange::new(annotation_end, value.end()),
         value: literal_text(value, source),
     };
-    let Some((call, style)) = field_call(value, aliases) else {
+    let Some((call, style)) = field_call(value, aliases, module_bindings) else {
         return Some(plain());
     };
     if let Some(first) = call.arguments.args.first() {

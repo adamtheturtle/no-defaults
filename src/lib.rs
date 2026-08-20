@@ -2246,6 +2246,7 @@ fn check_source(
         class_constructs: Vec::new(),
         class_deletions: Vec::new(),
         class_assignments: Vec::new(),
+        method_aliases: Vec::new(),
         signatures: Vec::new(),
         skipped: Vec::new(),
         directives,
@@ -2531,6 +2532,9 @@ struct Checker<'a> {
     class_constructs: Vec<bool>,
     class_deletions: Vec<BTreeSet<String>>,
     class_assignments: Vec<BTreeMap<String, Vec<TextSize>>>,
+    /// Direct `alias = method` bindings for each enclosing class, keyed by the
+    /// original method name.
+    method_aliases: Vec<BTreeMap<String, Vec<String>>>,
     signatures: Vec<Signature>,
     skipped: Vec<Skipped>,
     directives: Vec<Directive>,
@@ -2817,6 +2821,13 @@ impl Checker<'_> {
         )
     }
 
+    fn leave_class(&mut self) {
+        self.class_constructs.pop();
+        self.class_deletions.pop();
+        self.class_assignments.pop();
+        self.method_aliases.pop();
+    }
+
     /// Whether the rule applies to something with no name of its own, such as
     /// a lambda. It takes the privacy of the scope holding it.
     fn enabled_unnamed(&self) -> bool {
@@ -3079,9 +3090,15 @@ impl Checker<'_> {
         if removed.is_empty() {
             return;
         }
+        self.record_signature(function, removed);
+    }
+
+    /// Record what a call to this function has to be given back, under every
+    /// name it can be called by.
+    fn record_signature(&mut self, function: &ast::StmtFunctionDef, removed: Vec<Removed>) {
         let parameter_name =
             |parameter: &ast::ParameterWithDefault| parameter.parameter.name.to_string();
-        self.signatures.push(Signature {
+        let signature = Signature {
             name: function.name.to_string(),
             positional: function
                 .parameters
@@ -3101,7 +3118,21 @@ impl Checker<'_> {
             },
             complete: true,
             removed,
-        });
+        };
+        if self.scope.class_body {
+            if let Some(aliases) = self
+                .method_aliases
+                .last()
+                .and_then(|aliases| aliases.get(function.name.as_str()))
+            {
+                self.signatures
+                    .extend(aliases.iter().map(|alias| Signature {
+                        name: alias.clone(),
+                        ..signature.clone()
+                    }));
+            }
+        }
+        self.signatures.push(signature);
     }
 
     fn check_field(&mut self, style: FieldStyle, statement: &Stmt) {
@@ -3294,6 +3325,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     .push(class_constructs_safely(class, &self.aliases));
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
+                self.method_aliases.push(class_method_aliases(class));
                 if self.collect_signatures {
                     let inherited = self.inherited_fields(class, style);
                     // A base of this file's own contributes its fields ahead of
@@ -3329,9 +3361,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
                 self.record_base_field_class(class.name.as_str(), style);
-                self.class_deletions.pop();
-                self.class_assignments.pop();
-                self.class_constructs.pop();
+                self.leave_class();
                 let collector = self
                     .collect_signatures
                     .then(|| self.classes.pop())
@@ -3862,6 +3892,30 @@ fn generates_init(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
                 })
             })
         })
+}
+
+/// Direct method aliases created in a class namespace. Python applies the
+/// descriptor protocol to both names, so calls through either spelling have
+/// the same implicit receiver and parameters.
+fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<String>> {
+    let mut aliases = BTreeMap::<String, Vec<String>>::new();
+    for statement in &class.body {
+        let Stmt::Assign(assign) = statement else {
+            continue;
+        };
+        let Expr::Name(original) = assign.value.as_ref() else {
+            continue;
+        };
+        for target in &assign.targets {
+            if let Expr::Name(alias) = target {
+                aliases
+                    .entry(original.id.to_string())
+                    .or_default()
+                    .push(alias.id.to_string());
+            }
+        }
+    }
+    aliases
 }
 
 /// Whether the decorator says `kw_only=True`, making every field of the class
@@ -8401,6 +8455,16 @@ mod tests {
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_class_body_method_alias_has_the_original_signature() -> Result<(), String> {
+        let source = "class C:\n    def target(self, value=1):\n        return value\n    alias = target\n\nC().alias()\n";
+        assert_eq!(
+            fixed(source)?,
+            "class C:\n    def target(self, value):\n        return value\n    alias = target\n\nC().alias(value=1)\n"
+        );
+        Ok(())
     }
 
     #[test]

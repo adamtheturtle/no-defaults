@@ -4871,14 +4871,12 @@ fn collect_lexical_classes<'a>(
 fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
     let mut classes = Vec::new();
     collect_lexical_classes(suite, &mut Vec::new(), &mut classes);
-    let identities: BTreeSet<String> = classes
-        .iter()
-        .map(|(_, qualified, _)| qualified.clone())
-        .collect();
-    let resolve = |name: &str, scope: &[String]| {
+    let resolve = |name: &str, scope: &[String], before: usize| {
         (0..=scope.len()).rev().find_map(|length| {
             let candidate = qualified_class_name(&scope[..length], name);
-            identities.contains(&candidate).then_some(candidate)
+            classes[..before]
+                .iter()
+                .rposition(|(_, qualified, _)| qualified == &candidate)
         })
     };
     let mut metaclasses = BTreeSet::new();
@@ -4887,7 +4885,7 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
     let mut changed = true;
     while changed {
         changed = false;
-        for (class, qualified, scope) in &classes {
+        for (index, (class, _, scope)) in classes.iter().enumerate() {
             let bases = class
                 .arguments
                 .as_deref()
@@ -4897,9 +4895,9 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
             let base_names: Vec<String> = bases.collect();
             let is_metaclass = base_names.iter().any(|base| {
                 base == "type"
-                    || resolve(base, scope).is_some_and(|base| metaclasses.contains(&base))
+                    || resolve(base, scope, index).is_some_and(|base| metaclasses.contains(&base))
             });
-            if is_metaclass && metaclasses.insert(qualified.clone()) {
+            if is_metaclass && metaclasses.insert(index) {
                 changed = true;
             }
             let defines_getattribute = class.body.iter().any(|statement| {
@@ -4908,10 +4906,10 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
             if is_metaclass
                 && (defines_getattribute
                     || base_names.iter().any(|base| {
-                        resolve(base, scope)
+                        resolve(base, scope, index)
                             .is_some_and(|base| intercepting_metaclasses.contains(&base))
                     }))
-                && intercepting_metaclasses.insert(qualified.clone())
+                && intercepting_metaclasses.insert(index)
             {
                 changed = true;
             }
@@ -4922,21 +4920,24 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
                         .as_ref()
                         .is_some_and(|name| name.as_str() == "metaclass")
                         && dotted_name(&keyword.value)
-                            .and_then(|name| resolve(&name, scope))
+                            .and_then(|name| resolve(&name, scope, index))
                             .is_some_and(|name| intercepting_metaclasses.contains(&name))
                 })
             });
             if (declared_interceptor
                 || base_names.iter().any(|base| {
-                    resolve(base, scope).is_some_and(|base| intercepted.contains(&base))
+                    resolve(base, scope, index).is_some_and(|base| intercepted.contains(&base))
                 }))
-                && intercepted.insert(qualified.clone())
+                && intercepted.insert(index)
             {
                 changed = true;
             }
         }
     }
     intercepted
+        .into_iter()
+        .map(|index| classes[index].1.clone())
+        .collect()
 }
 
 /// Whether a class takes a metaclass from a base defined in the same file.

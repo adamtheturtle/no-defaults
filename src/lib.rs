@@ -3382,7 +3382,7 @@ impl Checker<'_> {
         if !self.enabled(name.id.as_str()) {
             return;
         }
-        let Some(default) = field_default(
+        let Some(mut default) = field_default(
             value,
             assign.annotation.end(),
             self.source,
@@ -3391,6 +3391,9 @@ impl Checker<'_> {
         ) else {
             return;
         };
+        if default.fix.start() == assign.annotation.end() {
+            default.fix = self.default_fix_range(assign.annotation.end(), value);
+        }
         // As in a signature, a field that keeps its default forces every field
         // after it to keep its own. A keyword-only field is exempt, since
         // `dataclasses` moves it past the `*` where order does not constrain it.
@@ -6325,6 +6328,17 @@ mod tests {
         assert_eq!(
             fixed("handler = lambda x=(1): x\n")?,
             "handler = lambda x: x\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_parenthesized_dataclass_field_default_is_removed_with_its_parentheses(
+    ) -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass A:\n    x: int = (1)\n    y: int = 2\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\n\n@dataclass\nclass A:\n    x: int\n    y: int\n"
         );
         Ok(())
     }

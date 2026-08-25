@@ -11,7 +11,7 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use ruff_python_ast::helpers::Truthiness;
 use ruff_python_ast::token::{TokenKind, Tokens};
-use ruff_python_ast::visitor::{walk_expr, walk_pattern, walk_stmt, Visitor};
+use ruff_python_ast::visitor::{walk_except_handler, walk_expr, walk_pattern, walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
 use ruff_python_parser::{parse_expression, parse_module};
 use ruff_text_size::{Ranged, TextRange, TextSize};
@@ -5956,6 +5956,28 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
 }
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
+    fn visit_except_handler(&mut self, except_handler: &'a ast::ExceptHandler) {
+        if !self.scopes.is_empty() {
+            walk_except_handler(self, except_handler);
+            return;
+        }
+        let ast::ExceptHandler::ExceptHandler(handler) = except_handler;
+        if let Some(type_) = &handler.type_ {
+            self.visit_expr(type_);
+        }
+        let replaced = handler.name.as_ref().map(ToString::to_string);
+        let was_invalidated = replaced
+            .as_ref()
+            .is_some_and(|name| self.invalidated_bindings.contains(name));
+        if let Some(name) = &replaced {
+            self.invalidated_bindings.insert(name.clone());
+        }
+        self.visit_body(&handler.body);
+        if let Some(name) = replaced.filter(|_| !was_invalidated) {
+            self.invalidated_bindings.remove(&name);
+        }
+    }
+
     fn visit_decorator(&mut self, decorator: &'a ast::Decorator) {
         if matches!(decorator.expression, Expr::Name(_) | Expr::Attribute(_)) {
             self.called

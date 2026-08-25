@@ -6032,6 +6032,17 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // Once an item is assigned, the body sees the target rather
                 // than an import that previously used the same name.
                 self.visit_expr(&loop_statement.iter);
+                let statically_empty = match loop_statement.iter.as_ref() {
+                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
+                    Expr::List(list) => list.elts.is_empty(),
+                    Expr::Set(set) => set.elts.is_empty(),
+                    Expr::Dict(dict) => dict.items.is_empty(),
+                    _ => false,
+                };
+                if statically_empty {
+                    self.visit_body(&loop_statement.orelse);
+                    return;
+                }
                 self.visit_expr(&loop_statement.target);
                 self.invalidated_bindings.extend(rebound_names(statement));
                 self.visit_body(&loop_statement.body);

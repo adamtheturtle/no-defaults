@@ -7223,6 +7223,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 }
                 for name in star_names {
                     self.invalidated_bindings.remove(&name);
+                    self.rebound_classes.remove(&name);
                 }
                 let resolutions: Vec<(String, bool)> = match statement {
                     Stmt::Import(import) => import
@@ -7267,6 +7268,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 for (name, resolved) in resolutions {
                     if resolved {
                         self.invalidated_bindings.remove(&name);
+                        self.rebound_classes.remove(&name);
                     } else {
                         self.invalidated_bindings.insert(name);
                     }

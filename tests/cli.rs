@@ -3240,6 +3240,36 @@ fn assignments_invalidate_same_file_class_receivers() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn successful_imports_restore_class_receiver_bindings() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    std::fs::write(
+        &api,
+        "class C:\n    def fetch(self, value=2): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &caller,
+        "class C:\n    def fetch(self, value=1): return value\nC = object()\nfrom api import C\nassert C().fetch() == 2\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "class C:\n    def fetch(self, value): return value\nC = object()\nfrom api import C\nassert C().fetch(value=2) == 2\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "class C:\n    def fetch(self, value): return value\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn definitions_invalidate_same_file_class_receivers() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

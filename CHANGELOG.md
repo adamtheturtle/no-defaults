@@ -60,6 +60,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A `with ... as` target invalidates any imported dataclass identity it replaces, both inside and after the suite.
 - A `for` target invalidates any imported dataclass identity it may replace, while a statically empty loop leaves the identity unchanged.
 - A user-defined helper named `PrivateAttr` is treated as an ordinary configured-model field default; only a resolved Pydantic helper suppresses field handling.
 - Assigning over an imported `TYPE_CHECKING` alias invalidates its type-only identity, so a statically live guarded branch is analyzed and fixed normally.

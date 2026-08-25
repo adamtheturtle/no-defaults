@@ -2933,6 +2933,14 @@ impl Checker<'_> {
         }
     }
 
+    fn invalidate_target_aliases(&mut self, target: &Expr) {
+        let mut bound = BoundNames::default();
+        bound.bind(target);
+        for name in bound.names {
+            self.aliases.invalidate(&name);
+        }
+    }
+
     fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, statement: &'a Stmt)
     where
         Self: Visitor<'a>,
@@ -2950,12 +2958,22 @@ impl Checker<'_> {
             self.visit_body(&loop_.orelse);
         } else {
             self.visit_uncertain(statement);
-            let mut bound = BoundNames::default();
-            bound.bind(&loop_.target);
-            for name in bound.names {
-                self.aliases.invalidate(&name);
+            self.invalidate_target_aliases(&loop_.target);
+        }
+    }
+
+    fn visit_with<'a>(&mut self, block: &'a ast::StmtWith)
+    where
+        Self: Visitor<'a>,
+    {
+        for item in &block.items {
+            self.visit_expr(&item.context_expr);
+            if let Some(target) = &item.optional_vars {
+                self.visit_expr(target);
+                self.invalidate_target_aliases(target);
             }
         }
+        self.visit_body(&block.body);
     }
 
     fn visit_while<'a>(&mut self, loop_: &'a ast::StmtWhile, statement: &'a Stmt)
@@ -3742,6 +3760,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::Try(_) | Stmt::Match(_) => self.visit_uncertain(statement),
             Stmt::For(loop_) => self.visit_loop(loop_, statement),
             Stmt::While(loop_) => self.visit_while(loop_, statement),
+            Stmt::With(block) => self.visit_with(block),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
             Stmt::ClassDef(class) => {

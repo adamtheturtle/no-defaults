@@ -5608,6 +5608,7 @@ fn rewrite_calls(
         aliases,
         module_bindings: BoundNames::of_body(parsed.suite()).names,
         bindings: vec![BTreeMap::new()],
+        binding_scope_depths: vec![0],
         class_bindings: Vec::new(),
         invalidated_bindings: BTreeSet::new(),
         rebound_classes: BTreeSet::new(),
@@ -6441,6 +6442,8 @@ struct Rewriter<'a> {
     module_bindings: BTreeSet<String>,
     /// What each imported name in this file refers to.
     bindings: Vec<BTreeMap<String, Binding>>,
+    /// Lexical scope index owning each non-module binding table.
+    binding_scope_depths: Vec<usize>,
     /// Imports bound directly in each enclosing class namespace.
     class_bindings: Vec<BTreeMap<String, Binding>>,
     /// Imported module-scope names replaced by an assignment already visited.
@@ -6553,11 +6556,16 @@ impl Rewriter<'_> {
     }
 
     fn function_binding(&self, name: &str) -> Option<&Binding> {
+        let owner = self.nested_binding(name).map(|(_, index)| index);
         self.bindings
             .iter()
+            .zip(&self.binding_scope_depths)
             .skip(1)
             .rev()
-            .find_map(|bindings| bindings.get(name))
+            .find_map(|(bindings, depth)| {
+                let binding = bindings.get(name)?;
+                owner.is_none_or(|owner| owner == *depth).then_some(binding)
+            })
     }
 
     fn function_symbol(&self, name: &str) -> Option<&Signature> {
@@ -7683,11 +7691,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.implicit_receivers.push(receiver);
                 self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
+                self.binding_scope_depths.push(self.scopes.len() - 1);
                 self.lexical_scope.push(function.name.to_string());
                 self.visit_body(&function.body);
                 self.lexical_scope.pop();
                 self.scopes.pop();
                 self.bindings.pop();
+                self.binding_scope_depths.pop();
                 self.implicit_receivers.pop();
                 if !module_scope && !self.in_class_scope() {
                     if let Some(bindings) = self.bindings.last_mut() {

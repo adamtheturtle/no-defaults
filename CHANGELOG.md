@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- An unresolved module-level `from … import name` still invalidates an earlier checked binding for `name`; later calls are left unchanged and the affected default is retained.
 - Captures in a selected module-level `match` case shadow imported callables before its guard and body are evaluated, preventing calls on captured values from being rewritten against stale imports.
 - Literal module-level `match` statements update bindings only from the selected case; imports in cases that do not match no longer affect later calls.
 - A module-level `while … else` suite is skipped when a statically true loop body ends in `break`, so imports in the unentered `else` no longer replace live bindings.

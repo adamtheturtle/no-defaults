@@ -1564,7 +1564,11 @@ fn an_unresolved_later_import_invalidates_an_earlier_binding(
         .arg("--fix")
         .arg(directory.path())
         .output()?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read_to_string(&api)?,
+        "def target(value=1): return value\n"
+    );
     assert_eq!(
         std::fs::read_to_string(caller)?,
         "import api\nimport external as api\n\napi.target()\n"
@@ -2088,6 +2092,31 @@ fn module_match_captures_invalidate_imported_callable_bindings(
 }
 
 #[test]
+fn unresolved_from_imports_invalidate_earlier_checked_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let external = directory.path().join("external.py");
+    let caller = directory.path().join("caller.py");
+    let api_source = "def target(value=1): return value\n";
+    let caller_source =
+        "from api import target\nfrom external import target\nassert target() == 9\n";
+    std::fs::write(&api, api_source)?;
+    std::fs::write(&external, "def target(): return 9\n")?;
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(&api)
+        .arg(&caller)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(&api)?, api_source);
+    assert_eq!(std::fs::read_to_string(&caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
 fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;
@@ -2133,13 +2162,17 @@ fn a_single_component_import_resolves_only_at_the_importers_root(
         .arg("--fix")
         .arg(directory.path())
         .output()?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains("cannot be tied to the definition that was fixed"),
         "{stderr}"
     );
     assert_eq!(std::fs::read_to_string(&main)?, before);
+    assert_eq!(
+        std::fs::read_to_string(nested.join("utils.py"))?,
+        "def helper(a, size=8192): return a\n"
+    );
     Ok(())
 }
 
@@ -2213,7 +2246,7 @@ fn an_import_two_roots_disagree_about_is_left_alone() -> Result<(), Box<dyn std:
         .arg("--fix")
         .arg(directory.path())
         .output()?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         std::fs::read_to_string(&caller)?,
         "import api\napi.target()\n",
@@ -2222,6 +2255,14 @@ fn an_import_two_roots_disagree_about_is_left_alone() -> Result<(), Box<dyn std:
     assert!(
         String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"),
         "the call is reported rather than silently skipped"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("api.py"))?,
+        "def target(value=1): return value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join("api.py"))?,
+        "def target(other=2): return other\n"
     );
     Ok(())
 }
@@ -2302,13 +2343,21 @@ fn an_import_two_roots_could_answer_is_left_alone() -> Result<(), Box<dyn std::e
         .arg("--fix")
         .arg(directory.path())
         .output()?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains("cannot be tied to the definition that was fixed"),
         "{stderr}"
     );
     assert_eq!(std::fs::read_to_string(&module)?, before);
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("utils.py"))?,
+        "def helper(a, size=8192): return a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(package.join("utils.py"))?,
+        "def helper(a, size=4096): return a\n"
+    );
     Ok(())
 }
 

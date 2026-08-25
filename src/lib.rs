@@ -6111,6 +6111,16 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             return;
         }
         match expression {
+            Expr::Named(named) if self.scopes.is_empty() => {
+                // A named expression evaluates its value before binding its
+                // target. Calls in the value therefore still see an imported
+                // callable, while calls reached afterwards see the replacement.
+                self.visit_expr(&named.value);
+                let mut rebound = BoundNames::default();
+                rebound.bind(&named.target);
+                self.invalidated_bindings.extend(rebound.names);
+                return;
+            }
             Expr::Call(call) => {
                 self.called.insert((call.func.start(), call.func.end()));
                 self.check_call(call);

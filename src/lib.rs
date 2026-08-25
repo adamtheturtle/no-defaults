@@ -3570,6 +3570,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__hash__"
             | "__sizeof__"
             | "__copy__"
+            | "__replace__"
             | "__deepcopy__"
             | "__reduce__"
             | "__reduce_ex__"
@@ -9959,6 +9960,24 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn copy_defaults_are_retained_for_implicit_shallow_copy_calls() {
         let source = "class C:\n    def __copy__(self, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn replace_defaults_are_retained_for_implicit_copy_replace_calls() {
+        let source =
+            "class C:\n    def __replace__(self, extra=1, **changes):\n        return extra\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

@@ -3440,6 +3440,10 @@ impl Checker<'_> {
 
 /// A method Python may call through syntax or a built-in rather than through
 /// an explicit attribute call that the fixer can rewrite.
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeping the exhaustive protocol-name catalogue together makes omissions visible"
+)]
 fn implicitly_called_method(name: &str) -> bool {
     matches!(
         name,
@@ -3456,6 +3460,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__set_name__"
             | "__instancecheck__"
             | "__subclasscheck__"
+            | "__subclasshook__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9236,6 +9241,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn subclasscheck_defaults_are_retained_for_implicit_issubclass_calls() {
         let source = "class M(type):\n    def __subclasscheck__(cls, subclass, extra=1):\n        return extra == 1\n\nclass C(metaclass=M):\n    pass\n\nissubclass(int, C)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn subclasshook_defaults_are_retained_for_implicit_abc_checks() {
+        let source = "from abc import ABC\n\nclass C(ABC):\n    @classmethod\n    def __subclasshook__(cls, subclass, extra=1):\n        return extra == 1\n\nissubclass(int, C)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

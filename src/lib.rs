@@ -3445,6 +3445,7 @@ fn implicitly_called_method(name: &str) -> bool {
         name,
         "__new__"
             | "__del__"
+            | "__getattribute__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9036,6 +9037,23 @@ def b(x=1): pass  # type: ignore  # noqa
     fn del_defaults_are_retained_for_implicit_finalization() {
         let source =
             "class C:\n    def __del__(self, extra=1):\n        print(extra)\n\nc = C()\ndel c\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn getattribute_defaults_are_retained_for_implicit_attribute_reads() {
+        let source = "class C:\n    def __getattribute__(self, name, extra=1):\n        return extra\n\nC().value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

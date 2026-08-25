@@ -3264,9 +3264,15 @@ impl Checker<'_> {
             class: ClassScope::None,
             kept_default: false,
         };
+        let outer_repeated_functions = self.repeated_functions.clone();
+        let mut function_names = BTreeSet::new();
+        let mut repeated_functions = BTreeSet::new();
+        collect_repeated_functions(&function.body, &mut function_names, &mut repeated_functions);
+        self.repeated_functions = repeated_functions;
         self.lexical_scope.push(function.name.to_string());
         walk_stmt(self, statement);
         self.lexical_scope.pop();
+        self.repeated_functions = outer_repeated_functions;
         self.aliases = outer_aliases;
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
@@ -4068,7 +4074,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         && !collector.removed.is_empty()
                     {
                         self.signatures.push(Signature {
-                            name: collector.name,
+                            name: qualified_lexical_name(&self.lexical_scope, &collector.name),
                             path: self.path.to_path_buf(),
                             positional: collector.fields,
                             positional_only: 0,
@@ -6155,17 +6161,16 @@ impl Rewriter<'_> {
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
-                let key = if self.nested_function(name.id.as_str()) {
-                    qualified_lexical_name(&self.lexical_scope, name.id.as_str())
+                let symbols = self.definitions.symbols.get(self.physical)?;
+                let qualified = qualified_lexical_name(&self.lexical_scope, name.id.as_str());
+                let signature = if self.nested_function(name.id.as_str()) {
+                    symbols.get(&qualified)?
                 } else {
-                    name.id.to_string()
-                };
-                let signature = self
-                    .definitions
-                    .symbols
-                    .get(self.physical)?
-                    .get(&key)?
-                    .as_ref()?;
+                    symbols
+                        .get(&qualified)
+                        .or_else(|| symbols.get(name.id.as_str()))?
+                }
+                .as_ref()?;
                 Some((signature, signature.kind.implicit_bound()))
             }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
@@ -11187,6 +11192,37 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(module_default)?,
             "def target(value): return value\ndef outer():\n    def target(): return 9\n    return target()\nassert outer() == 9\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn same_named_nested_callables_do_not_collide() -> Result<(), String> {
+        let functions = "def first():\n    def target(value=1): return value\n    return target()\ndef second():\n    def target(value=2): return value\n    return target()\n";
+        let result = fixed(functions)?;
+        assert!(result.contains("target(value=1)"), "{result}");
+        assert!(result.contains("target(value=2)"), "{result}");
+
+        let repeated = "def outer():\n    def target(value=1): return value\n    def target(value=2): return value\n    return target()\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            repeated,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.fix.is_none()));
+        assert!(checked.signatures.is_empty());
+
+        let dataclasses = "from dataclasses import dataclass\ndef first():\n    @dataclass\n    class C:\n        value: int = 1\n    return C()\ndef second():\n    @dataclass\n    class C:\n        value: int = 2\n    return C()\n";
+        let result = fixed(dataclasses)?;
+        assert!(result.contains("C(value=1)"), "{result}");
+        assert!(result.contains("C(value=2)"), "{result}");
         Ok(())
     }
 

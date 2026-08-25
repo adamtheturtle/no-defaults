@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A named expression in a class body binds its target in the class namespace after evaluating its value, so later calls no longer resolve through a stale global import.
 - A class-body `except … as` target shadows an imported callable while its handler runs and is deleted afterwards; calls on the caught object remain unchanged and the affected default is retained.
 - A class-body `with … as` target shadows an imported callable before the context-manager suite runs; calls on its value remain unchanged and the affected checked default is retained.
 - A class-body `for` target shadows an imported callable before the loop body runs; calls on its value remain unchanged and the affected checked default is retained.

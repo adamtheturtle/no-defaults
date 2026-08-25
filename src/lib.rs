@@ -3463,6 +3463,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__subclasshook__"
             | "__class_getitem__"
             | "__mro_entries__"
+            | "__prepare__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9294,6 +9295,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn mro_entries_defaults_are_retained_for_implicit_base_resolution() {
         let source = "class Proxy:\n    def __mro_entries__(self, bases, extra=1):\n        return ()\n\nproxy = Proxy()\n\nclass C(proxy):\n    pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn prepare_defaults_are_retained_for_implicit_metaclass_calls() {
+        let source = "class M(type):\n    @classmethod\n    def __prepare__(mcls, name, bases, extra=1):\n        return {}\n\nclass C(metaclass=M):\n    pass\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

@@ -60,6 +60,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Class-body aliases created with `staticmethod()` and `classmethod()` carry the wrapper's receiver convention; `property()` aliases retain defaults consumed by descriptor access.
 - Class-body control-flow suites are scanned conservatively for method aliases, while nested definition scopes remain excluded.
 - Annotated assignments, statically paired destructuring, and named expressions in class bodies record method aliases for call rewriting.
 - Transitive class-body method aliases resolve to the original method signature, so calls through every alias receive removed defaults.

@@ -285,6 +285,20 @@ enum Receiver {
     None,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MethodAliasKind {
+    Direct,
+    Static,
+    Class,
+    Property,
+}
+
+#[derive(Clone, Debug)]
+struct MethodAlias {
+    name: String,
+    kind: MethodAliasKind,
+}
+
 impl Callable {
     /// Whether the name refers to a function, whose appearance outside a call
     /// is worth a warning. A class name appears in annotations and `isinstance`
@@ -2696,7 +2710,7 @@ struct Checker<'a> {
     class_assignments: Vec<BTreeMap<String, Vec<TextSize>>>,
     /// Direct `alias = method` bindings for each enclosing class, keyed by the
     /// original method name.
-    method_aliases: Vec<BTreeMap<String, Vec<String>>>,
+    method_aliases: Vec<BTreeMap<String, Vec<MethodAlias>>>,
     signatures: Vec<Signature>,
     skipped: Vec<Skipped>,
     directives: Vec<Directive>,
@@ -3391,7 +3405,14 @@ impl Checker<'_> {
         let enclosing = self.header;
         self.header = Some(line_start(self.source, function.name.start()));
         let descriptor_invoked = self.scope.class != ClassScope::None
-            && is_property(function, &self.aliases, &self.module_bindings);
+            && (is_property(function, &self.aliases, &self.module_bindings)
+                || self.method_aliases.last().is_some_and(|aliases| {
+                    aliases.get(function.name.as_str()).is_some_and(|aliases| {
+                        aliases
+                            .iter()
+                            .any(|alias| alias.kind == MethodAliasKind::Property)
+                    })
+                }));
         let implicitly_called = self.scope.class != ClassScope::None
             && self.scope.fields == Some(FieldStyle::Dataclass)
             && function.name.as_str() == "__post_init__";
@@ -3514,11 +3535,22 @@ impl Checker<'_> {
                 .last()
                 .and_then(|aliases| aliases.get(function.name.as_str()))
             {
-                self.signatures
-                    .extend(aliases.iter().map(|alias| Signature {
-                        name: alias.clone(),
-                        ..signature.clone()
-                    }));
+                self.signatures.extend(aliases.iter().filter_map(|alias| {
+                    if alias.kind == MethodAliasKind::Property {
+                        return None;
+                    }
+                    let mut alias_signature = signature.clone();
+                    alias_signature.name.clone_from(&alias.name);
+                    if let Callable::Method { receiver, .. } = &mut alias_signature.kind {
+                        *receiver = match alias.kind {
+                            MethodAliasKind::Direct => *receiver,
+                            MethodAliasKind::Static => Receiver::None,
+                            MethodAliasKind::Class => Receiver::Class,
+                            MethodAliasKind::Property => unreachable!(),
+                        };
+                    }
+                    Some(alias_signature)
+                }));
             }
         }
         if function.name.as_str() == "__init__" {
@@ -4491,17 +4523,17 @@ fn generates_init(
 /// Direct method aliases created in a class namespace. Python applies the
 /// descriptor protocol to both names, so calls through either spelling have
 /// the same implicit receiver and parameters.
-fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<String>> {
-    let mut aliases = BTreeMap::<String, Vec<String>>::new();
-    let mut origins = BTreeMap::<String, String>::new();
+fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<MethodAlias>> {
+    let mut aliases = BTreeMap::<String, Vec<MethodAlias>>::new();
+    let mut origins = BTreeMap::<String, (String, MethodAliasKind)>::new();
     collect_class_method_aliases(&class.body, &mut aliases, &mut origins);
     aliases
 }
 
 fn collect_class_method_aliases(
     statements: &[Stmt],
-    aliases: &mut BTreeMap<String, Vec<String>>,
-    origins: &mut BTreeMap<String, String>,
+    aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
+    origins: &mut BTreeMap<String, (String, MethodAliasKind)>,
 ) {
     for statement in statements {
         match statement {
@@ -4575,8 +4607,8 @@ fn collect_class_method_aliases(
 
 fn collect_alias_branches<'a>(
     branches: impl IntoIterator<Item = &'a [Stmt]>,
-    aliases: &mut BTreeMap<String, Vec<String>>,
-    origins: &BTreeMap<String, String>,
+    aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
+    origins: &BTreeMap<String, (String, MethodAliasKind)>,
 ) {
     for branch in branches {
         let mut branch_origins = origins.clone();
@@ -4587,20 +4619,22 @@ fn collect_alias_branches<'a>(
 fn record_method_alias(
     target: &Expr,
     value: &Expr,
-    aliases: &mut BTreeMap<String, Vec<String>>,
-    origins: &mut BTreeMap<String, String>,
+    aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
+    origins: &mut BTreeMap<String, (String, MethodAliasKind)>,
 ) {
     match (target, value) {
-        (Expr::Name(alias), Expr::Name(original)) => {
-            let original = origins
-                .get(original.id.as_str())
-                .cloned()
-                .unwrap_or_else(|| original.id.to_string());
+        (Expr::Name(alias), value) => {
+            let Some((original, kind)) = method_alias_origin(value, origins) else {
+                return;
+            };
             aliases
                 .entry(original.clone())
                 .or_default()
-                .push(alias.id.to_string());
-            origins.insert(alias.id.to_string(), original);
+                .push(MethodAlias {
+                    name: alias.id.to_string(),
+                    kind,
+                });
+            origins.insert(alias.id.to_string(), (original, kind));
         }
         (Expr::Tuple(targets), Expr::Tuple(values)) if targets.elts.len() == values.elts.len() => {
             for (target, value) in targets.elts.iter().zip(&values.elts) {
@@ -4613,6 +4647,41 @@ fn record_method_alias(
             }
         }
         _ => {}
+    }
+}
+
+fn method_alias_origin(
+    value: &Expr,
+    origins: &BTreeMap<String, (String, MethodAliasKind)>,
+) -> Option<(String, MethodAliasKind)> {
+    match value {
+        Expr::Name(original) => Some(
+            origins
+                .get(original.id.as_str())
+                .cloned()
+                .unwrap_or_else(|| (original.id.to_string(), MethodAliasKind::Direct)),
+        ),
+        Expr::Call(call)
+            if call.arguments.args.len() == 1 && call.arguments.keywords.is_empty() =>
+        {
+            let Expr::Name(wrapper) = call.func.as_ref() else {
+                return None;
+            };
+            let kind = match wrapper.id.as_str() {
+                "staticmethod" => MethodAliasKind::Static,
+                "classmethod" => MethodAliasKind::Class,
+                "property" => MethodAliasKind::Property,
+                _ => return None,
+            };
+            let Expr::Name(original) = &call.arguments.args[0] else {
+                return None;
+            };
+            let root = origins
+                .get(original.id.as_str())
+                .map_or_else(|| original.id.to_string(), |(root, _)| root.clone());
+            Some((root, kind))
+        }
+        _ => None,
     }
 }
 

@@ -2949,6 +2949,34 @@ fn package_star_reexports_update_calls() -> Result<(), Box<dyn std::error::Error
 }
 
 #[test]
+fn dotted_imports_bind_the_top_level_package() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("a");
+    std::fs::create_dir(&package)?;
+    std::fs::write(
+        package.join("__init__.py"),
+        "def target(value=1): return value\n",
+    )?;
+    std::fs::write(package.join("b.py"), "")?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "import a.b\nassert a.target() == 1\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import a.b\nassert a.target(value=1) == 1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(package.join("__init__.py"))?,
+        "def target(value): return value\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

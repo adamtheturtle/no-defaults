@@ -5424,6 +5424,14 @@ fn collect_bindings(
                     };
                     if let Some(file) = resolve_module(module, 0, importer, known) {
                         bindings.insert(bound, Binding::Module(file));
+                        if alias.asname.is_none() {
+                            if let Some(top) = module.split('.').next().filter(|top| *top != module)
+                            {
+                                if let Some(package) = resolve_module(top, 0, importer, known) {
+                                    bindings.insert(top.to_owned(), Binding::Module(package));
+                                }
+                            }
+                        }
                     } else {
                         // The import still replaces the local name at runtime;
                         // an earlier checked binding must not survive merely

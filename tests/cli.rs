@@ -3440,6 +3440,20 @@ fn later_classes_do_not_shadow_metaclass_bases_before_their_definition(
 }
 
 #[test]
+fn conditional_class_bases_preserve_any_metaclass_interception(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "class Meta(type):\n    def __getattribute__(cls, name):\n        if name == 'target': return lambda: 9\n        return super().__getattribute__(name)\nif choose_first:\n    class Base(metaclass=Meta): pass\nelse:\n    class Base: pass\nclass Child(Base):\n    @staticmethod\n    def target(value=1): return value\nassert Child.target() == 9\n";
+    std::fs::write(&case, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&case).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(case)?, source);
+    Ok(())
+}
+
+#[test]
 fn assigned_instance_attributes_keep_method_defaults() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

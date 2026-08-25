@@ -424,6 +424,27 @@ fn custom_field_helpers_do_not_use_pydantic_argument_surgery(
 }
 
 #[test]
+fn assigning_over_pydantic_field_retains_the_replacement_call(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("pydantic.py"),
+        "class BaseModel: pass\ndef Field(**kwargs): return kwargs.get('default', 0)\n",
+    )?;
+    let path = directory.path().join("example.py");
+    let source = "from pydantic import BaseModel, Field\ndef replacement(**kwargs): return kwargs.get('default', 0)\nField = replacement\nclass C(BaseModel):\n    value: int = Field(default=1, description='kept')\nassert C.value == 1\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}
+
+#[test]
 fn real_project_uses_per_file_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = format!("{}/tests/fixtures/real_project", env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(binary())

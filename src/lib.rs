@@ -790,10 +790,16 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
     };
     let mut definitions = Definitions::default();
     for signature in signatures {
-        definitions.names.insert(signature.name.clone());
+        let display_name = signature
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&signature.name)
+            .to_owned();
+        definitions.names.insert(display_name.clone());
         definitions
             .fixes_by_name
-            .entry(signature.name.clone())
+            .entry(display_name)
             .or_default()
             .extend(
                 signature
@@ -3615,7 +3621,11 @@ impl Checker<'_> {
         let parameter_name =
             |parameter: &ast::ParameterWithDefault| parameter.parameter.name.to_string();
         let signature = Signature {
-            name: function.name.to_string(),
+            name: if self.scope.class == ClassScope::None {
+                qualified_lexical_name(&self.lexical_scope, function.name.as_str())
+            } else {
+                function.name.to_string()
+            },
             positional: function
                 .parameters
                 .posonlyargs
@@ -4250,6 +4260,14 @@ fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
 
 fn qualified_name(parent: Option<&str>, name: &str) -> String {
     parent.map_or_else(|| name.to_owned(), |parent| format!("{parent}.{name}"))
+}
+
+fn qualified_lexical_name(scope: &[String], name: &str) -> String {
+    if scope.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}.<locals>.{name}", scope.join(".<locals>."))
+    }
 }
 
 /// Local names that an aliased import bound to a member of `dataclasses` or
@@ -5350,6 +5368,7 @@ fn rewrite_calls(
         classes: Vec::new(),
         class_scope_depths: Vec::new(),
         implicit_receivers: Vec::new(),
+        lexical_scope: Vec::new(),
         called: BTreeSet::new(),
         scopes: Vec::new(),
         lines: LineIndex::new(source),
@@ -5892,6 +5911,9 @@ struct Rewriter<'a> {
     /// The implicit receiver name of each enclosing function. Static methods
     /// and module functions contribute `None`.
     implicit_receivers: Vec<Option<String>>,
+    /// Enclosing class and function names, matching the checker's lexical
+    /// identity for nested functions.
+    lexical_scope: Vec<String>,
     /// Ranges of the expressions being called, so that the same expression is
     /// not later mistaken for a reference that never calls the function.
     called: BTreeSet<(TextSize, TextSize)>,
@@ -5946,6 +5968,15 @@ impl Rewriter<'_> {
                 .contains(name)
                 .then(|| scope.functions.contains(name) || scope.classes.contains(name))
         })
+    }
+
+    fn nested_function(&self, name: &str) -> bool {
+        self.scopes.iter().rev().find_map(|scope| {
+            scope
+                .names
+                .contains(name)
+                .then(|| scope.functions.contains(name))
+        }) == Some(true)
     }
 
     fn binding(&self, name: &str) -> Option<&Binding> {
@@ -6124,11 +6155,16 @@ impl Rewriter<'_> {
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
+                let key = if self.nested_function(name.id.as_str()) {
+                    qualified_lexical_name(&self.lexical_scope, name.id.as_str())
+                } else {
+                    name.id.to_string()
+                };
                 let signature = self
                     .definitions
                     .symbols
                     .get(self.physical)?
-                    .get(name.id.as_str())?
+                    .get(&key)?
                     .as_ref()?;
                 Some((signature, signature.kind.implicit_bound()))
             }
@@ -6913,6 +6949,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 let qualified =
                     qualified_name(self.classes.last().map(String::as_str), class.name.as_str());
                 self.classes.push(qualified);
+                self.lexical_scope.push(class.name.to_string());
                 self.scopes.push(BoundNames::default());
                 self.class_bindings.push(BTreeMap::new());
                 self.class_scope_depths.push(self.scopes.len());
@@ -6920,6 +6957,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.class_scope_depths.pop();
                 self.class_bindings.pop();
                 self.scopes.pop();
+                self.lexical_scope.pop();
                 self.classes.pop();
                 self.bind_definition_in_class(class.name.as_str(), true);
                 if module_scope
@@ -6964,7 +7002,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 collect_bindings(&function.body, self.physical, self.known, &mut local);
                 self.bindings.push(local);
                 self.scopes.push(BoundNames::of_function(function));
+                self.lexical_scope.push(function.name.to_string());
                 self.visit_body(&function.body);
+                self.lexical_scope.pop();
                 self.scopes.pop();
                 self.bindings.pop();
                 self.implicit_receivers.pop();
@@ -11131,6 +11171,22 @@ def b(x=1): pass  # type: ignore  # noqa
             "def outer():\n    def inner(value):\n        return value\n    return inner(value=1)\n"
         );
         assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_and_module_functions_have_distinct_identities() -> Result<(), String> {
+        let nested_default = "def outer():\n    def target(value=1): return value\n    return target()\ndef target(): return 9\nassert target() == 9\n";
+        assert_eq!(
+            fixed(nested_default)?,
+            "def outer():\n    def target(value): return value\n    return target(value=1)\ndef target(): return 9\nassert target() == 9\n"
+        );
+
+        let module_default = "def target(value=1): return value\ndef outer():\n    def target(): return 9\n    return target()\nassert outer() == 9\n";
+        assert_eq!(
+            fixed(module_default)?,
+            "def target(value): return value\ndef outer():\n    def target(): return 9\n    return target()\nassert outer() == 9\n"
+        );
         Ok(())
     }
 

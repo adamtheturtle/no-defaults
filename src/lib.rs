@@ -6098,6 +6098,20 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_body(&loop_statement.body);
                 self.visit_body(&loop_statement.orelse);
             }
+            Stmt::With(block) if self.in_class_scope() => {
+                for item in &block.items {
+                    self.visit_expr(&item.context_expr);
+                    if let Some(target) = &item.optional_vars {
+                        self.visit_expr(target);
+                        let mut bound = BoundNames::default();
+                        bound.bind(target);
+                        if let Some(scope) = self.scopes.last_mut() {
+                            scope.names.extend(bound.names);
+                        }
+                    }
+                }
+                self.visit_body(&block.body);
+            }
             Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.scopes.is_empty() => {
                 // The assigned value is evaluated before its module-level
                 // target replaces whatever an import bound there.

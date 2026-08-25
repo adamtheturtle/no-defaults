@@ -6675,6 +6675,14 @@ impl Rewriter<'_> {
         self.invalidated_bindings.contains(name) || self.invalidated_bindings.contains(head)
     }
 
+    fn has_unknown_receiver_binding(&self, expression: &Expr) -> bool {
+        match expression {
+            Expr::Name(name) => matches!(self.binding(name.id.as_str()), Some(Binding::Unknown)),
+            Expr::Attribute(attribute) => self.has_unknown_receiver_binding(&attribute.value),
+            _ => false,
+        }
+    }
+
     fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
         let (line, column) = self.lines.locate(self.source, offset);
         self.skipped.push(Skipped {
@@ -6943,8 +6951,7 @@ impl Rewriter<'_> {
                 let replaced_import = dotted_name(&call.func)
                     .is_some_and(|binding| self.binding_is_replaced(&binding));
                 let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
-                let ambiguous_import = dotted_name(&call.func)
-                    .is_some_and(|name| matches!(self.binding(&name), Some(Binding::Unknown)));
+                let ambiguous_import = self.has_unknown_receiver_binding(&call.func);
                 if replaced_import || local_shadow || ambiguous_import {
                     if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
                         self.retained.extend(fixes.iter().cloned());

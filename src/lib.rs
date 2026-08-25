@@ -5460,7 +5460,9 @@ fn collect_bindings(
                         .as_ref()
                         .filter(|file| source_binds_name(file, name))
                         .cloned();
+                    let implicit_sibling = import.module.is_none() && import.level > 0;
                     let binding = match (package_member, submodule, &parent) {
+                        (_, Some(file), _) if implicit_sibling => Binding::Module(file),
                         (Some(file), _, _) => Binding::Symbol(file, name.to_owned()),
                         (None, Some(file), _) => Binding::Module(file),
                         (None, None, Some(file)) => Binding::Symbol(file.clone(), name.to_owned()),
@@ -5472,6 +5474,19 @@ fn collect_bindings(
                         }
                     };
                     bindings.insert(bound, binding);
+                }
+            }
+            Stmt::Assign(assign) => {
+                let binding = assignment_binding(&assign.value, bindings);
+                for target in &assign.targets {
+                    let Expr::Name(target) = target else {
+                        continue;
+                    };
+                    if let Some(binding) = &binding {
+                        bindings.insert(target.id.to_string(), binding.clone());
+                    } else {
+                        bindings.remove(target.id.as_str());
+                    }
                 }
             }
             Stmt::If(branch) => {
@@ -5500,6 +5515,21 @@ fn collect_bindings(
             // separately when the rewriter enters them.
             _ => {}
         }
+    }
+}
+
+/// Resolve a simple assignment alias through the imports already executed.
+fn assignment_binding(value: &Expr, bindings: &BTreeMap<String, Binding>) -> Option<Binding> {
+    match value {
+        Expr::Name(name) => bindings.get(name.id.as_str()).cloned(),
+        Expr::Attribute(attribute) => {
+            let module = dotted_name(&attribute.value)?;
+            let Binding::Module(file) = bindings.get(&module)? else {
+                return None;
+            };
+            Some(Binding::Symbol(file.clone(), attribute.attr.to_string()))
+        }
+        _ => None,
     }
 }
 

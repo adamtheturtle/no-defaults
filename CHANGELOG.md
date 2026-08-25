@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Calls through checked symbols and modules imported directly in a class body now receive removed defaults, while those class imports remain invisible to method lexical lookup.
 - Deleting a class-local shadow restores global name lookup for later statements in the class body, so calls to the global callable are rewritten with removed defaults.
 - A selected class-body `match` case installs its pattern captures in the class namespace before evaluating the guard and body, so calls on captured values no longer use stale global imports.
 - A named expression in a class body binds its target in the class namespace after evaluating its value, so later calls no longer resolve through a stale global import.

@@ -2277,6 +2277,41 @@ fn deleting_a_class_local_shadow_restores_the_global_callable(
 }
 
 #[test]
+fn class_local_import_calls_receive_removed_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    for body in [
+        "    from api import target\n    result = target()",
+        "    import api\n    result = api.target()",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1): return value\n")?;
+        let caller_source = format!("class C:\n{body}\nassert C.result == 1\n");
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(&api)?,
+            "def target(value): return value\n",
+            "{body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!(
+                "class C:\n{}\nassert C.result == 1\n",
+                body.replace("target()", "target(value=1)")
+            ),
+            "{body}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

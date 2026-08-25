@@ -7418,6 +7418,48 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 }
                 self.visit_body(&block.body);
             }
+            Stmt::For(loop_statement) => {
+                // The iterable still sees the import; a non-empty loop target
+                // replaces it before the body and later function statements.
+                self.visit_expr(&loop_statement.iter);
+                let statically_empty = match loop_statement.iter.as_ref() {
+                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
+                    Expr::List(list) => list.elts.is_empty(),
+                    Expr::Set(set) => set.elts.is_empty(),
+                    Expr::Dict(dict) => dict.items.is_empty(),
+                    _ => false,
+                };
+                if statically_empty {
+                    self.visit_body(&loop_statement.orelse);
+                    return;
+                }
+                self.visit_expr(&loop_statement.target);
+                if let Some(bindings) = self.bindings.last_mut() {
+                    for name in rebound_names(statement) {
+                        bindings.remove(&name);
+                    }
+                }
+                self.visit_body(&loop_statement.body);
+                self.visit_body(&loop_statement.orelse);
+            }
+            Stmt::With(block) => {
+                // With-items enter left to right, and each optional target is
+                // bound before the next context expression is evaluated.
+                for item in &block.items {
+                    self.visit_expr(&item.context_expr);
+                    if let Some(target) = &item.optional_vars {
+                        self.visit_expr(target);
+                        let mut rebound = BoundNames::default();
+                        rebound.bind(target);
+                        if let Some(bindings) = self.bindings.last_mut() {
+                            for name in rebound.names {
+                                bindings.remove(&name);
+                            }
+                        }
+                    }
+                }
+                self.visit_body(&block.body);
+            }
             Stmt::If(branch) if self.scopes.is_empty() => {
                 let clauses = std::iter::once((Some(branch.test.as_ref()), branch.body.as_slice()))
                     .chain(
@@ -7700,6 +7742,18 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 let mut rebound = BoundNames::default();
                 rebound.bind(&named.target);
                 self.invalidated_bindings.extend(rebound.names);
+                return;
+            }
+            Expr::Named(named) => {
+                self.visit_expr(&named.value);
+                self.visit_expr(&named.target);
+                let mut rebound = BoundNames::default();
+                rebound.bind(&named.target);
+                if let Some(bindings) = self.bindings.last_mut() {
+                    for name in rebound.names {
+                        bindings.remove(&name);
+                    }
+                }
                 return;
             }
             Expr::Call(call) => {

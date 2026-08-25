@@ -5925,14 +5925,24 @@ impl Rewriter<'_> {
     /// lookup starts after the class the call appears in.
     fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
         if let Expr::Call(call) = receiver {
-            if call.arguments.args.is_empty()
-                && call.arguments.keywords.is_empty()
+            let current_class = self.classes.last();
+            let implicit_receiver = self.implicit_receivers.last().and_then(Option::as_deref);
+            let zero_argument_super = call.arguments.args.is_empty() && implicit_receiver.is_some();
+            let explicit_super = match &*call.arguments.args {
+                [Expr::Name(class), Expr::Name(receiver)] => {
+                    current_class.and_then(|class| class.rsplit('.').next())
+                        == Some(class.id.as_str())
+                        && implicit_receiver == Some(receiver.id.as_str())
+                }
+                _ => false,
+            };
+            if call.arguments.keywords.is_empty()
                 && matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "super")
-                && self.implicit_receivers.last().is_some_and(Option::is_some)
+                && (zero_argument_super || explicit_super)
             {
                 return Some((
                     self.physical.to_path_buf(),
-                    self.classes.last()?.clone(),
+                    current_class?.clone(),
                     true,
                     true,
                 ));
@@ -9964,6 +9974,26 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return super().target(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_super_calls_resolve_in_the_enclosing_method() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self): return super(Child, self).target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self): return super(Child, self).target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_super_with_another_context_is_left_unresolved() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self, other): return super(Base, other).target()\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self, other): return super(Base, other).target()\n"
         );
         Ok(())
     }

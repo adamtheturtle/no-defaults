@@ -6123,9 +6123,17 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     Truthiness::False | Truthiness::Falsey | Truthiness::None => {
                         self.visit_body(&loop_statement.orelse);
                     }
-                    _ => {
+                    truth => {
                         self.visit_body(&loop_statement.body);
-                        self.visit_body(&loop_statement.orelse);
+                        let definitely_breaks = loop_statement
+                            .body
+                            .last()
+                            .is_some_and(|statement| matches!(statement, Stmt::Break(_)));
+                        let definitely_enters =
+                            matches!(truth, Truthiness::True | Truthiness::Truthy);
+                        if !(definitely_enters && definitely_breaks) {
+                            self.visit_body(&loop_statement.orelse);
+                        }
                     }
                 }
             }

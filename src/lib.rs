@@ -9327,6 +9327,23 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn metaclass_new_defaults_are_retained_for_implicit_class_creation() {
+        let source = "class M(type):\n    def __new__(mcls, name, bases, namespace, extra=1):\n        return super().__new__(mcls, name, bases, namespace)\n\nclass C(metaclass=M):\n    pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
     fn dataclass_post_init_defaults_are_retained_for_generated_calls() {
         let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int\n\n    def __post_init__(self, extra=1):\n        self.extra = extra\n\nC(5)\n";
         let checked = check_source(

@@ -3496,6 +3496,7 @@ impl Checker<'_> {
             || self.conditional_depth > 0
             || !constructs
             || !self.class_constructs.last().copied().unwrap_or(true)
+            || matches!(value, Expr::Call(call) if matches!(call.func.as_ref(), Expr::Name(name) if self.aliases.invalidated_dataclass_fields.contains(name.id.as_str())))
             || (style == FieldStyle::Base
                 && pydantic_field_has_validation_alias(value, &self.aliases, &self.module_bindings))
             || (self.scope.kept_default && !kw_only)
@@ -3971,6 +3972,7 @@ struct Aliases {
     renamed: BTreeMap<String, Option<String>>,
     dataclasses_members: BTreeSet<String>,
     dataclass_fields: BTreeSet<String>,
+    invalidated_dataclass_fields: BTreeSet<String>,
     dataclass_decorators: BTreeSet<String>,
     pydantic_fields: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
@@ -3991,6 +3993,9 @@ impl Aliases {
     fn invalidate(&mut self, name: &str) {
         self.renamed.remove(name);
         self.dataclasses_members.remove(name);
+        if self.dataclass_fields.remove(name) {
+            self.invalidated_dataclass_fields.insert(name.to_owned());
+        }
         self.dataclass_decorators.remove(name);
         self.dataclasses_modules.remove(name);
         self.staticmethods.remove(name);

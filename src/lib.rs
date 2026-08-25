@@ -2381,6 +2381,7 @@ fn check_source(
         lines: LineIndex::new(source),
         classes: Vec::new(),
         class_constructs: Vec::new(),
+        delegation_protocols: Vec::new(),
         class_deletions: Vec::new(),
         class_assignments: Vec::new(),
         method_aliases: Vec::new(),
@@ -2681,6 +2682,9 @@ struct Checker<'a> {
     lines: LineIndex,
     classes: Vec<ClassCollector>,
     class_constructs: Vec<bool>,
+    /// Whether each enclosing class directly defines the iterator methods that
+    /// make `yield from` forward protocol calls to it.
+    delegation_protocols: Vec<bool>,
     class_deletions: Vec<BTreeSet<String>>,
     class_assignments: Vec<BTreeMap<String, Vec<TextSize>>>,
     /// Direct `alias = method` bindings for each enclosing class, keyed by the
@@ -3045,6 +3049,7 @@ impl Checker<'_> {
 
     fn leave_class(&mut self) {
         self.class_constructs.pop();
+        self.delegation_protocols.pop();
         self.class_deletions.pop();
         self.class_assignments.pop();
         self.method_aliases.pop();
@@ -3322,6 +3327,8 @@ impl Checker<'_> {
                 || self.is_stub()
                 || (self.scope.class != ClassScope::None
                     && implicitly_called_method(function.name.as_str()))
+                || (self.delegation_protocols.last() == Some(&true)
+                    && function.name.as_str() == "send")
                 || (self.scope.class == ClassScope::Metaclass
                     && matches!(function.name.as_str(), "__init__" | "mro"))
                 || (self.scope.class == ClassScope::None
@@ -3683,6 +3690,14 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 };
                 self.class_constructs
                     .push(self.class_constructs_safely(class));
+                let defines_iterator_method = |expected: &str| {
+                    class.body.iter().any(|statement| {
+                        matches!(statement, ast::Stmt::FunctionDef(function) if function.name.as_str() == expected)
+                    })
+                };
+                self.delegation_protocols.push(
+                    defines_iterator_method("__iter__") && defines_iterator_method("__next__"),
+                );
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
                 self.method_aliases.push(class_method_aliases(class));
@@ -8908,6 +8923,23 @@ def b(x=1): pass  # type: ignore  # noqa
     fn release_buffer_defaults_are_retained_for_implicit_memoryview_callbacks() {
         let source =
             "class C:\n    def __release_buffer__(self, view, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn iterator_send_defaults_are_retained_for_yield_from_delegation() {
+        let source = "class I:\n    def __iter__(self):\n        return self\n    def __next__(self):\n        return 0\n    def send(self, value, extra=1):\n        return extra\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

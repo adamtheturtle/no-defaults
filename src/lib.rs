@@ -6016,14 +6016,47 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         bindings,
                     );
                 }
-                let runtime_names = BoundNames::of_body(std::slice::from_ref(statement)).names;
-                for name in runtime_names {
-                    let resolved = self.bindings.first().is_some_and(|bindings| {
-                        bindings.keys().any(|binding| {
-                            binding == &name
-                                || binding.split('.').next().is_some_and(|head| head == name)
+                let resolutions: Vec<(String, bool)> = match statement {
+                    Stmt::Import(import) => import
+                        .names
+                        .iter()
+                        .map(|alias| {
+                            let name = alias.asname.as_ref().map_or_else(
+                                || {
+                                    alias
+                                        .name
+                                        .split('.')
+                                        .next()
+                                        .unwrap_or(alias.name.as_str())
+                                        .to_owned()
+                                },
+                                ToString::to_string,
+                            );
+                            let resolved =
+                                resolve_module(alias.name.as_str(), 0, self.physical, self.known)
+                                    .is_some();
+                            (name, resolved)
                         })
-                    });
+                        .collect(),
+                    Stmt::ImportFrom(import) => import
+                        .names
+                        .iter()
+                        .filter(|alias| alias.name.as_str() != "*")
+                        .map(|alias| {
+                            let name = alias
+                                .asname
+                                .as_ref()
+                                .map_or_else(|| alias.name.to_string(), ToString::to_string);
+                            let resolved = self
+                                .bindings
+                                .first()
+                                .is_some_and(|bindings| bindings.contains_key(&name));
+                            (name, resolved)
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (name, resolved) in resolutions {
                     if resolved {
                         self.invalidated_bindings.remove(&name);
                     } else {

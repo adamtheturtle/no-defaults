@@ -7011,23 +7011,28 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 if let Some(returns) = &function.returns {
                     self.visit_annotation(returns);
                 }
-                let receiver = (self.class_scope_depths.last() == Some(&self.scopes.len())
+                let function_scope = BoundNames::of_function(function);
+                let receiver = if self.class_scope_depths.last() == Some(&self.scopes.len())
                     && method_receiver(function, &self.aliases, &self.module_bindings)
-                        != Receiver::None)
-                    .then(|| {
-                        function
-                            .parameters
-                            .posonlyargs
-                            .first()
-                            .or_else(|| function.parameters.args.first())
-                            .map(|parameter| parameter.parameter.name.to_string())
-                    })
-                    .flatten();
+                        != Receiver::None
+                {
+                    function
+                        .parameters
+                        .posonlyargs
+                        .first()
+                        .or_else(|| function.parameters.args.first())
+                        .map(|parameter| parameter.parameter.name.to_string())
+                } else {
+                    self.implicit_receivers
+                        .last()
+                        .and_then(Clone::clone)
+                        .filter(|name| !function_scope.names.contains(name))
+                };
                 self.implicit_receivers.push(receiver);
                 let mut local = BTreeMap::new();
                 collect_bindings(&function.body, self.physical, self.known, &mut local);
                 self.bindings.push(local);
-                self.scopes.push(BoundNames::of_function(function));
+                self.scopes.push(function_scope);
                 self.lexical_scope.push(function.name.to_string());
                 self.visit_body(&function.body);
                 self.lexical_scope.pop();
@@ -10913,6 +10918,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             skipped_reasons(source)?.first().map(String::as_str),
             Some("this call cannot be tied to the definition that was fixed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_function_can_close_over_the_enclosing_receiver() -> Result<(), String> {
+        let source = "class C:\n    def target(self, value=1): return value\n    def run(self):\n        def nested(): return self.target()\n        return nested()\nassert C().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class C:\n    def target(self, value): return value\n    def run(self):\n        def nested(): return self.target(value=1)\n        return nested()\nassert C().run() == 1\n"
         );
         Ok(())
     }

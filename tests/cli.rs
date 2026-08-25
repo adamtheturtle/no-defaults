@@ -3154,6 +3154,28 @@ fn nearer_function_locals_shadow_outer_imports() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
+fn inner_function_definitions_shadow_outer_imports() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    let caller = directory.path().join("caller.py");
+    let caller_source = "def outer():\n    from api import target\n    def inner():\n        def target():\n            return 2\n        return target()\n    return inner()\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value): return value\n"
+    );
+    assert_eq!(std::fs::read_to_string(caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
 fn local_imports_resolve_before_later_definitions() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

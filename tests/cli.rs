@@ -2117,6 +2117,33 @@ fn unresolved_from_imports_invalidate_earlier_checked_bindings(
 }
 
 #[test]
+fn unresolved_dotted_imports_invalidate_the_top_level_binding(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let external = directory.path().join("external");
+    let caller = directory.path().join("caller.py");
+    std::fs::create_dir(&external)?;
+    let api_source = "def target(value=1): return value\n";
+    let caller_source =
+        "import api as external\nimport external.sub\nassert external.target() == 9\n";
+    std::fs::write(&api, api_source)?;
+    std::fs::write(external.join("__init__.py"), "def target(): return 9\n")?;
+    std::fs::write(external.join("sub.py"), "")?;
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(&api)
+        .arg(&caller)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(&api)?, api_source);
+    assert_eq!(std::fs::read_to_string(&caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
 fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

@@ -4470,19 +4470,19 @@ impl Aliases {
                         .module
                         .as_ref()
                         .is_some_and(|module| module.as_str() == "dataclasses");
+                    let pydantic = import
+                        .module
+                        .as_ref()
+                        .is_some_and(|module| module.split('.').next() == Some("pydantic"));
                     for alias in &import.names {
                         let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                         if dataclasses && alias.name.as_str() == "field" {
                             self.dataclass_fields.insert(local.clone());
                         }
-                        if import.module.as_ref().is_some_and(|module| {
-                            module.as_str() == "pydantic" && alias.name.as_str() == "Field"
-                        }) {
+                        if pydantic && alias.name.as_str() == "Field" {
                             self.pydantic_fields.insert(local.clone());
                         }
-                        if import.module.as_ref().is_some_and(|module| {
-                            module.as_str() == "pydantic" && alias.name.as_str() == "PrivateAttr"
-                        }) {
+                        if pydantic && alias.name.as_str() == "PrivateAttr" {
                             self.pydantic_private_attrs.insert(local.clone());
                         }
                         if dataclasses && alias.name.as_str() == "dataclass" {
@@ -7766,6 +7766,18 @@ mod tests {
         assert_eq!(
             found,
             "import pydantic as p\n\nclass Job(p.BaseModel):\n value: int = p.Field(description=\"kept\")\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pydantic_v1_field_keeps_its_metadata_when_fixed() -> Result<(), String> {
+        let found = fixed(
+            "from pydantic.v1 import BaseModel, Field\n\nclass Job(BaseModel):\n value: int = Field(default=1, description=\"kept\")\n",
+        )?;
+        assert_eq!(
+            found,
+            "from pydantic.v1 import BaseModel, Field\n\nclass Job(BaseModel):\n value: int = Field(description=\"kept\")\n"
         );
         Ok(())
     }

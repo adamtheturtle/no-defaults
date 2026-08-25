@@ -370,8 +370,8 @@ struct Definitions {
     /// Imported names in checked files, used to follow package re-exports to
     /// the file that owns a callable's signature.
     bindings: BTreeMap<(PathBuf, String), Binding>,
-    /// Direct same-file base classes for method lookup.
-    bases: BTreeMap<(PathBuf, String), Vec<String>>,
+    /// Direct statically resolved base classes for method lookup.
+    bases: BTreeMap<(PathBuf, String), Vec<(PathBuf, String)>>,
     /// Every name a fixed callable goes by, so a call that cannot be resolved
     /// to one can still be reported rather than silently left behind.
     names: BTreeSet<String>,
@@ -413,11 +413,11 @@ impl Definitions {
     /// calls, even when it is the one `--fix` changed.
     fn super_method(&self, file: &Path, class: &str, name: &str) -> Option<&Signature> {
         let mut seen = BTreeSet::new();
-        seen.insert(class.to_owned());
+        seen.insert((file.to_path_buf(), class.to_owned()));
         self.bases
             .get(&(file.to_path_buf(), class.to_owned()))?
             .iter()
-            .find_map(|base| self.inherited(file, base, name, &mut seen))
+            .find_map(|(base_file, base)| self.inherited(base_file, base, name, &mut seen))
     }
 
     fn inherited(
@@ -425,9 +425,9 @@ impl Definitions {
         file: &Path,
         class: &str,
         name: &str,
-        seen: &mut BTreeSet<String>,
+        seen: &mut BTreeSet<(PathBuf, String)>,
     ) -> Option<&Signature> {
-        if !seen.insert(class.to_owned()) {
+        if !seen.insert((file.to_path_buf(), class.to_owned())) {
             return None;
         }
         if let Some(method) = self
@@ -440,7 +440,7 @@ impl Definitions {
         self.bases
             .get(&(file.to_path_buf(), class.to_owned()))?
             .iter()
-            .find_map(|base| self.inherited(file, base, name, seen))
+            .find_map(|(base_file, base)| self.inherited(base_file, base, name, seen))
     }
 }
 
@@ -811,11 +811,6 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
-        definitions.bindings.extend(
-            bindings
-                .into_iter()
-                .map(|(name, binding)| ((importer.clone(), name), binding)),
-        );
         for statement in parsed.suite() {
             let Stmt::ClassDef(class) = statement else {
                 continue;
@@ -825,7 +820,18 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                 .iter()
                 .flat_map(|arguments| arguments.args.iter())
                 .filter_map(|base| match base {
-                    Expr::Name(name) => Some(name.id.to_string()),
+                    Expr::Name(name) => match bindings.get(name.id.as_str()) {
+                        Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
+                        Some(Binding::Module(_)) => None,
+                        None => Some((importer.clone(), name.id.to_string())),
+                    },
+                    Expr::Attribute(attribute) => {
+                        let dotted = dotted_name(&attribute.value)?;
+                        let Binding::Module(file) = bindings.get(&dotted)? else {
+                            return None;
+                        };
+                        Some((file.clone(), attribute.attr.to_string()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -833,6 +839,11 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                 .bases
                 .insert((importer.clone(), class.name.to_string()), bases);
         }
+        definitions.bindings.extend(
+            bindings
+                .into_iter()
+                .map(|(name, binding)| ((importer.clone(), name), binding)),
+        );
     }
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()

@@ -3157,6 +3157,30 @@ fn subclass_overrides_without_defaults_block_base_methods() -> Result<(), Box<dy
 }
 
 #[test]
+fn package_reexported_class_methods_update_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    std::fs::write(package.join("__init__.py"), "from .api import C\n")?;
+    std::fs::write(
+        package.join("api.py"),
+        "class C:\n    def target(self, value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "from pkg import C\nassert C().target() == 1\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from pkg import C\nassert C().target(value=1) == 1\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

@@ -3025,6 +3025,42 @@ fn local_imports_resolve_before_later_definitions() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn assignments_invalidate_same_file_class_receivers() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "class C:\n    def target(self, value=1): return value\nclass Other:\n    def target(self): return 9\nC = Other\nassert C().target() == 9\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(case)?,
+        source.replace("value=1", "value")
+    );
+    Ok(())
+}
+
+#[test]
+fn definitions_invalidate_same_file_class_receivers() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "class C:\n    def target(self, value=1): return value\nclass Other:\n    def target(self): return 9\ndef C(): return Other()\nassert C().target() == 9\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(case)?,
+        source.replace("value=1", "value")
+    );
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

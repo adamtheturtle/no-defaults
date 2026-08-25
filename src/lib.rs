@@ -5378,6 +5378,7 @@ fn rewrite_calls(
         bindings: vec![BTreeMap::new()],
         class_bindings: Vec::new(),
         invalidated_bindings: BTreeSet::new(),
+        rebound_classes: BTreeSet::new(),
         known,
         classes: Vec::new(),
         class_scope_depths: Vec::new(),
@@ -6033,6 +6034,8 @@ struct Rewriter<'a> {
     class_bindings: Vec<BTreeMap<String, Binding>>,
     /// Imported module-scope names replaced by an assignment already visited.
     invalidated_bindings: BTreeSet<String>,
+    /// Module names that can no longer be assumed to denote an earlier class.
+    rebound_classes: BTreeSet<String>,
     known: &'a BTreeSet<&'a Path>,
     /// The class bodies being walked, so `self.method(...)` can be resolved.
     classes: Vec<String>,
@@ -6265,6 +6268,9 @@ impl Rewriter<'_> {
                 .iter()
                 .any(|scope| scope.names.contains(name.id.as_str()))
             {
+                return None;
+            }
+            if self.rebound_classes.contains(name.id.as_str()) {
                 return None;
             }
             return match self.binding(name.id.as_str()) {
@@ -6917,7 +6923,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // The assigned value is evaluated before its module-level
                 // target replaces whatever an import bound there.
                 walk_stmt(self, statement);
-                self.invalidated_bindings.extend(rebound_names(statement));
+                let rebound = rebound_names(statement);
+                self.invalidated_bindings.extend(rebound.iter().cloned());
+                self.rebound_classes.extend(rebound);
             }
             Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) => {
                 walk_stmt(self, statement);
@@ -7211,6 +7219,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                 }
                 self.bind_definition_in_class(function.name.as_str(), false);
+                if module_scope {
+                    self.rebound_classes.insert(function.name.to_string());
+                }
                 if module_scope
                     && self
                         .bindings

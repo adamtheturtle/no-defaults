@@ -3455,6 +3455,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__delete__"
             | "__set_name__"
             | "__instancecheck__"
+            | "__subclasscheck__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9218,6 +9219,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn instancecheck_defaults_are_retained_for_implicit_isinstance_calls() {
         let source = "class M(type):\n    def __instancecheck__(cls, instance, extra=1):\n        return extra == 1\n\nclass C(metaclass=M):\n    pass\n\nisinstance(object(), C)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn subclasscheck_defaults_are_retained_for_implicit_issubclass_calls() {
+        let source = "class M(type):\n    def __subclasscheck__(cls, subclass, extra=1):\n        return extra == 1\n\nclass C(metaclass=M):\n    pass\n\nissubclass(int, C)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

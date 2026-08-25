@@ -1161,6 +1161,32 @@ fn module_candidate(base: &Path, known: &BTreeSet<&Path>) -> Option<PathBuf> {
         .find(|candidate| known.contains(candidate.as_path()))
 }
 
+/// Derive the package bound by `import a.b` from the file already selected for
+/// the complete dotted module. Resolving `a` again can choose a different
+/// search root from the one that supplied `a.b`.
+fn top_package_of_resolved(
+    module: &str,
+    resolved: &Path,
+    known: &BTreeSet<&Path>,
+) -> Option<PathBuf> {
+    let parts = module.split('.').filter(|part| !part.is_empty()).count();
+    if parts < 2 {
+        return None;
+    }
+    let initializer = matches!(
+        resolved.file_name().and_then(|name| name.to_str()),
+        Some("__init__.py" | "__init__.pyi")
+    );
+    let mut directory = resolved.parent()?.to_path_buf();
+    let ascents = parts - 2 + usize::from(initializer);
+    for _ in 0..ascents {
+        if !directory.pop() {
+            return None;
+        }
+    }
+    package_init(&directory).filter(|path| known.contains(path.as_path()))
+}
+
 #[derive(Serialize)]
 struct JsonDiagnostic<'a> {
     path: String,
@@ -5630,11 +5656,12 @@ fn collect_bindings(
                         None => module.to_owned(),
                     };
                     if let Some(file) = resolve_module(module, 0, importer, known) {
-                        bindings.insert(bound, Binding::Module(file));
+                        bindings.insert(bound, Binding::Module(file.clone()));
                         if alias.asname.is_none() {
                             if let Some(top) = module.split('.').next().filter(|top| *top != module)
                             {
-                                if let Some(package) = resolve_module(top, 0, importer, known) {
+                                if let Some(package) = top_package_of_resolved(module, &file, known)
+                                {
                                     bindings.insert(top.to_owned(), Binding::Module(package));
                                 }
                             }

@@ -1861,6 +1861,27 @@ fn module_with_targets_invalidate_imported_bindings_inside_the_body(
 }
 
 #[test]
+fn module_except_targets_invalidate_imported_bindings_inside_the_handler(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    let api_source = "def target(value=1): return value\n";
+    let caller_source = "from api import target\nclass Error(Exception):\n    def __call__(self): return 9\ntry:\n    raise Error()\nexcept Error as target:\n    assert target() == 9\n";
+    std::fs::write(&api, api_source)?;
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(&api)?, api_source);
+    assert_eq!(std::fs::read_to_string(&caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
 fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

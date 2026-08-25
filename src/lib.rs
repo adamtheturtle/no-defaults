@@ -3509,6 +3509,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__sizeof__"
             | "__copy__"
             | "__deepcopy__"
+            | "__reduce__"
             | "__index__"
             | "__int__"
             | "__float__"
@@ -9482,6 +9483,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn deepcopy_defaults_are_retained_for_implicit_deep_copy_calls() {
         let source = "class C:\n    def __deepcopy__(self, memo, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn reduce_defaults_are_retained_for_implicit_pickle_calls() {
+        let source = "class C:\n    def __reduce__(self, extra=1):\n        return (C, ())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

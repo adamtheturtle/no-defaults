@@ -4493,6 +4493,7 @@ fn generates_init(
 /// the same implicit receiver and parameters.
 fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<String>> {
     let mut aliases = BTreeMap::<String, Vec<String>>::new();
+    let mut origins = BTreeMap::<String, String>::new();
     for statement in &class.body {
         let Stmt::Assign(assign) = statement else {
             continue;
@@ -4500,12 +4501,17 @@ fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<Strin
         let Expr::Name(original) = assign.value.as_ref() else {
             continue;
         };
+        let original = origins
+            .get(original.id.as_str())
+            .cloned()
+            .unwrap_or_else(|| original.id.to_string());
         for target in &assign.targets {
             if let Expr::Name(alias) = target {
                 aliases
-                    .entry(original.id.to_string())
+                    .entry(original.clone())
                     .or_default()
                     .push(alias.id.to_string());
+                origins.insert(alias.id.to_string(), original.clone());
             }
         }
     }

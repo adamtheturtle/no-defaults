@@ -2036,6 +2036,37 @@ fn imports_in_while_else_skipped_by_break_do_not_replace_live_bindings(
 }
 
 #[test]
+fn imports_in_unselected_match_cases_do_not_replace_live_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for cases in [
+        "    case 1:\n        pass\n    case _:\n        from other import target",
+        "    case 2:\n        from other import target",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1): return value\n")?;
+        std::fs::write(&other, "def target(value=2): return value\n")?;
+        let caller_source =
+            format!("from api import target\nmatch 1:\n{cases}\nassert target() == 1\n");
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{cases}");
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!("from api import target\nmatch 1:\n{cases}\nassert target(value=1) == 1\n"),
+            "{cases}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

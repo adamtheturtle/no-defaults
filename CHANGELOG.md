@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A class-body `for` target shadows an imported callable before the loop body runs; calls on its value remain unchanged and the affected checked default is retained.
 - An unresolved dotted import invalidates the top-level name Python binds, rather than leaving an earlier checked module reachable through that stale name.
 - An unresolved module-level `from … import name` still invalidates an earlier checked binding for `name`; later calls are left unchanged and the affected default is retained.
 - Captures in a selected module-level `match` case shadow imported callables before its guard and body are evaluated, preventing calls on captured values from being rewritten against stale imports.

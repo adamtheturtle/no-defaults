@@ -5670,8 +5670,10 @@ impl Rewriter<'_> {
             // known, or a call through an unresolved import. Rewriting it would
             // break working code, so say so instead.
             if self.definitions.names.contains(name) {
-                if dotted_name(&call.func).is_some_and(|binding| self.binding_is_replaced(&binding))
-                {
+                let replaced_import = dotted_name(&call.func)
+                    .is_some_and(|binding| self.binding_is_replaced(&binding));
+                let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
+                if replaced_import || local_shadow {
                     if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
                         self.retained.extend(fixes.iter().cloned());
                     }
@@ -6073,6 +6075,28 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
+            }
+            Stmt::For(loop_statement) if self.in_class_scope() => {
+                self.visit_expr(&loop_statement.iter);
+                let statically_empty = match loop_statement.iter.as_ref() {
+                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
+                    Expr::List(list) => list.elts.is_empty(),
+                    Expr::Set(set) => set.elts.is_empty(),
+                    Expr::Dict(dict) => dict.items.is_empty(),
+                    _ => false,
+                };
+                if statically_empty {
+                    self.visit_body(&loop_statement.orelse);
+                    return;
+                }
+                self.visit_expr(&loop_statement.target);
+                let mut target = BoundNames::default();
+                target.bind(&loop_statement.target);
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.names.extend(target.names);
+                }
+                self.visit_body(&loop_statement.body);
+                self.visit_body(&loop_statement.orelse);
             }
             Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.scopes.is_empty() => {
                 // The assigned value is evaluated before its module-level

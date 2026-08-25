@@ -442,6 +442,30 @@ impl Definitions {
             .iter()
             .find_map(|(base_file, base)| self.inherited(base_file, base, name, seen))
     }
+
+    /// Give a subclass with no constructor of its own the signature of the
+    /// checked `__init__` it inherits.
+    fn index_inherited_constructors(&mut self) {
+        let classes: Vec<(PathBuf, String)> = self.bases.keys().cloned().collect();
+        for (file, class) in classes {
+            if self
+                .symbols
+                .get(&file)
+                .is_some_and(|symbols| symbols.contains_key(&class))
+            {
+                continue;
+            }
+            let Some(mut signature) = self.method(&file, &class, "__init__").cloned() else {
+                continue;
+            };
+            signature.name.clone_from(&class);
+            signature.kind = Callable::Constructor;
+            self.symbols
+                .entry(file)
+                .or_default()
+                .insert(class, Some(signature));
+        }
+    }
 }
 
 /// What checking one file produced.
@@ -868,6 +892,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                 .map(|(name, binding)| ((importer.clone(), name), binding)),
         );
     }
+    definitions.index_inherited_constructors();
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()
         .map(|path| {
@@ -10158,6 +10183,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "class C:\n    def __init__(self, value):\n        self.value = value\n\nC(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_call_uses_its_inherited_init_signature() -> Result<(), String> {
+        let source = "class Base:\n    def __init__(self, value=1): self.value = value\n\nclass Child(Base):\n    pass\n\nassert Child().value == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def __init__(self, value): self.value = value\n\nclass Child(Base):\n    pass\n\nassert Child(value=1).value == 1\n"
         );
         Ok(())
     }

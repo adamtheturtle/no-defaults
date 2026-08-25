@@ -3328,7 +3328,7 @@ impl Checker<'_> {
                 || (self.scope.class != ClassScope::None
                     && implicitly_called_method(function.name.as_str()))
                 || (self.delegation_protocols.last() == Some(&true)
-                    && matches!(function.name.as_str(), "send" | "throw"))
+                    && matches!(function.name.as_str(), "close" | "send" | "throw"))
                 || (self.scope.class == ClassScope::Metaclass
                     && matches!(function.name.as_str(), "__init__" | "mro"))
                 || (self.scope.class == ClassScope::None
@@ -8971,6 +8971,23 @@ def b(x=1): pass  # type: ignore  # noqa
             .diagnostics
             .iter()
             .all(|diagnostic| diagnostic.fix.is_none()));
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn iterator_close_defaults_are_retained_for_yield_from_cleanup() {
+        let source = "class I:\n    def __iter__(self):\n        return self\n    def __next__(self):\n        return 0\n    def close(self, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
     }
 

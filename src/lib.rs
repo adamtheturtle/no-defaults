@@ -2309,6 +2309,7 @@ fn check_source(
         module_bindings,
         local_classes: BTreeSet::new(),
         metaclass_classes: BTreeSet::new(),
+        metaclass_definitions: BTreeSet::new(),
         repeated_functions,
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
@@ -2593,6 +2594,9 @@ struct Checker<'a> {
     /// through a base. A metaclass is inherited, so a subclass is built by it
     /// too even when it names no `metaclass=` of its own.
     metaclass_classes: BTreeSet<String>,
+    /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
+    /// methods class creation invokes implicitly.
+    metaclass_definitions: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
     /// call-site signature, so their defaults are reported but retained.
     repeated_functions: BTreeSet<String>,
@@ -2638,12 +2642,20 @@ struct Scope {
     private: bool,
     /// How assignments here declare fields, if they do at all.
     fields: Option<FieldStyle>,
-    /// Whether definitions here sit directly in a class body.
-    class_body: bool,
+    /// What kind of class body definitions here sit directly in, if any.
+    class: ClassScope,
     /// Whether a field of this class has kept its default, which forces every
     /// field after it to keep its own: `dataclasses` rejects a field without a
     /// default following one with it.
     kept_default: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ClassScope {
+    #[default]
+    None,
+    Ordinary,
+    Metaclass,
 }
 
 /// What made a class carry fields, which is what its violations are called
@@ -2943,10 +2955,11 @@ impl Checker<'_> {
         let outer_aliases = self.aliases.clone();
         let outer_local_classes = self.local_classes.clone();
         let outer_metaclass_classes = self.metaclass_classes.clone();
+        let outer_metaclass_definitions = self.metaclass_definitions.clone();
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
             fields: None,
-            class_body: false,
+            class: ClassScope::None,
             kept_default: false,
         };
         self.lexical_scope.push(function.name.to_string());
@@ -2955,6 +2968,7 @@ impl Checker<'_> {
         self.aliases = outer_aliases;
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
+        self.metaclass_definitions = outer_metaclass_definitions;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
@@ -3199,9 +3213,9 @@ impl Checker<'_> {
         // locates the `def` line that a signature-wide directive sits on.
         let enclosing = self.header;
         self.header = Some(line_start(self.source, function.name.start()));
-        let descriptor_invoked =
-            self.scope.class_body && is_property(function, &self.aliases, &self.module_bindings);
-        let implicitly_called = self.scope.class_body
+        let descriptor_invoked = self.scope.class != ClassScope::None
+            && is_property(function, &self.aliases, &self.module_bindings);
+        let implicitly_called = self.scope.class != ClassScope::None
             && self.scope.fields == Some(FieldStyle::Dataclass)
             && function.name.as_str() == "__post_init__";
         let mut removed = Vec::new();
@@ -3249,7 +3263,10 @@ impl Checker<'_> {
                 || descriptor_invoked
                 || unknown_decorator
                 || self.is_stub()
-                || (self.scope.class_body && implicitly_called_method(function.name.as_str()))
+                || (self.scope.class != ClassScope::None
+                    && implicitly_called_method(function.name.as_str()))
+                || (self.scope.class == ClassScope::Metaclass
+                    && function.name.as_str() == "__init__")
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
             {
@@ -3299,7 +3316,7 @@ impl Checker<'_> {
             positional_only: function.parameters.posonlyargs.len(),
             path: self.path.to_path_buf(),
             kind: match self.classes.last() {
-                Some(class) if self.scope.class_body => Callable::Method {
+                Some(class) if self.scope.class != ClassScope::None => Callable::Method {
                     class: class.qualified.clone(),
                     receiver: method_receiver(function, &self.aliases, &self.module_bindings),
                 },
@@ -3308,7 +3325,7 @@ impl Checker<'_> {
             complete: true,
             removed,
         };
-        if self.scope.class_body {
+        if self.scope.class != ClassScope::None {
             if let Some(aliases) = self
                 .method_aliases
                 .last()
@@ -3556,6 +3573,10 @@ fn implicitly_called_method(name: &str) -> bool {
 }
 
 impl<'a> Visitor<'a> for Checker<'a> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "class traversal saves and restores every piece of lexical resolution state"
+    )]
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
             Stmt::If(branch) => self.visit_conditional(branch),
@@ -3569,13 +3590,18 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer_aliases = self.aliases.clone();
                 let outer_local_classes = self.local_classes.clone();
                 let outer_metaclass_classes = self.metaclass_classes.clone();
+                let outer_metaclass_definitions = self.metaclass_definitions.clone();
                 let old_header = self.header;
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
                     fields: style,
-                    class_body: true,
+                    class: if defines_metaclass(class, &self.metaclass_definitions) {
+                        ClassScope::Metaclass
+                    } else {
+                        ClassScope::Ordinary
+                    },
                     // Each class body starts fresh; a base's fields are not
                     // written here.
                     kept_default: false,
@@ -3621,6 +3647,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.local_classes.insert(class.name.to_string());
                 self.metaclass_classes = outer_metaclass_classes;
                 self.record_metaclass_construction(class);
+                self.metaclass_definitions = outer_metaclass_definitions;
+                if defines_metaclass(class, &self.metaclass_definitions) {
+                    self.metaclass_definitions.insert(class.name.to_string());
+                } else {
+                    self.metaclass_definitions.remove(class.name.as_str());
+                }
                 self.record_base_field_class(class.name.as_str(), style);
                 self.leave_class();
                 let collector = self
@@ -4154,6 +4186,15 @@ fn declares_metaclass(class: &ast::StmtClassDef) -> bool {
                 .arg
                 .as_ref()
                 .is_some_and(|name| name.as_str() == "metaclass")
+        })
+    })
+}
+
+/// Whether a class is itself a metaclass, directly or through a local base.
+fn defines_metaclass(class: &ast::StmtClassDef, known: &BTreeSet<String>) -> bool {
+    class.arguments.as_ref().is_some_and(|arguments| {
+        arguments.args.iter().any(|base| {
+            matches!(base, Expr::Name(name) if name.id.as_str() == "type" || known.contains(name.id.as_str()))
         })
     })
 }
@@ -9341,6 +9382,29 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn metaclass_init_defaults_are_retained_for_implicit_class_creation() -> Result<(), String> {
+        let source = "class M(type):\n    def __init__(cls, name, bases, namespace, extra=1):\n        super().__init__(name, bases, namespace)\n\nclass C(metaclass=M):\n    pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+
+        assert_eq!(
+            fixed("class Ordinary:\n    def __init__(self, value=1):\n        self.value = value\n\nOrdinary()\n")?,
+            "class Ordinary:\n    def __init__(self, value):\n        self.value = value\n\nOrdinary(value=1)\n"
+        );
+        Ok(())
     }
 
     #[test]

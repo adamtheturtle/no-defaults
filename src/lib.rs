@@ -3513,6 +3513,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__reduce_ex__"
             | "__getnewargs__"
             | "__getnewargs_ex__"
+            | "__getstate__"
             | "__index__"
             | "__int__"
             | "__float__"
@@ -9555,6 +9556,24 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn getnewargs_ex_defaults_are_retained_for_implicit_pickle_calls() {
         let source = "class C(tuple):\n    def __new__(cls):\n        return super().__new__(cls, ())\n\n    def __getnewargs_ex__(self, extra=1):\n        return (), {}\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn getstate_defaults_are_retained_for_implicit_pickle_calls() {
+        let source =
+            "class C:\n    def __getstate__(self, extra=1):\n        return {\"extra\": extra}\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

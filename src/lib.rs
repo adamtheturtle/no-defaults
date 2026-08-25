@@ -3447,6 +3447,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__del__"
             | "__getattribute__"
             | "__getattr__"
+            | "__setattr__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9073,6 +9074,23 @@ def b(x=1): pass  # type: ignore  # noqa
     fn getattr_defaults_are_retained_for_implicit_fallback_attribute_reads() {
         let source =
             "class C:\n    def __getattr__(self, name, extra=1):\n        return extra\n\nC().value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn setattr_defaults_are_retained_for_implicit_attribute_assignment() {
+        let source = "class C:\n    def __setattr__(self, name, value, extra=1):\n        object.__setattr__(self, name, value + extra)\n\nc = C()\nc.value = 1\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

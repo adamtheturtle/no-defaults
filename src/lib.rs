@@ -6121,14 +6121,7 @@ fn collect_explicit_all(suite: &[Stmt], names: &mut Option<BTreeSet<String>>) {
                 continue;
             }
             Stmt::Match(block) => {
-                let initial = names.clone();
-                let mut outcomes = vec![initial.clone()];
-                for case in &block.cases {
-                    let mut outcome = initial.clone();
-                    collect_explicit_all(&case.body, &mut outcome);
-                    outcomes.push(outcome);
-                }
-                *names = common_all_state(&outcomes);
+                collect_match_all(block, names);
                 continue;
             }
             _ => continue,
@@ -6157,6 +6150,35 @@ fn collect_explicit_all(suite: &[Stmt], names: &mut Option<BTreeSet<String>>) {
         } else if let Some(names) = names {
             names.extend(literal);
         }
+    }
+}
+
+fn collect_match_all(block: &ast::StmtMatch, names: &mut Option<BTreeSet<String>>) {
+    let initial = names.clone();
+    let exhaustive = block
+        .cases
+        .iter()
+        .any(|case| case.guard.is_none() && pattern_is_irrefutable(&case.pattern));
+    let mut outcomes = Vec::new();
+    if !exhaustive {
+        outcomes.push(initial.clone());
+    }
+    for case in &block.cases {
+        let mut outcome = initial.clone();
+        collect_explicit_all(&case.body, &mut outcome);
+        outcomes.push(outcome);
+    }
+    *names = common_all_state(&outcomes);
+}
+
+fn pattern_is_irrefutable(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::MatchAs(pattern) => pattern
+            .pattern
+            .as_deref()
+            .is_none_or(pattern_is_irrefutable),
+        Pattern::MatchOr(pattern) => pattern.patterns.iter().any(pattern_is_irrefutable),
+        _ => false,
     }
 }
 
@@ -8988,6 +9010,22 @@ mod tests {
         assert_eq!(
             explicit_all_names(&path),
             Some(BTreeSet::from(["body".to_owned()]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exhaustive_match_has_no_fallthrough_export_state() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(
+            &path,
+            "__all__ = ['old']\nmatch value:\n    case 1:\n        __all__ = ['new']\n    case _:\n        __all__ = ['new']\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            explicit_all_names(&path),
+            Some(BTreeSet::from(["new".to_owned()]))
         );
         Ok(())
     }

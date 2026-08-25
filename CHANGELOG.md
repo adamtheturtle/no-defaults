@@ -22,6 +22,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- `--fix` removes wrapping parentheses with a parameter default, so a default such as `x=(1)` no longer leaves an unparseable closing parenthesis behind and prevents the file's other fixes.
 - A definition named through a symlink and one named through its target are one module, so a call is tied to the definition that was fixed rather than left behind. A directory walk follows symlinked Python files, a fix writes through to the target instead of replacing the link, and a hard-linked file is refused rather than silently detached from its other names. Two spellings of one path given on the command line are checked once.
 - Names are bound in statement order, so a call earlier in a file is resolved against what the name meant there. An import, a class-body assignment, a dataclass alias and a module-level rebinding no longer reach backwards over calls that precede them.
 - A diagnostic's quoted source line escapes control characters instead of passing them to the terminal, and its caret is placed by display width, so a tab or a wide character does not push it out of line.

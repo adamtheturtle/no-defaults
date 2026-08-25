@@ -2301,6 +2301,7 @@ fn check_source(
     let mut checker = Checker {
         path,
         source,
+        tokens: parsed.tokens(),
         private_only,
         reexports,
         field_bases,
@@ -2571,6 +2572,7 @@ fn text_size(value: usize) -> TextSize {
 struct Checker<'a> {
     path: &'a Path,
     source: &'a str,
+    tokens: &'a Tokens,
     private_only: bool,
     /// The names the enclosing package re-exports, which are public API
     /// whichever module they are defined in. Empty unless `respect_reexports`
@@ -3068,6 +3070,37 @@ impl Checker<'_> {
         Some(fix)
     }
 
+    /// Include redundant parentheses that belong to a default in its deletion.
+    ///
+    /// Expression ranges omit wrapping parentheses. Deleting only through the
+    /// expression in `value=(1)` therefore leaves the closing `)` behind. The
+    /// opening parentheses between the parameter and expression tell us how
+    /// many following closing parentheses belong to the default rather than to
+    /// the function signature.
+    fn default_fix_range(&self, parameter_end: TextSize, default: &Expr) -> TextRange {
+        let wrapping = self
+            .tokens
+            .in_range(TextRange::new(parameter_end, default.start()))
+            .iter()
+            .filter(|token| token.kind() == TokenKind::Lpar)
+            .count();
+        let mut end = default.end();
+        let mut remaining = wrapping;
+        for token in self
+            .tokens
+            .after(default.end())
+            .iter()
+            .filter(|token| !token.kind().is_trivia())
+        {
+            if remaining == 0 || token.kind() != TokenKind::Rpar {
+                break;
+            }
+            end = token.end();
+            remaining -= 1;
+        }
+        TextRange::new(parameter_end, end)
+    }
+
     /// Add a diagnostic for every directive that named `NOD001` without
     /// suppressing anything, then return the file's diagnostics in order.
     fn finish(mut self) -> Checked {
@@ -3211,7 +3244,7 @@ impl Checker<'_> {
             let Some(default) = &parameter.default else {
                 continue;
             };
-            let range = TextRange::new(parameter.parameter.end(), default.end());
+            let range = self.default_fix_range(parameter.parameter.end(), default);
             let fix = if implicitly_called
                 || descriptor_invoked
                 || unknown_decorator
@@ -6275,6 +6308,15 @@ mod tests {
     fn a_lambda_default_is_suppressible_and_fixable() -> Result<(), String> {
         assert!(codes("lam = lambda z=4: z  # noqa: NOD001\n").is_empty());
         assert_eq!(fixed("lam = lambda z=4: z\n")?, "lam = lambda z: z\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_parenthesized_parameter_default_is_removed_with_its_parentheses() -> Result<(), String> {
+        assert_eq!(
+            fixed("def f(x=(1), y=2):\n    pass\n")?,
+            "def f(x, y):\n    pass\n"
+        );
         Ok(())
     }
 

@@ -2860,6 +2860,33 @@ fn star_imports_honor_literal_dunder_all() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
+fn star_imports_include_private_names_listed_in_dunder_all(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    std::fs::write(
+        &api,
+        "__all__ = [\"_target\"]\ndef _target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "from api import *\nassert _target() == 1\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import *\nassert _target(value=1) == 1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "__all__ = [\"_target\"]\ndef _target(value): return value\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

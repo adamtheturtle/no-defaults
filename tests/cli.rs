@@ -3342,6 +3342,24 @@ fn non_simple_class_body_method_aliases_have_the_original_signature(
 }
 
 #[test]
+fn class_control_flow_method_aliases_have_the_original_signature(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "class C:\n    def target(self, value=1): return value\n    if True:\n        conditional = target\n    for _ in [0]:\n        looped = target\nassert C().conditional() == 1\nassert C().looped() == 1\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("C().conditional(value=1)"), "{fixed}");
+    assert!(fixed.contains("C().looped(value=1)"), "{fixed}");
+    Ok(())
+}
+
+#[test]
 fn nested_classes_have_qualified_method_identities() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

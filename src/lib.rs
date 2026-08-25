@@ -6702,6 +6702,14 @@ impl Rewriter<'_> {
         let Expr::Attribute(attribute) = receiver else {
             return None;
         };
+        // `import a.b` records both `a` and the exact `a.b` module. Prefer the
+        // latter: otherwise the attribute form can be mistaken for class `b`
+        // stored on package `a`.
+        if dotted_name(receiver)
+            .is_some_and(|name| matches!(self.binding(&name), Some(Binding::Module(_))))
+        {
+            return None;
+        }
         let dotted = dotted_name(&attribute.value)?;
         match self.binding(&dotted)? {
             Binding::Module(file) => Some((file.clone(), attribute.attr.to_string(), false, false)),

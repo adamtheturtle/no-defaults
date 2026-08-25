@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Captures in a selected module-level `match` case shadow imported callables before its guard and body are evaluated, preventing calls on captured values from being rewritten against stale imports.
 - Literal module-level `match` statements update bindings only from the selected case; imports in cases that do not match no longer affect later calls.
 - A module-level `while … else` suite is skipped when a statically true loop body ends in `break`, so imports in the unentered `else` no longer replace live bindings.
 - Imports in a statically false module-level `while` body no longer replace the binding used for later calls; its test is still checked and its `else` suite still runs.

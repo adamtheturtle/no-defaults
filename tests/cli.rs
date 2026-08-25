@@ -2979,6 +2979,27 @@ fn package_star_reexports_update_calls() -> Result<(), Box<dyn std::error::Error
 }
 
 #[test]
+fn ambiguous_star_imports_shadow_local_callables() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let api_source = "from dataclasses import dataclass\ndef target(value=1): return value\n@dataclass\nclass target:\n    value: int = 2\n";
+    std::fs::write(&api, api_source)?;
+    let caller = directory.path().join("caller.py");
+    let caller_source =
+        "def target(value=3): return value\nfrom api import *\nassert target() == 2\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(api)?, api_source);
+    assert_eq!(std::fs::read_to_string(caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
 fn dotted_imports_bind_the_top_level_package() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let package = directory.path().join("a");

@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Module-level `def` and `class` statements invalidate an earlier imported callable binding before later calls are resolved. When a checked call can no longer be tied safely to a changed callable, that callable's default is retained rather than merely warning after breaking the caller.
 - `--fix` removes wrapping parentheses with a parameter default, so a default such as `x=(1)` no longer leaves an unparseable closing parenthesis behind and prevents the file's other fixes.
 - Parenthesized defaults on lambda parameters are removed with their wrapping parentheses too.
 - A parenthesized bare dataclass field default is removed through its closing parenthesis, so it no longer prevents every fix in the file.

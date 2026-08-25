@@ -9,6 +9,7 @@ use clap::{Parser, ValueEnum};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use ruff_python_ast::comparable::ComparableLiteral;
 use ruff_python_ast::helpers::Truthiness;
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::{walk_except_handler, walk_expr, walk_pattern, walk_stmt, Visitor};
@@ -6135,6 +6136,48 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                             self.visit_body(&loop_statement.orelse);
                         }
                     }
+                }
+            }
+            Stmt::Match(match_statement) if self.scopes.is_empty() => {
+                self.visit_expr(&match_statement.subject);
+                let subject = match_statement
+                    .subject
+                    .as_literal_expr()
+                    .map(ComparableLiteral::from);
+                for case in &match_statement.cases {
+                    let matches = match (&subject, &case.pattern) {
+                        (Some(subject), Pattern::MatchValue(pattern)) => pattern
+                            .value
+                            .as_literal_expr()
+                            .map(ComparableLiteral::from)
+                            .is_some_and(|pattern| pattern == *subject),
+                        (_, Pattern::MatchAs(pattern)) if pattern.pattern.is_none() => true,
+                        _ => {
+                            // A dynamic subject or pattern is not safe to
+                            // select statically, so retain the conservative walk.
+                            self.visit_pattern(&case.pattern);
+                            if let Some(guard) = &case.guard {
+                                self.visit_expr(guard);
+                            }
+                            self.visit_body(&case.body);
+                            continue;
+                        }
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    self.visit_pattern(&case.pattern);
+                    if let Some(guard) = &case.guard {
+                        self.visit_expr(guard);
+                        if matches!(
+                            Truthiness::from_expr(guard, |_| false),
+                            Truthiness::False | Truthiness::Falsey | Truthiness::None
+                        ) {
+                            continue;
+                        }
+                    }
+                    self.visit_body(&case.body);
+                    break;
                 }
             }
             Stmt::ClassDef(class) => {

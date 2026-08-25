@@ -2478,6 +2478,7 @@ fn check_source(
     }
     let aliases = Aliases::default();
     let module_bindings = BoundNames::of_body(parsed.suite()).names;
+    let metaclass_intercepted_classes = metaclass_intercepted_classes(parsed.suite());
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
     collect_repeated_functions(parsed.suite(), &mut function_names, &mut repeated_functions);
@@ -2493,6 +2494,7 @@ fn check_source(
         local_classes: BTreeSet::new(),
         metaclass_classes: BTreeSet::new(),
         metaclass_definitions: BTreeSet::new(),
+        metaclass_intercepted_classes,
         repeated_functions,
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
@@ -2784,6 +2786,8 @@ struct Checker<'a> {
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
+    /// Same-file classes whose metaclass can replace class attributes.
+    metaclass_intercepted_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
     /// call-site signature, so their defaults are reported but retained.
     repeated_functions: BTreeSet<String>,
@@ -4009,8 +4013,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.delegation_protocols.push(
                     defines_iterator_method("__iter__") && defines_iterator_method("__next__"),
                 );
-                self.attribute_interceptors
-                    .push(defines_iterator_method("__getattribute__"));
+                self.attribute_interceptors.push(
+                    defines_iterator_method("__getattribute__")
+                        || self
+                            .metaclass_intercepted_classes
+                            .contains(class.name.as_str()),
+                );
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
                 self.method_aliases.push(class_method_aliases(class));
@@ -4648,6 +4656,66 @@ fn defines_metaclass(class: &ast::StmtClassDef, known: &BTreeSet<String>) -> boo
             matches!(base, Expr::Name(name) if name.id.as_str() == "type" || known.contains(name.id.as_str()))
         })
     })
+}
+
+/// Same-file classes whose metaclass can replace attributes read on the class.
+fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
+    let classes: Vec<&ast::StmtClassDef> = suite
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::ClassDef(class) => Some(class),
+            _ => None,
+        })
+        .collect();
+    let mut metaclasses = BTreeSet::new();
+    let mut intercepting_metaclasses = BTreeSet::new();
+    let mut intercepted = BTreeSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for class in &classes {
+            let bases = class
+                .arguments
+                .as_deref()
+                .into_iter()
+                .flat_map(|arguments| &arguments.args)
+                .filter_map(|base| match base {
+                    Expr::Name(name) => Some(name.id.as_str()),
+                    _ => None,
+                });
+            let base_names: Vec<&str> = bases.collect();
+            let is_metaclass = base_names
+                .iter()
+                .any(|base| *base == "type" || metaclasses.contains(*base));
+            if is_metaclass && metaclasses.insert(class.name.to_string()) {
+                changed = true;
+            }
+            let defines_getattribute = class.body.iter().any(|statement| {
+                matches!(statement, Stmt::FunctionDef(function) if function.name.as_str() == "__getattribute__")
+            });
+            if is_metaclass
+                && (defines_getattribute
+                    || base_names
+                        .iter()
+                        .any(|base| intercepting_metaclasses.contains(*base)))
+                && intercepting_metaclasses.insert(class.name.to_string())
+            {
+                changed = true;
+            }
+            let declared_interceptor = class.arguments.as_deref().is_some_and(|arguments| {
+                arguments.keywords.iter().any(|keyword| {
+                    keyword.arg.as_ref().is_some_and(|name| name.as_str() == "metaclass")
+                        && matches!(&keyword.value, Expr::Name(name) if intercepting_metaclasses.contains(name.id.as_str()))
+                })
+            });
+            if (declared_interceptor || base_names.iter().any(|base| intercepted.contains(*base)))
+                && intercepted.insert(class.name.to_string())
+            {
+                changed = true;
+            }
+        }
+    }
+    intercepted
 }
 
 /// Whether a class takes a metaclass from a base defined in the same file.

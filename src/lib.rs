@@ -6117,6 +6117,18 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_body(&block.orelse);
                 self.visit_body(&block.finalbody);
             }
+            Stmt::While(loop_statement) if self.scopes.is_empty() => {
+                self.visit_expr(&loop_statement.test);
+                match Truthiness::from_expr(&loop_statement.test, |_| false) {
+                    Truthiness::False | Truthiness::Falsey | Truthiness::None => {
+                        self.visit_body(&loop_statement.orelse);
+                    }
+                    _ => {
+                        self.visit_body(&loop_statement.body);
+                        self.visit_body(&loop_statement.orelse);
+                    }
+                }
+            }
             Stmt::ClassDef(class) => {
                 let module_scope = self.scopes.is_empty();
                 // The class header is evaluated before its local namespace is

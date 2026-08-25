@@ -2513,6 +2513,7 @@ fn check_source(
         class_constructs: Vec::new(),
         delegation_protocols: Vec::new(),
         attribute_interceptors: Vec::new(),
+        instance_attributes: Vec::new(),
         class_deletions: Vec::new(),
         class_assignments: Vec::new(),
         method_aliases: Vec::new(),
@@ -2825,6 +2826,8 @@ struct Checker<'a> {
     delegation_protocols: Vec<bool>,
     /// Whether each enclosing class can replace ordinary method attributes.
     attribute_interceptors: Vec<bool>,
+    /// Attributes visibly assigned on instances of each enclosing class.
+    instance_attributes: Vec<BTreeSet<String>>,
     class_deletions: Vec<BTreeSet<String>>,
     class_assignments: Vec<BTreeMap<String, Vec<TextSize>>>,
     /// Direct `alias = method` bindings for each enclosing class, keyed by the
@@ -3305,6 +3308,7 @@ impl Checker<'_> {
         self.class_constructs.pop();
         self.delegation_protocols.pop();
         self.attribute_interceptors.pop();
+        self.instance_attributes.pop();
         self.class_deletions.pop();
         self.class_assignments.pop();
         self.method_aliases.pop();
@@ -3589,8 +3593,7 @@ impl Checker<'_> {
                 || self.is_stub()
                 || (self.scope.class != ClassScope::None
                     && implicitly_called_method(function.name.as_str()))
-                || (self.scope.class != ClassScope::None
-                    && self.attribute_interceptors.last() == Some(&true))
+                || self.method_is_intercepted(function.name.as_str())
                 || (self.delegation_protocols.last() == Some(&true)
                     && matches!(function.name.as_str(), "close" | "send" | "throw"))
                 || (self.scope.class == ClassScope::Metaclass
@@ -3629,6 +3632,15 @@ impl Checker<'_> {
             return;
         }
         self.record_signature(function, removed);
+    }
+
+    fn method_is_intercepted(&self, name: &str) -> bool {
+        self.scope.class != ClassScope::None
+            && (self.attribute_interceptors.last() == Some(&true)
+                || self
+                    .instance_attributes
+                    .last()
+                    .is_some_and(|attributes| attributes.contains(name)))
     }
 
     /// Record what a call to this function has to be given back, under every
@@ -3837,6 +3849,73 @@ impl Checker<'_> {
     }
 }
 
+fn instance_attributes(class: &ast::StmtClassDef) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for statement in &class.body {
+        let Stmt::FunctionDef(function) = statement else {
+            continue;
+        };
+        let Some(receiver) = function
+            .parameters
+            .posonlyargs
+            .first()
+            .or_else(|| function.parameters.args.first())
+        else {
+            continue;
+        };
+        let mut collector = InstanceAttributeCollector {
+            receiver: receiver.parameter.name.as_str(),
+            names: &mut names,
+        };
+        for statement in &function.body {
+            collector.visit_stmt(statement);
+        }
+    }
+    names
+}
+
+struct InstanceAttributeCollector<'a> {
+    receiver: &'a str,
+    names: &'a mut BTreeSet<String>,
+}
+
+impl InstanceAttributeCollector<'_> {
+    fn bind(&mut self, target: &Expr) {
+        match target {
+            Expr::Attribute(attribute) if matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == self.receiver) =>
+            {
+                self.names.insert(attribute.attr.to_string());
+            }
+            Expr::Tuple(tuple) => tuple.elts.iter().for_each(|target| self.bind(target)),
+            Expr::List(list) => list.elts.iter().for_each(|target| self.bind(target)),
+            _ => {}
+        }
+    }
+}
+
+impl<'a> Visitor<'a> for InstanceAttributeCollector<'_> {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        match statement {
+            Stmt::Assign(assign) => {
+                assign.targets.iter().for_each(|target| self.bind(target));
+                self.visit_expr(&assign.value);
+            }
+            Stmt::AnnAssign(assign) => {
+                self.bind(&assign.target);
+                if let Some(value) = &assign.value {
+                    self.visit_expr(value);
+                }
+            }
+            Stmt::AugAssign(assign) => {
+                self.bind(&assign.target);
+                self.visit_expr(&assign.value);
+            }
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => walk_stmt(self, statement),
+        }
+    }
+}
+
 /// A method Python may call through syntax or a built-in rather than through
 /// an explicit attribute call that the fixer can rewrite.
 #[allow(
@@ -4019,6 +4098,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                             .metaclass_intercepted_classes
                             .contains(class.name.as_str()),
                 );
+                self.instance_attributes.push(instance_attributes(class));
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
                 self.method_aliases.push(class_method_aliases(class));

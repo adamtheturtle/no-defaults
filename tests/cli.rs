@@ -3092,6 +3092,21 @@ fn metaclass_getattribute_keeps_class_attribute_defaults() -> Result<(), Box<dyn
 }
 
 #[test]
+fn assigned_instance_attributes_keep_method_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "class C:\n    def __init__(self): self.target = lambda: 9\n    def target(self, value=1): return value\n    def run(self): return self.target()\nassert C().run() == 9\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(case)?, source);
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

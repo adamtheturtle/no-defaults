@@ -3266,7 +3266,7 @@ impl Checker<'_> {
                 || (self.scope.class != ClassScope::None
                     && implicitly_called_method(function.name.as_str()))
                 || (self.scope.class == ClassScope::Metaclass
-                    && function.name.as_str() == "__init__")
+                    && matches!(function.name.as_str(), "__init__" | "mro"))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
             {
@@ -9405,6 +9405,23 @@ def b(x=1): pass  # type: ignore  # noqa
             "class Ordinary:\n    def __init__(self, value):\n        self.value = value\n\nOrdinary(value=1)\n"
         );
         Ok(())
+    }
+
+    #[test]
+    fn metaclass_mro_defaults_are_retained_for_implicit_class_creation() {
+        let source = "class M(type):\n    def mro(cls, extra=1):\n        return super().mro()\n\nclass C(metaclass=M):\n    pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

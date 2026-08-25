@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A module-level `for … else` suite is skipped when a known non-empty literal loop body ends in `break`, so imports in the unentered `else` no longer replace live bindings.
 - Imports in the body of a module-level `for` over an empty tuple, list, set, or dictionary no longer replace the binding used for later calls.
 - Imports in an exception handler after a non-raising module-level `try: pass` suite no longer replace the successful path's binding for later calls.
 - Imports in a statically unreachable module-level `if`, `elif`, or `else` suite no longer replace the binding used to resolve later calls.

@@ -424,6 +424,30 @@ fn custom_field_helpers_do_not_use_pydantic_argument_surgery(
 }
 
 #[test]
+fn a_user_defined_private_attr_is_a_configured_model_field(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("pyproject.toml"),
+        "[tool.no_defaults]\nfield_base_classes = ['Model']\n",
+    )?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "def PrivateAttr(default): return default\nclass Model: pass\nclass C(Model):\n    value: int = PrivateAttr(1)\nassert C.value == 1\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--output-format")
+        .arg("concise")
+        .arg(&path)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stdout)?.contains("NOD001"));
+    Ok(())
+}
+
+#[test]
 fn assigning_over_pydantic_field_retains_the_replacement_call(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

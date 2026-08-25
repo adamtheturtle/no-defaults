@@ -4320,6 +4320,7 @@ impl Aliases {
         }
         self.pydantic_private_attrs.remove(name);
         self.dataclasses_modules.remove(name);
+        self.pydantic_modules.remove(name);
         self.staticmethods.remove(name);
         self.classmethods.remove(name);
         self.builtins_modules.remove(name);
@@ -4418,6 +4419,13 @@ impl Aliases {
                         .asname
                         .as_ref()
                         .map_or_else(|| "dataclasses".to_owned(), ToString::to_string),
+                );
+            } else if alias.name.as_str() == "pydantic" {
+                self.pydantic_modules.insert(
+                    alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| "pydantic".to_owned(), ToString::to_string),
                 );
             } else if alias.name.as_str() == "builtins" {
                 self.builtins_modules.insert(
@@ -7746,6 +7754,18 @@ mod tests {
         assert_eq!(
             found,
             "class Job(BaseModel):\n x: list = Field(description=\"d\")\n y: int = Field(gt=0)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_qualified_pydantic_field_keeps_its_metadata_when_fixed() -> Result<(), String> {
+        let found = fixed(
+            "import pydantic as p\n\nclass Job(p.BaseModel):\n value: int = p.Field(default=1, description=\"kept\")\n",
+        )?;
+        assert_eq!(
+            found,
+            "import pydantic as p\n\nclass Job(p.BaseModel):\n value: int = p.Field(description=\"kept\")\n"
         );
         Ok(())
     }

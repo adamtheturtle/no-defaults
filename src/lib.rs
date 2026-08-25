@@ -4495,27 +4495,58 @@ fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<Strin
     let mut aliases = BTreeMap::<String, Vec<String>>::new();
     let mut origins = BTreeMap::<String, String>::new();
     for statement in &class.body {
-        let Stmt::Assign(assign) = statement else {
-            continue;
-        };
-        let Expr::Name(original) = assign.value.as_ref() else {
-            continue;
-        };
-        let original = origins
-            .get(original.id.as_str())
-            .cloned()
-            .unwrap_or_else(|| original.id.to_string());
-        for target in &assign.targets {
-            if let Expr::Name(alias) = target {
-                aliases
-                    .entry(original.clone())
-                    .or_default()
-                    .push(alias.id.to_string());
-                origins.insert(alias.id.to_string(), original.clone());
+        match statement {
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    record_method_alias(target, &assign.value, &mut aliases, &mut origins);
+                }
             }
+            Stmt::AnnAssign(assign) => {
+                if let Some(value) = &assign.value {
+                    record_method_alias(&assign.target, value, &mut aliases, &mut origins);
+                }
+            }
+            Stmt::Expr(expression) => {
+                if let Expr::Named(named) = expression.value.as_ref() {
+                    record_method_alias(&named.target, &named.value, &mut aliases, &mut origins);
+                }
+            }
+            _ => {}
         }
     }
     aliases
+}
+
+fn record_method_alias(
+    target: &Expr,
+    value: &Expr,
+    aliases: &mut BTreeMap<String, Vec<String>>,
+    origins: &mut BTreeMap<String, String>,
+) {
+    match (target, value) {
+        (Expr::Name(alias), Expr::Name(original)) => {
+            let original = origins
+                .get(original.id.as_str())
+                .cloned()
+                .unwrap_or_else(|| original.id.to_string());
+            aliases
+                .entry(original.clone())
+                .or_default()
+                .push(alias.id.to_string());
+            origins.insert(alias.id.to_string(), original);
+        }
+        (Expr::Tuple(targets), Expr::Tuple(values)) if targets.elts.len() == values.elts.len() => {
+            for (target, value) in targets.elts.iter().zip(&values.elts) {
+                record_method_alias(target, value, aliases, origins);
+            }
+        }
+        (Expr::List(targets), Expr::List(values)) if targets.elts.len() == values.elts.len() => {
+            for (target, value) in targets.elts.iter().zip(&values.elts) {
+                record_method_alias(target, value, aliases, origins);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether the decorator says `kw_only=True`, making every field of the class

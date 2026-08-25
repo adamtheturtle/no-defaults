@@ -5968,21 +5968,27 @@ impl Rewriter<'_> {
     /// Whether the nearest lexical binding for `name` is a nested callable.
     /// `None` means no enclosing scope binds it at all.
     fn nested_callable(&self, name: &str) -> Option<bool> {
-        self.scopes.iter().rev().find_map(|scope| {
-            scope
-                .names
-                .contains(name)
-                .then(|| scope.functions.contains(name) || scope.classes.contains(name))
-        })
+        self.nested_binding(name).map(|(callable, _)| callable)
     }
 
     fn nested_function(&self, name: &str) -> bool {
-        self.scopes.iter().rev().find_map(|scope| {
-            scope
-                .names
-                .contains(name)
-                .then(|| scope.functions.contains(name))
-        }) == Some(true)
+        self.nested_binding(name)
+            .is_some_and(|(_, index)| self.scopes[index].functions.contains(name))
+    }
+
+    fn nested_binding(&self, name: &str) -> Option<(bool, usize)> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, scope)| {
+                scope.names.contains(name).then(|| {
+                    (
+                        scope.functions.contains(name) || scope.classes.contains(name),
+                        index,
+                    )
+                })
+            })
     }
 
     fn binding(&self, name: &str) -> Option<&Binding> {
@@ -6162,7 +6168,12 @@ impl Rewriter<'_> {
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
                 let symbols = self.definitions.symbols.get(self.physical)?;
-                let qualified = qualified_lexical_name(&self.lexical_scope, name.id.as_str());
+                let (_, owner) = self.nested_binding(name.id.as_str())?;
+                let owner_scope = self
+                    .lexical_scope
+                    .get(..=owner)
+                    .unwrap_or(&self.lexical_scope);
+                let qualified = qualified_lexical_name(owner_scope, name.id.as_str());
                 let signature = if self.nested_function(name.id.as_str()) {
                     symbols.get(&qualified)?
                 } else {
@@ -11191,6 +11202,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(module_default)?,
             "def target(value): return value\ndef outer():\n    def target(): return 9\n    return target()\nassert outer() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_function_calls_use_the_binding_owner_scope() -> Result<(), String> {
+        let source = "def outer():\n    def target(value=1): return value\n    def run(): return target()\n    return run()\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer():\n    def target(value): return value\n    def run(): return target(value=1)\n    return run()\nassert outer() == 1\n"
         );
         Ok(())
     }

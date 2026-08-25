@@ -3594,6 +3594,7 @@ impl Checker<'_> {
                 || (self.scope.class != ClassScope::None
                     && implicitly_called_method(function.name.as_str()))
                 || self.method_is_intercepted(function.name.as_str())
+                || self.method_is_rebound_later(function)
                 || (self.delegation_protocols.last() == Some(&true)
                     && matches!(function.name.as_str(), "close" | "send" | "throw"))
                 || (self.scope.class == ClassScope::Metaclass
@@ -3641,6 +3642,15 @@ impl Checker<'_> {
                     .instance_attributes
                     .last()
                     .is_some_and(|attributes| attributes.contains(name)))
+    }
+
+    fn method_is_rebound_later(&self, function: &ast::StmtFunctionDef) -> bool {
+        self.scope.class != ClassScope::None
+            && self.class_assignments.last().is_some_and(|assignments| {
+                assignments
+                    .get(function.name.as_str())
+                    .is_some_and(|offsets| offsets.iter().any(|offset| *offset > function.start()))
+            })
     }
 
     /// Record what a call to this function has to be given back, under every

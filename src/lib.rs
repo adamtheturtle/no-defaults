@@ -6052,6 +6052,34 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 }
                 self.visit_body(&block.body);
             }
+            Stmt::If(branch) if self.scopes.is_empty() => {
+                let clauses = std::iter::once((Some(branch.test.as_ref()), branch.body.as_slice()))
+                    .chain(
+                        branch
+                            .elif_else_clauses
+                            .iter()
+                            .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
+                    );
+                for (test, body) in clauses {
+                    if let Some(test) = test {
+                        self.visit_expr(test);
+                    }
+                    match test.map_or(Truthiness::True, |test| {
+                        Truthiness::from_expr(test, |_| false)
+                    }) {
+                        Truthiness::False | Truthiness::Falsey | Truthiness::None => {}
+                        Truthiness::True | Truthiness::Truthy => {
+                            self.visit_body(body);
+                            break;
+                        }
+                        Truthiness::Unknown => {
+                            // Until paths are merged, preserve the conservative
+                            // traversal for a condition whose result is not known.
+                            self.visit_body(body);
+                        }
+                    }
+                }
+            }
             Stmt::ClassDef(class) => {
                 let module_scope = self.scopes.is_empty();
                 // The class header is evaluated before its local namespace is

@@ -1882,6 +1882,36 @@ fn module_except_targets_invalidate_imported_bindings_inside_the_handler(
 }
 
 #[test]
+fn unreachable_if_imports_do_not_replace_live_bindings() -> Result<(), Box<dyn std::error::Error>> {
+    for conditional in [
+        "if False:\n    from other import target",
+        "if True:\n    pass\nelse:\n    from other import target",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1): return value\n")?;
+        std::fs::write(&other, "def target(value=2): return value\n")?;
+        let caller_source =
+            format!("from api import target\n{conditional}\nassert target() == 1\n");
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{conditional}");
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!("from api import target\n{conditional}\nassert target(value=1) == 1\n"),
+            "{conditional}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

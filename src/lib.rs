@@ -811,33 +811,56 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
+        let local_classes: BTreeSet<String> = parsed
+            .suite()
+            .iter()
+            .filter_map(|statement| match statement {
+                Stmt::ClassDef(class) => Some(class.name.to_string()),
+                _ => None,
+            })
+            .collect();
+        let mut class_aliases = BTreeMap::new();
         for statement in parsed.suite() {
-            let Stmt::ClassDef(class) = statement else {
-                continue;
-            };
-            let bases = class
-                .arguments
-                .iter()
-                .flat_map(|arguments| arguments.args.iter())
-                .filter_map(|base| match base {
-                    Expr::Name(name) => match bindings.get(name.id.as_str()) {
-                        Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
-                        Some(Binding::Module(_)) => None,
-                        None => Some((importer.clone(), name.id.to_string())),
-                    },
-                    Expr::Attribute(attribute) => {
-                        let dotted = dotted_name(&attribute.value)?;
-                        let Binding::Module(file) = bindings.get(&dotted)? else {
-                            return None;
-                        };
-                        Some((file.clone(), attribute.attr.to_string()))
+            match statement {
+                Stmt::ClassDef(class) => {
+                    let bases = class
+                        .arguments
+                        .iter()
+                        .flat_map(|arguments| arguments.args.iter())
+                        .filter_map(|base| {
+                            method_base_identity(
+                                base,
+                                &importer,
+                                &bindings,
+                                &local_classes,
+                                &class_aliases,
+                                &definitions.methods,
+                            )
+                        })
+                        .collect();
+                    definitions
+                        .bases
+                        .insert((importer.clone(), class.name.to_string()), bases);
+                }
+                Stmt::Assign(assign) => {
+                    let Some(identity) = method_base_identity(
+                        &assign.value,
+                        &importer,
+                        &bindings,
+                        &local_classes,
+                        &class_aliases,
+                        &definitions.methods,
+                    ) else {
+                        continue;
+                    };
+                    for target in &assign.targets {
+                        if let Expr::Name(alias) = target {
+                            class_aliases.insert(alias.id.to_string(), identity.clone());
+                        }
                     }
-                    _ => None,
-                })
-                .collect();
-            definitions
-                .bases
-                .insert((importer.clone(), class.name.to_string()), bases);
+                }
+                _ => {}
+            }
         }
         definitions.bindings.extend(
             bindings
@@ -880,6 +903,50 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
     Ok(call_sites)
+}
+
+/// Resolve the class identity denoted by a base expression for method lookup.
+fn method_base_identity(
+    expression: &Expr,
+    importer: &Path,
+    bindings: &BTreeMap<String, Binding>,
+    local_classes: &BTreeSet<String>,
+    aliases: &BTreeMap<String, (PathBuf, String)>,
+    methods: &BTreeMap<(PathBuf, String), BTreeMap<String, Option<Signature>>>,
+) -> Option<(PathBuf, String)> {
+    match expression {
+        Expr::Subscript(subscript) => method_base_identity(
+            &subscript.value,
+            importer,
+            bindings,
+            local_classes,
+            aliases,
+            methods,
+        ),
+        Expr::Name(name) => aliases.get(name.id.as_str()).cloned().or_else(|| {
+            match bindings.get(name.id.as_str()) {
+                Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
+                _ => local_classes
+                    .contains(name.id.as_str())
+                    .then(|| (importer.to_path_buf(), name.id.to_string())),
+            }
+        }),
+        Expr::Attribute(attribute) => {
+            let qualified = dotted_name(expression)?;
+            if methods
+                .keys()
+                .any(|(file, class)| file == importer && class == &qualified)
+            {
+                return Some((importer.to_path_buf(), qualified));
+            }
+            let module = dotted_name(&attribute.value)?;
+            let Binding::Module(file) = bindings.get(&module)? else {
+                return None;
+            };
+            Some((file.clone(), attribute.attr.to_string()))
+        }
+        _ => None,
+    }
 }
 
 /// Find the checked file a dotted module name refers to.
@@ -9947,6 +10014,20 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return self.target(value=1)\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn statically_resolvable_base_expressions_preserve_inherited_calls() -> Result<(), String> {
+        for source in [
+            "class Base:\n    def target(self, value=1): return value\nAlias = Base\nclass Child(Alias):\n    def run(self): return self.target()\n",
+            "class Base:\n    @classmethod\n    def __class_getitem__(cls, item): return cls\n    def target(self, value=1): return value\nclass Child(Base[int]):\n    def run(self): return self.target()\n",
+            "class Outer:\n    class Base:\n        def target(self, value=1): return value\nclass Child(Outer.Base):\n    def run(self): return self.target()\n",
+        ] {
+            let fixed = fixed(source)?;
+            assert!(fixed.contains("def target(self, value):"), "{fixed}");
+            assert!(fixed.contains("self.target(value=1)"), "{fixed}");
+        }
         Ok(())
     }
 

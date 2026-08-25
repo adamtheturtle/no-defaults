@@ -3452,6 +3452,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__dir__"
             | "__get__"
             | "__set__"
+            | "__delete__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9164,6 +9165,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn descriptor_set_defaults_are_retained_for_implicit_writes() {
         let source = "class D:\n    def __set__(self, instance, value, extra=1):\n        instance.saved = value + extra\n\nclass C:\n    value = D()\n\nc = C()\nc.value = 2\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn descriptor_delete_defaults_are_retained_for_implicit_deletions() {
+        let source = "class D:\n    def __delete__(self, instance, extra=1):\n        instance.deleted = extra\n\nclass C:\n    value = D()\n\nc = C()\ndel c.value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

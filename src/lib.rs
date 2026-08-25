@@ -3514,6 +3514,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__getnewargs__"
             | "__getnewargs_ex__"
             | "__getstate__"
+            | "__setstate__"
             | "__index__"
             | "__int__"
             | "__float__"
@@ -9574,6 +9575,23 @@ def b(x=1): pass  # type: ignore  # noqa
     fn getstate_defaults_are_retained_for_implicit_pickle_calls() {
         let source =
             "class C:\n    def __getstate__(self, extra=1):\n        return {\"extra\": extra}\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn setstate_defaults_are_retained_for_implicit_unpickle_calls() {
+        let source = "class C:\n    def __setstate__(self, state, extra=1):\n        self.__dict__.update(state)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

@@ -6167,6 +6167,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         continue;
                     }
                     self.visit_pattern(&case.pattern);
+                    let mut captures = BoundNames::default();
+                    captures.visit_pattern(&case.pattern);
+                    self.invalidated_bindings.extend(captures.names);
                     if let Some(guard) = &case.guard {
                         self.visit_expr(guard);
                         if matches!(

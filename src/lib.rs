@@ -3269,7 +3269,7 @@ impl Checker<'_> {
                     && matches!(function.name.as_str(), "__init__" | "mro"))
                 || (self.scope.class == ClassScope::None
                     && self.lexical_scope.is_empty()
-                    && function.name.as_str() == "__getattr__")
+                    && matches!(function.name.as_str(), "__getattr__" | "__dir__"))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
             {
@@ -9612,6 +9612,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn module_getattr_defaults_are_retained_for_implicit_attribute_fallback() {
         let source = "import sys\n\nmodule = sys.modules[__name__]\n\ndef __getattr__(name, extra=1):\n    return extra\n\nmodule.missing\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn module_dir_defaults_are_retained_for_implicit_builtin_calls() {
+        let source = "import sys\n\nmodule = sys.modules[__name__]\n\ndef __dir__(extra=1):\n    return [str(extra)]\n\ndir(module)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

@@ -1986,6 +1986,30 @@ fn imports_in_for_else_skipped_by_break_do_not_replace_live_bindings(
 }
 
 #[test]
+fn imports_in_while_false_bodies_do_not_replace_live_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let other = directory.path().join("other.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&other, "def target(value=2): return value\n")?;
+    let caller_source = "from api import target\nwhile False:\n    from other import target\nassert target() == 1\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import target\nwhile False:\n    from other import target\nassert target(value=1) == 1\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

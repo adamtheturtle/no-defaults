@@ -5689,17 +5689,7 @@ fn collect_bindings(
                 }
             }
             Stmt::Assign(assign) => {
-                let binding = assignment_binding(&assign.value, bindings);
-                for target in &assign.targets {
-                    let Expr::Name(target) = target else {
-                        continue;
-                    };
-                    if let Some(binding) = &binding {
-                        bindings.insert(target.id.to_string(), binding.clone());
-                    } else {
-                        bindings.remove(target.id.as_str());
-                    }
-                }
+                collect_assignment_bindings(assign, bindings);
             }
             Stmt::If(branch) => {
                 collect_conditional_bindings(branch, importer, known, bindings);
@@ -5726,6 +5716,25 @@ fn collect_bindings(
             // Definitions introduce lexical scopes whose imports are collected
             // separately when the rewriter enters them.
             _ => {}
+        }
+    }
+}
+
+fn collect_assignment_bindings(assign: &ast::StmtAssign, bindings: &mut BTreeMap<String, Binding>) {
+    let binding = assignment_binding(&assign.value, bindings);
+    for target in &assign.targets {
+        if let Expr::Name(target) = target {
+            if let Some(binding) = &binding {
+                bindings.insert(target.id.to_string(), binding.clone());
+            } else {
+                bindings.remove(target.id.as_str());
+            }
+        } else {
+            let mut bound = BoundNames::default();
+            bound.bind(target);
+            for name in bound.names {
+                bindings.remove(&name);
+            }
         }
     }
 }

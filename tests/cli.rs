@@ -2918,6 +2918,36 @@ fn package_assignment_reexports_update_calls() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn unpacking_assignments_invalidate_package_reexports() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    let initializer = "from .api import target\ntarget, other = (lambda: 9, 0)\n";
+    std::fs::write(package.join("__init__.py"), initializer)?;
+    let api = package.join("api.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    let caller = directory.path().join("caller.py");
+    let call = "from pkg import target\nassert target() == 9\n";
+    std::fs::write(&caller, call)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(package.join("__init__.py"))?,
+        initializer
+    );
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value): return value\n"
+    );
+    assert_eq!(std::fs::read_to_string(caller)?, call);
+    Ok(())
+}
+
+#[test]
 fn package_star_reexports_update_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let package = directory.path().join("pkg");

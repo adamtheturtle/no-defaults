@@ -5909,7 +5909,12 @@ fn explicit_all_names(path: &Path) -> Option<BTreeSet<String>> {
                 (assign.value.as_ref(), true)
             }
             Stmt::AnnAssign(assign) if is_dunder_all(&assign.target) => {
-                (assign.value.as_deref()?, true)
+                let Some(value) = assign.value.as_deref() else {
+                    // A declaration such as `__all__: list[str]` does not
+                    // change the value established by another assignment.
+                    continue;
+                };
+                (value, true)
             }
             Stmt::AugAssign(assign) if is_dunder_all(&assign.target) => {
                 (assign.value.as_ref(), false)
@@ -8563,6 +8568,22 @@ mod tests {
         assert!(!reexports.covers("old"));
         assert!(reexports.covers("new"));
         assert!(!reexports.covers("also_unbound"));
+        Ok(())
+    }
+
+    #[test]
+    fn annotation_only_dunder_all_does_not_abort_export_scanning() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(
+            &path,
+            "__all__ = ['old']\n__all__: list[str]\n__all__ = ['new']\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            explicit_all_names(&path),
+            Some(BTreeSet::from(["new".to_owned()]))
+        );
         Ok(())
     }
 

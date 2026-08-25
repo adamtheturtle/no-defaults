@@ -3516,3 +3516,21 @@ fn type_checking_only_dataclass_fields_are_not_constructor_parameters(
     );
     Ok(())
 }
+
+#[test]
+fn assigning_over_type_checking_makes_the_live_branch_fixable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\nfrom typing import TYPE_CHECKING as checking\nchecking = True\nif checking:\n    @dataclass\n    class C:\n        value: int = 1\nassert C().value == 1\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("value: int\n"), "{fixed}");
+    assert!(fixed.contains("C(value=1).value"), "{fixed}");
+    Ok(())
+}

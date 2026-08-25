@@ -3443,7 +3443,8 @@ impl Checker<'_> {
 fn implicitly_called_method(name: &str) -> bool {
     matches!(
         name,
-        "__init_subclass__"
+        "__new__"
+            | "__init_subclass__"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -8999,6 +9000,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn init_subclass_defaults_are_retained_for_implicit_calls() {
         let source = "class Base:\n    def __init_subclass__(cls, flag=1):\n        cls.flag = flag\n\nclass Child(Base):\n    pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn new_defaults_are_retained_for_implicit_object_construction() {
+        let source = "class C:\n    def __new__(cls, extra=1):\n        return super().__new__(cls)\n\nC()\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

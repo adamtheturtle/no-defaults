@@ -3449,6 +3449,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__getattr__"
             | "__setattr__"
             | "__delattr__"
+            | "__dir__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9109,6 +9110,24 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn delattr_defaults_are_retained_for_implicit_attribute_deletion() {
         let source = "class C:\n    def __delattr__(self, name, extra=1):\n        object.__delattr__(self, name)\n\nc = C()\nc.value = 1\ndel c.value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn dir_defaults_are_retained_for_implicit_builtin_calls() {
+        let source =
+            "class C:\n    def __dir__(self, extra=1):\n        return [str(extra)]\n\ndir(C())\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

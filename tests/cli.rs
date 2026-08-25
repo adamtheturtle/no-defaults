@@ -3138,6 +3138,25 @@ fn repeated_methods_keep_their_defaults() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
+fn subclass_overrides_without_defaults_block_base_methods() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "class Base:\n    def target(self, value=1): return value\nclass Child(Base):\n    def target(self): return 9\n    def run(self): return self.target()\nassert Child().run() == 9\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(case)?,
+        source.replace("value=1", "value")
+    );
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

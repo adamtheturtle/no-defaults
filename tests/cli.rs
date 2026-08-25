@@ -2918,6 +2918,37 @@ fn package_assignment_reexports_update_calls() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn package_star_reexports_update_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("pkg");
+    std::fs::create_dir(&package)?;
+    std::fs::write(
+        package.join("__init__.py"),
+        "from .api import target\n__all__ = [\"target\"]\n",
+    )?;
+    std::fs::write(
+        package.join("api.py"),
+        "def target(value=1): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "from pkg import *\nassert target() == 1\n")?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from pkg import *\nassert target(value=1) == 1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(package.join("api.py"))?,
+        "def target(value): return value\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

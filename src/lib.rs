@@ -5641,14 +5641,28 @@ fn collect_star_bindings(
                 let Some(file) = resolve_module(module, import.level, importer, known) else {
                     continue;
                 };
-                if let Some(symbols) = definitions.symbols.get(&file) {
-                    let explicit = explicit_all_names(&file);
-                    for name in symbols.keys().filter(|name| {
-                        explicit
-                            .as_ref()
-                            .map_or_else(|| !name.starts_with('_'), |all| all.contains(*name))
-                    }) {
-                        bindings.insert(name.clone(), Binding::Symbol(file.clone(), name.clone()));
+                let explicit = explicit_all_names(&file);
+                let mut candidates: BTreeSet<String> = definitions
+                    .symbols
+                    .get(&file)
+                    .into_iter()
+                    .flat_map(BTreeMap::keys)
+                    .cloned()
+                    .collect();
+                candidates.extend(
+                    definitions
+                        .bindings
+                        .keys()
+                        .filter(|(binding_file, _)| binding_file == &file)
+                        .map(|(_, name)| name.clone()),
+                );
+                for name in candidates.into_iter().filter(|name| {
+                    explicit
+                        .as_ref()
+                        .map_or_else(|| !name.starts_with('_'), |all| all.contains(name))
+                }) {
+                    if definitions.symbol(&file, &name).is_some() {
+                        bindings.insert(name.clone(), Binding::Symbol(file.clone(), name));
                     }
                 }
             }

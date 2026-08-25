@@ -3487,6 +3487,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__exit__"
             | "__aenter__"
             | "__aexit__"
+            | "__await__"
             | "__iter__"
             | "__next__"
             | "__aiter__"
@@ -9410,6 +9411,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn metaclass_mro_defaults_are_retained_for_implicit_class_creation() {
         let source = "class M(type):\n    def mro(cls, extra=1):\n        return super().mro()\n\nclass C(metaclass=M):\n    pass\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn await_defaults_are_retained_for_implicit_await_expressions() {
+        let source = "class C:\n    def __await__(self, extra=1):\n        async def done():\n            return extra\n        return done().__await__()\n\nasync def main():\n    return await C()\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

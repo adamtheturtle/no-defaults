@@ -3159,7 +3159,7 @@ impl Checker<'_> {
             let Some(default) = &parameter.default else {
                 continue;
             };
-            let range = TextRange::new(parameter.parameter.end(), default.end());
+            let range = self.default_fix_range(parameter.parameter.end(), default);
             let fix = if self.is_stub() || (positional && kept) {
                 None
             } else {
@@ -6316,6 +6316,15 @@ mod tests {
         assert_eq!(
             fixed("def f(x=(1), y=2):\n    pass\n")?,
             "def f(x, y):\n    pass\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_parenthesized_lambda_default_is_removed_with_its_parentheses() -> Result<(), String> {
+        assert_eq!(
+            fixed("handler = lambda x=(1): x\n")?,
+            "handler = lambda x: x\n"
         );
         Ok(())
     }

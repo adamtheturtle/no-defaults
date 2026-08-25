@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Imports in an exception handler after a non-raising module-level `try: pass` suite no longer replace the successful path's binding for later calls.
 - Imports in a statically unreachable module-level `if`, `elif`, or `else` suite no longer replace the binding used to resolve later calls.
 - A module-level `except … as` target shadows an imported callable while its exception handler runs, so calls on the caught object are no longer rewritten against the stale import.
 - A module-level `with … as` target shadows an imported callable inside the context-manager body, after its context expression has been evaluated.

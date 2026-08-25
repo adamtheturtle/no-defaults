@@ -6080,6 +6080,19 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                 }
             }
+            Stmt::Try(block)
+                if self.scopes.is_empty()
+                    && block
+                        .body
+                        .iter()
+                        .all(|statement| matches!(statement, Stmt::Pass(_))) =>
+            {
+                // A suite made only of `pass` cannot transfer control to an
+                // exception handler. Its else suite runs, followed by finally.
+                self.visit_body(&block.body);
+                self.visit_body(&block.orelse);
+                self.visit_body(&block.finalbody);
+            }
             Stmt::ClassDef(class) => {
                 let module_scope = self.scopes.is_empty();
                 // The class header is evaluated before its local namespace is

@@ -5999,11 +5999,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
             }
-            Stmt::Assign(_)
-            | Stmt::AnnAssign(_)
-            | Stmt::AugAssign(_)
-            | Stmt::For(_)
-            | Stmt::With(_)
+            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) | Stmt::With(_)
                 if self.scopes.is_empty() =>
             {
                 // Every one of these binds a module-level name of its own — an
@@ -6014,6 +6010,16 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // own rather than through the one holding it.
                 walk_stmt(self, statement);
                 self.invalidated_bindings.extend(rebound_names(statement));
+            }
+            Stmt::For(loop_statement) if self.scopes.is_empty() => {
+                // The iterable is evaluated before the first target binding.
+                // Once an item is assigned, the body sees the target rather
+                // than an import that previously used the same name.
+                self.visit_expr(&loop_statement.iter);
+                self.visit_expr(&loop_statement.target);
+                self.invalidated_bindings.extend(rebound_names(statement));
+                self.visit_body(&loop_statement.body);
+                self.visit_body(&loop_statement.orelse);
             }
             Stmt::ClassDef(class) => {
                 let module_scope = self.scopes.is_empty();

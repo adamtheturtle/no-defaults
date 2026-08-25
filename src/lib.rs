@@ -3450,6 +3450,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__setattr__"
             | "__delattr__"
             | "__dir__"
+            | "__get__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9128,6 +9129,23 @@ def b(x=1): pass  # type: ignore  # noqa
     fn dir_defaults_are_retained_for_implicit_builtin_calls() {
         let source =
             "class C:\n    def __dir__(self, extra=1):\n        return [str(extra)]\n\ndir(C())\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn descriptor_get_defaults_are_retained_for_implicit_reads() {
+        let source = "class D:\n    def __get__(self, instance, owner, extra=1):\n        return extra\n\nclass C:\n    value = D()\n\nC().value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

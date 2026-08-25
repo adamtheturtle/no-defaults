@@ -3061,6 +3061,21 @@ fn definitions_invalidate_same_file_class_receivers() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn custom_getattribute_keeps_method_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "class C:\n    def target(self, value=1): return value\n    def __getattribute__(self, name):\n        if name == \"target\": return lambda: 9\n        return object.__getattribute__(self, name)\n    def run(self): return self.target()\nassert C().run() == 9\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(case)?, source);
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

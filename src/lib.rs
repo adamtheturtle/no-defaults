@@ -6046,7 +6046,20 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&loop_statement.target);
                 self.invalidated_bindings.extend(rebound_names(statement));
                 self.visit_body(&loop_statement.body);
-                self.visit_body(&loop_statement.orelse);
+                let statically_nonempty = match loop_statement.iter.as_ref() {
+                    Expr::Tuple(tuple) => !tuple.elts.is_empty(),
+                    Expr::List(list) => !list.elts.is_empty(),
+                    Expr::Set(set) => !set.elts.is_empty(),
+                    Expr::Dict(dict) => !dict.items.is_empty(),
+                    _ => false,
+                };
+                let definitely_breaks = loop_statement
+                    .body
+                    .last()
+                    .is_some_and(|statement| matches!(statement, Stmt::Break(_)));
+                if !(statically_nonempty && definitely_breaks) {
+                    self.visit_body(&loop_statement.orelse);
+                }
             }
             Stmt::With(block) if self.scopes.is_empty() => {
                 // With-items enter from left to right. Each context expression

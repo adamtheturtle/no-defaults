@@ -3444,6 +3444,7 @@ fn implicitly_called_method(name: &str) -> bool {
     matches!(
         name,
         "__new__"
+            | "__del__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9017,6 +9018,24 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn new_defaults_are_retained_for_implicit_object_construction() {
         let source = "class C:\n    def __new__(cls, extra=1):\n        return super().__new__(cls)\n\nC()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn del_defaults_are_retained_for_implicit_finalization() {
+        let source =
+            "class C:\n    def __del__(self, extra=1):\n        print(extra)\n\nc = C()\ndel c\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

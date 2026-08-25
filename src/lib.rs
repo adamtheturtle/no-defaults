@@ -297,6 +297,9 @@ enum MethodAliasKind {
 struct MethodAlias {
     name: String,
     kind: MethodAliasKind,
+    /// A statically named class whose method was copied into this namespace.
+    /// `None` means the original is a method defined by this class itself.
+    original_class: Option<String>,
 }
 
 impl Callable {
@@ -3536,7 +3539,7 @@ impl Checker<'_> {
                 .and_then(|aliases| aliases.get(function.name.as_str()))
             {
                 self.signatures.extend(aliases.iter().filter_map(|alias| {
-                    if alias.kind == MethodAliasKind::Property {
+                    if alias.original_class.is_some() || alias.kind == MethodAliasKind::Property {
                         return None;
                     }
                     let mut alias_signature = signature.clone();
@@ -3669,6 +3672,39 @@ impl Checker<'_> {
                 });
             }
         }
+    }
+
+    /// Index aliases copied from a same-file class whose signature has already
+    /// been collected. Unknown and forward-referenced classes stay unresolved.
+    fn record_inherited_method_aliases(&mut self) {
+        let (Some(class), Some(aliases)) = (self.classes.last(), self.method_aliases.last()) else {
+            return;
+        };
+        let mut inherited = Vec::new();
+        for (method, aliases) in aliases {
+            for alias in aliases {
+                let Some(original_class) = &alias.original_class else {
+                    continue;
+                };
+                let original_class = qualified_class_name(&self.lexical_scope, original_class);
+                let Some(signature) = self.signatures.iter().find(|signature| {
+                    signature.name == *method
+                        && matches!(
+                            &signature.kind,
+                            Callable::Method { class, .. } if class == &original_class
+                        )
+                }) else {
+                    continue;
+                };
+                let mut signature = signature.clone();
+                signature.name.clone_from(&alias.name);
+                if let Callable::Method { class: owner, .. } = &mut signature.kind {
+                    owner.clone_from(&class.qualified);
+                }
+                inherited.push(signature);
+            }
+        }
+        self.signatures.extend(inherited);
     }
 }
 
@@ -3875,6 +3911,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         fields,
                         removed,
                     });
+                    self.record_inherited_method_aliases();
                 }
                 let shape_name = qualified_class_name(&self.lexical_scope, class.name.as_str());
                 self.lexical_scope.push(class.name.to_string());
@@ -4525,7 +4562,7 @@ fn generates_init(
 /// the same implicit receiver and parameters.
 fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<MethodAlias>> {
     let mut aliases = BTreeMap::<String, Vec<MethodAlias>>::new();
-    let mut origins = BTreeMap::<String, (String, MethodAliasKind)>::new();
+    let mut origins = BTreeMap::<String, (String, MethodAliasKind, Option<String>)>::new();
     collect_class_method_aliases(&class.body, &mut aliases, &mut origins);
     aliases
 }
@@ -4533,7 +4570,7 @@ fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<Metho
 fn collect_class_method_aliases(
     statements: &[Stmt],
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
-    origins: &mut BTreeMap<String, (String, MethodAliasKind)>,
+    origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     for statement in statements {
         match statement {
@@ -4608,7 +4645,7 @@ fn collect_class_method_aliases(
 fn collect_alias_branches<'a>(
     branches: impl IntoIterator<Item = &'a [Stmt]>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
-    origins: &BTreeMap<String, (String, MethodAliasKind)>,
+    origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     for branch in branches {
         let mut branch_origins = origins.clone();
@@ -4620,11 +4657,11 @@ fn record_method_alias(
     target: &Expr,
     value: &Expr,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
-    origins: &mut BTreeMap<String, (String, MethodAliasKind)>,
+    origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     match (target, value) {
         (Expr::Name(alias), value) => {
-            let Some((original, kind)) = method_alias_origin(value, origins) else {
+            let Some((original, kind, original_class)) = method_alias_origin(value, origins) else {
                 return;
             };
             aliases
@@ -4633,8 +4670,9 @@ fn record_method_alias(
                 .push(MethodAlias {
                     name: alias.id.to_string(),
                     kind,
+                    original_class: original_class.clone(),
                 });
-            origins.insert(alias.id.to_string(), (original, kind));
+            origins.insert(alias.id.to_string(), (original, kind, original_class));
         }
         (Expr::Tuple(targets), Expr::Tuple(values)) if targets.elts.len() == values.elts.len() => {
             for (target, value) in targets.elts.iter().zip(&values.elts) {
@@ -4652,15 +4690,25 @@ fn record_method_alias(
 
 fn method_alias_origin(
     value: &Expr,
-    origins: &BTreeMap<String, (String, MethodAliasKind)>,
-) -> Option<(String, MethodAliasKind)> {
+    origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
+) -> Option<(String, MethodAliasKind, Option<String>)> {
     match value {
         Expr::Name(original) => Some(
             origins
                 .get(original.id.as_str())
                 .cloned()
-                .unwrap_or_else(|| (original.id.to_string(), MethodAliasKind::Direct)),
+                .unwrap_or_else(|| (original.id.to_string(), MethodAliasKind::Direct, None)),
         ),
+        Expr::Attribute(attribute) => {
+            let Expr::Name(class) = attribute.value.as_ref() else {
+                return None;
+            };
+            Some((
+                attribute.attr.to_string(),
+                MethodAliasKind::Direct,
+                Some(class.id.to_string()),
+            ))
+        }
         Expr::Call(call)
             if call.arguments.args.len() == 1 && call.arguments.keywords.is_empty() =>
         {
@@ -4676,10 +4724,11 @@ fn method_alias_origin(
             let Expr::Name(original) = &call.arguments.args[0] else {
                 return None;
             };
-            let root = origins
-                .get(original.id.as_str())
-                .map_or_else(|| original.id.to_string(), |(root, _)| root.clone());
-            Some((root, kind))
+            let (root, original_class) = origins.get(original.id.as_str()).map_or_else(
+                || (original.id.to_string(), None),
+                |(root, _, original_class)| (root.clone(), original_class.clone()),
+            );
+            Some((root, kind, original_class))
         }
         _ => None,
     }
@@ -9877,6 +9926,23 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return self.target(value=1)\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_of_inherited_methods_are_indexed() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    alias = Base.target\n\nassert Child().alias() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    alias = Base.target\n\nassert Child().alias(value=1) == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_of_unknown_inherited_methods_are_left_unresolved() -> Result<(), String> {
+        let source = "class Child(External):\n    alias = External.target\n\nChild().alias()\n";
+        assert_eq!(fixed(source)?, source);
         Ok(())
     }
 

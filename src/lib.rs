@@ -225,9 +225,18 @@ struct Diagnostic {
 #[derive(Clone, Debug)]
 struct Removed {
     parameter: String,
+    /// The default deletion to cancel if a checked call cannot be rewritten
+    /// safely.
+    fix: TextRange,
     /// Source text to pass at call sites, when the default can be reproduced
     /// without depending on names that the caller may not have imported.
     value: Option<String>,
+}
+
+type FixKey = (PathBuf, TextSize, TextSize);
+
+fn fix_key(path: &Path, range: TextRange) -> FixKey {
+    (path.to_path_buf(), range.start(), range.end())
 }
 
 /// Enough of a callable's shape to decide what a call to it is missing.
@@ -348,6 +357,9 @@ struct Definitions {
     /// Every name a fixed callable goes by, so a call that cannot be resolved
     /// to one can still be reported rather than silently left behind.
     names: BTreeSet<String>,
+    /// Default deletions grouped by every callable spelling, used to retain
+    /// them when an unresolved checked call may refer to that callable.
+    fixes_by_name: BTreeMap<String, BTreeSet<FixKey>>,
 }
 
 impl Definitions {
@@ -429,6 +441,7 @@ struct Checked {
 struct CallSites {
     edits: BTreeMap<PathBuf, Vec<Edit>>,
     skipped: Vec<Skipped>,
+    retained: BTreeSet<FixKey>,
 }
 
 /// The calls one file makes to fixed callables.
@@ -436,6 +449,7 @@ struct CallSites {
 struct FileCallSites {
     edits: Vec<Edit>,
     skipped: Vec<Skipped>,
+    retained: BTreeSet<FixKey>,
 }
 
 #[must_use]
@@ -544,6 +558,12 @@ fn apply_fixes(
         let Some(range) = diagnostic.fix else {
             continue;
         };
+        if call_sites
+            .retained
+            .contains(&fix_key(&diagnostic.path, range))
+        {
+            continue;
+        }
         call_sites
             .edits
             .entry(diagnostic.path.clone())
@@ -557,7 +577,13 @@ fn apply_fixes(
         print_diffs(&changes);
         let remaining = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.fix.is_none() || unfixed.contains(&diagnostic.path))
+            .filter(|diagnostic| {
+                diagnostic.fix.is_none_or(|range| {
+                    call_sites
+                        .retained
+                        .contains(&fix_key(&diagnostic.path, range))
+                }) || unfixed.contains(&diagnostic.path)
+            })
             .cloned()
             .collect::<Vec<_>>();
         report_diagnostics(&remaining, cli.output_format, true)?;
@@ -570,7 +596,13 @@ fn apply_fixes(
     // run has to say so rather than claim everything was fixed.
     let remaining_diagnostics = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.fix.is_none() || unfixed.contains(&diagnostic.path))
+        .filter(|diagnostic| {
+            diagnostic.fix.is_none_or(|range| {
+                call_sites
+                    .retained
+                    .contains(&fix_key(&diagnostic.path, range))
+            }) || unfixed.contains(&diagnostic.path)
+        })
         .cloned()
         .collect::<Vec<_>>();
     let remaining = remaining_diagnostics.len();
@@ -599,6 +631,7 @@ fn apply_fixes(
         updated,
         cli.output_format,
         &unfixed,
+        &call_sites.retained,
     );
     Ok(remaining > 0)
 }
@@ -622,12 +655,19 @@ fn warn_about_skipped_calls(skipped: &[Skipped]) {
 /// A default counts only if it carried a fix and its file was written. One
 /// left on disk because its result would not have parsed still has every
 /// default it started with.
-fn removed_defaults(diagnostics: &[Diagnostic], unfixed: &BTreeSet<PathBuf>) -> usize {
+fn removed_defaults(
+    diagnostics: &[Diagnostic],
+    unfixed: &BTreeSet<PathBuf>,
+    retained: &BTreeSet<FixKey>,
+) -> usize {
     diagnostics
         .iter()
         .filter(|diagnostic| {
             diagnostic.code == "NOD001"
                 && diagnostic.fix.is_some()
+                && !diagnostic
+                    .fix
+                    .is_some_and(|range| retained.contains(&fix_key(&diagnostic.path, range)))
                 && !unfixed.contains(&diagnostic.path)
         })
         .count()
@@ -639,8 +679,9 @@ fn report_call_sites(
     updated: usize,
     format: OutputFormat,
     unfixed: &BTreeSet<PathBuf>,
+    retained: &BTreeSet<FixKey>,
 ) {
-    let removed = removed_defaults(diagnostics, unfixed);
+    let removed = removed_defaults(diagnostics, unfixed, retained);
     // A run that removed only unused `noqa` directives touched no call site
     // and has nothing to say here. Rewritten or skipped calls are reported
     // whether or not a default survived in a file that could not be written.
@@ -693,6 +734,10 @@ fn physical_paths(files: &[PathBuf]) -> BTreeMap<&Path, PathBuf> {
         .collect()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "building the cross-file definition index and scanning its callers is one pipeline"
+)]
 fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<CallSites, String> {
     let physical = physical_paths(files);
     let physical_path = |path: &Path| -> PathBuf {
@@ -704,6 +749,16 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
     let mut definitions = Definitions::default();
     for signature in signatures {
         definitions.names.insert(signature.name.clone());
+        definitions
+            .fixes_by_name
+            .entry(signature.name.clone())
+            .or_default()
+            .extend(
+                signature
+                    .removed
+                    .iter()
+                    .map(|removed| fix_key(&signature.path, removed.fix)),
+            );
         let defining = physical_path(&signature.path);
         let table = match &signature.kind {
             Callable::Method { class, .. } => definitions
@@ -790,6 +845,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                 .extend(file.edits);
         }
         call_sites.skipped.extend(file.skipped);
+        call_sites.retained.extend(file.retained);
     }
     call_sites.skipped.sort_by(|left, right| {
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
@@ -3291,6 +3347,7 @@ impl Checker<'_> {
             if was_removed && self.collect_signatures {
                 removed.push(Removed {
                     parameter: parameter.parameter.name.to_string(),
+                    fix: range,
                     value: literal_text(default, self.source),
                 });
             }
@@ -3451,6 +3508,7 @@ impl Checker<'_> {
             if let Some(class) = self.classes.last_mut() {
                 class.removed.push(Removed {
                     parameter: name.id.to_string(),
+                    fix: default.fix,
                     value: default.value,
                 });
             }
@@ -4797,6 +4855,7 @@ fn rewrite_calls(
         lines: LineIndex::new(source),
         edits: Vec::new(),
         skipped: Vec::new(),
+        retained: BTreeSet::new(),
     };
     for statement in parsed.suite() {
         rewriter.visit_stmt(statement);
@@ -4804,6 +4863,7 @@ fn rewrite_calls(
     Ok(FileCallSites {
         edits: rewriter.edits,
         skipped: rewriter.skipped,
+        retained: rewriter.retained,
     })
 }
 
@@ -5337,6 +5397,7 @@ struct Rewriter<'a> {
     lines: LineIndex,
     edits: Vec<Edit>,
     skipped: Vec<Skipped>,
+    retained: BTreeSet<FixKey>,
 }
 
 impl Rewriter<'_> {
@@ -5603,6 +5664,12 @@ impl Rewriter<'_> {
             // known, or a call through an unresolved import. Rewriting it would
             // break working code, so say so instead.
             if self.definitions.names.contains(name) {
+                if dotted_name(&call.func).is_some_and(|binding| self.binding_is_replaced(&binding))
+                {
+                    if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
+                        self.retained.extend(fixes.iter().cloned());
+                    }
+                }
                 self.skip(
                     call.start(),
                     name,
@@ -5898,6 +5965,10 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
         self.visit_expr(&decorator.expression);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "statement-order binding and lexical-scope transitions are kept in one dispatch"
+    )]
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
             Stmt::Import(_) | Stmt::ImportFrom(_) if self.scopes.is_empty() => {
@@ -5945,6 +6016,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.invalidated_bindings.extend(rebound_names(statement));
             }
             Stmt::ClassDef(class) => {
+                let module_scope = self.scopes.is_empty();
                 // The class header is evaluated before its local namespace is
                 // populated, so body bindings cannot shadow header calls.
                 for decorator in &class.decorator_list {
@@ -5966,8 +6038,17 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.scopes.pop();
                 self.classes.pop();
                 self.bind_definition_in_class(class.name.as_str(), true);
+                if module_scope
+                    && self
+                        .bindings
+                        .first()
+                        .is_some_and(|bindings| bindings.contains_key(class.name.as_str()))
+                {
+                    self.invalidated_bindings.insert(class.name.to_string());
+                }
             }
             Stmt::FunctionDef(function) => {
+                let module_scope = self.scopes.is_empty();
                 // Decorators run while the function object is being created,
                 // before names local to its body exist.
                 for decorator in &function.decorator_list {
@@ -6004,6 +6085,14 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.bindings.pop();
                 self.implicit_receivers.pop();
                 self.bind_definition_in_class(function.name.as_str(), false);
+                if module_scope
+                    && self
+                        .bindings
+                        .first()
+                        .is_some_and(|bindings| bindings.contains_key(function.name.as_str()))
+                {
+                    self.invalidated_bindings.insert(function.name.to_string());
+                }
             }
             _ => walk_stmt(self, statement),
         }
@@ -10588,11 +10677,14 @@ def b(x=1): pass  # type: ignore  # noqa
         };
         let diagnostics = [diagnostic("left.py"), diagnostic("written.py")];
         assert_eq!(
-            removed_defaults(&diagnostics, &BTreeSet::from([unfixed])),
+            removed_defaults(&diagnostics, &BTreeSet::from([unfixed]), &BTreeSet::new()),
             1,
             "the file left on disk still has its default"
         );
-        assert_eq!(removed_defaults(&diagnostics, &BTreeSet::new()), 2);
+        assert_eq!(
+            removed_defaults(&diagnostics, &BTreeSet::new(), &BTreeSet::new()),
+            2
+        );
     }
 
     #[test]

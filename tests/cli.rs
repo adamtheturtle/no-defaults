@@ -1620,8 +1620,12 @@ fn rebinding_a_package_name_drops_its_dotted_import() -> Result<(), Box<dyn std:
         .arg("--fix")
         .arg(directory.path())
         .output()?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
     assert_eq!(std::fs::read_to_string(caller)?, source);
+    assert_eq!(
+        std::fs::read_to_string(package.join("api.py"))?,
+        "def target(value=1): return value\n"
+    );
     Ok(())
 }
 
@@ -1647,8 +1651,13 @@ fn module_level_targets_replace_an_imported_name() -> Result<(), Box<dyn std::er
             .arg("--fix")
             .arg(directory.path())
             .output()?;
-        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.status.code(), Some(1));
         assert_eq!(std::fs::read_to_string(&caller)?, source, "{rebinding}");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("mod.py"))?,
+            "def target(value=1): return value\n",
+            "{rebinding}"
+        );
     }
     Ok(())
 }
@@ -1717,12 +1726,16 @@ fn reassigning_an_imported_module_invalidates_its_binding() -> Result<(), Box<dy
         .arg("--fix")
         .arg(directory.path())
         .output()?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
     assert!(
         std::fs::read_to_string(caller)?.ends_with("api = Other()\napi.target()\n"),
         "the call through the reassigned receiver must stay unchanged"
     );
     assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value=1): return value\n"
+    );
     Ok(())
 }
 
@@ -1742,12 +1755,43 @@ fn reassigning_an_imported_symbol_invalidates_its_binding() -> Result<(), Box<dy
         .arg("--fix")
         .arg(directory.path())
         .output()?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
     assert!(
         std::fs::read_to_string(caller)?.ends_with("target = lambda: 5\ntarget()\n"),
         "the call through the reassigned symbol must stay unchanged"
     );
     assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value=1): return value\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn module_definitions_invalidate_imported_callable_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for definition in ["def target(): return 9", "class target: pass"] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        let api_source = "def target(value=1): return value\n";
+        let caller_source = format!("from api import target\n{definition}\ntarget()\n");
+        std::fs::write(&api, api_source)?;
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(1), "{definition}");
+        assert_eq!(std::fs::read_to_string(&api)?, api_source, "{definition}");
+        assert_eq!(
+            std::fs::read_to_string(&caller)?,
+            caller_source,
+            "{definition}"
+        );
+    }
     Ok(())
 }
 

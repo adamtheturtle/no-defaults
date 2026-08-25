@@ -3462,6 +3462,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__subclasscheck__"
             | "__subclasshook__"
             | "__class_getitem__"
+            | "__mro_entries__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9276,6 +9277,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn class_getitem_defaults_are_retained_for_implicit_subscription() {
         let source = "class C:\n    def __class_getitem__(cls, item, extra=1):\n        return (item, extra)\n\nC[int]\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn mro_entries_defaults_are_retained_for_implicit_base_resolution() {
+        let source = "class Proxy:\n    def __mro_entries__(self, bases, extra=1):\n        return ()\n\nproxy = Proxy()\n\nclass C(proxy):\n    pass\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

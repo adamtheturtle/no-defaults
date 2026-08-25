@@ -3991,6 +3991,7 @@ impl Aliases {
     fn invalidate(&mut self, name: &str) {
         self.renamed.remove(name);
         self.dataclasses_members.remove(name);
+        self.dataclass_decorators.remove(name);
         self.dataclasses_modules.remove(name);
         self.staticmethods.remove(name);
         self.classmethods.remove(name);

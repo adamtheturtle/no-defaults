@@ -3014,6 +3014,21 @@ fn rebinding_a_dataclass_alias_invalidates_the_import() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn assigning_over_a_dataclass_decorator_invalidates_the_import(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "from dataclasses import dataclass\ndataclass = lambda cls: cls\n\n@dataclass\nclass C:\n    value: int = 1\n\nassert C().value == 1\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}
+
+#[test]
 fn later_class_assignments_do_not_shadow_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

@@ -2228,6 +2228,27 @@ fn class_named_expressions_shadow_imported_callables_after_binding(
 }
 
 #[test]
+fn class_match_captures_shadow_imported_callables_inside_the_case(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    let api_source = "def target(value=1): return value\n";
+    let caller_source = "from api import target\nclass C:\n    match (lambda: 9):\n        case target:\n            result = target()\nassert C.result == 9\n";
+    std::fs::write(&api, api_source)?;
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(&api)?, api_source);
+    assert_eq!(std::fs::read_to_string(&caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
 fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

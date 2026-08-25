@@ -3454,6 +3454,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__set__"
             | "__delete__"
             | "__set_name__"
+            | "__instancecheck__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9200,6 +9201,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn set_name_defaults_are_retained_for_implicit_class_creation_calls() {
         let source = "class D:\n    def __set_name__(self, owner, name, extra=1):\n        owner.bound_name = name + str(extra)\n\nclass C:\n    value = D()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn instancecheck_defaults_are_retained_for_implicit_isinstance_calls() {
+        let source = "class M(type):\n    def __instancecheck__(cls, instance, extra=1):\n        return extra == 1\n\nclass C(metaclass=M):\n    pass\n\nisinstance(object(), C)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

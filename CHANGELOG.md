@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Deleting a class-local shadow restores global name lookup for later statements in the class body, so calls to the global callable are rewritten with removed defaults.
 - A selected class-body `match` case installs its pattern captures in the class namespace before evaluating the guard and body, so calls on captured values no longer use stale global imports.
 - A named expression in a class body binds its target in the class namespace after evaluating its value, so later calls no longer resolve through a stale global import.
 - A class-body `except … as` target shadows an imported callable while its handler runs and is deleted afterwards; calls on the caught object remain unchanged and the affected default is retained.

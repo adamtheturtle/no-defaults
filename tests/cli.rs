@@ -2249,6 +2249,34 @@ fn class_match_captures_shadow_imported_callables_inside_the_case(
 }
 
 #[test]
+fn deleting_a_class_local_shadow_restores_the_global_callable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(
+        &caller,
+        "from api import target\nclass C:\n    target = lambda: 9\n    del target\n    result = target()\nassert C.result == 1\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value): return value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import target\nclass C:\n    target = lambda: 9\n    del target\n    result = target(value=1)\nassert C.result == 1\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn function_local_imports_do_not_replace_module_bindings() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempfile::tempdir()?;

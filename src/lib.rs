@@ -6096,6 +6096,20 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
             }
+            Stmt::Delete(delete) if self.in_class_scope() => {
+                walk_stmt(self, statement);
+                let mut deleted = BoundNames::default();
+                for target in &delete.targets {
+                    deleted.bind(target);
+                }
+                if let Some(scope) = self.scopes.last_mut() {
+                    for name in deleted.names {
+                        scope.names.remove(&name);
+                        scope.functions.remove(&name);
+                        scope.classes.remove(&name);
+                    }
+                }
+            }
             Stmt::For(loop_statement) if self.in_class_scope() => {
                 self.visit_expr(&loop_statement.iter);
                 let statically_empty = match loop_statement.iter.as_ref() {

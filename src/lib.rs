@@ -5697,6 +5697,7 @@ fn deleted_names(body: &[Stmt]) -> BTreeSet<String> {
 struct BoundNames {
     names: BTreeSet<String>,
     globals: BTreeSet<String>,
+    nonlocals: BTreeSet<String>,
     functions: BTreeSet<String>,
     classes: BTreeSet<String>,
 }
@@ -5744,6 +5745,11 @@ impl BoundNames {
     /// The names bound anywhere inside a function, including its parameters.
     fn finish(mut self) -> Self {
         for name in &self.globals {
+            self.names.remove(name);
+            self.functions.remove(name);
+            self.classes.remove(name);
+        }
+        for name in &self.nonlocals {
             self.names.remove(name);
             self.functions.remove(name);
             self.classes.remove(name);
@@ -5839,6 +5845,10 @@ impl<'a> Visitor<'a> for BoundNames {
             Stmt::Global(global) => {
                 self.globals
                     .extend(global.names.iter().map(ToString::to_string));
+            }
+            Stmt::Nonlocal(nonlocal) => {
+                self.nonlocals
+                    .extend(nonlocal.names.iter().map(ToString::to_string));
             }
             _ => {}
         }
@@ -11091,6 +11101,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "def target(value): return value\n\ndef run():\n    global target\n    result = target(value=1)\n    target = lambda: 2\n    return result\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_nonlocal_declaration_keeps_the_enclosing_binding_visible() -> Result<(), String> {
+        let source = "def outer():\n    def target(value=1): return value\n    def run():\n        nonlocal target\n        result = target()\n        target = lambda: 2\n        return result\n    return run()\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer():\n    def target(value): return value\n    def run():\n        nonlocal target\n        result = target(value=1)\n        target = lambda: 2\n        return result\n    return run()\nassert outer() == 1\n"
         );
         Ok(())
     }

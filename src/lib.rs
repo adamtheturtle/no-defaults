@@ -5674,6 +5674,7 @@ fn rewrite_calls(
         module_bindings: BoundNames::of_body(parsed.suite()).names,
         bindings: vec![BTreeMap::new()],
         binding_scope_depths: vec![0],
+        lambda_scope_depths: Vec::new(),
         class_bindings: Vec::new(),
         invalidated_bindings: BTreeSet::new(),
         rebound_classes: BTreeSet::new(),
@@ -6534,6 +6535,8 @@ struct Rewriter<'a> {
     bindings: Vec<BTreeMap<String, Binding>>,
     /// Lexical scope index owning each non-module binding table.
     binding_scope_depths: Vec<usize>,
+    /// Lexical scope indices belonging to lambdas, whose walruses bind there.
+    lambda_scope_depths: Vec<usize>,
     /// Imports bound directly in each enclosing class namespace.
     class_bindings: Vec<BTreeMap<String, Binding>>,
     /// Imported module-scope names replaced by an assignment already visited.
@@ -7863,10 +7866,32 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&named.target);
                 let mut rebound = BoundNames::default();
                 rebound.bind(&named.target);
-                if let Some(bindings) = self.bindings.last_mut() {
+                let function_depth = self
+                    .binding_scope_depths
+                    .last()
+                    .copied()
+                    .filter(|_| self.bindings.len() > 1);
+                let lambda_owner = self
+                    .lambda_scope_depths
+                    .last()
+                    .copied()
+                    .filter(|lambda| function_depth.is_none_or(|function| *lambda > function));
+                if let Some(lambda) = lambda_owner {
+                    if let Some(scope) = self.scopes.get_mut(lambda) {
+                        scope.names.extend(rebound.names);
+                    }
+                } else if let Some(bindings) = self
+                    .bindings
+                    .last_mut()
+                    .filter(|_| function_depth.is_some())
+                {
                     for name in rebound.names {
                         bindings.remove(&name);
                     }
+                } else {
+                    self.invalidated_bindings
+                        .extend(rebound.names.iter().cloned());
+                    self.rebound_classes.extend(rebound.names);
                 }
                 return;
             }
@@ -7884,7 +7909,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 let receiver = receiver.filter(|name| !scope.names.contains(name));
                 self.implicit_receivers.push(receiver);
                 self.scopes.push(scope);
+                self.lambda_scope_depths.push(self.scopes.len() - 1);
                 self.visit_expr(&lambda.body);
+                self.lambda_scope_depths.pop();
                 self.scopes.pop();
                 self.implicit_receivers.pop();
                 return;

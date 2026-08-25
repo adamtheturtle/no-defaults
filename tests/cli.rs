@@ -3319,6 +3319,20 @@ fn metaclass_getattribute_keeps_class_attribute_defaults() -> Result<(), Box<dyn
 }
 
 #[test]
+fn nested_control_flow_metaclasses_intercept_class_attributes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "def build():\n    if True:\n        class Meta(type):\n            def __getattribute__(cls, name):\n                if name == 'target': return lambda: 9\n                return super().__getattribute__(name)\n        class C(metaclass=Meta):\n            @staticmethod\n            def target(value=1): return value\n    return C.target()\nassert build() == 9\n";
+    std::fs::write(&case, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&case).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(case)?, source);
+    Ok(())
+}
+
+#[test]
 fn assigned_instance_attributes_keep_method_defaults() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

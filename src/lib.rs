@@ -6103,13 +6103,16 @@ fn collect_explicit_all(suite: &[Stmt], names: &mut Option<BTreeSet<String>>) {
                 let truth = Truthiness::from_expr(&loop_.test, |_| false);
                 let mut iterated = initial.clone();
                 collect_explicit_all(&loop_.body, &mut iterated);
-                collect_explicit_all(&loop_.orelse, &mut iterated);
+                let mut completed = iterated.clone();
+                collect_explicit_all(&loop_.orelse, &mut completed);
                 let mut skipped = initial;
                 collect_explicit_all(&loop_.orelse, &mut skipped);
                 *names = match truth {
                     Truthiness::False | Truthiness::Falsey | Truthiness::None => skipped,
+                    // An always-true loop reaches following statements only
+                    // through `break`, which skips its `else` suite.
                     Truthiness::True | Truthiness::Truthy => iterated,
-                    Truthiness::Unknown => common_all_state(&[iterated, skipped]),
+                    Truthiness::Unknown => common_all_state(&[iterated, completed, skipped]),
                 };
                 continue;
             }
@@ -8970,6 +8973,22 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         assert_eq!(explicit_all_names(&path), None);
+        Ok(())
+    }
+
+    #[test]
+    fn always_true_while_does_not_apply_its_else_exports() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(
+            &path,
+            "__all__ = ['before']\nwhile True:\n    __all__ = ['body']\n    break\nelse:\n    __all__ = ['else']\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            explicit_all_names(&path),
+            Some(BTreeSet::from(["body".to_owned()]))
+        );
         Ok(())
     }
 

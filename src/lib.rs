@@ -4932,7 +4932,12 @@ fn collect_bindings(
                         (Some(file), _, _) => Binding::Symbol(file, name.to_owned()),
                         (None, Some(file), _) => Binding::Module(file),
                         (None, None, Some(file)) => Binding::Symbol(file.clone(), name.to_owned()),
-                        (None, None, None) => continue,
+                        (None, None, None) => {
+                            // Python still replaces the local name when the
+                            // imported module is outside the checked file set.
+                            bindings.remove(&bound);
+                            continue;
+                        }
                     };
                     bindings.insert(bound, binding);
                 }
@@ -6010,6 +6015,20 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         self.definitions,
                         bindings,
                     );
+                }
+                let runtime_names = BoundNames::of_body(std::slice::from_ref(statement)).names;
+                for name in runtime_names {
+                    let resolved = self.bindings.first().is_some_and(|bindings| {
+                        bindings.keys().any(|binding| {
+                            binding == &name
+                                || binding.split('.').next().is_some_and(|head| head == name)
+                        })
+                    });
+                    if resolved {
+                        self.invalidated_bindings.remove(&name);
+                    } else {
+                        self.invalidated_bindings.insert(name);
+                    }
                 }
             }
             Stmt::Import(_)

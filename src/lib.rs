@@ -3461,6 +3461,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__instancecheck__"
             | "__subclasscheck__"
             | "__subclasshook__"
+            | "__class_getitem__"
             | "__init_subclass__"
             | "__call__"
             | "__enter__"
@@ -9258,6 +9259,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn subclasshook_defaults_are_retained_for_implicit_abc_checks() {
         let source = "from abc import ABC\n\nclass C(ABC):\n    @classmethod\n    def __subclasshook__(cls, subclass, extra=1):\n        return extra == 1\n\nissubclass(int, C)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn class_getitem_defaults_are_retained_for_implicit_subscription() {
+        let source = "class C:\n    def __class_getitem__(cls, item, extra=1):\n        return (item, extra)\n\nC[int]\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

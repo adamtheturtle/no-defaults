@@ -3890,6 +3890,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
     }
 
     fn visit_expr(&mut self, expression: &'a Expr) {
+        if let Expr::Named(named) = expression {
+            self.visit_expr(&named.value);
+            self.visit_expr(&named.target);
+            self.invalidate_target_aliases(&named.target);
+            return;
+        }
         if let Expr::Lambda(lambda) = expression {
             self.check_lambda(lambda);
         }

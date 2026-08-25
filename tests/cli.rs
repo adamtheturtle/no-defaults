@@ -3586,3 +3586,18 @@ fn with_targets_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn st
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
+
+#[test]
+fn walrus_targets_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "from dataclasses import dataclass as dc\n(dc := lambda cls: cls)\n@dc\nclass C:\n    value: int = 1\nassert C().value == 1\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}

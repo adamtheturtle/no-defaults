@@ -60,6 +60,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A match-pattern capture invalidates any imported dataclass identity it may replace before its guard and case body are analyzed.
 - A named-expression target invalidates any imported dataclass identity it replaces after its value has been evaluated.
 - A `with ... as` target invalidates any imported dataclass identity it replaces, both inside and after the suite.
 - A `for` target invalidates any imported dataclass identity it may replace, while a statically empty loop leaves the identity unchanged.

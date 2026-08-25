@@ -3123,6 +3123,21 @@ fn later_class_assignments_keep_overwritten_method_defaults(
 }
 
 #[test]
+fn repeated_methods_keep_their_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "class C:\n    def target(self, value=1): return value\n    def target(self, value=2): return value\nassert C().target() == 2\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(case)?, source);
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

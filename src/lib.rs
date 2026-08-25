@@ -5999,15 +5999,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
             }
-            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) | Stmt::With(_)
-                if self.scopes.is_empty() =>
-            {
-                // Every one of these binds a module-level name of its own — an
-                // assignment target, a loop target, or a context-manager
-                // target — and replaces whatever an import bound there. The
-                // statement is walked first: what it evaluates still sees the
-                // old binding, and a nested statement reaches this arm on its
-                // own rather than through the one holding it.
+            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.scopes.is_empty() => {
+                // The assigned value is evaluated before its module-level
+                // target replaces whatever an import bound there.
                 walk_stmt(self, statement);
                 self.invalidated_bindings.extend(rebound_names(statement));
             }
@@ -6020,6 +6014,21 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.invalidated_bindings.extend(rebound_names(statement));
                 self.visit_body(&loop_statement.body);
                 self.visit_body(&loop_statement.orelse);
+            }
+            Stmt::With(block) if self.scopes.is_empty() => {
+                // With-items enter from left to right. Each context expression
+                // sees targets bound by preceding items, and the suite sees
+                // every optional target.
+                for item in &block.items {
+                    self.visit_expr(&item.context_expr);
+                    if let Some(target) = &item.optional_vars {
+                        self.visit_expr(target);
+                        let mut rebound = BoundNames::default();
+                        rebound.bind(target);
+                        self.invalidated_bindings.extend(rebound.names);
+                    }
+                }
+                self.visit_body(&block.body);
             }
             Stmt::ClassDef(class) => {
                 let module_scope = self.scopes.is_empty();

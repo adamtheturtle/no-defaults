@@ -54,6 +54,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A module-level `with … as` target shadows an imported callable inside the context-manager body, after its context expression has been evaluated.
 - A module-level `for` target shadows an imported callable inside the loop body as soon as the first item is assigned, so calls there are no longer rewritten against the stale import.
 - Module-level named expressions invalidate an earlier imported callable binding before later calls are resolved, while the expression assigning the replacement still sees the old binding.
 - Module-level `def` and `class` statements invalidate an earlier imported callable binding before later calls are resolved. When a checked call can no longer be tied safely to a changed callable, that callable's default is retained rather than merely warning after breaking the caller.

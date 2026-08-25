@@ -6314,7 +6314,16 @@ impl Rewriter<'_> {
                 Some((signature, signature.kind.implicit_bound()))
             }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
-            Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false) => None,
+            Expr::Name(name)
+                if self.nested_callable(name.id.as_str()) == Some(false)
+                    && !self
+                        .bindings
+                        .iter()
+                        .skip(1)
+                        .any(|bindings| bindings.contains_key(name.id.as_str())) =>
+            {
+                None
+            }
             Expr::Name(name) => match self.binding(name.id.as_str()) {
                 Some(Binding::Symbol(file, symbol)) => {
                     let signature = self.definitions.symbol(file, symbol)?;
@@ -6818,6 +6827,23 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 }
                 self.bind_statement_in_class(statement);
             }
+            Stmt::Import(_) | Stmt::ImportFrom(_) => {
+                if let Some(bindings) = self.bindings.last_mut() {
+                    collect_bindings(
+                        std::slice::from_ref(statement),
+                        self.physical,
+                        self.known,
+                        bindings,
+                    );
+                    collect_star_bindings(
+                        std::slice::from_ref(statement),
+                        self.physical,
+                        self.known,
+                        self.definitions,
+                        bindings,
+                    );
+                }
+            }
             Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.in_class_scope() => {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
@@ -6877,6 +6903,14 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // target replaces whatever an import bound there.
                 walk_stmt(self, statement);
                 self.invalidated_bindings.extend(rebound_names(statement));
+            }
+            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) => {
+                walk_stmt(self, statement);
+                if let Some(bindings) = self.bindings.last_mut() {
+                    for name in rebound_names(statement) {
+                        bindings.remove(&name);
+                    }
+                }
             }
             Stmt::For(loop_statement) if self.scopes.is_empty() => {
                 // The iterable is evaluated before the first target binding.
@@ -7148,9 +7182,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         .filter(|name| !function_scope.names.contains(name))
                 };
                 self.implicit_receivers.push(receiver);
-                let mut local = BTreeMap::new();
-                collect_bindings(&function.body, self.physical, self.known, &mut local);
-                self.bindings.push(local);
+                self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
                 self.lexical_scope.push(function.name.to_string());
                 self.visit_body(&function.body);

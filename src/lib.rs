@@ -9827,6 +9827,22 @@ mod tests {
     }
 
     #[test]
+    fn function_parameters_shadow_pydantic_field_imports() {
+        let source = "from pydantic import BaseModel, Field\n\ndef helper(*, default, description): return default\ndef outer(Field):\n    class C(BaseModel):\n        x: int = Field(default=1, description='x')\n    return C\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
     fn function_parameters_shadow_class_var_imports() {
         let source = "from dataclasses import dataclass\nfrom typing import ClassVar\n\nclass Marker:\n    def __getitem__(self, item): return item\n\ndef outer(ClassVar):\n    @dataclass\n    class C:\n        x: ClassVar[int] = 1\n    return C\n";
         let checked = check_source(

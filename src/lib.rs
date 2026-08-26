@@ -9100,6 +9100,16 @@ mod tests {
     }
 
     #[test]
+    fn qualified_pydantic_private_attributes_are_not_model_fields() {
+        for source in [
+            "import pydantic\n\nclass C(pydantic.BaseModel):\n    _value: int = pydantic.PrivateAttr(default=1)\n",
+            "import pydantic as pd\n\nclass C(pd.BaseModel):\n    _value: int = pd.PrivateAttr(default=1)\n",
+        ] {
+            assert!(messages(source, false).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
     fn underscore_model_attributes_are_not_constructor_fields() {
         assert!(messages(
             "from pydantic import BaseModel\n\nclass C(BaseModel):\n    _value: int = 1\n",

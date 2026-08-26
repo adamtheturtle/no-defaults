@@ -7355,17 +7355,39 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             if let Some(type_) = &handler.type_ {
                 self.visit_expr(type_);
             }
+            let previous = handler.name.as_ref().and_then(|name| {
+                self.scopes.last().map(|scope| {
+                    (
+                        scope.names.contains(name.as_str()),
+                        scope.functions.contains(name.as_str()),
+                        scope.classes.contains(name.as_str()),
+                    )
+                })
+            });
             if let Some(name) = &handler.name {
                 if let Some(scope) = self.scopes.last_mut() {
                     scope.names.insert(name.to_string());
+                    scope.functions.remove(name.as_str());
+                    scope.classes.remove(name.as_str());
                 }
             }
             self.visit_body(&handler.body);
-            if let Some(name) = &handler.name {
+            if let (Some(name), Some((was_name, was_function, was_class))) =
+                (&handler.name, previous)
+            {
                 if let Some(scope) = self.scopes.last_mut() {
                     scope.names.remove(name.as_str());
                     scope.functions.remove(name.as_str());
                     scope.classes.remove(name.as_str());
+                    if was_name {
+                        scope.names.insert(name.to_string());
+                    }
+                    if was_function {
+                        scope.functions.insert(name.to_string());
+                    }
+                    if was_class {
+                        scope.classes.insert(name.to_string());
+                    }
                 }
             }
             return;

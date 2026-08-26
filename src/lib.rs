@@ -7473,7 +7473,8 @@ impl Rewriter<'_> {
     /// lookup starts after the class the call appears in.
     fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
         if let Expr::Subscript(subscript) = receiver {
-            return self.receiving_class(&subscript.value);
+            let class = self.receiving_class(&subscript.value)?;
+            return (!class.2).then_some(class);
         }
         if let Expr::Call(call) = receiver {
             if let Some(class) = self.type_of_implicit_instance(call) {
@@ -14050,6 +14051,16 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "from typing import Generic, TypeVar\n\nT = TypeVar('T')\nclass Box(Generic[T]):\n    @classmethod\n    def make(cls, value):\n        return cls()\n\nBox[int].make(value=1)\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_instance_method_calls_are_not_treated_as_generic_classes() -> Result<(), String> {
+        let source = "class Other:\n    def target(self):\n        pass\n\nclass C:\n    def target(self, value=1):\n        pass\n    def __getitem__(self, index):\n        return Other()\n    def run(self):\n        self[0].target()\n        C()[0].target()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("def target(self, value):"), "{updated}");
+        assert!(updated.contains("self[0].target()"), "{updated}");
+        assert!(updated.contains("C()[0].target()"), "{updated}");
         Ok(())
     }
 

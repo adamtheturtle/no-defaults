@@ -4462,6 +4462,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "persistent_id"
             | "reducer_override"
             | "persistent_load"
+            | "find_class"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9479,6 +9480,23 @@ mod tests {
     fn unpickler_persistent_load_defaults_are_retained() {
         let source =
             "class U:\n    def persistent_load(self, pid, extra=1):\n        return (pid, extra)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn unpickler_find_class_defaults_are_retained() {
+        let source = "class U:\n    def find_class(self, module, name, extra=1):\n        return super().find_class(module, name)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

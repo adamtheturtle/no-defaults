@@ -4240,9 +4240,17 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         Inherited::Known(shape) => (shape.fields.clone(), shape.removed.clone()),
                         Inherited::Nothing | Inherited::Unknown => (Vec::new(), Vec::new()),
                     };
-                    if let Inherited::Known(shape) = &inherited {
-                        self.scope.kept_default = shape.kept_default;
-                    }
+                    self.scope.kept_default = match &inherited {
+                        Inherited::Known(shape) => shape.kept_default,
+                        // An unseen base may end in a positional default. A
+                        // child field without one would then make dataclass
+                        // construction fail before any call can be rewritten.
+                        Inherited::Unknown => class_bases(class).any(|base| {
+                            base_root_name(base)
+                                .is_some_and(|name| self.aliases.import_bindings.contains(name))
+                        }),
+                        Inherited::Nothing => false,
+                    };
                     let qualified = self.qualified_class(class.name.as_str());
                     self.classes.push(ClassCollector {
                         name: class.name.to_string(),
@@ -4489,6 +4497,20 @@ fn class_bases(class: &ast::StmtClassDef) -> impl Iterator<Item = &Expr> {
         .flat_map(|arguments| arguments.args.iter())
 }
 
+fn base_root_name(base: &Expr) -> Option<&str> {
+    let mut expression = match base {
+        Expr::Subscript(subscript) => subscript.value.as_ref(),
+        expression => expression,
+    };
+    while let Expr::Attribute(attribute) = expression {
+        expression = attribute.value.as_ref();
+    }
+    match expression {
+        Expr::Name(name) => Some(name.id.as_str()),
+        _ => None,
+    }
+}
+
 fn qualified_name(parent: Option<&str>, name: &str) -> String {
     parent.map_or_else(|| name.to_owned(), |parent| format!("{parent}.{name}"))
 }
@@ -4511,6 +4533,7 @@ fn qualified_lexical_name(scope: &[String], name: &str) -> String {
 /// member, which makes it resolve to neither.
 #[derive(Clone, Debug, Default)]
 struct Aliases {
+    import_bindings: BTreeSet<String>,
     renamed: BTreeMap<String, Option<String>>,
     dataclasses_members: BTreeSet<String>,
     dataclass_fields: BTreeSet<String>,
@@ -4535,6 +4558,7 @@ struct Aliases {
 
 impl Aliases {
     fn invalidate(&mut self, name: &str) {
+        self.import_bindings.remove(name);
         self.renamed.remove(name);
         self.dataclasses_members.remove(name);
         if self.dataclass_fields.remove(name) {
@@ -4650,6 +4674,11 @@ impl Aliases {
     /// The names a plain `import` binds for the modules whose members matter.
     fn collect_module_aliases(&mut self, import: &ast::StmtImport) {
         for alias in &import.names {
+            self.import_bindings
+                .insert(alias.asname.as_ref().map_or_else(
+                    || alias.name.split('.').next().unwrap_or_default().to_owned(),
+                    ToString::to_string,
+                ));
             if alias.name.as_str() == "dataclasses" {
                 self.dataclasses_modules.insert(
                     alias
@@ -4694,6 +4723,13 @@ impl Aliases {
             match statement {
                 Stmt::Import(import) => self.collect_module_aliases(import),
                 Stmt::ImportFrom(import) => {
+                    self.import_bindings.extend(
+                        import
+                            .names
+                            .iter()
+                            .filter(|alias| alias.name.as_str() != "*")
+                            .map(|alias| alias.asname.as_ref().unwrap_or(&alias.name).to_string()),
+                    );
                     self.collect_typing_members(import);
                     self.collect_builtin_members(import);
                     self.collect_abc_members(import);
@@ -13198,6 +13234,23 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics[0].line, 8);
         assert_eq!(checked.diagnostics[0].fix, None);
         assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_base_protects_positional_but_not_keyword_only_defaults() {
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\n@dataclass\nclass Child(Parent):\n    positional: int = 2\n    keyword: int = field(default=3, kw_only=True)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
     }
 
     #[test]

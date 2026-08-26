@@ -3396,6 +3396,16 @@ impl Checker<'_> {
 
     fn class_constructs_safely(&self, class: &ast::StmtClassDef) -> bool {
         class_constructs_safely(class, &self.aliases, &self.metaclass_classes)
+            && !class_bases(class).any(|base| {
+                base_root_name(base).is_some_and(|name| self.aliases.import_bindings.contains(name))
+                    && !self.field_bases.matches(base, &self.aliases)
+                    && !carries_no_fields(
+                        base,
+                        &self.aliases,
+                        &self.local_classes,
+                        &self.module_bindings,
+                    )
+            })
     }
 
     fn generates_init(&self, class: &ast::StmtClassDef) -> bool {
@@ -13004,6 +13014,23 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn a_dataclass_with_an_imported_base_has_no_assumed_metaclass() {
+        let source = "from dataclasses import dataclass\nfrom base import Parent\n\n@dataclass\nclass Child(Parent):\n    value: int = 1\n\nassert Child() == 9\nassert Child.value == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
     fn a_redefined_base_without_a_metaclass_is_not_treated_as_metaclass_built() {
         // An earlier `Base` that named a metaclass must not stick after a
         // later plain `Base` takes its place.
@@ -13539,7 +13566,7 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn an_unknown_base_protects_positional_but_not_keyword_only_defaults() {
+    fn an_unknown_base_protects_every_default_from_inherited_metaclasses() {
         let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\n@dataclass\nclass Child(Parent):\n    positional: int = 2\n    keyword: int = field(default=3, kw_only=True)\n";
         let checked = check_source(
             Path::new("fixture.py"),
@@ -13552,7 +13579,8 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 2);
         assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.diagnostics[1].fix.is_some());
+        assert!(checked.diagnostics[1].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

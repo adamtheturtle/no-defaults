@@ -3572,3 +3572,17 @@ fn for_targets_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn std
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
+
+#[test]
+fn with_targets_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "from dataclasses import dataclass as dc\nclass Manager:\n    def __enter__(self): return lambda cls: cls\n    def __exit__(self, *args): pass\nwith Manager() as dc:\n    pass\n@dc\nclass C:\n    value: int = 1\nassert C().value == 1\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}

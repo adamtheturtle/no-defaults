@@ -11860,6 +11860,16 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn classmethod_receivers_use_class_level_descriptor_binding() -> Result<(), String> {
+        let source = "class C:\n    def target(self, value=1): return value\n\n    @classmethod\n    def run(cls): return cls.target(C())\n\nassert C.run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class C:\n    def target(self, value): return value\n\n    @classmethod\n    def run(cls): return cls.target(C(), value=1)\n\nassert C.run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_method_on_an_unknown_receiver_is_left_alone() -> Result<(), String> {
         assert_eq!(
             skipped_reasons(

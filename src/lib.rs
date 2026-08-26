@@ -3618,7 +3618,9 @@ impl Checker<'_> {
             }
             Expr::Name(name) => (0..=self.lexical_scope.len())
                 .rev()
-                .filter(|depth| !self.class_scope_depths.contains(depth))
+                .filter(|depth| {
+                    *depth == self.lexical_scope.len() || !self.class_scope_depths.contains(depth)
+                })
                 .find_map(|depth| {
                     let identity =
                         qualified_class_name(&self.lexical_scope[..depth], name.id.as_str());
@@ -9295,6 +9297,23 @@ mod tests {
     #[test]
     fn inherited_enum_member_initializer_defaults_are_retained() {
         let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn nested_inherited_enum_initializer_defaults_are_retained() {
+        let source = "from enum import Enum\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

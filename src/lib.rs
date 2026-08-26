@@ -1040,8 +1040,61 @@ fn index_method_bases(
                     }
                 }
             }
-            _ => {}
+            _ => index_control_flow_method_bases(
+                statement,
+                importer,
+                bindings,
+                parent_class,
+                lexical_scope,
+                definitions,
+            ),
         }
+    }
+}
+
+fn index_control_flow_method_bases(
+    statement: &Stmt,
+    importer: &Path,
+    bindings: &BTreeMap<String, Binding>,
+    parent_class: Option<&str>,
+    lexical_scope: &mut Vec<String>,
+    definitions: &mut Definitions,
+) {
+    let suites: Vec<&[Stmt]> = match statement {
+        Stmt::If(branch) => std::iter::once(branch.body.as_slice())
+            .chain(
+                branch
+                    .elif_else_clauses
+                    .iter()
+                    .map(|clause| clause.body.as_slice()),
+            )
+            .collect(),
+        Stmt::For(loop_) => vec![&loop_.body, &loop_.orelse],
+        Stmt::While(loop_) => vec![&loop_.body, &loop_.orelse],
+        Stmt::With(block) => vec![&block.body],
+        Stmt::Try(block) => std::iter::once(block.body.as_slice())
+            .chain(block.handlers.iter().map(|handler| {
+                let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                handler.body.as_slice()
+            }))
+            .chain([block.orelse.as_slice(), block.finalbody.as_slice()])
+            .collect(),
+        Stmt::Match(block) => block
+            .cases
+            .iter()
+            .map(|case| case.body.as_slice())
+            .collect(),
+        _ => Vec::new(),
+    };
+    for suite in suites {
+        index_method_bases(
+            suite,
+            importer,
+            bindings,
+            parent_class,
+            lexical_scope,
+            definitions,
+        );
     }
 }
 
@@ -11845,6 +11898,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "def outer():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_flow_classes_preserve_inherited_method_calls() -> Result<(), String> {
+        let source = "if True:\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "if True:\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
         );
         Ok(())
     }

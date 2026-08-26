@@ -6248,6 +6248,51 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                 }
             }
+            Stmt::Match(match_statement) if self.in_class_scope() => {
+                self.visit_expr(&match_statement.subject);
+                let subject = match_statement
+                    .subject
+                    .as_literal_expr()
+                    .map(ComparableLiteral::from);
+                for case in &match_statement.cases {
+                    let selected = match (&subject, &case.pattern) {
+                        (Some(subject), Pattern::MatchValue(pattern)) => pattern
+                            .value
+                            .as_literal_expr()
+                            .map(ComparableLiteral::from)
+                            .is_some_and(|pattern| pattern == *subject),
+                        (_, Pattern::MatchAs(pattern)) if pattern.pattern.is_none() => true,
+                        _ => {
+                            self.visit_pattern(&case.pattern);
+                            if let Some(guard) = &case.guard {
+                                self.visit_expr(guard);
+                            }
+                            self.visit_body(&case.body);
+                            continue;
+                        }
+                    };
+                    if !selected {
+                        continue;
+                    }
+                    self.visit_pattern(&case.pattern);
+                    let mut captures = BoundNames::default();
+                    captures.visit_pattern(&case.pattern);
+                    if let Some(scope) = self.scopes.last_mut() {
+                        scope.names.extend(captures.names);
+                    }
+                    if let Some(guard) = &case.guard {
+                        self.visit_expr(guard);
+                        if matches!(
+                            Truthiness::from_expr(guard, |_| false),
+                            Truthiness::False | Truthiness::Falsey | Truthiness::None
+                        ) {
+                            continue;
+                        }
+                    }
+                    self.visit_body(&case.body);
+                    break;
+                }
+            }
             Stmt::Match(match_statement) if self.scopes.is_empty() => {
                 self.visit_expr(&match_statement.subject);
                 let subject = match_statement

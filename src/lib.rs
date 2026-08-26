@@ -4463,6 +4463,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "reducer_override"
             | "persistent_load"
             | "find_class"
+            | "invalidate_caches"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9497,6 +9498,24 @@ mod tests {
     #[test]
     fn unpickler_find_class_defaults_are_retained() {
         let source = "class U:\n    def find_class(self, module, name, extra=1):\n        return super().find_class(module, name)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn import_finder_invalidate_caches_defaults_are_retained() {
+        let source =
+            "class Finder:\n    def invalidate_caches(self, extra=1):\n        assert extra == 1\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

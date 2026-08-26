@@ -2807,6 +2807,7 @@ fn check_source(
         shape_namespaces: BTreeSet::new(),
         known_truthiness: BTreeMap::new(),
         lexical_scope: Vec::new(),
+        class_scope_depths: Vec::new(),
         conditional_depth: 0,
         scope: Scope {
             private: is_private_module(path, project_root, reexports),
@@ -3115,6 +3116,9 @@ struct Checker<'a> {
     /// Enclosing definitions, used to keep same-named nested class shapes
     /// separate from classes in other lexical scopes.
     lexical_scope: Vec<String>,
+    /// Prefix lengths in `lexical_scope` that name class bodies. They are not
+    /// closure scopes for code in a nested class.
+    class_scope_depths: Vec<usize>,
     /// Unknown control-flow branches do not describe one reliable constructor.
     conditional_depth: usize,
     scope: Scope,
@@ -3301,10 +3305,15 @@ impl Checker<'_> {
 
     /// Find the nearest class shape visible from the current lexical scope.
     fn visible_shape(&self, name: &str) -> Option<&Option<Shape>> {
-        (0..=self.lexical_scope.len()).rev().find_map(|depth| {
-            self.shapes
-                .get(&qualified_class_name(&self.lexical_scope[..depth], name))
-        })
+        (0..=self.lexical_scope.len())
+            .rev()
+            .filter(|depth| {
+                *depth == self.lexical_scope.len() || !self.class_scope_depths.contains(depth)
+            })
+            .find_map(|depth| {
+                self.shapes
+                    .get(&qualified_class_name(&self.lexical_scope[..depth], name))
+            })
     }
 
     fn unknown_base_may_end_in_default(&self, class: &ast::StmtClassDef) -> bool {
@@ -4548,7 +4557,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     self.record_inherited_method_aliases();
                 }
                 self.lexical_scope.push(class.name.to_string());
+                self.class_scope_depths.push(self.lexical_scope.len());
                 walk_stmt(self, statement);
+                self.class_scope_depths.pop();
                 self.lexical_scope.pop();
                 // The class name becomes visible only after its body has
                 // executed. A later class with the same name must not change
@@ -13162,6 +13173,27 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn a_class_shape_alias_uses_the_nearest_enclosing_scope() -> Result<(), String> {
         let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    module: int = 1\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    class Container:\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n    return Container.Child()\n\nouter()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        let child = checked
+            .signatures
+            .iter()
+            .find(|signature| signature.positional.iter().any(|field| field == "child"))
+            .ok_or("expected the nested child signature")?;
+        assert_eq!(child.positional, ["local", "child"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_class_shape_alias_skips_outer_class_scopes() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 1\n\n    class Container:\n        @dataclass\n        class Base:\n            class_body: int = 2\n\n        class Nested:\n            Alias = Base\n\n            @dataclass\n            class Child(Alias):\n                child: int = 3\n\n    return Container.Nested.Child\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

@@ -4465,6 +4465,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "find_class"
             | "invalidate_caches"
             | "load_module"
+            | "get_code"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9534,6 +9535,24 @@ mod tests {
     #[test]
     fn legacy_import_loader_defaults_are_retained() {
         let source = "class Loader:\n    def load_module(self, fullname, extra=1):\n        return fullname\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn inspect_loader_get_code_defaults_are_retained() {
+        let source =
+            "class Loader:\n    def get_code(self, fullname, extra=1):\n        return None\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

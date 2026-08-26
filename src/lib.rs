@@ -417,21 +417,36 @@ impl Definitions {
 
     fn ambiguous_inherited_fixes(&self) -> BTreeSet<FixKey> {
         let mut fixes = BTreeSet::new();
-        for bases in self.ambiguous_base_options.values() {
-            for base in bases {
-                let Some(mro) = self.linearized_mro(base, &mut BTreeSet::new()) else {
-                    continue;
-                };
-                for (file, class) in mro {
-                    for ((owner, owner_class, _), method_fixes) in &self.fixes_by_method {
-                        if owner == &file && owner_class == &class {
-                            fixes.extend(method_fixes.iter().cloned());
-                        }
-                    }
-                }
-            }
+        let mut seen = BTreeSet::new();
+        for class in &self.ambiguous_bases {
+            self.collect_inherited_fixes(class, &mut seen, &mut fixes);
         }
         fixes
+    }
+
+    fn collect_inherited_fixes(
+        &self,
+        class: &(PathBuf, String),
+        seen: &mut BTreeSet<(PathBuf, String)>,
+        fixes: &mut BTreeSet<FixKey>,
+    ) {
+        if !seen.insert(class.clone()) {
+            return;
+        }
+        for ((file, owner, _), method_fixes) in &self.fixes_by_method {
+            if file == &class.0 && owner == &class.1 {
+                fixes.extend(method_fixes.iter().cloned());
+            }
+        }
+        if let Some(bases) = self.ambiguous_base_options.get(class) {
+            for base in bases {
+                self.collect_inherited_fixes(base, seen, fixes);
+            }
+        } else if let Some(bases) = self.bases.get(class) {
+            for base in bases {
+                self.collect_inherited_fixes(base, seen, fixes);
+            }
+        }
     }
 
     fn class_identity(&self, file: &Path, class: &str) -> Option<(PathBuf, String)> {
@@ -12031,7 +12046,7 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn competing_conditional_class_bases_retain_inherited_defaults() -> Result<(), String> {
-        let source = "class First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif flag:\n    class Child(First):\n        def run(self): return self.target()\nelse:\n    class Child(Second):\n        def run(self): return self.target()\n\nChild().run()\n";
+        let source = "class First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif flag:\n    class Child(First):\n        def target(self, value=3): return value\n        def run(self): return self.target()\nelse:\n    class Child(Second):\n        def target(self, value=4): return value\n        def run(self): return self.target()\n\nChild().run()\n";
         let module = parse_module(source).map_err(|error| error.to_string())?;
         let mut definitions = Definitions::default();
         index_method_bases(

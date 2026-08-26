@@ -151,7 +151,10 @@ impl FieldBases {
 
     fn matches(&self, base: &Expr, aliases: &Aliases) -> bool {
         match base {
-            Expr::Name(name) => self.names.contains(aliases.resolve(name.id.as_str())),
+            Expr::Name(name) => {
+                !aliases.parameter_bindings.contains(name.id.as_str())
+                    && self.names.contains(aliases.resolve(name.id.as_str()))
+            }
             Expr::Attribute(attribute) => self.names.contains(attribute.attr.as_str()),
             // `class Job(BaseModel, Generic[T])` names its base through a
             // subscript, as a generic model does.
@@ -5014,6 +5017,7 @@ struct Aliases {
     invalidated_structural_bases: BTreeSet<String>,
     type_checking: BTreeSet<String>,
     kw_only_markers: BTreeSet<String>,
+    parameter_bindings: BTreeSet<String>,
 }
 
 impl Aliases {
@@ -5043,6 +5047,7 @@ impl Aliases {
         self.structural_bases.remove(name);
         self.type_checking.remove(name);
         self.kw_only_markers.remove(name);
+        self.parameter_bindings.remove(name);
     }
 
     fn invalidate_parameter(&mut self, name: &str) {
@@ -5054,6 +5059,7 @@ impl Aliases {
             self.invalidated_structural_bases.insert(name.to_owned());
         }
         self.invalidate(name);
+        self.parameter_bindings.insert(name.to_owned());
     }
 
     /// The `dataclasses` or `pydantic` member `name` was imported as, or `name`
@@ -9882,6 +9888,13 @@ mod tests {
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
+    fn function_parameters_shadow_configured_field_bases() -> Result<(), String> {
+        let source = "from pydantic import BaseModel\n\nclass Plain:\n    pass\n\ndef outer(BaseModel):\n    class C(BaseModel):\n        x: int = 1\n    return C\n\nassert outer(Plain).x == 1\n";
+        assert_eq!(fixed(source)?, source);
+        Ok(())
     }
 
     #[test]

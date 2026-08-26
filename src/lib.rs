@@ -10015,6 +10015,20 @@ mod tests {
     }
 
     #[test]
+    fn except_targets_shadow_dataclass_field_imports() {
+        // `field(repr=False)` names no default, so `dataclasses.field` leaves
+        // the attribute clean. Under the handler `field` is the exception
+        // instead, and the call is an ordinary default that is reported.
+        let shadowed = "from dataclasses import dataclass, field\n\nclass FieldError(Exception):\n    def __call__(self, *, repr): return repr\n\ntry:\n    raise FieldError()\nexcept FieldError as field:\n    @dataclass\n    class C:\n        x: int = field(repr=False)\n";
+        assert_eq!(
+            messages(shadowed, false),
+            ["dataclass field `x` has a default"]
+        );
+        let live = shadowed.replace("as field:", "as error:");
+        assert!(messages(&live, false).is_empty());
+    }
+
+    #[test]
     fn a_function_local_dataclass_alias_does_not_escape() {
         assert!(messages(
             "def dc(cls): return cls\n\ndef load():\n    from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    value: int = 1\n",

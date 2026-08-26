@@ -3567,6 +3567,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__repr__"
             | "__bytes__"
             | "__buffer__"
+            | "__release_buffer__"
             | "__format__"
             | "__hash__"
             | "__sizeof__"
@@ -8889,6 +8890,24 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn buffer_defaults_are_retained_for_implicit_memoryview_calls() {
         let source = "class C:\n    def __buffer__(self, flags, extra=1):\n        return memoryview(b'abc')\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn release_buffer_defaults_are_retained_for_implicit_memoryview_callbacks() {
+        let source =
+            "class C:\n    def __release_buffer__(self, view, extra=1):\n        return extra\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

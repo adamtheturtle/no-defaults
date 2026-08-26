@@ -45,6 +45,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A default on `__setstate__` is reported but retained because unpickling invokes it implicitly.
 - A default on `__replace__` is reported but retained because `copy.replace()` invokes it implicitly.
 - A default on `__buffer__` is reported but retained because creating a `memoryview` invokes it implicitly.
+- A default on `__release_buffer__` is reported but retained because releasing a `memoryview` invokes it implicitly.
 - A default on module-level `__getattr__` is reported but retained because module attribute fallback invokes it implicitly.
 - A default on module-level `__dir__` is reported but retained because `dir(module)` invokes it implicitly.
 - A default on a parameter of an implicitly called method is reported but never removed. The interpreter is the caller, so there is no call site that could be given the argument back, and removing it changed behaviour. This covers the context manager, iterator and async iterator protocols, `__len__` and `__length_hint__`, subscription, `__contains__`, `__missing__`, `__reversed__`, the comparison, arithmetic, bitwise and matrix operators, `divmod` and `pow`, the `str`, `repr`, `bytes`, `format`, `hash`, `bool`, `index`, `int`, `float`, `complex` and `os.PathLike` conversions, `round`, `trunc`, `floor` and `ceil`, along with `__call__`, `__init_subclass__`, a dataclass's `__post_init__`, and a property getter.

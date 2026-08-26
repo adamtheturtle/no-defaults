@@ -2976,6 +2976,27 @@ impl Checker<'_> {
         self.visit_body(&block.body);
     }
 
+    fn visit_match<'a>(&mut self, block: &'a ast::StmtMatch)
+    where
+        Self: Visitor<'a>,
+    {
+        self.visit_expr(&block.subject);
+        self.conditional_depth += 1;
+        for case in &block.cases {
+            self.visit_pattern(&case.pattern);
+            let mut captures = BoundNames::default();
+            captures.visit_pattern(&case.pattern);
+            for name in captures.names {
+                self.aliases.invalidate(&name);
+            }
+            if let Some(guard) = &case.guard {
+                self.visit_expr(guard);
+            }
+            self.visit_body(&case.body);
+        }
+        self.conditional_depth -= 1;
+    }
+
     fn visit_while<'a>(&mut self, loop_: &'a ast::StmtWhile, statement: &'a Stmt)
     where
         Self: Visitor<'a>,
@@ -3757,7 +3778,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
             Stmt::If(branch) => self.visit_conditional(branch),
-            Stmt::Try(_) | Stmt::Match(_) => self.visit_uncertain(statement),
+            Stmt::Try(_) => self.visit_uncertain(statement),
+            Stmt::Match(block) => self.visit_match(block),
             Stmt::For(loop_) => self.visit_loop(loop_, statement),
             Stmt::While(loop_) => self.visit_while(loop_, statement),
             Stmt::With(block) => self.visit_with(block),

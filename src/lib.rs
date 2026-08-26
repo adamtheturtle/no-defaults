@@ -4459,6 +4459,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "find_spec"
             | "create_module"
             | "exec_module"
+            | "persistent_id"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9424,6 +9425,23 @@ mod tests {
     fn import_loader_exec_module_defaults_are_retained() {
         let source =
             "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn pickler_persistent_id_defaults_are_retained() {
+        let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return None\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

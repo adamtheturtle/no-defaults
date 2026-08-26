@@ -2607,6 +2607,47 @@ fn stale_dotted_keys_do_not_resolve_replacement_imports() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn unresolved_sibling_imports_keep_a_resolved_package_head(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for imports in [
+        "import pkg.api\nimport pkg.other",
+        "import pkg.api, pkg.other",
+        "import pkg.other, pkg.api",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let package = directory.path().join("pkg");
+        let caller = directory.path().join("caller.py");
+        std::fs::create_dir(&package)?;
+        std::fs::write(package.join("__init__.py"), "")?;
+        std::fs::write(
+            package.join("api.py"),
+            "def target(value=1): return value\n",
+        )?;
+        std::fs::write(package.join("other.py"), "")?;
+        let caller_source = format!("{imports}\nassert pkg.api.target() == 1\n");
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(package.join("api.py"))
+            .arg(&caller)
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{imports}");
+        assert_eq!(
+            std::fs::read_to_string(package.join("api.py"))?,
+            "def target(value): return value\n",
+            "{imports}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!("{imports}\nassert pkg.api.target(value=1) == 1\n"),
+            "{imports}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn class_for_targets_shadow_imported_callables_inside_the_body(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

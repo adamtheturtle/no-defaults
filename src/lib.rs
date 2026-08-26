@@ -5965,6 +5965,26 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_except_handler(&mut self, except_handler: &'a ast::ExceptHandler) {
+        if self.in_class_scope() {
+            let ast::ExceptHandler::ExceptHandler(handler) = except_handler;
+            if let Some(type_) = &handler.type_ {
+                self.visit_expr(type_);
+            }
+            if let Some(name) = &handler.name {
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.names.insert(name.to_string());
+                }
+            }
+            self.visit_body(&handler.body);
+            if let Some(name) = &handler.name {
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.names.remove(name.as_str());
+                    scope.functions.remove(name.as_str());
+                    scope.classes.remove(name.as_str());
+                }
+            }
+            return;
+        }
         if !self.scopes.is_empty() {
             walk_except_handler(self, except_handler);
             return;

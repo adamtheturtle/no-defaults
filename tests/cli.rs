@@ -3075,6 +3075,26 @@ fn assigning_over_a_generic_alias_restores_inherited_dataclass_fields(
 }
 
 #[test]
+fn assigning_over_the_abc_module_alias_restores_inherited_dataclass_fields(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "import abc\nfrom dataclasses import dataclass\n@dataclass\nclass Base:\n    first: int = 1\nclass Namespace:\n    ABC = Base\nabc = Namespace()\n@dataclass\nclass Child(abc.ABC):\n    second: int = 2\nassert Child() == Child(first=1, second=2)\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(
+        fixed.contains("Child(first=1, second=2) == Child(first=1, second=2)"),
+        "{fixed}"
+    );
+    Ok(())
+}
+
+#[test]
 fn assigning_over_a_dataclass_decorator_invalidates_the_import(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

@@ -2370,6 +2370,7 @@ fn check_source(
         repeated_functions,
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
+        shape_namespaces: BTreeSet::new(),
         lexical_scope: Vec::new(),
         conditional_depth: 0,
         scope: Scope {
@@ -2664,6 +2665,9 @@ struct Checker<'a> {
     /// What each field-carrying class of this file's own contributes to a
     /// subclass's constructor, by the name it was defined under.
     shapes: BTreeMap<String, Option<Shape>>,
+    /// Module-level names rebound to namespace instances whose class members
+    /// have known field shapes.
+    shape_namespaces: BTreeSet<String>,
     /// Enclosing definitions, used to keep same-named nested class shapes
     /// separate from classes in other lexical scopes.
     lexical_scope: Vec<String>,
@@ -2817,6 +2821,19 @@ impl Checker<'_> {
                     _ => Inherited::Unknown,
                 }
             }
+            [Expr::Attribute(attribute)] => {
+                let Expr::Name(module) = attribute.value.as_ref() else {
+                    return Inherited::Unknown;
+                };
+                if !self.shape_namespaces.contains(module.id.as_str()) {
+                    return Inherited::Unknown;
+                }
+                let qualified = format!("{}.{}", module.id, attribute.attr);
+                match self.shapes.get(&qualified) {
+                    Some(Some(shape)) if shape.complete => Inherited::Known(shape.clone()),
+                    _ => Inherited::Unknown,
+                }
+            }
             _ => Inherited::Unknown,
         }
     }
@@ -2868,14 +2885,37 @@ impl Checker<'_> {
         for name in bound.names {
             self.aliases.invalidate(&name);
         }
-        if self.scope.class == ClassScope::None && self.lexical_scope.is_empty() {
-            if let Stmt::Assign(assign) = statement {
-                if let (Some(Expr::Name(target)), Expr::Name(value)) =
-                    (assign.targets.first(), assign.value.as_ref())
-                {
-                    if assign.targets.len() == 1 {
-                        if let Some(shape) = self.shapes.get(value.id.as_str()).cloned() {
-                            self.shapes.insert(target.id.to_string(), shape);
+        if let Stmt::Assign(assign) = statement {
+            if let Some(Expr::Name(target)) =
+                assign.targets.first().filter(|_| assign.targets.len() == 1)
+            {
+                let target = qualified_class_name(&self.lexical_scope, target.id.as_str());
+                if let Expr::Name(value) = assign.value.as_ref() {
+                    let qualified = qualified_class_name(&self.lexical_scope, value.id.as_str());
+                    if let Some(shape) = self
+                        .shapes
+                        .get(&qualified)
+                        .or_else(|| self.shapes.get(value.id.as_str()))
+                        .cloned()
+                    {
+                        self.shapes.insert(target, shape);
+                    }
+                } else if self.lexical_scope.is_empty() {
+                    if let Expr::Call(call) = assign.value.as_ref() {
+                        if let Expr::Name(namespace) = call.func.as_ref() {
+                            let prefix = format!("{}.", namespace.id);
+                            let aliases: Vec<(String, Option<Shape>)> = self
+                                .shapes
+                                .iter()
+                                .filter_map(|(name, shape)| {
+                                    name.strip_prefix(&prefix)
+                                        .map(|member| (format!("{target}.{member}"), shape.clone()))
+                                })
+                                .collect();
+                            if !aliases.is_empty() {
+                                self.shape_namespaces.insert(target.clone());
+                            }
+                            self.shapes.extend(aliases);
                         }
                     }
                 }
@@ -3946,9 +3986,7 @@ fn carries_no_fields(
                     matches!(module.id.as_str(), "typing" | "typing_extensions")
                         || aliases.typing_modules.contains(module.id.as_str())
                 }
-                "ABC" => {
-                    module.id.as_str() == "abc" || aliases.abc_modules.contains(module.id.as_str())
-                }
+                "ABC" => aliases.abc_modules.contains(module.id.as_str()),
                 "object" => {
                     module.id.as_str() == "builtins"
                         || aliases.builtins_modules.contains(module.id.as_str())
@@ -4019,6 +4057,7 @@ impl Aliases {
         self.builtins_modules.remove(name);
         self.class_vars.remove(name);
         self.typing_modules.remove(name);
+        self.abc_modules.remove(name);
         self.structural_bases.remove(name);
         self.kw_only_markers.remove(name);
     }

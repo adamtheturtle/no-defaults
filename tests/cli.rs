@@ -20,6 +20,22 @@ fn a_closed_stdout_pipe_is_a_normal_termination() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn a_closed_stderr_pipe_is_a_normal_termination() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def f(value=1): pass\n")?;
+    let mut child = Command::new(binary())
+        .arg("--fix")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    drop(child.stderr.take());
+    assert_eq!(child.wait()?.code(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn bare_carriage_returns_are_line_endings() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

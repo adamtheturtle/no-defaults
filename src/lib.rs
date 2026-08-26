@@ -7312,11 +7312,13 @@ impl Rewriter<'_> {
             .collect::<Vec<_>>()
             .join(", ");
         let original = &self.source[expression.start().to_usize()..expression.end().to_usize()];
+        let mut parameter = "__no_defaults_decorated".to_owned();
+        while original.contains(&parameter) {
+            parameter.push('_');
+        }
         self.edits.push(Edit {
             range: expression.range(),
-            replacement: format!(
-                "lambda __no_defaults_decorated: {original}(__no_defaults_decorated, {supplied})"
-            ),
+            replacement: format!("lambda {parameter}: {original}({parameter}, {supplied})"),
             site: expression.start(),
         });
     }
@@ -10495,6 +10497,17 @@ def b(x=1): pass  # type: ignore  # noqa
                 "def decorate(function, flag=1):\n    function.flag = flag\n    return function\n\n@decorate\ndef target():\n    pass\n"
             )?,
             "def decorate(function, flag):\n    function.flag = flag\n    return function\n\n@lambda __no_defaults_decorated: decorate(__no_defaults_decorated, flag=1)\ndef target():\n    pass\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_decorator_parameter_does_not_capture_the_decorator() -> Result<(), String> {
+        assert_eq!(
+            fixed(
+                "def __no_defaults_decorated(function, flag=1):\n    function.flag = flag\n    return function\n\n@__no_defaults_decorated\ndef target():\n    pass\n"
+            )?,
+            "def __no_defaults_decorated(function, flag):\n    function.flag = flag\n    return function\n\n@lambda __no_defaults_decorated_: __no_defaults_decorated(__no_defaults_decorated_, flag=1)\ndef target():\n    pass\n"
         );
         Ok(())
     }

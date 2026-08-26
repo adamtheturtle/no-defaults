@@ -4519,9 +4519,10 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
                 let identity = qualified_class_name(&self.lexical_scope, class.name.as_str());
+                let inherits_imported_metaclass = self.may_inherit_imported_metaclass(class);
                 self.defined_class_identities.insert(identity.clone());
                 self.imported_metaclass_classes.remove(&identity);
-                if self.may_inherit_imported_metaclass(class) {
+                if inherits_imported_metaclass {
                     self.imported_metaclass_classes.insert(identity);
                 }
                 self.scope = Scope {
@@ -13522,6 +13523,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn imported_metaclass_uncertainty_propagates_through_local_bases() {
         let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Middle(Parent):\n    pass\n\n@dataclass\nclass Child(Middle):\n    value: int = field(default=1, kw_only=True)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_self_named_base_uses_the_previous_metaclass_binding() {
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base(Base):\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = field(default=1, kw_only=True)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

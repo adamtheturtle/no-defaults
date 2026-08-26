@@ -3359,6 +3359,11 @@ impl Checker<'_> {
         let outer_local_classes = self.local_classes.clone();
         let outer_metaclass_classes = self.metaclass_classes.clone();
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
+        let mut parameters = BoundNames::default();
+        parameters.parameters(&function.parameters);
+        for name in parameters.names {
+            self.aliases.invalidate(&name);
+        }
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
             fields: None,
@@ -8796,6 +8801,13 @@ mod tests {
             ["dataclass field `x` has a default"],
             "a called decorator resolves through its function"
         );
+    }
+
+    #[test]
+    fn function_parameters_shadow_dataclass_decorator_imports() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\ndef identity(cls): return cls\ndef outer(dataclass):\n    @dataclass\n    class C:\n        x: int = 1\n    return C\n\nassert outer(identity).x == 1\n";
+        assert_eq!(fixed(source)?, source);
+        Ok(())
     }
 
     #[test]

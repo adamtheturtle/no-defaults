@@ -5694,6 +5694,7 @@ fn rewrite_calls(
         known,
         classes: Vec::new(),
         class_scope_depths: Vec::new(),
+        class_direct_statements: Vec::new(),
         implicit_receivers: Vec::new(),
         lexical_scope: Vec::new(),
         called: BTreeSet::new(),
@@ -6562,6 +6563,9 @@ struct Rewriter<'a> {
     /// Scope-stack depth immediately inside each class body, distinguishing a
     /// direct method from a function nested inside one.
     class_scope_depths: Vec<usize>,
+    /// Statements directly in each class suite. A nested control-flow delete
+    /// is conditional and cannot definitely remove an earlier class binding.
+    class_direct_statements: Vec<BTreeSet<TextSize>>,
     /// The implicit receiver name of each enclosing function. Static methods
     /// and module functions contribute `None`.
     implicit_receivers: Vec<Option<String>>,
@@ -7642,6 +7646,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             }
             Stmt::Delete(delete) if self.in_class_scope() => {
                 walk_stmt(self, statement);
+                let direct = self
+                    .class_direct_statements
+                    .last()
+                    .is_some_and(|statements| statements.contains(&statement.start()));
+                if !direct {
+                    return;
+                }
                 let mut deleted = BoundNames::default();
                 for target in &delete.targets {
                     deleted.bind(target);
@@ -8008,7 +8019,10 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.scopes.push(BoundNames::default());
                 self.class_bindings.push(BTreeMap::new());
                 self.class_scope_depths.push(self.scopes.len());
+                self.class_direct_statements
+                    .push(class.body.iter().map(Ranged::start).collect());
                 self.visit_body(&class.body);
+                self.class_direct_statements.pop();
                 self.class_scope_depths.pop();
                 self.class_bindings.pop();
                 self.scopes.pop();

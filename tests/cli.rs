@@ -406,6 +406,26 @@ fn assigning_over_dataclasses_field_retains_the_replacement_call(
 }
 
 #[test]
+fn reimporting_dataclasses_field_clears_stale_invalidation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass, field\nfield = lambda **kwargs: 0\nfrom dataclasses import field\n@dataclass\nclass C:\n    value: int = field(default=1, compare=False)\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(
+        fixed.contains("value: int = field(compare=False)"),
+        "{fixed}"
+    );
+    Ok(())
+}
+
+#[test]
 fn custom_field_helpers_do_not_use_pydantic_argument_surgery(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

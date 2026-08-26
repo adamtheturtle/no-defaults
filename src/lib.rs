@@ -4652,9 +4652,11 @@ impl Aliases {
                     for alias in &import.names {
                         let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                         if dataclasses && alias.name.as_str() == "field" {
+                            self.invalidated_field_helpers.remove(&local);
                             self.dataclass_fields.insert(local.clone());
                         }
                         if pydantic && alias.name.as_str() == "Field" {
+                            self.invalidated_field_helpers.remove(&local);
                             self.pydantic_fields.insert(local.clone());
                         }
                         if pydantic && alias.name.as_str() == "PrivateAttr" {

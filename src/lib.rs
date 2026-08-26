@@ -4458,6 +4458,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__annotate__"
             | "find_spec"
             | "create_module"
+            | "exec_module"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9405,6 +9406,24 @@ mod tests {
     fn import_loader_create_module_defaults_are_retained() {
         let source =
             "class Loader:\n    def create_module(self, spec, extra=1):\n        return None\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn import_loader_exec_module_defaults_are_retained() {
+        let source =
+            "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

@@ -7653,6 +7653,15 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     .map(ComparableLiteral::from);
                 for case in &match_statement.cases {
                     let selected = match (&subject, &case.pattern) {
+                        (Some(subject), Pattern::MatchSingleton(pattern)) => match pattern.value {
+                            ast::Singleton::None => matches!(subject, ComparableLiteral::None),
+                            ast::Singleton::True => {
+                                matches!(subject, ComparableLiteral::Bool(value) if **value)
+                            }
+                            ast::Singleton::False => {
+                                matches!(subject, ComparableLiteral::Bool(value) if !**value)
+                            }
+                        },
                         (Some(subject), Pattern::MatchValue(pattern)) => {
                             let Some(pattern) = pattern.value.as_literal_expr() else {
                                 self.visit_pattern(&case.pattern);
@@ -7708,6 +7717,15 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     .map(ComparableLiteral::from);
                 for case in &match_statement.cases {
                     let matches = match (&subject, &case.pattern) {
+                        (Some(subject), Pattern::MatchSingleton(pattern)) => match pattern.value {
+                            ast::Singleton::None => matches!(subject, ComparableLiteral::None),
+                            ast::Singleton::True => {
+                                matches!(subject, ComparableLiteral::Bool(value) if **value)
+                            }
+                            ast::Singleton::False => {
+                                matches!(subject, ComparableLiteral::Bool(value) if !**value)
+                            }
+                        },
                         (Some(subject), Pattern::MatchValue(pattern)) => {
                             let Some(pattern) = pattern.value.as_literal_expr() else {
                                 // A non-literal value pattern cannot be compared

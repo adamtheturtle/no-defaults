@@ -5694,6 +5694,11 @@ fn rewrite_calls(
         source,
         definitions,
         aliases,
+        future_annotations: parsed.suite().iter().any(|statement| {
+            matches!(statement, Stmt::ImportFrom(import)
+                if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
+                    && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+        }),
         module_bindings: BoundNames::of_body(parsed.suite()).names,
         bindings: vec![BTreeMap::new()],
         binding_scope_depths: vec![0],
@@ -6554,6 +6559,9 @@ struct Rewriter<'a> {
     source: &'a str,
     definitions: &'a Definitions,
     aliases: Aliases,
+    /// Annotation expressions are stored as strings and never evaluated when
+    /// the future annotations feature is active.
+    future_annotations: bool,
     module_bindings: BTreeSet<String>,
     /// What each imported name in this file refers to.
     bindings: Vec<BTreeMap<String, Binding>>,
@@ -7417,6 +7425,12 @@ fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral
 }
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
+    fn visit_annotation(&mut self, annotation: &'a Expr) {
+        if !self.future_annotations {
+            self.visit_expr(annotation);
+        }
+    }
+
     fn visit_except_handler(&mut self, except_handler: &'a ast::ExceptHandler) {
         if self.in_class_scope() {
             let ast::ExceptHandler::ExceptHandler(handler) = except_handler;
@@ -12626,6 +12640,16 @@ def b(x=1): pass  # type: ignore  # noqa
             "def target(value):\n    return int\n\ndef decorated(item: target(value=1)):\n    target = 5\n"
         );
         assert!(skipped_reasons(source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn future_annotations_are_not_rewritten_as_calls() -> Result<(), String> {
+        let source = "from __future__ import annotations\n\ndef value(x=1): return x\ndef f(x: value()) -> value(): pass\ny: value()\nresult = value()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from __future__ import annotations\n\ndef value(x): return x\ndef f(x: value()) -> value(): pass\ny: value()\nresult = value(x=1)\n"
+        );
         Ok(())
     }
 

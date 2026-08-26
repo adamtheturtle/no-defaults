@@ -3055,6 +3055,26 @@ fn rebinding_a_dataclass_alias_invalidates_the_import() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn assigning_over_a_generic_alias_restores_inherited_dataclass_fields(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass\nfrom typing import Generic as G\n@dataclass\nclass Base:\n    first: int = 1\nG = Base\n@dataclass\nclass Child(G):\n    second: int = 2\nassert Child() == Child(first=1, second=2)\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(
+        fixed.contains("Child(first=1, second=2) == Child(first=1, second=2)"),
+        "{fixed}"
+    );
+    Ok(())
+}
+
+#[test]
 fn assigning_over_a_dataclass_decorator_invalidates_the_import(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

@@ -2868,6 +2868,19 @@ impl Checker<'_> {
         for name in bound.names {
             self.aliases.invalidate(&name);
         }
+        if self.scope.class == ClassScope::None && self.lexical_scope.is_empty() {
+            if let Stmt::Assign(assign) = statement {
+                if let (Some(Expr::Name(target)), Expr::Name(value)) =
+                    (assign.targets.first(), assign.value.as_ref())
+                {
+                    if assign.targets.len() == 1 {
+                        if let Some(shape) = self.shapes.get(value.id.as_str()).cloned() {
+                            self.shapes.insert(target.id.to_string(), shape);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, statement: &'a Stmt)
@@ -4006,6 +4019,7 @@ impl Aliases {
         self.builtins_modules.remove(name);
         self.class_vars.remove(name);
         self.typing_modules.remove(name);
+        self.structural_bases.remove(name);
         self.kw_only_markers.remove(name);
     }
 

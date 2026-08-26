@@ -6794,6 +6794,9 @@ impl Rewriter<'_> {
             };
             if call.arguments.keywords.is_empty()
                 && matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "super")
+                && self.nested_binding("super").is_none()
+                && self.binding("super").is_none()
+                && !self.module_bindings.contains("super")
                 && (zero_argument_super || explicit_super)
             {
                 return Some((
@@ -11424,6 +11427,16 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return super().target(value=1)\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_shadowed_super_call_is_not_the_builtin() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nclass Other:\n    def target(self): return 9\n\nclass Child(Base):\n    def run(self):\n        def super(): return Other()\n        return super().target()\n\nassert Child().run() == 9\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("def target(self, value): return value"));
+        assert!(updated.contains("return super().target()"));
+        assert!(!updated.contains("super().target(value="));
         Ok(())
     }
 

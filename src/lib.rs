@@ -3557,12 +3557,17 @@ impl Checker<'_> {
             let Expr::Name(name) = base else {
                 return false;
             };
-            (0..=self.lexical_scope.len()).rev().find_map(|depth| {
-                let identity = qualified_class_name(&self.lexical_scope[..depth], name.id.as_str());
-                self.defined_class_identities
-                    .contains(&identity)
-                    .then(|| self.imported_metaclass_classes.contains(&identity))
-            }) == Some(true)
+            (0..=self.lexical_scope.len())
+                .rev()
+                .filter(|depth| !self.class_scope_depths.contains(depth))
+                .find_map(|depth| {
+                    let identity =
+                        qualified_class_name(&self.lexical_scope[..depth], name.id.as_str());
+                    self.defined_class_identities
+                        .contains(&identity)
+                        .then(|| self.imported_metaclass_classes.contains(&identity))
+                })
+                == Some(true)
         })
     }
 
@@ -13540,6 +13545,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn a_self_named_base_uses_the_previous_metaclass_binding() {
         let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base(Base):\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = field(default=1, kw_only=True)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn imported_metaclass_lookup_skips_enclosing_class_scopes() {
+        let source = "from dataclasses import dataclass, field\n\ndef build():\n    from base import Parent\n\n    class Base(Parent):\n        pass\n\n    class Container:\n        class Base:\n            pass\n\n        @dataclass\n        class Child(Base):\n            value: int = field(default=1, kw_only=True)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

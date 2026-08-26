@@ -4410,7 +4410,8 @@ fn carries_no_fields(
         }
         Expr::Name(name) => {
             aliases.structural_bases.contains(name.id.as_str())
-                || matches!(name.id.as_str(), "Generic" | "Protocol" | "ABC" | "object")
+                || (!module_bindings.contains(name.id.as_str())
+                    && matches!(name.id.as_str(), "Generic" | "Protocol" | "ABC" | "object"))
         }
         Expr::Attribute(attribute) => {
             let Expr::Name(module) = attribute.value.as_ref() else {
@@ -12227,6 +12228,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n@dataclass\nclass C(Generic[T]):\n    value: int\n\nC(value=1)\n\nclass Generic:\n    pass\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebound_bare_structural_name_carries_aliased_fields() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nGeneric = Base\n\n@dataclass\nclass Child(Generic):\n    value: int = 2\n\nChild()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int\n\nGeneric = Base\n\n@dataclass\nclass Child(Generic):\n    value: int\n\nChild(inherited=1, value=2)\n"
         );
         Ok(())
     }

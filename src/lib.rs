@@ -6603,6 +6603,14 @@ impl Rewriter<'_> {
         }
     }
 
+    fn invalidate_class_bindings(&mut self, names: impl IntoIterator<Item = String>) {
+        if let Some(bindings) = self.class_bindings.last_mut() {
+            for name in names {
+                bindings.remove(&name);
+            }
+        }
+    }
+
     fn bind_definition_in_class(&mut self, name: &str, is_class: bool) {
         if !self.in_class_scope() {
             return;
@@ -7414,6 +7422,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     )
                 })
             });
+            let previous_binding = handler.name.as_ref().and_then(|name| {
+                self.class_bindings
+                    .last_mut()
+                    .and_then(|bindings| bindings.remove(name.as_str()))
+            });
             if let Some(name) = &handler.name {
                 if let Some(scope) = self.scopes.last_mut() {
                     scope.names.insert(name.to_string());
@@ -7439,6 +7452,12 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         scope.classes.insert(name.to_string());
                     }
                 }
+            }
+            if let (Some(name), Some(binding)) = (&handler.name, previous_binding) {
+                self.class_bindings
+                    .last_mut()
+                    .expect("class binding frame")
+                    .insert(name.to_string(), binding);
             }
             return;
         }
@@ -7642,6 +7661,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             }
             Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.in_class_scope() => {
                 walk_stmt(self, statement);
+                self.invalidate_class_bindings(rebound_names(statement));
                 self.bind_statement_in_class(statement);
             }
             Stmt::Delete(delete) if self.in_class_scope() => {
@@ -7657,6 +7677,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 for target in &delete.targets {
                     deleted.bind(target);
                 }
+                self.invalidate_class_bindings(deleted.names.iter().cloned());
                 if let Some(scope) = self.scopes.last_mut() {
                     for name in deleted.names {
                         scope.names.remove(&name);
@@ -7681,6 +7702,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&loop_statement.target);
                 let mut target = BoundNames::default();
                 target.bind(&loop_statement.target);
+                self.invalidate_class_bindings(target.names.iter().cloned());
                 if let Some(scope) = self.scopes.last_mut() {
                     scope.names.extend(target.names);
                 }
@@ -7694,6 +7716,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         self.visit_expr(target);
                         let mut bound = BoundNames::default();
                         bound.bind(target);
+                        self.invalidate_class_bindings(bound.names.iter().cloned());
                         if let Some(scope) = self.scopes.last_mut() {
                             scope.names.extend(bound.names);
                         }
@@ -7913,6 +7936,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_pattern(&case.pattern);
                     let mut captures = BoundNames::default();
                     captures.visit_pattern(&case.pattern);
+                    self.invalidate_class_bindings(captures.names.iter().cloned());
                     if let Some(scope) = self.scopes.last_mut() {
                         scope.names.extend(captures.names);
                     }

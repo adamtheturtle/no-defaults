@@ -8859,6 +8859,22 @@ mod tests {
     }
 
     #[test]
+    fn function_parameters_shadow_classmethod_imports() {
+        let source = "from builtins import classmethod as cm\n\ndef identity(function): return function\ndef outer(cm):\n    class C:\n        @cm\n        def f(cls, value=1): return value\n    return C.f(C())\n\nassert outer(identity) == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
     fn a_function_local_dataclass_alias_does_not_escape() {
         assert!(messages(
             "def dc(cls): return cls\n\ndef load():\n    from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    value: int = 1\n",

@@ -7496,58 +7496,101 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.invalidated_bindings.remove(&name);
                     self.rebound_classes.remove(&name);
                 }
-                let resolutions: Vec<(String, bool)> = match statement {
-                    Stmt::Import(import) => {
-                        let mut resolutions = BTreeMap::new();
-                        for alias in &import.names {
-                            let name = alias.asname.as_ref().map_or_else(
-                                || {
-                                    alias
-                                        .name
-                                        .split('.')
-                                        .next()
-                                        .unwrap_or(alias.name.as_str())
-                                        .to_owned()
-                                },
-                                ToString::to_string,
-                            );
-                            let module_resolved =
-                                resolve_module(alias.name.as_str(), 0, self.physical, self.known)
-                                    .is_some();
-                            let sibling_resolved = alias.asname.is_none()
-                                && alias.name.contains('.')
-                                && self.bindings.first().is_some_and(|bindings| {
-                                    bindings.keys().any(|binding| {
-                                        binding.contains('.')
-                                            && binding.split('.').next() == Some(name.as_str())
-                                    })
-                                });
-                            let resolved = module_resolved || sibling_resolved;
-                            resolutions
-                                .entry(name)
-                                .and_modify(|known| *known |= resolved)
-                                .or_insert(resolved);
+                let (resolutions, replaced_heads): (Vec<(String, bool)>, BTreeSet<String>) =
+                    match statement {
+                        Stmt::Import(import) => {
+                            let mut resolutions: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+                            for alias in &import.names {
+                                let name = alias.asname.as_ref().map_or_else(
+                                    || {
+                                        alias
+                                            .name
+                                            .split('.')
+                                            .next()
+                                            .unwrap_or(alias.name.as_str())
+                                            .to_owned()
+                                    },
+                                    ToString::to_string,
+                                );
+                                let module_resolved = resolve_module(
+                                    alias.name.as_str(),
+                                    0,
+                                    self.physical,
+                                    self.known,
+                                )
+                                .is_some();
+                                if alias.asname.is_some() {
+                                    resolutions.insert(name, (module_resolved, true));
+                                    continue;
+                                }
+                                let sibling_resolved = alias.name.contains('.')
+                                    && self.bindings.first().is_some_and(|bindings| {
+                                        bindings.keys().any(|binding| {
+                                            binding.contains('.')
+                                                && binding.split('.').next() == Some(name.as_str())
+                                        })
+                                    });
+                                let resolved = module_resolved || sibling_resolved;
+                                match resolutions.entry(name) {
+                                    Entry::Occupied(mut entry) => {
+                                        let (known, last_was_alias) = entry.get_mut();
+                                        if *last_was_alias {
+                                            *known = resolved;
+                                            *last_was_alias = false;
+                                        } else {
+                                            *known |= resolved;
+                                        }
+                                    }
+                                    Entry::Vacant(entry) => {
+                                        entry.insert((resolved, false));
+                                    }
+                                }
+                            }
+                            let replaced = resolutions
+                                .iter()
+                                .filter(|(_, (_, last_was_alias))| *last_was_alias)
+                                .map(|(name, _)| name.clone())
+                                .collect();
+                            (
+                                resolutions
+                                    .into_iter()
+                                    .map(|(name, (resolved, _))| (name, resolved))
+                                    .collect(),
+                                replaced,
+                            )
                         }
-                        resolutions.into_iter().collect()
-                    }
-                    Stmt::ImportFrom(import) => import
-                        .names
-                        .iter()
-                        .filter(|alias| alias.name.as_str() != "*")
-                        .map(|alias| {
-                            let name = alias
-                                .asname
-                                .as_ref()
-                                .map_or_else(|| alias.name.to_string(), ToString::to_string);
-                            let resolved = self
-                                .bindings
-                                .first()
-                                .is_some_and(|bindings| bindings.contains_key(&name));
-                            (name, resolved)
+                        Stmt::ImportFrom(import) => {
+                            let resolutions: Vec<_> = import
+                                .names
+                                .iter()
+                                .filter(|alias| alias.name.as_str() != "*")
+                                .map(|alias| {
+                                    let name = alias.asname.as_ref().map_or_else(
+                                        || alias.name.to_string(),
+                                        ToString::to_string,
+                                    );
+                                    let resolved = self
+                                        .bindings
+                                        .first()
+                                        .is_some_and(|bindings| bindings.contains_key(&name));
+                                    (name, resolved)
+                                })
+                                .collect();
+                            let replaced =
+                                resolutions.iter().map(|(name, _)| name.clone()).collect();
+                            (resolutions, replaced)
+                        }
+                        _ => (Vec::new(), BTreeSet::new()),
+                    };
+                if let Some(bindings) = self.bindings.first_mut() {
+                    bindings.retain(|binding, _| {
+                        !replaced_heads.iter().any(|head| {
+                            binding
+                                .strip_prefix(head)
+                                .is_some_and(|suffix| suffix.starts_with('.'))
                         })
-                        .collect(),
-                    _ => Vec::new(),
-                };
+                    });
+                }
                 for (name, resolved) in resolutions {
                     if resolved {
                         self.invalidated_bindings.remove(&name);

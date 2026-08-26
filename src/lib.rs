@@ -1129,6 +1129,19 @@ fn method_base_identity(
                 _ => None,
             }),
         Expr::Attribute(attribute) => {
+            if let Some((file, parent)) = method_base_identity(
+                &attribute.value,
+                importer,
+                bindings,
+                local_classes,
+                aliases,
+                methods,
+            ) {
+                let class = format!("{parent}.{}", attribute.attr);
+                if methods.contains_key(&(file.clone(), class.clone())) {
+                    return Some((file, class));
+                }
+            }
             let qualified = dotted_name(expression)?;
             if methods
                 .keys()
@@ -11918,6 +11931,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "def first():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\ndef second():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=2)\n    return Child().run()\n\nassert first() == 1\nassert second() == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_attribute_bases_preserve_inherited_method_calls() -> Result<(), String> {
+        let source = "def outer():\n    class Namespace:\n        class Base:\n            def target(self, value=1): return value\n    class Child(Namespace.Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer():\n    class Namespace:\n        class Base:\n            def target(self, value): return value\n    class Child(Namespace.Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
         );
         Ok(())
     }

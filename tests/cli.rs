@@ -2262,6 +2262,34 @@ fn imports_in_nonliteral_value_patterns_conservatively_replace_class_bindings(
 }
 
 #[test]
+fn calls_in_dynamic_class_value_patterns_receive_removed_defaults(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let constants = directory.path().join("constants.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&constants, "class marker:\n    value = 1\n")?;
+    let caller_source = "from api import target\nfrom constants import marker\nclass C:\n    match 1:\n        case marker.value:\n            result = target()\nassert C.result == 1\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value): return value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import target\nfrom constants import marker\nclass C:\n    match 1:\n        case marker.value:\n            result = target(value=1)\nassert C.result == 1\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn unknown_module_match_guards_do_not_hide_later_case_imports(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

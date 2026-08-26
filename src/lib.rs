@@ -3646,6 +3646,7 @@ impl Checker<'_> {
         let outer_local_classes = self.local_classes.clone();
         let outer_metaclass_classes = self.metaclass_classes.clone();
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
+        let outer_known_truthiness = self.known_truthiness.clone();
         let mut parameters = BoundNames::default();
         parameters.parameters(&function.parameters);
         for name in parameters.names {
@@ -3670,6 +3671,7 @@ impl Checker<'_> {
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
         self.metaclass_definitions = outer_metaclass_definitions;
+        self.known_truthiness = outer_known_truthiness;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
@@ -4482,6 +4484,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer_local_classes = self.local_classes.clone();
                 let outer_metaclass_classes = self.metaclass_classes.clone();
                 let outer_metaclass_definitions = self.metaclass_definitions.clone();
+                let outer_known_truthiness = self.known_truthiness.clone();
                 let outer_repeated_functions = self.repeated_functions.clone();
                 let mut method_names = BTreeSet::new();
                 let mut repeated_methods = BTreeSet::new();
@@ -4616,6 +4619,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.header = old_header;
                 self.aliases = outer_aliases;
                 self.aliases.invalidate(class.name.as_str());
+                self.known_truthiness = outer_known_truthiness;
                 self.scope = outer;
             }
             _ => {
@@ -9316,6 +9320,16 @@ mod tests {
             false,
         )
         .is_empty());
+    }
+
+    #[test]
+    fn nested_assignments_do_not_clear_module_truthiness() -> Result<(), String> {
+        let source = "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value=1): return value\n    target()\n";
+        assert_eq!(
+            fixed(source)?,
+            "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value): return value\n    target(value=1)\n"
+        );
+        Ok(())
     }
 
     #[test]

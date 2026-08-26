@@ -955,8 +955,31 @@ fn index_method_bases(
     lexical_scope: &mut Vec<String>,
     definitions: &mut Definitions,
 ) {
-    let mut local_classes = BTreeMap::new();
-    let mut aliases = BTreeMap::new();
+    index_method_bases_with_environment(
+        statements,
+        importer,
+        bindings,
+        parent_class,
+        lexical_scope,
+        definitions,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_method_bases_with_environment(
+    statements: &[Stmt],
+    importer: &Path,
+    bindings: &BTreeMap<String, Binding>,
+    parent_class: Option<&str>,
+    lexical_scope: &mut Vec<String>,
+    definitions: &mut Definitions,
+    inherited_local_classes: &BTreeMap<String, String>,
+    inherited_aliases: &BTreeMap<String, (PathBuf, String)>,
+) {
+    let mut local_classes = inherited_local_classes.clone();
+    let mut aliases = inherited_aliases.clone();
     for statement in statements {
         match statement {
             Stmt::ClassDef(class) => {
@@ -1042,11 +1065,17 @@ fn index_method_bases(
                 parent_class,
                 lexical_scope,
                 definitions,
+                &local_classes,
+                &aliases,
             ),
         }
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "control-flow suites inherit both lexical resolution environments"
+)]
 fn index_control_flow_method_bases(
     statement: &Stmt,
     importer: &Path,
@@ -1054,6 +1083,8 @@ fn index_control_flow_method_bases(
     parent_class: Option<&str>,
     lexical_scope: &mut Vec<String>,
     definitions: &mut Definitions,
+    local_classes: &BTreeMap<String, String>,
+    aliases: &BTreeMap<String, (PathBuf, String)>,
 ) {
     let suites: Vec<&[Stmt]> = match statement {
         Stmt::If(branch) => std::iter::once(branch.body.as_slice())
@@ -1082,13 +1113,15 @@ fn index_control_flow_method_bases(
         _ => Vec::new(),
     };
     for suite in suites {
-        index_method_bases(
+        index_method_bases_with_environment(
             suite,
             importer,
             bindings,
             parent_class,
             lexical_scope,
             definitions,
+            local_classes,
+            aliases,
         );
     }
 }
@@ -11926,6 +11959,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "if True:\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_flow_classes_see_enclosing_suite_bases() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
         );
         Ok(())
     }

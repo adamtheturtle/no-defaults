@@ -2795,6 +2795,7 @@ fn check_source(
         module_bindings,
         local_classes: BTreeSet::new(),
         metaclass_classes: BTreeSet::new(),
+        imported_metaclass_classes: BTreeSet::new(),
         metaclass_definitions: BTreeSet::new(),
         metaclass_intercepted_classes,
         repeated_functions,
@@ -3086,6 +3087,9 @@ struct Checker<'a> {
     /// through a base. A metaclass is inherited, so a subclass is built by it
     /// too even when it names no `metaclass=` of its own.
     metaclass_classes: BTreeSet<String>,
+    /// Local classes that transitively inherit a possibly custom metaclass
+    /// from an ordinary imported base.
+    imported_metaclass_classes: BTreeSet<String>,
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
@@ -3495,16 +3499,38 @@ impl Checker<'_> {
 
     fn class_constructs_safely(&self, class: &ast::StmtClassDef) -> bool {
         class_constructs_safely(class, &self.aliases, &self.metaclass_classes)
-            && !class_bases(class).any(|base| {
-                base_root_name(base).is_some_and(|name| self.aliases.import_bindings.contains(name))
-                    && !self.field_bases.matches(base, &self.aliases)
-                    && !carries_no_fields(
-                        base,
-                        &self.aliases,
-                        &self.local_classes,
-                        &self.module_bindings,
-                    )
+            && !self.may_inherit_imported_metaclass(class)
+    }
+
+    fn may_inherit_imported_metaclass(&self, class: &ast::StmtClassDef) -> bool {
+        class_bases(class).any(|base| {
+            let ordinary_import = base_root_name(base)
+                .is_some_and(|name| self.aliases.import_bindings.contains(name))
+                && !self.field_bases.matches(base, &self.aliases)
+                && !carries_no_fields(
+                    base,
+                    &self.aliases,
+                    &self.local_classes,
+                    &self.module_bindings,
+                );
+            if ordinary_import {
+                return true;
+            }
+            let base = match base {
+                Expr::Subscript(subscript) => subscript.value.as_ref(),
+                expression => expression,
+            };
+            let Expr::Name(name) = base else {
+                return false;
+            };
+            (0..=self.lexical_scope.len()).rev().any(|depth| {
+                self.imported_metaclass_classes
+                    .contains(&qualified_class_name(
+                        &self.lexical_scope[..depth],
+                        name.id.as_str(),
+                    ))
             })
+        })
     }
 
     fn generates_init(&self, class: &ast::StmtClassDef) -> bool {
@@ -4449,6 +4475,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let old_header = self.header;
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
+                if self.may_inherit_imported_metaclass(class) {
+                    self.imported_metaclass_classes.insert(qualified_class_name(
+                        &self.lexical_scope,
+                        class.name.as_str(),
+                    ));
+                }
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
                     fields: style,
@@ -13207,6 +13239,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn a_dataclass_with_an_imported_base_has_no_assumed_metaclass() {
         let source = "from dataclasses import dataclass\nfrom base import Parent\n\n@dataclass\nclass Child(Parent):\n    value: int = 1\n\nassert Child() == 9\nassert Child.value == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn imported_metaclass_uncertainty_propagates_through_local_bases() {
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Middle(Parent):\n    pass\n\n@dataclass\nclass Child(Middle):\n    value: int = field(default=1, kw_only=True)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

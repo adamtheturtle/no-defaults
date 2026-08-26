@@ -3135,6 +3135,10 @@ impl Checker<'_> {
             {
                 return true;
             }
+            let base = match base {
+                Expr::Subscript(subscript) => subscript.value.as_ref(),
+                expression => expression,
+            };
             let Expr::Name(name) = base else {
                 return false;
             };
@@ -13468,6 +13472,22 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn imported_base_default_uncertainty_propagates_through_local_subclasses() {
         let source = "from dataclasses import dataclass\nfrom base import Parent\n\n@dataclass\nclass Middle(Parent):\n    middle: int = 2\n\n@dataclass\nclass Child(Middle):\n    child: int = 3\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics.iter().all(|item| item.fix.is_none()));
+    }
+
+    #[test]
+    fn imported_base_default_uncertainty_propagates_through_subscripted_bases() {
+        let source = "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\nfrom base import Parent\n\nT = TypeVar('T')\n\n@dataclass\nclass Middle(Parent, Generic[T]):\n    middle: int = 2\n\n@dataclass\nclass Child(Middle[T]):\n    child: int = 3\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

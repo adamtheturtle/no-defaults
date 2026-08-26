@@ -2950,6 +2950,11 @@ impl Checker<'_> {
             self.visit_body(&loop_.orelse);
         } else {
             self.visit_uncertain(statement);
+            let mut bound = BoundNames::default();
+            bound.bind(&loop_.target);
+            for name in bound.names {
+                self.aliases.invalidate(&name);
+            }
         }
     }
 

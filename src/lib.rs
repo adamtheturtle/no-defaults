@@ -3388,6 +3388,12 @@ impl Checker<'_> {
         !self.reexports.covers(name) && (self.scope.private || is_private(name))
     }
 
+    fn is_delegation_protocol_method(&self, name: &str) -> bool {
+        self.scope.class != ClassScope::None
+            && self.delegation_protocols.last() == Some(&true)
+            && matches!(name, "close" | "send" | "throw")
+    }
+
     /// Whether definitions inside `name` are private, given the scope holding
     /// it. A re-exported class or function carries everything it contains into
     /// the public API with it.
@@ -3655,8 +3661,7 @@ impl Checker<'_> {
                     && implicitly_called_method(function.name.as_str()))
                 || self.method_is_intercepted(function.name.as_str())
                 || self.method_is_rebound_later(function)
-                || (self.delegation_protocols.last() == Some(&true)
-                    && matches!(function.name.as_str(), "close" | "send" | "throw"))
+                || self.is_delegation_protocol_method(function.name.as_str())
                 || (self.scope.class == ClassScope::Metaclass
                     && matches!(function.name.as_str(), "__init__" | "mro"))
                 || (self.scope.class == ClassScope::None
@@ -10733,6 +10738,23 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn nested_send_defaults_are_not_iterator_protocol_defaults() {
+        let source = "class I:\n    def __iter__(self):\n        return self\n    def __next__(self):\n        return 0\n    def outer(self):\n        def send(value=1):\n            return value\n        return send()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+        assert_eq!(checked.signatures.len(), 1);
     }
 
     #[test]

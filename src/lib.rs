@@ -3084,6 +3084,8 @@ impl Checker<'_> {
         for name in &bound.names {
             self.aliases.invalidate(name);
             self.known_truthiness.remove(name);
+            self.shapes
+                .remove(&qualified_class_name(&self.lexical_scope, name));
         }
         if let Stmt::Assign(assign) = statement {
             if let Some(Expr::Name(target)) =
@@ -12192,6 +12194,15 @@ def b(x=1): pass  # type: ignore  # noqa
                  that defines it"
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rebinding_a_shape_alias_drops_the_old_dataclass_fields() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\nAlias = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        let updated = fixed(source)?;
+        assert!(updated.ends_with("\nChild()\n"), "{updated}");
+        assert!(!updated.contains("Child(inherited="), "{updated}");
         Ok(())
     }
 

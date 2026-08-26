@@ -4846,6 +4846,7 @@ fn rewrite_calls(
         aliases,
         module_bindings: BoundNames::of_body(parsed.suite()).names,
         bindings: vec![BTreeMap::new()],
+        class_bindings: Vec::new(),
         invalidated_bindings: BTreeSet::new(),
         known,
         classes: Vec::new(),
@@ -5380,6 +5381,8 @@ struct Rewriter<'a> {
     module_bindings: BTreeSet<String>,
     /// What each imported name in this file refers to.
     bindings: Vec<BTreeMap<String, Binding>>,
+    /// Imports bound directly in each enclosing class namespace.
+    class_bindings: Vec<BTreeMap<String, Binding>>,
     /// Imported module-scope names replaced by an assignment already visited.
     invalidated_bindings: BTreeSet<String>,
     known: &'a BTreeSet<&'a Path>,
@@ -5448,6 +5451,15 @@ impl Rewriter<'_> {
     }
 
     fn binding(&self, name: &str) -> Option<&Binding> {
+        if self.in_class_scope() {
+            if let Some(binding) = self
+                .class_bindings
+                .last()
+                .and_then(|bindings| bindings.get(name))
+            {
+                return Some(binding);
+            }
+        }
         for (index, bindings) in self.bindings.iter().enumerate().rev() {
             if let Some(binding) = bindings.get(name) {
                 return (!(index == 0 && self.binding_is_replaced(name))).then_some(binding);
@@ -5588,6 +5600,19 @@ impl Rewriter<'_> {
     /// and how many parameters the call has already been given implicitly.
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
+            Expr::Name(name)
+                if self.in_class_scope()
+                    && self
+                        .class_bindings
+                        .last()
+                        .is_some_and(|bindings| bindings.contains_key(name.id.as_str())) =>
+            {
+                let Binding::Symbol(file, symbol) = self.binding(name.id.as_str())? else {
+                    return None;
+                };
+                let signature = self.definitions.symbol(file, symbol)?;
+                Some((signature, signature.kind.implicit_bound()))
+            }
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
@@ -6086,13 +6111,25 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                 }
             }
-            Stmt::Import(_)
-            | Stmt::ImportFrom(_)
-            | Stmt::Assign(_)
-            | Stmt::AnnAssign(_)
-            | Stmt::AugAssign(_)
-                if self.in_class_scope() =>
-            {
+            Stmt::Import(_) | Stmt::ImportFrom(_) if self.in_class_scope() => {
+                if let Some(bindings) = self.class_bindings.last_mut() {
+                    collect_bindings(
+                        std::slice::from_ref(statement),
+                        self.physical,
+                        self.known,
+                        bindings,
+                    );
+                    collect_star_bindings(
+                        std::slice::from_ref(statement),
+                        self.physical,
+                        self.known,
+                        self.definitions,
+                        bindings,
+                    );
+                }
+                self.bind_statement_in_class(statement);
+            }
+            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.in_class_scope() => {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
             }
@@ -6369,9 +6406,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     qualified_name(self.classes.last().map(String::as_str), class.name.as_str());
                 self.classes.push(qualified);
                 self.scopes.push(BoundNames::default());
+                self.class_bindings.push(BTreeMap::new());
                 self.class_scope_depths.push(self.scopes.len());
                 self.visit_body(&class.body);
                 self.class_scope_depths.pop();
+                self.class_bindings.pop();
                 self.scopes.pop();
                 self.classes.pop();
                 self.bind_definition_in_class(class.name.as_str(), true);

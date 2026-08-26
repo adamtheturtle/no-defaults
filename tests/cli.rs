@@ -4466,6 +4466,34 @@ fn class_assignments_invalidate_prior_import_bindings() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn annotation_only_class_declarations_preserve_import_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(
+        &caller,
+        "class C:\n    from api import target\n    target: object\n    result = target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value): return value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "class C:\n    from api import target\n    target: object\n    result = target(value=1)\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn later_class_imports_do_not_shadow_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(directory.path().join("api.py"), "def target(): return 5\n")?;

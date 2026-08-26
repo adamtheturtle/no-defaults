@@ -7270,7 +7270,7 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
     let mut bound = BoundNames::default();
     match statement {
         Stmt::Assign(assign) => assign.targets.iter().for_each(|target| bound.bind(target)),
-        Stmt::AnnAssign(assign) => bound.bind(&assign.target),
+        Stmt::AnnAssign(assign) if assign.value.is_some() => bound.bind(&assign.target),
         Stmt::AugAssign(assign) => bound.bind(&assign.target),
         Stmt::For(loop_statement) => bound.bind(&loop_statement.target),
         Stmt::With(block) => {

@@ -60,6 +60,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Assigning over an imported `dataclasses.field` helper invalidates that imported identity and retains the replacement call, so its arguments are not edited as though it were still the standard helper.
 - Assigning over an imported `dataclass` decorator invalidates that imported identity, so later ordinary classes are not rewritten as dataclasses.
 
 - Calls through checked symbols and modules imported directly in a class body now receive removed defaults, while those class imports remain invisible to method lexical lookup.

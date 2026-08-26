@@ -386,6 +386,26 @@ fn custom_field_calls_are_removed_whole_instead_of_surgically_edited(
 }
 
 #[test]
+fn assigning_over_dataclasses_field_retains_the_replacement_call(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass, field\ndef replacement(**kwargs): return kwargs.get('default', 0)\nfield = replacement\n@dataclass\nclass C:\n    value: int = field(default=1, compare=False)\nassert C().value == 1\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(
+        fixed.contains("value: int = field(default=1, compare=False)"),
+        "{fixed}"
+    );
+    Ok(())
+}
+
+#[test]
 fn custom_field_helpers_do_not_use_pydantic_argument_surgery(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

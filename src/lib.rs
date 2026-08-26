@@ -7653,11 +7653,17 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     .map(ComparableLiteral::from);
                 for case in &match_statement.cases {
                     let selected = match (&subject, &case.pattern) {
-                        (Some(subject), Pattern::MatchValue(pattern)) => pattern
-                            .value
-                            .as_literal_expr()
-                            .map(ComparableLiteral::from)
-                            .is_some_and(|pattern| pattern == *subject),
+                        (Some(subject), Pattern::MatchValue(pattern)) => {
+                            let Some(pattern) = pattern.value.as_literal_expr() else {
+                                self.visit_pattern(&case.pattern);
+                                if let Some(guard) = &case.guard {
+                                    self.visit_expr(guard);
+                                }
+                                self.visit_body(&case.body);
+                                continue;
+                            };
+                            ComparableLiteral::from(pattern) == *subject
+                        }
                         (_, Pattern::MatchAs(pattern)) if pattern.pattern.is_none() => true,
                         _ => {
                             self.visit_pattern(&case.pattern);
@@ -7698,11 +7704,19 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     .map(ComparableLiteral::from);
                 for case in &match_statement.cases {
                     let matches = match (&subject, &case.pattern) {
-                        (Some(subject), Pattern::MatchValue(pattern)) => pattern
-                            .value
-                            .as_literal_expr()
-                            .map(ComparableLiteral::from)
-                            .is_some_and(|pattern| pattern == *subject),
+                        (Some(subject), Pattern::MatchValue(pattern)) => {
+                            let Some(pattern) = pattern.value.as_literal_expr() else {
+                                // A non-literal value pattern cannot be compared
+                                // statically, so retain the conservative walk.
+                                self.visit_pattern(&case.pattern);
+                                if let Some(guard) = &case.guard {
+                                    self.visit_expr(guard);
+                                }
+                                self.visit_body(&case.body);
+                                continue;
+                            };
+                            ComparableLiteral::from(pattern) == *subject
+                        }
                         (_, Pattern::MatchAs(pattern)) if pattern.pattern.is_none() => true,
                         _ => {
                             // A dynamic subject or pattern is not safe to

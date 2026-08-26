@@ -2208,6 +2208,60 @@ fn imports_in_unselected_match_cases_do_not_replace_live_bindings(
 }
 
 #[test]
+fn imports_in_nonliteral_value_patterns_conservatively_replace_module_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let other = directory.path().join("other.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(
+        &other,
+        "class marker:\n    value = 1\ndef target(value=2): return value\n",
+    )?;
+    let caller_source = "from api import target\nfrom other import marker\nmatch 1:\n    case marker.value:\n        from other import target\nassert target() == 2\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import target\nfrom other import marker\nmatch 1:\n    case marker.value:\n        from other import target\nassert target(value=2) == 2\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn imports_in_nonliteral_value_patterns_conservatively_replace_class_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let other = directory.path().join("other.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(
+        &other,
+        "class marker:\n    value = 1\ndef target(value=2): return value\n",
+    )?;
+    let caller_source = "from api import target\nfrom other import marker\nclass C:\n    match 1:\n        case marker.value:\n            from other import target\n    result = target()\nassert C.result == 2\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import target\nfrom other import marker\nclass C:\n    match 1:\n        case marker.value:\n            from other import target\n    result = target(value=2)\nassert C.result == 2\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn module_match_captures_invalidate_imported_callable_bindings(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

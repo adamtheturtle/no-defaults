@@ -4085,7 +4085,10 @@ impl Checker<'_> {
                 || (self.scope.class == ClassScope::Metaclass
                     && matches!(function.name.as_str(), "__init__" | "mro"))
                 || (self.scope.enum_class
-                    && matches!(function.name.as_str(), "__init__" | "_missing_"))
+                    && matches!(
+                        function.name.as_str(),
+                        "__init__" | "_missing_" | "_generate_next_value_"
+                    ))
                 || (self.scope.class == ClassScope::None
                     && self.lexical_scope.is_empty()
                     && matches!(function.name.as_str(), "__getattr__" | "__dir__"))
@@ -9342,6 +9345,23 @@ mod tests {
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
+    fn enum_generate_next_value_defaults_are_retained() {
+        let source = "from enum import Enum, auto\n\nclass E(Enum):\n    @staticmethod\n    def _generate_next_value_(name, start, count, last_values, suffix='x'):\n        return name + suffix\n    A = auto()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

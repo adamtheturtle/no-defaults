@@ -406,7 +406,7 @@ impl Definitions {
     }
 
     fn method(&self, file: &Path, class: &str, name: &str) -> Option<&Signature> {
-        self.inherited(file, class, name, &mut BTreeSet::new())
+        self.method_in_mro(file, class, name, false)
     }
 
     fn class_identity(&self, file: &Path, class: &str) -> Option<(PathBuf, String)> {
@@ -437,35 +437,64 @@ impl Definitions {
     /// method the class itself defines is never what `super().name(...)`
     /// calls, even when it is the one `--fix` changed.
     fn super_method(&self, file: &Path, class: &str, name: &str) -> Option<&Signature> {
-        let mut seen = BTreeSet::new();
-        seen.insert((file.to_path_buf(), class.to_owned()));
-        self.bases
-            .get(&(file.to_path_buf(), class.to_owned()))?
-            .iter()
-            .find_map(|(base_file, base)| self.inherited(base_file, base, name, &mut seen))
+        self.method_in_mro(file, class, name, true)
     }
 
-    fn inherited(
+    fn method_in_mro(
         &self,
         file: &Path,
         class: &str,
         name: &str,
-        seen: &mut BTreeSet<(PathBuf, String)>,
+        skip_class: bool,
     ) -> Option<&Signature> {
-        if !seen.insert((file.to_path_buf(), class.to_owned())) {
+        let mro = self.linearized_mro(
+            &(file.to_path_buf(), class.to_owned()),
+            &mut BTreeSet::new(),
+        )?;
+        for identity in mro.iter().skip(usize::from(skip_class)) {
+            if let Some(method) = self
+                .methods
+                .get(identity)
+                .and_then(|methods| methods.get(name))
+            {
+                return method.as_ref();
+            }
+        }
+        None
+    }
+
+    fn linearized_mro(
+        &self,
+        class: &(PathBuf, String),
+        visiting: &mut BTreeSet<(PathBuf, String)>,
+    ) -> Option<Vec<(PathBuf, String)>> {
+        if !visiting.insert(class.clone()) {
             return None;
         }
-        if let Some(method) = self
-            .methods
-            .get(&(file.to_path_buf(), class.to_owned()))
-            .and_then(|methods| methods.get(name))
-        {
-            return method.as_ref();
-        }
-        self.bases
-            .get(&(file.to_path_buf(), class.to_owned()))?
+        let bases = self.bases.get(class).cloned().unwrap_or_default();
+        let mut sequences = bases
             .iter()
-            .find_map(|(base_file, base)| self.inherited(base_file, base, name, seen))
+            .map(|base| self.linearized_mro(base, visiting))
+            .collect::<Option<Vec<_>>>()?;
+        visiting.remove(class);
+        sequences.push(bases);
+        let mut result = vec![class.clone()];
+        while sequences.iter().any(|sequence| !sequence.is_empty()) {
+            let candidate = sequences.iter().find_map(|sequence| {
+                let head = sequence.first()?;
+                sequences
+                    .iter()
+                    .all(|other| !other.iter().skip(1).any(|item| item == head))
+                    .then(|| head.clone())
+            })?;
+            result.push(candidate.clone());
+            for sequence in &mut sequences {
+                if sequence.first() == Some(&candidate) {
+                    sequence.remove(0);
+                }
+            }
+        }
+        Some(result)
     }
 
     /// Give a subclass with no constructor of its own the signature of the
@@ -11427,6 +11456,16 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return super().target(value=1)\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_methods_follow_c3_mro_in_a_diamond() -> Result<(), String> {
+        let source = "class A:\n    def target(self, value=1): return value\n\nclass B(A): pass\n\nclass C(A):\n    def target(self): return 9\n\nclass D(B, C):\n    def run(self): return self.target()\n\nassert D().run() == 9\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("def target(self, value): return value"));
+        assert!(updated.contains("return self.target()"));
+        assert!(!updated.contains("self.target(value="));
         Ok(())
     }
 

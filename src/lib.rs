@@ -1226,6 +1226,13 @@ fn method_base_identity(
                 _ => None,
             }),
         Expr::Attribute(attribute) => {
+            // A dotted submodule binding is more specific than interpreting
+            // its components as nested classes in a package initializer.
+            if let Some(module) = dotted_name(&attribute.value) {
+                if let Some(Binding::Module(file)) = bindings.get(&module) {
+                    return Some((file.clone(), attribute.attr.to_string()));
+                }
+            }
             if let Some((file, parent)) = method_base_identity(
                 &attribute.value,
                 importer,
@@ -1246,11 +1253,7 @@ fn method_base_identity(
             {
                 return Some((importer.to_path_buf(), qualified));
             }
-            let module = dotted_name(&attribute.value)?;
-            let Binding::Module(file) = bindings.get(&module)? else {
-                return None;
-            };
-            Some((file.clone(), attribute.attr.to_string()))
+            None
         }
         _ => None,
     }
@@ -12131,6 +12134,35 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "def outer():\n    class Namespace:\n        class Base:\n            def target(self, value): return value\n    class Child(Namespace.Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dotted_submodules_win_over_package_nested_classes() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &initializer,
+            "class module:\n    class Base:\n        def target(self, value=1): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 2\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
         Ok(())
     }
 

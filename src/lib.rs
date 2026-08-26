@@ -4044,6 +4044,7 @@ struct Aliases {
     invalidated_field_helpers: BTreeSet<String>,
     dataclass_decorators: BTreeSet<String>,
     pydantic_fields: BTreeSet<String>,
+    pydantic_private_attrs: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
     pydantic_modules: BTreeSet<String>,
     staticmethods: BTreeSet<String>,
@@ -4069,6 +4070,7 @@ impl Aliases {
         if self.pydantic_fields.remove(name) {
             self.invalidated_field_helpers.insert(name.to_owned());
         }
+        self.pydantic_private_attrs.remove(name);
         self.dataclasses_modules.remove(name);
         self.staticmethods.remove(name);
         self.classmethods.remove(name);
@@ -4221,6 +4223,11 @@ impl Aliases {
                             module.as_str() == "pydantic" && alias.name.as_str() == "Field"
                         }) {
                             self.pydantic_fields.insert(local.clone());
+                        }
+                        if import.module.as_ref().is_some_and(|module| {
+                            module.as_str() == "pydantic" && alias.name.as_str() == "PrivateAttr"
+                        }) {
+                            self.pydantic_private_attrs.insert(local.clone());
                         }
                         if dataclasses && alias.name.as_str() == "dataclass" {
                             self.dataclass_decorators.insert(local.clone());
@@ -4569,7 +4576,13 @@ fn is_pydantic_private_attr(value: Option<&Expr>, aliases: &Aliases) -> bool {
     let Some(Expr::Call(call)) = value else {
         return false;
     };
-    matched_name(&call.func, aliases) == Some("PrivateAttr")
+    match call.func.as_ref() {
+        Expr::Name(name) => aliases.pydantic_private_attrs.contains(name.id.as_str()),
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "PrivateAttr" => {
+            matches!(attribute.value.as_ref(), Expr::Name(module) if aliases.pydantic_modules.contains(module.id.as_str()))
+        }
+        _ => false,
+    }
 }
 
 /// Whether an annotation names `ClassVar`, bare, qualified, or quoted.

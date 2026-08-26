@@ -60,6 +60,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A user-defined helper named `PrivateAttr` is treated as an ordinary configured-model field default; only a resolved Pydantic helper suppresses field handling.
 - Assigning over an imported `TYPE_CHECKING` alias invalidates its type-only identity, so a statically live guarded branch is analyzed and fixed normally.
 - Assigning over an imported `abc` module alias invalidates its module identity, so a dataclass reached through the replacement namespace contributes its inherited fields.
 - Assigning over an imported `typing.Generic` or `Protocol` alias invalidates its structural-base identity, so a dataclass rebound under that name contributes its inherited fields.

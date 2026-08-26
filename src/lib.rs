@@ -955,24 +955,15 @@ fn index_method_bases(
     lexical_scope: &mut Vec<String>,
     definitions: &mut Definitions,
 ) {
-    let local_classes: BTreeMap<String, String> = statements
-        .iter()
-        .filter_map(|statement| match statement {
+    let mut local_classes = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    for statement in statements {
+        match statement {
             Stmt::ClassDef(class) => {
                 let identity = parent_class.map_or_else(
                     || qualified_lexical_name(lexical_scope, class.name.as_str()),
                     |parent| qualified_name(Some(parent), class.name.as_str()),
                 );
-                Some((class.name.to_string(), identity))
-            }
-            _ => None,
-        })
-        .collect();
-    let mut aliases = BTreeMap::new();
-    for statement in statements {
-        match statement {
-            Stmt::ClassDef(class) => {
-                let identity = local_classes[class.name.as_str()].clone();
                 let bases = class
                     .arguments
                     .iter()
@@ -988,6 +979,10 @@ fn index_method_bases(
                         )
                     })
                     .collect();
+                // The new class name is bound only after its header has been
+                // evaluated. This matters for `class Base(Base)`, whose base
+                // still denotes the import or earlier local binding.
+                local_classes.insert(class.name.to_string(), identity.clone());
                 let methods = definitions
                     .methods
                     .entry((importer.to_path_buf(), identity.clone()))
@@ -11974,6 +11969,29 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             std::fs::read_to_string(case).map_err(|error| error.to_string())?,
             "from api import Base\n\ndef outer():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_does_not_shadow_its_own_imported_base() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Base\n\nclass Base(Base):\n    def run(self): return self.target()\n\nassert Base().run() == 9\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
+            "from api import Base\n\nclass Base(Base):\n    def run(self): return self.target(value=9)\n\nassert Base().run() == 9\n"
         );
         Ok(())
     }

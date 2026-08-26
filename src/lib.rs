@@ -4455,6 +4455,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__mro_entries__"
             | "__prepare__"
             | "__init_subclass__"
+            | "__annotate__"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9350,6 +9351,23 @@ mod tests {
     #[test]
     fn enum_generate_next_value_defaults_are_retained() {
         let source = "from enum import Enum, auto\n\nclass E(Enum):\n    @staticmethod\n    def _generate_next_value_(name, start, count, last_values, suffix='x'):\n        return name + suffix\n    A = auto()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn annotate_hook_defaults_are_retained() {
+        let source = "class C:\n    @staticmethod\n    def __annotate__(format, extra=1):\n        return {'x': extra}\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

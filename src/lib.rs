@@ -4457,6 +4457,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__init_subclass__"
             | "__annotate__"
             | "find_spec"
+            | "create_module"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9386,6 +9387,24 @@ mod tests {
     #[test]
     fn import_finder_defaults_are_retained() {
         let source = "class Finder:\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn import_loader_create_module_defaults_are_retained() {
+        let source =
+            "class Loader:\n    def create_module(self, spec, extra=1):\n        return None\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

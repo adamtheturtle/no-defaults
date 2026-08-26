@@ -895,7 +895,14 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
-        index_method_bases(parsed.suite(), &importer, &bindings, None, &mut definitions);
+        index_method_bases(
+            parsed.suite(),
+            &importer,
+            &bindings,
+            None,
+            &mut Vec::new(),
+            &mut definitions,
+        );
         definitions.bindings.extend(
             bindings
                 .into_iter()
@@ -945,15 +952,19 @@ fn index_method_bases(
     importer: &Path,
     bindings: &BTreeMap<String, Binding>,
     parent_class: Option<&str>,
+    lexical_scope: &mut Vec<String>,
     definitions: &mut Definitions,
 ) {
     let local_classes: BTreeMap<String, String> = statements
         .iter()
         .filter_map(|statement| match statement {
-            Stmt::ClassDef(class) => Some((
-                class.name.to_string(),
-                qualified_name(parent_class, class.name.as_str()),
-            )),
+            Stmt::ClassDef(class) => {
+                let identity = parent_class.map_or_else(
+                    || qualified_lexical_name(lexical_scope, class.name.as_str()),
+                    |parent| qualified_name(Some(parent), class.name.as_str()),
+                );
+                Some((class.name.to_string(), identity))
+            }
             _ => None,
         })
         .collect();
@@ -961,7 +972,7 @@ fn index_method_bases(
     for statement in statements {
         match statement {
             Stmt::ClassDef(class) => {
-                let identity = qualified_name(parent_class, class.name.as_str());
+                let identity = local_classes[class.name.as_str()].clone();
                 let bases = class
                     .arguments
                     .iter()
@@ -989,21 +1000,29 @@ fn index_method_bases(
                 definitions
                     .bases
                     .insert((importer.to_path_buf(), identity.clone()), bases);
+                lexical_scope.push(class.name.to_string());
                 index_method_bases(
                     &class.body,
                     importer,
                     bindings,
                     Some(&identity),
+                    lexical_scope,
                     definitions,
                 );
+                lexical_scope.pop();
             }
-            Stmt::FunctionDef(function) => index_method_bases(
-                &function.body,
-                importer,
-                bindings,
-                parent_class,
-                definitions,
-            ),
+            Stmt::FunctionDef(function) => {
+                lexical_scope.push(function.name.to_string());
+                index_method_bases(
+                    &function.body,
+                    importer,
+                    bindings,
+                    None,
+                    lexical_scope,
+                    definitions,
+                );
+                lexical_scope.pop();
+            }
             Stmt::Assign(assign) => {
                 let Some(identity) = method_base_identity(
                     &assign.value,
@@ -3437,11 +3456,15 @@ impl Checker<'_> {
             .is_some_and(|extension| extension == "pyi")
     }
 
-    fn qualified_class(&self, name: &str) -> String {
-        qualified_name(
-            self.classes.last().map(|parent| parent.qualified.as_str()),
-            name,
-        )
+    fn qualified_class(&self, name: &str, direct_class_member: bool) -> String {
+        if direct_class_member {
+            qualified_name(
+                self.classes.last().map(|parent| parent.qualified.as_str()),
+                name,
+            )
+        } else {
+            qualified_lexical_name(&self.lexical_scope, name)
+        }
     }
 
     fn leave_class(&mut self) {
@@ -4292,7 +4315,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         Inherited::Unknown => self.unknown_base_may_end_in_default(class),
                         Inherited::Nothing => false,
                     };
-                    let qualified = self.qualified_class(class.name.as_str());
+                    let qualified =
+                        self.qualified_class(class.name.as_str(), outer.class != ClassScope::None);
                     self.classes.push(ClassCollector {
                         name: class.name.to_string(),
                         qualified,
@@ -8332,8 +8356,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 if let Some(arguments) = &class.arguments {
                     self.visit_arguments(arguments);
                 }
-                let qualified =
-                    qualified_name(self.classes.last().map(String::as_str), class.name.as_str());
+                let qualified = if self.in_class_scope() {
+                    qualified_name(self.classes.last().map(String::as_str), class.name.as_str())
+                } else {
+                    qualified_lexical_name(&self.lexical_scope, class.name.as_str())
+                };
                 self.classes.push(qualified);
                 self.lexical_scope.push(class.name.to_string());
                 self.scopes.push(BoundNames::default());
@@ -11810,6 +11837,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "def outer():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_class_inheritance_is_lexically_scoped() -> Result<(), String> {
+        let source = "def first():\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\ndef second():\n    class Base:\n        def target(self, value=2): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert first() == 1\nassert second() == 2\n";
+        assert_eq!(
+            fixed(source)?,
+            "def first():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\ndef second():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=2)\n    return Child().run()\n\nassert first() == 1\nassert second() == 2\n"
         );
         Ok(())
     }

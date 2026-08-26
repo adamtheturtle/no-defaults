@@ -4641,14 +4641,52 @@ impl<'a> Visitor<'a> for Checker<'a> {
     }
 
     fn visit_expr(&mut self, expression: &'a Expr) {
+        if let Expr::Lambda(lambda) = expression {
+            self.check_lambda(lambda);
+            if let Some(parameters) = &lambda.parameters {
+                for default in parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(&parameters.args)
+                    .chain(&parameters.kwonlyargs)
+                    .filter_map(|parameter| parameter.default.as_deref())
+                {
+                    self.visit_expr(default);
+                }
+            }
+            let outer_aliases = self.aliases.clone();
+            self.visit_expr(&lambda.body);
+            self.aliases = outer_aliases;
+            return;
+        }
+        if let Expr::Generator(generator) = expression {
+            let Some((first, rest)) = generator.generators.split_first() else {
+                return;
+            };
+            // Creating a generator evaluates only its leftmost iterable. The
+            // targets, filters, remaining iterables, and element run later.
+            self.visit_expr(&first.iter);
+            let outer_aliases = self.aliases.clone();
+            self.visit_expr(&first.target);
+            for condition in &first.ifs {
+                self.visit_expr(condition);
+            }
+            for clause in rest {
+                self.visit_expr(&clause.iter);
+                self.visit_expr(&clause.target);
+                for condition in &clause.ifs {
+                    self.visit_expr(condition);
+                }
+            }
+            self.visit_expr(&generator.elt);
+            self.aliases = outer_aliases;
+            return;
+        }
         if let Expr::Named(named) = expression {
             self.visit_expr(&named.value);
             self.visit_expr(&named.target);
             self.invalidate_target_aliases(&named.target);
             return;
-        }
-        if let Expr::Lambda(lambda) = expression {
-            self.check_lambda(lambda);
         }
         walk_expr(self, expression);
     }
@@ -9348,6 +9386,20 @@ mod tests {
             "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value): return value\n    target(value=1)\n"
         );
         Ok(())
+    }
+
+    #[test]
+    fn deferred_walruses_do_not_invalidate_live_imports() {
+        for source in [
+            "from dataclasses import dataclass as dc\n\ncallback = lambda: (dc := replacement)\n\n@dc\nclass C:\n    value: int = 1\n",
+            "from dataclasses import dataclass as dc\n\nvalues = ((dc := replacement) for _ in items)\n\n@dc\nclass C:\n    value: int = 1\n",
+        ] {
+            assert_eq!(
+                messages(source, false),
+                ["dataclass field `value` has a default"],
+                "{source}"
+            );
+        }
     }
 
     #[test]

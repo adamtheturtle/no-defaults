@@ -5217,11 +5217,12 @@ impl Aliases {
     /// The names a plain `import` binds for the modules whose members matter.
     fn collect_module_aliases(&mut self, import: &ast::StmtImport) {
         for alias in &import.names {
-            self.import_bindings
-                .insert(alias.asname.as_ref().map_or_else(
-                    || alias.name.split('.').next().unwrap_or_default().to_owned(),
-                    ToString::to_string,
-                ));
+            let local = alias.asname.as_ref().map_or_else(
+                || alias.name.split('.').next().unwrap_or_default().to_owned(),
+                ToString::to_string,
+            );
+            self.parameter_bindings.remove(&local);
+            self.import_bindings.insert(local);
             if alias.name.as_str() == "dataclasses" {
                 self.dataclasses_modules.insert(
                     alias
@@ -5284,11 +5285,21 @@ impl Aliases {
         }
     }
 
+    fn reclaim_parameter_imports(&mut self, import: &ast::StmtImportFrom) {
+        for alias in &import.names {
+            if alias.name.as_str() != "*" {
+                self.parameter_bindings
+                    .remove(alias.asname.as_ref().unwrap_or(&alias.name).as_str());
+            }
+        }
+    }
+
     fn collect(&mut self, statements: &[Stmt]) {
         for statement in statements {
             match statement {
                 Stmt::Import(import) => self.collect_module_aliases(import),
                 Stmt::ImportFrom(import) => {
+                    self.reclaim_parameter_imports(import);
                     self.import_bindings.extend(
                         import
                             .names
@@ -9998,6 +10009,16 @@ mod tests {
     fn function_parameters_shadow_configured_field_bases() -> Result<(), String> {
         let source = "from pydantic import BaseModel\n\nclass Plain:\n    pass\n\ndef outer(BaseModel):\n    class C(BaseModel):\n        x: int = 1\n    return C\n\nassert outer(Plain).x == 1\n";
         assert_eq!(fixed(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn imports_reclaim_parameter_shadowed_field_bases() -> Result<(), String> {
+        let source = "def outer(BaseModel):\n    from pydantic import BaseModel\n    class C(BaseModel):\n        x: int = 1\n    return C()\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer(BaseModel):\n    from pydantic import BaseModel\n    class C(BaseModel):\n        x: int\n    return C(x=1)\n"
+        );
         Ok(())
     }
 

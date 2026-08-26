@@ -4468,6 +4468,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "load_module"
             | "get_code"
             | "get_source"
+            | "is_package"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9598,6 +9599,24 @@ mod tests {
     #[test]
     fn sqlite_conform_defaults_are_retained() {
         let source = "class Value:\n    def __conform__(self, protocol, extra=1):\n        return str(extra)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn import_loader_is_package_defaults_are_retained() {
+        let source =
+            "class Loader:\n    def is_package(self, fullname, extra=1):\n        return False\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

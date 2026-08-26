@@ -5875,6 +5875,7 @@ fn rewrite_calls(
         class_direct_statements: Vec::new(),
         implicit_receivers: Vec::new(),
         implicit_receiver_is_class: Vec::new(),
+        implicit_receiver_classes: Vec::new(),
         lexical_scope: Vec::new(),
         called: BTreeSet::new(),
         scopes: Vec::new(),
@@ -6754,6 +6755,9 @@ struct Rewriter<'a> {
     /// Whether each implicit receiver is a classmethod's class rather than an
     /// instance method's instance.
     implicit_receiver_is_class: Vec<bool>,
+    /// The class cell owned by each enclosing function, independently of
+    /// whether that function has an implicit descriptor receiver.
+    implicit_receiver_classes: Vec<Option<String>>,
     /// Enclosing class and function names, matching the checker's lexical
     /// identity for nested functions.
     lexical_scope: Vec<String>,
@@ -7055,7 +7059,7 @@ impl Rewriter<'_> {
     fn enclosing_class_cell(&self) -> Option<(PathBuf, String, bool, bool)> {
         Some((
             self.physical.to_path_buf(),
-            self.classes.last()?.clone(),
+            self.implicit_receiver_classes.last()?.clone()?,
             false,
             false,
         ))
@@ -8376,10 +8380,16 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_annotation(returns);
                 }
                 let function_scope = BoundNames::of_function(function);
-                let receiver_kind = if self.class_scope_depths.last() == Some(&self.scopes.len()) {
+                let direct_method = self.class_scope_depths.last() == Some(&self.scopes.len());
+                let receiver_kind = if direct_method {
                     method_receiver(function, &self.aliases, &self.module_bindings)
                 } else {
                     Receiver::None
+                };
+                let receiver_class = if direct_method {
+                    self.classes.last().cloned()
+                } else {
+                    self.implicit_receiver_classes.last().cloned().flatten()
                 };
                 let (receiver, receiver_is_class) = if receiver_kind == Receiver::None {
                     let receiver = self
@@ -8405,6 +8415,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 };
                 self.implicit_receivers.push(receiver);
                 self.implicit_receiver_is_class.push(receiver_is_class);
+                self.implicit_receiver_classes.push(receiver_class);
                 self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
                 self.binding_scope_depths.push(self.scopes.len() - 1);
@@ -8415,6 +8426,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.bindings.pop();
                 self.binding_scope_depths.pop();
                 self.implicit_receiver_is_class.pop();
+                self.implicit_receiver_classes.pop();
                 self.implicit_receivers.pop();
                 if !module_scope && !self.in_class_scope() {
                     if let Some(bindings) = self.bindings.last_mut() {
@@ -11891,6 +11903,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "class C:\n    @staticmethod\n    def target(value): return value\n\n    def run(self): return __class__.target(value=1)\n\nassert C().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn class_cells_keep_their_owner_inside_nested_class_bodies() -> Result<(), String> {
+        let source = "class Outer:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self):\n        class Inner:\n            value = __class__.target()\n        return Inner.value\n\nassert Outer().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Outer:\n    @staticmethod\n    def target(value): return value\n\n    def run(self):\n        class Inner:\n            value = __class__.target(value=1)\n        return Inner.value\n\nassert Outer().run() == 1\n"
         );
         Ok(())
     }

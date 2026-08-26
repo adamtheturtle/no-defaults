@@ -2807,6 +2807,7 @@ fn check_source(
         metaclass_classes: BTreeSet::new(),
         imported_metaclass_classes: BTreeSet::new(),
         defined_class_identities: BTreeSet::new(),
+        enum_class_identities: BTreeSet::new(),
         metaclass_definitions: BTreeSet::new(),
         metaclass_intercepted_classes,
         repeated_functions,
@@ -3105,6 +3106,9 @@ struct Checker<'a> {
     /// Every class identity visited, including safe redefinitions used to
     /// shadow earlier imported-metaclass uncertainty.
     defined_class_identities: BTreeSet<String>,
+    /// Same-file Enum subclasses, keyed by lexical identity so nested Enum
+    /// subclasses retain defaults used by implicit member construction.
+    enum_class_identities: BTreeSet<String>,
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
@@ -3568,6 +3572,27 @@ impl Checker<'_> {
                         .then(|| self.imported_metaclass_classes.contains(&identity))
                 })
                 == Some(true)
+        })
+    }
+
+    fn is_enum_class(&self, class: &ast::StmtClassDef) -> bool {
+        class_bases(class).any(|base| match base {
+            Expr::Name(name) if self.aliases.enum_classes.contains(name.id.as_str()) => true,
+            Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
+                matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
+            }
+            Expr::Name(name) => (0..=self.lexical_scope.len())
+                .rev()
+                .filter(|depth| !self.class_scope_depths.contains(depth))
+                .find_map(|depth| {
+                    let identity =
+                        qualified_class_name(&self.lexical_scope[..depth], name.id.as_str());
+                    self.defined_class_identities
+                        .contains(&identity)
+                        .then(|| self.enum_class_identities.contains(&identity))
+                })
+                == Some(true),
+            _ => false,
         })
     }
 
@@ -4525,10 +4550,15 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let style = self.class_field_style(class);
                 let identity = qualified_class_name(&self.lexical_scope, class.name.as_str());
                 let inherits_imported_metaclass = self.may_inherit_imported_metaclass(class);
+                let enum_class = self.is_enum_class(class);
                 self.defined_class_identities.insert(identity.clone());
                 self.imported_metaclass_classes.remove(&identity);
                 if inherits_imported_metaclass {
-                    self.imported_metaclass_classes.insert(identity);
+                    self.imported_metaclass_classes.insert(identity.clone());
+                }
+                self.enum_class_identities.remove(&identity);
+                if enum_class {
+                    self.enum_class_identities.insert(identity);
                 }
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
@@ -4538,15 +4568,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     } else {
                         ClassScope::Ordinary
                     },
-                    enum_class: class_bases(class).any(|base| match base {
-                        Expr::Name(name) => {
-                            self.aliases.enum_classes.contains(name.id.as_str())
-                        }
-                        Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
-                            matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
-                        }
-                        _ => false,
-                    }),
+                    enum_class,
                     // Each class body starts fresh; a base's fields are not
                     // written here.
                     kept_default: false,
@@ -9233,6 +9255,23 @@ mod tests {
             assert_eq!(checked.diagnostics.len(), 1);
             assert!(checked.diagnostics[0].fix.is_none());
         }
+    }
+
+    #[test]
+    fn inherited_enum_member_initializer_defaults_are_retained() {
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

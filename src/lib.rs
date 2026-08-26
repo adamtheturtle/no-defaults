@@ -3424,7 +3424,7 @@ impl Checker<'_> {
         }
     }
 
-    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, statement: &'a Stmt)
+    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, _statement: &'a Stmt)
     where
         Self: Visitor<'a>,
     {
@@ -3440,8 +3440,16 @@ impl Checker<'_> {
         if statically_empty {
             self.visit_body(&loop_.orelse);
         } else {
-            self.visit_uncertain(statement);
+            // The iterable is evaluated before the target is assigned. The
+            // body sees the target binding, and an import in that body may
+            // establish the name that remains after an iteration.
+            self.visit_expr(&loop_.iter);
             self.invalidate_target_aliases(&loop_.target);
+            self.conditional_depth += 1;
+            self.visit_expr(&loop_.target);
+            self.visit_body(&loop_.body);
+            self.visit_body(&loop_.orelse);
+            self.conditional_depth -= 1;
         }
     }
 

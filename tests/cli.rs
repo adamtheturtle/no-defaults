@@ -5055,6 +5055,24 @@ fn for_targets_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn std
 }
 
 #[test]
+fn imports_in_for_bodies_can_restore_target_aliases() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "from dataclasses import dataclass as dc\nfor dc in [lambda cls: cls]:\n    from dataclasses import dataclass as dc\n@dc\nclass C:\n    value: int = 1\nC()\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "from dataclasses import dataclass as dc\nfor dc in [lambda cls: cls]:\n    from dataclasses import dataclass as dc\n@dc\nclass C:\n    value: int\nC(value=1)\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn with_targets_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

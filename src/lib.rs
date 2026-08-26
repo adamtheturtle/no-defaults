@@ -6904,6 +6904,9 @@ impl Rewriter<'_> {
                 )),
             };
         }
+        if let Some(class) = self.self_class_receiver(receiver) {
+            return Some(class);
+        }
         let Expr::Attribute(attribute) = receiver else {
             return None;
         };
@@ -6919,6 +6922,33 @@ impl Rewriter<'_> {
         match self.binding(&dotted)? {
             Binding::Module(file) => Some((file.clone(), attribute.attr.to_string(), false, false)),
             Binding::Symbol(..) | Binding::Unknown => None,
+        }
+    }
+
+    fn self_class_receiver(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
+        let Expr::Attribute(attribute) = receiver else {
+            return None;
+        };
+        let Expr::Name(instance) = attribute.value.as_ref() else {
+            return None;
+        };
+        if attribute.attr.as_str() == "__class__"
+            && self.implicit_receivers.last().and_then(Option::as_deref)
+                == Some(instance.id.as_str())
+            && !self
+                .implicit_receiver_is_class
+                .last()
+                .copied()
+                .unwrap_or(false)
+        {
+            Some((
+                self.physical.to_path_buf(),
+                self.classes.last()?.clone(),
+                false,
+                false,
+            ))
+        } else {
+            None
         }
     }
 
@@ -11537,6 +11567,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "class C:\n    def target(self, value): return value\n\n    @classmethod\n    def run(cls): return cls().target(value=1)\n\nassert C.run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn self_class_calls_resolve_to_the_enclosing_class() -> Result<(), String> {
+        let source = "class C:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self): return self.__class__.target()\n\nassert C().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class C:\n    @staticmethod\n    def target(value): return value\n\n    def run(self): return self.__class__.target(value=1)\n\nassert C().run() == 1\n"
         );
         Ok(())
     }

@@ -895,66 +895,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
-        let local_classes: BTreeSet<String> = parsed
-            .suite()
-            .iter()
-            .filter_map(|statement| match statement {
-                Stmt::ClassDef(class) => Some(class.name.to_string()),
-                _ => None,
-            })
-            .collect();
-        let mut class_aliases = BTreeMap::new();
-        for statement in parsed.suite() {
-            match statement {
-                Stmt::ClassDef(class) => {
-                    let methods = definitions
-                        .methods
-                        .entry((importer.clone(), class.name.to_string()))
-                        .or_default();
-                    for statement in &class.body {
-                        if let Stmt::FunctionDef(function) = statement {
-                            methods.entry(function.name.to_string()).or_insert(None);
-                        }
-                    }
-                    let bases = class
-                        .arguments
-                        .iter()
-                        .flat_map(|arguments| arguments.args.iter())
-                        .filter_map(|base| {
-                            method_base_identity(
-                                base,
-                                &importer,
-                                &bindings,
-                                &local_classes,
-                                &class_aliases,
-                                &definitions.methods,
-                            )
-                        })
-                        .collect();
-                    definitions
-                        .bases
-                        .insert((importer.clone(), class.name.to_string()), bases);
-                }
-                Stmt::Assign(assign) => {
-                    let Some(identity) = method_base_identity(
-                        &assign.value,
-                        &importer,
-                        &bindings,
-                        &local_classes,
-                        &class_aliases,
-                        &definitions.methods,
-                    ) else {
-                        continue;
-                    };
-                    for target in &assign.targets {
-                        if let Expr::Name(alias) = target {
-                            class_aliases.insert(alias.id.to_string(), identity.clone());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        index_method_bases(parsed.suite(), &importer, &bindings, None, &mut definitions);
         definitions.bindings.extend(
             bindings
                 .into_iter()
@@ -999,12 +940,98 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
     Ok(call_sites)
 }
 
+fn index_method_bases(
+    statements: &[Stmt],
+    importer: &Path,
+    bindings: &BTreeMap<String, Binding>,
+    parent_class: Option<&str>,
+    definitions: &mut Definitions,
+) {
+    let local_classes: BTreeMap<String, String> = statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::ClassDef(class) => Some((
+                class.name.to_string(),
+                qualified_name(parent_class, class.name.as_str()),
+            )),
+            _ => None,
+        })
+        .collect();
+    let mut aliases = BTreeMap::new();
+    for statement in statements {
+        match statement {
+            Stmt::ClassDef(class) => {
+                let identity = qualified_name(parent_class, class.name.as_str());
+                let bases = class
+                    .arguments
+                    .iter()
+                    .flat_map(|arguments| arguments.args.iter())
+                    .filter_map(|base| {
+                        method_base_identity(
+                            base,
+                            importer,
+                            bindings,
+                            &local_classes,
+                            &aliases,
+                            &definitions.methods,
+                        )
+                    })
+                    .collect();
+                let methods = definitions
+                    .methods
+                    .entry((importer.to_path_buf(), identity.clone()))
+                    .or_default();
+                for statement in &class.body {
+                    if let Stmt::FunctionDef(function) = statement {
+                        methods.entry(function.name.to_string()).or_insert(None);
+                    }
+                }
+                definitions
+                    .bases
+                    .insert((importer.to_path_buf(), identity.clone()), bases);
+                index_method_bases(
+                    &class.body,
+                    importer,
+                    bindings,
+                    Some(&identity),
+                    definitions,
+                );
+            }
+            Stmt::FunctionDef(function) => index_method_bases(
+                &function.body,
+                importer,
+                bindings,
+                parent_class,
+                definitions,
+            ),
+            Stmt::Assign(assign) => {
+                let Some(identity) = method_base_identity(
+                    &assign.value,
+                    importer,
+                    bindings,
+                    &local_classes,
+                    &aliases,
+                    &definitions.methods,
+                ) else {
+                    continue;
+                };
+                for target in &assign.targets {
+                    if let Expr::Name(alias) = target {
+                        aliases.insert(alias.id.to_string(), identity.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Resolve the class identity denoted by a base expression for method lookup.
 fn method_base_identity(
     expression: &Expr,
     importer: &Path,
     bindings: &BTreeMap<String, Binding>,
-    local_classes: &BTreeSet<String>,
+    local_classes: &BTreeMap<String, String>,
     aliases: &BTreeMap<String, (PathBuf, String)>,
     methods: &BTreeMap<(PathBuf, String), BTreeMap<String, Option<Signature>>>,
 ) -> Option<(PathBuf, String)> {
@@ -1021,8 +1048,8 @@ fn method_base_identity(
             match bindings.get(name.id.as_str()) {
                 Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
                 _ => local_classes
-                    .contains(name.id.as_str())
-                    .then(|| (importer.to_path_buf(), name.id.to_string())),
+                    .get(name.id.as_str())
+                    .map(|class| (importer.to_path_buf(), class.clone())),
             }
         }),
         Expr::Attribute(attribute) => {
@@ -11747,6 +11774,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return self.target(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_same_scope_classes_preserve_inherited_method_calls() -> Result<(), String> {
+        let source = "def outer():\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
         );
         Ok(())
     }

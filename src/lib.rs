@@ -1063,14 +1063,18 @@ fn method_base_identity(
             aliases,
             methods,
         ),
-        Expr::Name(name) => aliases.get(name.id.as_str()).cloned().or_else(|| {
-            match bindings.get(name.id.as_str()) {
-                Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
-                _ => local_classes
+        Expr::Name(name) => aliases
+            .get(name.id.as_str())
+            .cloned()
+            .or_else(|| {
+                local_classes
                     .get(name.id.as_str())
-                    .map(|class| (importer.to_path_buf(), class.clone())),
-            }
-        }),
+                    .map(|class| (importer.to_path_buf(), class.clone()))
+            })
+            .or_else(|| match bindings.get(name.id.as_str()) {
+                Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
+                _ => None,
+            }),
         Expr::Attribute(attribute) => {
             let qualified = dotted_name(expression)?;
             if methods
@@ -11847,6 +11851,29 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "def first():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\ndef second():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=2)\n    return Child().run()\n\nassert first() == 1\nassert second() == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_scope_local_bases_shadow_imported_classes() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Base\n\ndef outer():\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert outer() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
+            "from api import Base\n\ndef outer():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
         );
         Ok(())
     }

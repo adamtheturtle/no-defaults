@@ -1025,6 +1025,33 @@ fn index_method_bases(
     );
 }
 
+fn imported_names(statement: &Stmt) -> Vec<&str> {
+    match statement {
+        Stmt::Import(import) => import
+            .names
+            .iter()
+            .map(|alias| {
+                alias.asname.as_ref().map_or_else(
+                    || alias.name.as_str().split('.').next().unwrap_or_default(),
+                    ast::Identifier::as_str,
+                )
+            })
+            .collect(),
+        Stmt::ImportFrom(import) => import
+            .names
+            .iter()
+            .filter(|alias| alias.name.as_str() != "*")
+            .map(|alias| {
+                alias
+                    .asname
+                    .as_ref()
+                    .map_or_else(|| alias.name.as_str(), ast::Identifier::as_str)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn index_method_bases_with_environment(
     statements: &[Stmt],
@@ -1098,6 +1125,12 @@ fn index_method_bases_with_environment(
                     definitions,
                 );
                 lexical_scope.pop();
+            }
+            Stmt::Import(_) | Stmt::ImportFrom(_) => {
+                for bound in imported_names(statement) {
+                    local_classes.remove(bound);
+                    aliases.remove(bound);
+                }
             }
             Stmt::Assign(assign) => {
                 let Some(identity) = method_base_identity(
@@ -12421,6 +12454,31 @@ def b(x=1): pass  # type: ignore  # noqa
         fix_all(&[initializer, module, case.clone()])?;
         let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
         assert!(updated.contains("self.target(value=3)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn later_imports_reclaim_dotted_module_owners() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nimport package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
         Ok(())
     }
 

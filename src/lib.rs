@@ -7454,10 +7454,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 }
             }
             if let (Some(name), Some(binding)) = (&handler.name, previous_binding) {
-                self.class_bindings
-                    .last_mut()
-                    .expect("class binding frame")
-                    .insert(name.to_string(), binding);
+                if let Some(bindings) = self.class_bindings.last_mut() {
+                    bindings.insert(name.to_string(), binding);
+                }
             }
             return;
         }

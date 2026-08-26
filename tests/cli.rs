@@ -2376,6 +2376,99 @@ fn selected_class_singleton_patterns_stop_later_case_imports(
 }
 
 #[test]
+fn python_equal_module_literals_select_the_first_match_case(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (subject, pattern) in [
+        ("1", "1.0"),
+        ("1.0", "1"),
+        ("True", "1"),
+        ("False", "0"),
+        ("0", "0j"),
+        ("9007199254740992", "9007199254740992.0"),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1): return value\n")?;
+        std::fs::write(&other, "def target(value=2): return value\n")?;
+        let caller_source = format!(
+            "from api import target\nmatch {subject}:\n    case {pattern}:\n        pass\n    case _:\n        from other import target\nassert target() == 1\n"
+        );
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{subject}, {pattern}");
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!(
+                "from api import target\nmatch {subject}:\n    case {pattern}:\n        pass\n    case _:\n        from other import target\nassert target(value=1) == 1\n"
+            ),
+            "{subject}, {pattern}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rounded_float_patterns_do_not_equal_distinct_large_integers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let other = directory.path().join("other.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&other, "def target(value=2): return value\n")?;
+    let caller_source = "from api import target\nmatch 9007199254740993:\n    case 9007199254740993.0:\n        pass\n    case _:\n        from other import target\nassert target() == 2\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import target\nmatch 9007199254740993:\n    case 9007199254740993.0:\n        pass\n    case _:\n        from other import target\nassert target(value=2) == 2\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn python_equal_class_literals_select_the_first_match_case(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (subject, pattern) in [("1", "1.0"), ("True", "1")] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1): return value\n")?;
+        std::fs::write(&other, "def target(value=2): return value\n")?;
+        let caller_source = format!(
+            "from api import target\nclass C:\n    match {subject}:\n        case {pattern}:\n            pass\n        case _:\n            from other import target\n    result = target()\nassert C.result == 1\n"
+        );
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{subject}, {pattern}");
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!(
+                "from api import target\nclass C:\n    match {subject}:\n        case {pattern}:\n            pass\n        case _:\n            from other import target\n    result = target(value=1)\nassert C.result == 1\n"
+            ),
+            "{subject}, {pattern}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn module_match_captures_invalidate_imported_callable_bindings(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

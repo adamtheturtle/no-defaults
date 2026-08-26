@@ -7067,14 +7067,14 @@ impl Rewriter<'_> {
 
     fn is_builtin_super_call(&self, call: &ast::ExprCall) -> bool {
         match call.func.as_ref() {
+            Expr::Name(name) if self.aliases.supers.contains(name.id.as_str()) => {
+                self.nested_binding(name.id.as_str()).is_none()
+                    && !self.binding_is_replaced(name.id.as_str())
+            }
             Expr::Name(name) if name.id.as_str() == "super" => {
                 self.nested_binding("super").is_none()
                     && self.binding("super").is_none()
                     && !self.module_bindings.contains("super")
-            }
-            Expr::Name(name) if self.aliases.supers.contains(name.id.as_str()) => {
-                self.nested_binding(name.id.as_str()).is_none()
-                    && !self.binding_is_replaced(name.id.as_str())
             }
             _ => false,
         }
@@ -11863,6 +11863,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "from builtins import super as parent\n\nclass Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return parent().target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unrenamed_imported_super_supports_zero_argument_lookup() -> Result<(), String> {
+        let source = "from builtins import super\n\nclass Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "from builtins import super\n\nclass Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().target(value=1)\n\nassert Child().run() == 1\n"
         );
         Ok(())
     }

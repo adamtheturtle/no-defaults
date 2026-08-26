@@ -2371,6 +2371,7 @@ fn check_source(
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
         shape_namespaces: BTreeSet::new(),
+        known_truthiness: BTreeMap::new(),
         lexical_scope: Vec::new(),
         conditional_depth: 0,
         scope: Scope {
@@ -2668,6 +2669,8 @@ struct Checker<'a> {
     /// Module-level names rebound to namespace instances whose class members
     /// have known field shapes.
     shape_namespaces: BTreeSet<String>,
+    /// Unconditional module assignments whose truth value is statically known.
+    known_truthiness: BTreeMap<String, Truthiness>,
     /// Enclosing definitions, used to keep same-named nested class shapes
     /// separate from classes in other lexical scopes.
     lexical_scope: Vec<String>,
@@ -2882,13 +2885,20 @@ impl Checker<'_> {
             Stmt::AugAssign(assign) => bound.bind(&assign.target),
             _ => return,
         }
-        for name in bound.names {
-            self.aliases.invalidate(&name);
+        for name in &bound.names {
+            self.aliases.invalidate(name);
+            self.known_truthiness.remove(name);
         }
         if let Stmt::Assign(assign) = statement {
             if let Some(Expr::Name(target)) =
                 assign.targets.first().filter(|_| assign.targets.len() == 1)
             {
+                if self.conditional_depth == 0 && self.lexical_scope.is_empty() {
+                    let truth = Truthiness::from_expr(&assign.value, |_| false);
+                    if truth != Truthiness::Unknown {
+                        self.known_truthiness.insert(target.id.to_string(), truth);
+                    }
+                }
                 let target = qualified_class_name(&self.lexical_scope, target.id.as_str());
                 if let Expr::Name(value) = assign.value.as_ref() {
                     let qualified = qualified_class_name(&self.lexical_scope, value.id.as_str());
@@ -3032,8 +3042,16 @@ impl Checker<'_> {
                 self.scope.fields = fields;
                 continue;
             }
-            let truth = test.map_or(Truthiness::True, |test| {
-                Truthiness::from_expr(test, |_| false)
+            let truth = test.map_or(Truthiness::True, |test| match test {
+                Expr::Name(name)
+                    if self.scope.class == ClassScope::None && self.lexical_scope.is_empty() =>
+                {
+                    self.known_truthiness
+                        .get(name.id.as_str())
+                        .copied()
+                        .unwrap_or(Truthiness::Unknown)
+                }
+                _ => Truthiness::from_expr(test, |_| false),
             });
             match truth {
                 Truthiness::False | Truthiness::Falsey | Truthiness::None => {}
@@ -4059,6 +4077,7 @@ impl Aliases {
         self.typing_modules.remove(name);
         self.abc_modules.remove(name);
         self.structural_bases.remove(name);
+        self.type_checking.remove(name);
         self.kw_only_markers.remove(name);
     }
 

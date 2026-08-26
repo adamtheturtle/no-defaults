@@ -4470,6 +4470,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "get_source"
             | "is_package"
             | "get_filename"
+            | "source_to_code"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9646,6 +9647,26 @@ mod tests {
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn inspect_loader_source_to_code_defaults_are_retained() {
+        let source = "class Loader:\n    def source_to_code(self, data, path='<string>', extra=1):\n        return compile(data, path, 'exec')\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.fix.is_none()));
         assert!(checked.signatures.is_empty());
     }
 

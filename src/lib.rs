@@ -3277,6 +3277,14 @@ impl Checker<'_> {
         }
     }
 
+    /// Find the nearest class shape visible from the current lexical scope.
+    fn visible_shape(&self, name: &str) -> Option<&Option<Shape>> {
+        (0..=self.lexical_scope.len()).rev().find_map(|depth| {
+            self.shapes
+                .get(&qualified_class_name(&self.lexical_scope[..depth], name))
+        })
+    }
+
     fn unknown_base_may_end_in_default(&self, class: &ast::StmtClassDef) -> bool {
         class_bases(class).any(|base| {
             if base_root_name(base).is_some_and(|name| self.aliases.import_bindings.contains(name))
@@ -3347,13 +3355,7 @@ impl Checker<'_> {
                 }
                 let target = qualified_class_name(&self.lexical_scope, target.id.as_str());
                 if let Expr::Name(value) = assign.value.as_ref() {
-                    let qualified = qualified_class_name(&self.lexical_scope, value.id.as_str());
-                    if let Some(shape) = self
-                        .shapes
-                        .get(&qualified)
-                        .or_else(|| self.shapes.get(value.id.as_str()))
-                        .cloned()
-                    {
+                    if let Some(shape) = self.visible_shape(value.id.as_str()).cloned() {
                         self.shapes.insert(target, shape);
                     }
                 } else if self.lexical_scope.is_empty() {
@@ -13075,6 +13077,27 @@ def b(x=1): pass  # type: ignore  # noqa
         let updated = fixed(source)?;
         assert!(updated.ends_with("\nChild()\n"), "{updated}");
         assert!(!updated.contains("Child(inherited="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_shape_alias_uses_the_nearest_enclosing_scope() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    module: int = 1\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    class Container:\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n    return Container.Child()\n\nouter()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        let child = checked
+            .signatures
+            .iter()
+            .find(|signature| signature.positional.iter().any(|field| field == "child"))
+            .ok_or("expected the nested child signature")?;
+        assert_eq!(child.positional, ["local", "child"]);
         Ok(())
     }
 

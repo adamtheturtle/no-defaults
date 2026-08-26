@@ -4753,6 +4753,17 @@ impl<'a> Visitor<'a> for Checker<'a> {
         }
     }
 
+    fn visit_except_handler(&mut self, except_handler: &'a ast::ExceptHandler) {
+        let ast::ExceptHandler::ExceptHandler(handler) = except_handler;
+        if let Some(type_) = &handler.type_ {
+            self.visit_expr(type_);
+        }
+        if let Some(name) = &handler.name {
+            self.aliases.invalidate(name.as_str());
+        }
+        self.visit_body(&handler.body);
+    }
+
     fn visit_expr(&mut self, expression: &'a Expr) {
         if let Expr::Lambda(lambda) = expression {
             self.check_lambda(lambda);
@@ -9927,6 +9938,12 @@ mod tests {
         let source = "from pydantic import BaseModel\n\nclass Plain:\n    pass\n\ndef outer(BaseModel):\n    class C(BaseModel):\n        x: int = 1\n    return C\n\nassert outer(Plain).x == 1\n";
         assert_eq!(fixed(source)?, source);
         Ok(())
+    }
+
+    #[test]
+    fn except_targets_shadow_dataclass_decorator_imports() {
+        let source = "from dataclasses import dataclass\n\nclass DecoratorError(Exception):\n    def __call__(self, cls): return cls\n\ntry:\n    raise DecoratorError()\nexcept DecoratorError as dataclass:\n    @dataclass\n    class C:\n        x: int = 1\n";
+        assert!(messages(source, false).is_empty());
     }
 
     #[test]

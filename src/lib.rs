@@ -7258,11 +7258,57 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
     bound.names
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "each base-ten digit is reduced modulo 10 before conversion"
+)]
+fn integer_decimal_value(integer: &ast::Int) -> Option<String> {
+    let spelling = integer.to_string().replace('_', "");
+    let (radix, digits) = if let Some(digits) = spelling
+        .strip_prefix("0x")
+        .or_else(|| spelling.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if let Some(digits) = spelling
+        .strip_prefix("0o")
+        .or_else(|| spelling.strip_prefix("0O"))
+    {
+        (8, digits)
+    } else if let Some(digits) = spelling
+        .strip_prefix("0b")
+        .or_else(|| spelling.strip_prefix("0B"))
+    {
+        (2, digits)
+    } else {
+        (10, spelling.as_str())
+    };
+    let mut decimal = vec![0_u8];
+    for character in digits.chars() {
+        let mut carry = character.to_digit(radix)?;
+        for digit in &mut decimal {
+            let value = u32::from(*digit) * radix + carry;
+            *digit = (value % 10) as u8;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            decimal.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    Some(
+        decimal
+            .into_iter()
+            .rev()
+            .map(|digit| char::from(b'0' + digit))
+            .collect(),
+    )
+}
+
 fn python_int_equals_float(integer: &ast::Int, float: f64) -> bool {
     float.is_finite()
         && float >= 0.0
         && float.fract() == 0.0
-        && integer.to_string() == format!("{float:.0}")
+        && integer_decimal_value(integer).is_some_and(|integer| integer == format!("{float:.0}"))
 }
 
 #[allow(

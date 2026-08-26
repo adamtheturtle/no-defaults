@@ -375,12 +375,18 @@ struct Definitions {
     bindings: BTreeMap<(PathBuf, String), Binding>,
     /// Direct statically resolved base classes for method lookup.
     bases: BTreeMap<(PathBuf, String), Vec<(PathBuf, String)>>,
+    /// Classes whose competing control-flow definitions have different bases.
+    ambiguous_bases: BTreeSet<(PathBuf, String)>,
+    /// Every direct base seen for those competing definitions.
+    ambiguous_base_options: BTreeMap<(PathBuf, String), BTreeSet<(PathBuf, String)>>,
     /// Every name a fixed callable goes by, so a call that cannot be resolved
     /// to one can still be reported rather than silently left behind.
     names: BTreeSet<String>,
     /// Default deletions grouped by every callable spelling, used to retain
     /// them when an unresolved checked call may refer to that callable.
     fixes_by_name: BTreeMap<String, BTreeSet<FixKey>>,
+    /// Removed defaults owned by an exact method identity.
+    fixes_by_method: BTreeMap<(PathBuf, String, String), BTreeSet<FixKey>>,
 }
 
 impl Definitions {
@@ -407,6 +413,25 @@ impl Definitions {
 
     fn method(&self, file: &Path, class: &str, name: &str) -> Option<&Signature> {
         self.method_in_mro(file, class, name, false)
+    }
+
+    fn ambiguous_inherited_fixes(&self) -> BTreeSet<FixKey> {
+        let mut fixes = BTreeSet::new();
+        for bases in self.ambiguous_base_options.values() {
+            for base in bases {
+                let Some(mro) = self.linearized_mro(base, &mut BTreeSet::new()) else {
+                    continue;
+                };
+                for (file, class) in mro {
+                    for ((owner, owner_class, _), method_fixes) in &self.fixes_by_method {
+                        if owner == &file && owner_class == &class {
+                            fixes.extend(method_fixes.iter().cloned());
+                        }
+                    }
+                }
+            }
+        }
+        fixes
     }
 
     fn class_identity(&self, file: &Path, class: &str) -> Option<(PathBuf, String)> {
@@ -468,6 +493,9 @@ impl Definitions {
         class: &(PathBuf, String),
         visiting: &mut BTreeSet<(PathBuf, String)>,
     ) -> Option<Vec<(PathBuf, String)>> {
+        if self.ambiguous_bases.contains(class) {
+            return None;
+        }
         if !visiting.insert(class.clone()) {
             return None;
         }
@@ -862,6 +890,18 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                     .map(|removed| fix_key(&signature.path, removed.fix)),
             );
         let defining = physical_path(&signature.path);
+        if let Callable::Method { class, .. } = &signature.kind {
+            definitions
+                .fixes_by_method
+                .entry((defining.clone(), class.clone(), signature.name.clone()))
+                .or_default()
+                .extend(signature.removed.iter().flat_map(|removed| {
+                    [
+                        fix_key(&signature.path, removed.fix),
+                        fix_key(&defining, removed.fix),
+                    ]
+                }));
+        }
         let table = match &signature.kind {
             Callable::Method { class, .. } => definitions
                 .methods
@@ -910,6 +950,9 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         );
     }
     definitions.index_inherited_constructors();
+    call_sites
+        .retained
+        .extend(definitions.ambiguous_inherited_fixes());
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()
         .map(|path| {
@@ -1113,6 +1156,7 @@ fn index_control_flow_method_bases(
         _ => Vec::new(),
     };
     for suite in suites {
+        let before = definitions.bases.clone();
         index_method_bases_with_environment(
             suite,
             importer,
@@ -1123,6 +1167,16 @@ fn index_control_flow_method_bases(
             local_classes,
             aliases,
         );
+        for (class, bases) in &definitions.bases {
+            if let Some(previous) = before.get(class).filter(|previous| *previous != bases) {
+                definitions.ambiguous_bases.insert(class.clone());
+                definitions
+                    .ambiguous_base_options
+                    .entry(class.clone())
+                    .or_default()
+                    .extend(previous.iter().chain(bases).cloned());
+            }
+        }
     }
 }
 
@@ -11970,6 +12024,44 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "class Base:\n    def target(self, value): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn competing_conditional_class_bases_retain_inherited_defaults() -> Result<(), String> {
+        let source = "class First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif flag:\n    class Child(First):\n        def run(self): return self.target()\nelse:\n    class Child(Second):\n        def run(self): return self.target()\n\nChild().run()\n";
+        let module = parse_module(source).map_err(|error| error.to_string())?;
+        let mut definitions = Definitions::default();
+        index_method_bases(
+            module.suite(),
+            Path::new("fixture.py"),
+            &BTreeMap::new(),
+            None,
+            &mut Vec::new(),
+            &mut definitions,
+        );
+        assert!(definitions
+            .ambiguous_bases
+            .contains(&(PathBuf::from("fixture.py"), "Child".to_owned())));
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.py");
+        std::fs::write(&path, source).map_err(|error| error.to_string())?;
+        let checked = check_file(
+            &path,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        let expected: BTreeSet<FixKey> = checked
+            .diagnostics
+            .iter()
+            .filter_map(|diagnostic| diagnostic.fix.map(|range| fix_key(&diagnostic.path, range)))
+            .collect();
+        let call_sites = call_site_edits(std::slice::from_ref(&path), checked.signatures)?;
+        assert!(call_sites.retained.is_superset(&expected));
+        assert!(call_sites.edits.is_empty());
         Ok(())
     }
 

@@ -7685,11 +7685,15 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                     if let Some(guard) = &case.guard {
                         self.visit_expr(guard);
-                        if matches!(
-                            Truthiness::from_expr(guard, |_| false),
-                            Truthiness::False | Truthiness::Falsey | Truthiness::None
-                        ) {
-                            continue;
+                        match Truthiness::from_expr(guard, |_| false) {
+                            Truthiness::False | Truthiness::Falsey | Truthiness::None => {
+                                continue;
+                            }
+                            Truthiness::Unknown => {
+                                self.visit_body(&case.body);
+                                continue;
+                            }
+                            Truthiness::True | Truthiness::Truthy => {}
                         }
                     }
                     self.visit_body(&case.body);
@@ -7738,11 +7742,15 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.invalidated_bindings.extend(captures.names);
                     if let Some(guard) = &case.guard {
                         self.visit_expr(guard);
-                        if matches!(
-                            Truthiness::from_expr(guard, |_| false),
-                            Truthiness::False | Truthiness::Falsey | Truthiness::None
-                        ) {
-                            continue;
+                        match Truthiness::from_expr(guard, |_| false) {
+                            Truthiness::False | Truthiness::Falsey | Truthiness::None => {
+                                continue;
+                            }
+                            Truthiness::Unknown => {
+                                self.visit_body(&case.body);
+                                continue;
+                            }
+                            Truthiness::True | Truthiness::Truthy => {}
                         }
                     }
                     self.visit_body(&case.body);

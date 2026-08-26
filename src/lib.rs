@@ -3745,9 +3745,10 @@ impl Checker<'_> {
         self.scope.class != ClassScope::None
             && self.method_aliases.last().is_some_and(|aliases| {
                 aliases.get(name).is_some_and(|aliases| {
-                    aliases
-                        .iter()
-                        .any(|alias| implicitly_called_method(&alias.name))
+                    aliases.iter().any(|alias| {
+                        implicitly_called_method(&alias.name)
+                            || matches!(alias.name.as_str(), "__init__" | "__new__")
+                    })
                 })
             })
     }
@@ -10818,6 +10819,27 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn constructor_aliases_retain_implementation_defaults() {
+        for source in [
+            "class C:\n    def setup(self, value=1): self.value = value\n    __init__ = setup\n\nassert C().value == 1\n",
+            "class C:\n    def make(cls, value=1):\n        obj = object.__new__(cls)\n        obj.value = value\n        return obj\n    __new__ = staticmethod(make)\n\nassert C().value == 1\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
     }
 
     #[test]

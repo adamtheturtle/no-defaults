@@ -2799,6 +2799,7 @@ fn check_source(
         local_classes: BTreeSet::new(),
         metaclass_classes: BTreeSet::new(),
         imported_metaclass_classes: BTreeSet::new(),
+        defined_class_identities: BTreeSet::new(),
         metaclass_definitions: BTreeSet::new(),
         metaclass_intercepted_classes,
         repeated_functions,
@@ -3094,6 +3095,9 @@ struct Checker<'a> {
     /// Local classes that transitively inherit a possibly custom metaclass
     /// from an ordinary imported base.
     imported_metaclass_classes: BTreeSet<String>,
+    /// Every class identity visited, including safe redefinitions used to
+    /// shadow earlier imported-metaclass uncertainty.
+    defined_class_identities: BTreeSet<String>,
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
@@ -3535,13 +3539,12 @@ impl Checker<'_> {
             let Expr::Name(name) = base else {
                 return false;
             };
-            (0..=self.lexical_scope.len()).rev().any(|depth| {
-                self.imported_metaclass_classes
-                    .contains(&qualified_class_name(
-                        &self.lexical_scope[..depth],
-                        name.id.as_str(),
-                    ))
-            })
+            (0..=self.lexical_scope.len()).rev().find_map(|depth| {
+                let identity = qualified_class_name(&self.lexical_scope[..depth], name.id.as_str());
+                self.defined_class_identities
+                    .contains(&identity)
+                    .then(|| self.imported_metaclass_classes.contains(&identity))
+            }) == Some(true)
         })
     }
 
@@ -4487,11 +4490,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let old_header = self.header;
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
+                let identity = qualified_class_name(&self.lexical_scope, class.name.as_str());
+                self.defined_class_identities.insert(identity.clone());
+                self.imported_metaclass_classes.remove(&identity);
                 if self.may_inherit_imported_metaclass(class) {
-                    self.imported_metaclass_classes.insert(qualified_class_name(
-                        &self.lexical_scope,
-                        class.name.as_str(),
-                    ));
+                    self.imported_metaclass_classes.insert(identity);
                 }
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
@@ -13332,6 +13335,26 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_safe_redefinition_clears_imported_metaclass_uncertainty() {
+        let source = "from dataclasses import dataclass\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base:\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+        assert!(checked
+            .signatures
+            .iter()
+            .any(|signature| signature.positional == ["value"]));
     }
 
     #[test]

@@ -4010,7 +4010,8 @@ impl Checker<'_> {
                 || self.is_delegation_protocol_method(function.name.as_str())
                 || (self.scope.class == ClassScope::Metaclass
                     && matches!(function.name.as_str(), "__init__" | "mro"))
-                || (self.scope.enum_class && function.name.as_str() == "__init__")
+                || (self.scope.enum_class
+                    && matches!(function.name.as_str(), "__init__" | "_missing_"))
                 || (self.scope.class == ClassScope::None
                     && self.lexical_scope.is_empty()
                     && matches!(function.name.as_str(), "__getattr__" | "__dir__"))
@@ -9219,6 +9220,22 @@ mod tests {
             assert_eq!(checked.diagnostics.len(), 1);
             assert!(checked.diagnostics[0].fix.is_none());
         }
+    }
+
+    #[test]
+    fn enum_missing_hook_defaults_are_retained() {
+        let source = "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
     }
 
     #[test]

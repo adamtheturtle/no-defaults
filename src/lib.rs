@@ -4464,6 +4464,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "persistent_load"
             | "find_class"
             | "invalidate_caches"
+            | "load_module"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -9516,6 +9517,23 @@ mod tests {
     fn import_finder_invalidate_caches_defaults_are_retained() {
         let source =
             "class Finder:\n    def invalidate_caches(self, extra=1):\n        assert extra == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn legacy_import_loader_defaults_are_retained() {
+        let source = "class Loader:\n    def load_module(self, fullname, extra=1):\n        return fullname\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

@@ -7392,6 +7392,9 @@ impl Rewriter<'_> {
     /// and whether it was reached through a zero-argument `super()`, whose
     /// lookup starts after the class the call appears in.
     fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
+        if let Expr::Subscript(subscript) = receiver {
+            return self.receiving_class(&subscript.value);
+        }
         if let Expr::Call(call) = receiver {
             if let Some(class) = self.type_of_implicit_instance(call) {
                 return Some(class);
@@ -7582,6 +7585,7 @@ impl Rewriter<'_> {
     /// and how many parameters the call has already been given implicitly.
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
+            Expr::Subscript(subscript) => self.resolve(&subscript.value),
             Expr::Name(name)
                 if self.in_class_scope()
                     && self
@@ -7695,6 +7699,11 @@ impl Rewriter<'_> {
         let name = match &*call.func {
             Expr::Name(name) => name.id.as_str(),
             Expr::Attribute(attribute) => attribute.attr.as_str(),
+            Expr::Subscript(subscript) => match subscript.value.as_ref() {
+                Expr::Name(name) => name.id.as_str(),
+                Expr::Attribute(attribute) => attribute.attr.as_str(),
+                _ => return,
+            },
             _ => return,
         };
         let Some((signature, bound)) = self.resolve(&call.func) else {
@@ -13818,6 +13827,26 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n@dataclass\nclass C(Generic[T]):\n    value: int\n\nC(value=1)\n\nclass Generic:\n    pass\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parameterized_generic_constructor_calls_are_updated() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar('T')\n@dataclass\nclass Box(Generic[T]):\n    value: int = 1\n\nBox[int]()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar('T')\n@dataclass\nclass Box(Generic[T]):\n    value: int\n\nBox[int](value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parameterized_generic_method_calls_are_updated() -> Result<(), String> {
+        let source = "from typing import Generic, TypeVar\n\nT = TypeVar('T')\nclass Box(Generic[T]):\n    @classmethod\n    def make(cls, value=1):\n        return cls()\n\nBox[int].make()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from typing import Generic, TypeVar\n\nT = TypeVar('T')\nclass Box(Generic[T]):\n    @classmethod\n    def make(cls, value):\n        return cls()\n\nBox[int].make(value=1)\n"
         );
         Ok(())
     }

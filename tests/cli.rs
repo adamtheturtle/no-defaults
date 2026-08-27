@@ -3360,6 +3360,49 @@ fn class_control_flow_method_aliases_have_the_original_signature(
 }
 
 #[test]
+fn descriptor_wrapped_method_aliases_preserve_their_calling_conventions(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (wrapper, definition, call, expected_status, expected) in [
+        (
+            "staticmethod",
+            "def target(value=1): return value",
+            "C.alias()",
+            0,
+            "C.alias(value=1)",
+        ),
+        (
+            "classmethod",
+            "def target(cls, value=1): return value",
+            "C.alias()",
+            0,
+            "C.alias(value=1)",
+        ),
+        (
+            "property",
+            "def target(self, value=1): return value",
+            "C().alias",
+            1,
+            "def target(self, value=1)",
+        ),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("example.py");
+        std::fs::write(
+            &path,
+            format!(
+                "class C:\n    {definition}\n    alias = {wrapper}(target)\nassert {call} == 1\n"
+            ),
+        )?;
+
+        let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+        assert_eq!(output.status.code(), Some(expected_status));
+        let fixed = std::fs::read_to_string(path)?;
+        assert!(fixed.contains(expected), "{wrapper}: {fixed}");
+    }
+    Ok(())
+}
+
+#[test]
 fn nested_classes_have_qualified_method_identities() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

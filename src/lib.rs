@@ -2303,6 +2303,132 @@ fn source_error(path: &Path, error: String) -> Checked {
 /// `with`, a `try` — holds definitions that compete for the same name just as
 /// two definitions written side by side do. Only one of them survives, and
 /// which one is not knowable, so neither may have its defaults removed.
+/// The local names that mean the `property` builtin: the name itself and
+/// anything an import bound it to.
+///
+/// This runs before the alias table exists, so the import statements are read
+/// directly. A module-qualified `builtins.property` needs no entry — the
+/// attribute is matched by its own name.
+fn property_alias_names(statements: &[Stmt], names: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            Stmt::ImportFrom(import) => {
+                for alias in &import.names {
+                    if alias.name.as_str() == "property" {
+                        names.insert(
+                            alias
+                                .asname
+                                .as_ref()
+                                .map_or_else(|| alias.name.to_string(), ToString::to_string),
+                        );
+                    }
+                }
+            }
+            Stmt::ClassDef(class) => property_alias_names(&class.body, names),
+            Stmt::FunctionDef(function) => property_alias_names(&function.body, names),
+            Stmt::If(branch) => {
+                property_alias_names(&branch.body, names);
+                for clause in &branch.elif_else_clauses {
+                    property_alias_names(&clause.body, names);
+                }
+            }
+            Stmt::For(loop_) => {
+                property_alias_names(&loop_.body, names);
+                property_alias_names(&loop_.orelse, names);
+            }
+            Stmt::While(loop_) => {
+                property_alias_names(&loop_.body, names);
+                property_alias_names(&loop_.orelse, names);
+            }
+            Stmt::With(block) => property_alias_names(&block.body, names),
+            Stmt::Try(block) => {
+                property_alias_names(&block.body, names);
+                property_alias_names(&block.orelse, names);
+                property_alias_names(&block.finalbody, names);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    property_alias_names(&handler.body, names);
+                }
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    property_alias_names(&case.body, names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The methods a single class body hands to `property()` under another name,
+/// including the ones written inside its control flow.
+fn class_property_aliases(
+    statements: &[Stmt],
+    names: &BTreeSet<String>,
+    found: &mut BTreeSet<(String, String)>,
+) {
+    for statement in statements {
+        let value = match statement {
+            Stmt::Assign(assign) => Some(assign.value.as_ref()),
+            Stmt::AnnAssign(assign) => assign.value.as_deref(),
+            Stmt::If(branch) => {
+                class_property_aliases(&branch.body, names, found);
+                for clause in &branch.elif_else_clauses {
+                    class_property_aliases(&clause.body, names, found);
+                }
+                None
+            }
+            Stmt::For(loop_) => {
+                class_property_aliases(&loop_.body, names, found);
+                class_property_aliases(&loop_.orelse, names, found);
+                None
+            }
+            Stmt::While(loop_) => {
+                class_property_aliases(&loop_.body, names, found);
+                class_property_aliases(&loop_.orelse, names, found);
+                None
+            }
+            Stmt::With(block) => {
+                class_property_aliases(&block.body, names, found);
+                None
+            }
+            Stmt::Try(block) => {
+                class_property_aliases(&block.body, names, found);
+                class_property_aliases(&block.orelse, names, found);
+                class_property_aliases(&block.finalbody, names, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    class_property_aliases(&handler.body, names, found);
+                }
+                None
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    class_property_aliases(&case.body, names, found);
+                }
+                None
+            }
+            _ => None,
+        };
+        let Some(Expr::Call(call)) = value else {
+            continue;
+        };
+        let names_property = match call.func.as_ref() {
+            Expr::Name(name) => names.contains(name.id.as_str()),
+            Expr::Attribute(attribute) => attribute.attr.as_str() == "property",
+            _ => false,
+        };
+        if !names_property || call.arguments.args.len() != 1 {
+            continue;
+        }
+        if let Expr::Attribute(source) = &call.arguments.args[0] {
+            if let Expr::Name(owner) = source.value.as_ref() {
+                found.insert((owner.id.to_string(), source.attr.to_string()));
+            }
+        }
+    }
+}
+
 /// Methods that some class body hands to `property()` under another name,
 /// as `(class, method)`.
 ///
@@ -2310,65 +2436,47 @@ fn source_error(path: &Path, error: String) -> Checked {
 /// behind such an alias has no call site a fixer could update — and the class
 /// holding the alias may be written after the one defining the method, so this
 /// is gathered before checking starts.
-fn collect_property_aliased_methods(statements: &[Stmt], found: &mut BTreeSet<(String, String)>) {
+fn collect_property_aliased_methods(
+    statements: &[Stmt],
+    names: &BTreeSet<String>,
+    found: &mut BTreeSet<(String, String)>,
+) {
     for statement in statements {
         match statement {
             Stmt::ClassDef(class) => {
-                for inner in &class.body {
-                    let value = match inner {
-                        Stmt::Assign(assign) => Some(assign.value.as_ref()),
-                        Stmt::AnnAssign(assign) => assign.value.as_deref(),
-                        _ => None,
-                    };
-                    let Some(Expr::Call(call)) = value else {
-                        continue;
-                    };
-                    let names_property = match call.func.as_ref() {
-                        Expr::Name(name) => name.id.as_str() == "property",
-                        Expr::Attribute(attribute) => attribute.attr.as_str() == "property",
-                        _ => false,
-                    };
-                    if !names_property || call.arguments.args.len() != 1 {
-                        continue;
-                    }
-                    if let Expr::Attribute(source) = &call.arguments.args[0] {
-                        if let Expr::Name(owner) = source.value.as_ref() {
-                            found.insert((owner.id.to_string(), source.attr.to_string()));
-                        }
-                    }
-                }
-                collect_property_aliased_methods(&class.body, found);
+                class_property_aliases(&class.body, names, found);
+                collect_property_aliased_methods(&class.body, names, found);
             }
             Stmt::FunctionDef(function) => {
-                collect_property_aliased_methods(&function.body, found);
+                collect_property_aliased_methods(&function.body, names, found);
             }
             Stmt::If(branch) => {
-                collect_property_aliased_methods(&branch.body, found);
+                collect_property_aliased_methods(&branch.body, names, found);
                 for clause in &branch.elif_else_clauses {
-                    collect_property_aliased_methods(&clause.body, found);
+                    collect_property_aliased_methods(&clause.body, names, found);
                 }
             }
             Stmt::For(loop_) => {
-                collect_property_aliased_methods(&loop_.body, found);
-                collect_property_aliased_methods(&loop_.orelse, found);
+                collect_property_aliased_methods(&loop_.body, names, found);
+                collect_property_aliased_methods(&loop_.orelse, names, found);
             }
             Stmt::While(loop_) => {
-                collect_property_aliased_methods(&loop_.body, found);
-                collect_property_aliased_methods(&loop_.orelse, found);
+                collect_property_aliased_methods(&loop_.body, names, found);
+                collect_property_aliased_methods(&loop_.orelse, names, found);
             }
-            Stmt::With(block) => collect_property_aliased_methods(&block.body, found),
+            Stmt::With(block) => collect_property_aliased_methods(&block.body, names, found),
             Stmt::Try(block) => {
-                collect_property_aliased_methods(&block.body, found);
-                collect_property_aliased_methods(&block.orelse, found);
-                collect_property_aliased_methods(&block.finalbody, found);
+                collect_property_aliased_methods(&block.body, names, found);
+                collect_property_aliased_methods(&block.orelse, names, found);
+                collect_property_aliased_methods(&block.finalbody, names, found);
                 for handler in &block.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                    collect_property_aliased_methods(&handler.body, found);
+                    collect_property_aliased_methods(&handler.body, names, found);
                 }
             }
             Stmt::Match(block) => {
                 for case in &block.cases {
-                    collect_property_aliased_methods(&case.body, found);
+                    collect_property_aliased_methods(&case.body, names, found);
                 }
             }
             _ => {}
@@ -2478,8 +2586,14 @@ fn check_source(
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
     collect_repeated_functions(parsed.suite(), &mut function_names, &mut repeated_functions);
+    let mut property_names = BTreeSet::from(["property".to_owned()]);
+    property_alias_names(parsed.suite(), &mut property_names);
     let mut property_aliased_methods = BTreeSet::new();
-    collect_property_aliased_methods(parsed.suite(), &mut property_aliased_methods);
+    collect_property_aliased_methods(
+        parsed.suite(),
+        &property_names,
+        &mut property_aliased_methods,
+    );
     let mut checker = Checker {
         path,
         source,
@@ -7476,6 +7590,29 @@ mod tests {
         for source in [
             "class Base:\n    def target(self, value=1): pass\n    alias = property(target)\n",
             "class Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = property(Base.target)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn property_aliases_are_found_however_they_are_written() {
+        // The wrapper spellings the decorator path accepts, and a class body
+        // suite, all still mean the getter runs on attribute access.
+        for source in [
+            "from builtins import property as prop\n\nclass Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = prop(Base.target)\n",
+            "import builtins\n\nclass Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = builtins.property(Base.target)\n",
+            "class Base:\n    def target(self, value=1): pass\n\nclass Child:\n    if cond:\n        alias = property(Base.target)\n",
         ] {
             let checked = check_source(
                 Path::new("fixture.py"),

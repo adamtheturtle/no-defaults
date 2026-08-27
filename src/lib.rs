@@ -5863,7 +5863,17 @@ fn collect_bindings(
                         .as_ref()
                         .filter(|file| source_binds_name(file, name))
                         .cloned();
+                    // `from . import name` reaches the submodule, unless the
+                    // package defines `name` itself: the package attribute is
+                    // already set by the time the submodule would be imported,
+                    // so that is what Python hands out.
+                    let implicit_sibling = import.module.is_none()
+                        && import.level > 0
+                        && !parent
+                            .as_ref()
+                            .is_some_and(|file| source_defines_symbol(file, name));
                     let binding = match (package_member, submodule, &parent) {
+                        (_, Some(file), _) if implicit_sibling => Binding::Module(file),
                         (Some(file), _, _) => Binding::Symbol(file, name.to_owned()),
                         (None, Some(file), _) => Binding::Module(file),
                         (None, None, Some(file)) => Binding::Symbol(file.clone(), name.to_owned()),
@@ -5876,6 +5886,11 @@ fn collect_bindings(
                     };
                     bindings.insert(bound, binding);
                 }
+            }
+            // An annotated binding names the same thing a plain one does, so
+            // `target: Final = api.target` has to be followed too.
+            Stmt::Assign(_) | Stmt::AnnAssign(_) => {
+                collect_assignment_binding(statement, bindings);
             }
             Stmt::If(branch) => {
                 collect_conditional_bindings(branch, importer, known, bindings);
@@ -5903,6 +5918,21 @@ fn collect_bindings(
             // separately when the rewriter enters them.
             _ => {}
         }
+    }
+}
+
+/// Resolve a simple assignment alias through the imports already executed.
+fn assignment_binding(value: &Expr, bindings: &BTreeMap<String, Binding>) -> Option<Binding> {
+    match value {
+        Expr::Name(name) => bindings.get(name.id.as_str()).cloned(),
+        Expr::Attribute(attribute) => {
+            let module = dotted_name(&attribute.value)?;
+            let Binding::Module(file) = bindings.get(&module)? else {
+                return None;
+            };
+            Some(Binding::Symbol(file.clone(), attribute.attr.to_string()))
+        }
+        _ => None,
     }
 }
 
@@ -5941,6 +5971,69 @@ fn retain_common_bindings(
             .skip(1)
             .all(|path| path.get(name) == Some(binding))
     });
+}
+
+/// Whether a module defines `name` itself, rather than merely binding it by
+/// importing something of that name.
+///
+/// A package whose `__init__.py` re-exports its own submodule still hands out
+/// the submodule, so only a definition or an assignment counts here.
+/// Follow an assignment, annotated or not, into the binding index.
+fn collect_assignment_binding(statement: &Stmt, bindings: &mut BTreeMap<String, Binding>) {
+    let bound: Option<(&Expr, &[Expr])> = match statement {
+        Stmt::Assign(assign) => Some((assign.value.as_ref(), assign.targets.as_slice())),
+        Stmt::AnnAssign(assign) => assign
+            .value
+            .as_deref()
+            .map(|value| (value, std::slice::from_ref(&*assign.target))),
+        _ => None,
+    };
+    let Some((value, targets)) = bound else {
+        return;
+    };
+    let binding = assignment_binding(value, bindings);
+    for target in targets {
+        let Expr::Name(target) = target else {
+            continue;
+        };
+        if let Some(binding) = &binding {
+            bindings.insert(target.id.to_string(), binding.clone());
+        } else {
+            bindings.remove(target.id.as_str());
+        }
+    }
+}
+
+fn source_defines_symbol(path: &Path, name: &str) -> bool {
+    let Some(parsed) = read_source(path)
+        .ok()
+        .and_then(|source| parse_module(&source).ok())
+    else {
+        return false;
+    };
+    parsed.suite().iter().any(|statement| match statement {
+        Stmt::FunctionDef(function) => function.name.as_str() == name,
+        Stmt::ClassDef(class) => class.name.as_str() == name,
+        Stmt::Assign(assign) => assign
+            .targets
+            .iter()
+            .any(|target| matches!(target, Expr::Name(target) if target.id.as_str() == name)),
+        Stmt::AnnAssign(assign) => {
+            assign.value.is_some()
+                && matches!(assign.target.as_ref(), Expr::Name(target) if target.id.as_str() == name)
+        }
+        // `from .impl import name` puts a symbol under the name just as an
+        // assignment would. `from . import name` is the submodule itself, and
+        // is what the caller is deciding against.
+        Stmt::ImportFrom(import) => {
+            import.module.is_some()
+                && import.names.iter().any(|alias| {
+                    alias.asname.as_ref().unwrap_or(&alias.name).as_str() == name
+                        && alias.name.as_str() != "*"
+                })
+        }
+        _ => false,
+    })
 }
 
 fn source_binds_name(path: &Path, name: &str) -> bool {
@@ -7858,6 +7951,28 @@ mod tests {
     }
 
     #[test]
+    fn a_package_definition_outranks_a_sibling_submodule() -> Result<(), String> {
+        // `from . import helper` reaches the package's own `helper`, since the
+        // attribute is already set when the submodule would be imported.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let init = package.join("__init__.py");
+        let submodule = package.join("helper.py");
+        let user = package.join("user.py");
+        std::fs::write(&init, "def helper(value=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&submodule, "OTHER = 1\n").map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from . import helper\n\nhelper()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[init, submodule, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from . import helper\n\nhelper(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_nested_dataclass_is_reached_from_a_deeper_scope() -> Result<(), String> {
         // `C` inside `inner` is the class `outer` holds, not the module-level
         // one that happens to share its name.
@@ -8009,6 +8124,52 @@ mod tests {
             let updated = fixed(&format!("{holder}{written}"))?;
             assert!(updated.ends_with(expected), "{updated}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_package_reexport_outranks_a_sibling_submodule() -> Result<(), String> {
+        // `__init__.py` puts a symbol under `helper`, so that is the package
+        // attribute even though a `helper` submodule sits beside it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let init = package.join("__init__.py");
+        let implementation = package.join("impl.py");
+        let submodule = package.join("helper.py");
+        let user = package.join("user.py");
+        std::fs::write(&init, "from .impl import helper\n").map_err(|error| error.to_string())?;
+        std::fs::write(&implementation, "def helper(value=1): pass\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&submodule, "OTHER = 1\n").map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from . import helper\n\nhelper()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[init, implementation, submodule, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from . import helper\n\nhelper(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotated_cross_file_alias_is_followed() -> Result<(), String> {
+        // `target: object = api.target` names the same callable a plain
+        // assignment would.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let reexport = directory.path().join("re_export.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(value=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&reexport, "import api\n\ntarget: object = api.target\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from re_export import target\n\ntarget()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[api, reexport, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from re_export import target\n\ntarget(value=1)\n"
+        );
         Ok(())
     }
 

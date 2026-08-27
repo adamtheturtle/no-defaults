@@ -5460,7 +5460,15 @@ fn collect_bindings(
                         .as_ref()
                         .filter(|file| source_binds_name(file, name))
                         .cloned();
-                    let implicit_sibling = import.module.is_none() && import.level > 0;
+                    // `from . import name` reaches the submodule, unless the
+                    // package defines `name` itself: the package attribute is
+                    // already set by the time the submodule would be imported,
+                    // so that is what Python hands out.
+                    let implicit_sibling = import.module.is_none()
+                        && import.level > 0
+                        && !parent
+                            .as_ref()
+                            .is_some_and(|file| source_defines_symbol(file, name));
                     let binding = match (package_member, submodule, &parent) {
                         (_, Some(file), _) if implicit_sibling => Binding::Module(file),
                         (Some(file), _, _) => Binding::Symbol(file, name.to_owned()),
@@ -5568,6 +5576,33 @@ fn retain_common_bindings(
             .skip(1)
             .all(|path| path.get(name) == Some(binding))
     });
+}
+
+/// Whether a module defines `name` itself, rather than merely binding it by
+/// importing something of that name.
+///
+/// A package whose `__init__.py` re-exports its own submodule still hands out
+/// the submodule, so only a definition or an assignment counts here.
+fn source_defines_symbol(path: &Path, name: &str) -> bool {
+    let Some(parsed) = read_source(path)
+        .ok()
+        .and_then(|source| parse_module(&source).ok())
+    else {
+        return false;
+    };
+    parsed.suite().iter().any(|statement| match statement {
+        Stmt::FunctionDef(function) => function.name.as_str() == name,
+        Stmt::ClassDef(class) => class.name.as_str() == name,
+        Stmt::Assign(assign) => assign
+            .targets
+            .iter()
+            .any(|target| matches!(target, Expr::Name(target) if target.id.as_str() == name)),
+        Stmt::AnnAssign(assign) => {
+            assign.value.is_some()
+                && matches!(assign.target.as_ref(), Expr::Name(target) if target.id.as_str() == name)
+        }
+        _ => false,
+    })
 }
 
 fn source_binds_name(path: &Path, name: &str) -> bool {
@@ -7440,6 +7475,28 @@ mod tests {
             .into_iter()
             .map(|skip| skip.reason)
             .collect())
+    }
+
+    #[test]
+    fn a_package_definition_outranks_a_sibling_submodule() -> Result<(), String> {
+        // `from . import helper` reaches the package's own `helper`, since the
+        // attribute is already set when the submodule would be imported.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let init = package.join("__init__.py");
+        let submodule = package.join("helper.py");
+        let user = package.join("user.py");
+        std::fs::write(&init, "def helper(value=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&submodule, "OTHER = 1\n").map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from . import helper\n\nhelper()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[init, submodule, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from . import helper\n\nhelper(value=1)\n"
+        );
+        Ok(())
     }
 
     #[test]

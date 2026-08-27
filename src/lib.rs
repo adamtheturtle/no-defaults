@@ -4494,27 +4494,94 @@ fn generates_init(
 fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<String>> {
     let mut aliases = BTreeMap::<String, Vec<String>>::new();
     let mut origins = BTreeMap::<String, String>::new();
-    for statement in &class.body {
+    collect_class_method_aliases(&class.body, &mut aliases, &mut origins);
+    aliases
+}
+
+fn collect_class_method_aliases(
+    statements: &[Stmt],
+    aliases: &mut BTreeMap<String, Vec<String>>,
+    origins: &mut BTreeMap<String, String>,
+) {
+    for statement in statements {
         match statement {
             Stmt::Assign(assign) => {
                 for target in &assign.targets {
-                    record_method_alias(target, &assign.value, &mut aliases, &mut origins);
+                    record_method_alias(target, &assign.value, aliases, origins);
                 }
             }
             Stmt::AnnAssign(assign) => {
                 if let Some(value) = &assign.value {
-                    record_method_alias(&assign.target, value, &mut aliases, &mut origins);
+                    record_method_alias(&assign.target, value, aliases, origins);
                 }
             }
             Stmt::Expr(expression) => {
                 if let Expr::Named(named) = expression.value.as_ref() {
-                    record_method_alias(&named.target, &named.value, &mut aliases, &mut origins);
+                    record_method_alias(&named.target, &named.value, aliases, origins);
                 }
             }
+            Stmt::If(branch) => {
+                collect_alias_branches(
+                    std::iter::once(branch.body.as_slice()).chain(
+                        branch
+                            .elif_else_clauses
+                            .iter()
+                            .map(|clause| clause.body.as_slice()),
+                    ),
+                    aliases,
+                    origins,
+                );
+            }
+            Stmt::For(loop_) => collect_alias_branches(
+                [loop_.body.as_slice(), loop_.orelse.as_slice()],
+                aliases,
+                origins,
+            ),
+            Stmt::While(loop_) => collect_alias_branches(
+                [loop_.body.as_slice(), loop_.orelse.as_slice()],
+                aliases,
+                origins,
+            ),
+            Stmt::With(block) => {
+                let mut branch_origins = origins.clone();
+                collect_class_method_aliases(&block.body, aliases, &mut branch_origins);
+            }
+            Stmt::Try(block) => {
+                let handlers = block.handlers.iter().map(|handler| {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    handler.body.as_slice()
+                });
+                collect_alias_branches(
+                    [
+                        block.body.as_slice(),
+                        block.orelse.as_slice(),
+                        block.finalbody.as_slice(),
+                    ]
+                    .into_iter()
+                    .chain(handlers),
+                    aliases,
+                    origins,
+                );
+            }
+            Stmt::Match(block) => collect_alias_branches(
+                block.cases.iter().map(|case| case.body.as_slice()),
+                aliases,
+                origins,
+            ),
             _ => {}
         }
     }
-    aliases
+}
+
+fn collect_alias_branches<'a>(
+    branches: impl IntoIterator<Item = &'a [Stmt]>,
+    aliases: &mut BTreeMap<String, Vec<String>>,
+    origins: &BTreeMap<String, String>,
+) {
+    for branch in branches {
+        let mut branch_origins = origins.clone();
+        collect_class_method_aliases(branch, aliases, &mut branch_origins);
+    }
 }
 
 fn record_method_alias(

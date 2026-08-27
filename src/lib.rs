@@ -3508,7 +3508,7 @@ impl Checker<'_> {
     fn record_signature(&mut self, function: &ast::StmtFunctionDef, removed: Vec<Removed>) {
         let parameter_name =
             |parameter: &ast::ParameterWithDefault| parameter.parameter.name.to_string();
-        let signature = Signature {
+        let mut signature = Signature {
             name: function.name.to_string(),
             positional: function
                 .parameters
@@ -3534,20 +3534,32 @@ impl Checker<'_> {
                 .method_aliases
                 .last()
                 .and_then(|aliases| aliases.get(function.name.as_str()))
+                .cloned()
             {
+                // `target = staticmethod(target)` rebinds the method's own
+                // name rather than adding a second one. The wrapper decides
+                // how the one name is called, so it belongs on the signature
+                // already being emitted: a second signature under that name
+                // would collide with it and lose both.
+                if let Some(rebound) = aliases
+                    .iter()
+                    .rev()
+                    .find(|alias| alias.name == function.name.as_str())
+                {
+                    if let Callable::Method { receiver, .. } = &mut signature.kind {
+                        *receiver = alias_receiver(rebound.kind, *receiver);
+                    }
+                }
                 self.signatures.extend(aliases.iter().filter_map(|alias| {
-                    if alias.kind == MethodAliasKind::Property {
+                    if alias.kind == MethodAliasKind::Property
+                        || alias.name == function.name.as_str()
+                    {
                         return None;
                     }
                     let mut alias_signature = signature.clone();
                     alias_signature.name.clone_from(&alias.name);
                     if let Callable::Method { receiver, .. } = &mut alias_signature.kind {
-                        *receiver = match alias.kind {
-                            MethodAliasKind::Direct => *receiver,
-                            MethodAliasKind::Static => Receiver::None,
-                            MethodAliasKind::Class => Receiver::Class,
-                            MethodAliasKind::Property => unreachable!(),
-                        };
+                        *receiver = alias_receiver(alias.kind, *receiver);
                     }
                     Some(alias_signature)
                 }));
@@ -4523,6 +4535,17 @@ fn generates_init(
 /// Direct method aliases created in a class namespace. Python applies the
 /// descriptor protocol to both names, so calls through either spelling have
 /// the same implicit receiver and parameters.
+/// How a call through an alias passes its receiver. A `staticmethod` wrapper
+/// takes none and a `classmethod` wrapper takes the class, whatever the
+/// original method declared.
+fn alias_receiver(kind: MethodAliasKind, original: Receiver) -> Receiver {
+    match kind {
+        MethodAliasKind::Direct | MethodAliasKind::Property => original,
+        MethodAliasKind::Static => Receiver::None,
+        MethodAliasKind::Class => Receiver::Class,
+    }
+}
+
 fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<MethodAlias>> {
     let mut aliases = BTreeMap::<String, Vec<MethodAlias>>::new();
     let mut origins = BTreeMap::<String, (String, MethodAliasKind)>::new();
@@ -7110,6 +7133,25 @@ mod tests {
             .into_iter()
             .map(|skip| skip.reason)
             .collect())
+    }
+
+    #[test]
+    fn a_wrapper_alias_under_the_method_name_keeps_its_signature() -> Result<(), String> {
+        // `target = staticmethod(target)` renames nothing: the wrapper decides
+        // how the one name is called, so the call still has to be rewritten.
+        for (source, expected) in [
+            (
+                "class C:\n    def target(value=1): pass\n    target = staticmethod(target)\n\nC.target()\n",
+                "class C:\n    def target(value): pass\n    target = staticmethod(target)\n\nC.target(value=1)\n",
+            ),
+            (
+                "class C:\n    def target(cls, value=1): pass\n    target = classmethod(target)\n\nC.target()\n",
+                "class C:\n    def target(cls, value): pass\n    target = classmethod(target)\n\nC.target(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
     }
 
     #[test]

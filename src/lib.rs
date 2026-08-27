@@ -811,20 +811,42 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
+        // A class the file defines itself takes the name over from an import
+        // of the same name, so a subclass written after it is built on the
+        // local class. One written before it still reaches the import.
+        let mut local_classes = BTreeMap::<String, TextSize>::new();
+        for statement in parsed.suite() {
+            if let Stmt::ClassDef(class) = statement {
+                local_classes
+                    .entry(class.name.to_string())
+                    .or_insert_with(|| statement.start());
+            }
+        }
         for statement in parsed.suite() {
             let Stmt::ClassDef(class) = statement else {
                 continue;
             };
+            let defined_at = statement.start();
             let bases = class
                 .arguments
                 .iter()
                 .flat_map(|arguments| arguments.args.iter())
                 .filter_map(|base| match base {
-                    Expr::Name(name) => match bindings.get(name.id.as_str()) {
-                        Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
-                        Some(Binding::Module(_)) => None,
-                        None => Some((importer.clone(), name.id.to_string())),
-                    },
+                    Expr::Name(name) => {
+                        if local_classes
+                            .get(name.id.as_str())
+                            .is_some_and(|local| *local < defined_at)
+                        {
+                            return Some((importer.clone(), name.id.to_string()));
+                        }
+                        match bindings.get(name.id.as_str()) {
+                            Some(Binding::Symbol(file, class)) => {
+                                Some((file.clone(), class.clone()))
+                            }
+                            Some(Binding::Module(_)) => None,
+                            None => Some((importer.clone(), name.id.to_string())),
+                        }
+                    }
                     Expr::Attribute(attribute) => {
                         let dotted = dotted_name(&attribute.value)?;
                         let Binding::Module(file) = bindings.get(&dotted)? else {

@@ -60,6 +60,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Staticmethod and classmethod aliases imported inside `match` cases are available to call rewriting.
 - Staticmethod and classmethod aliases imported inside a `while` body or its `else` suite are available to call rewriting.
 - A match-pattern capture invalidates any imported dataclass identity it may replace before its guard and case body are analyzed.
 - A named-expression target invalidates any imported dataclass identity it replaces after its value has been evaluated.

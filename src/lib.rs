@@ -3536,6 +3536,13 @@ impl Checker<'_> {
                 .and_then(|aliases| aliases.get(function.name.as_str()))
                 .cloned()
             {
+                // Another name still takes the receiver the method itself
+                // declared, so read that before a same-name wrapper rewrites
+                // it below.
+                let declared = match &signature.kind {
+                    Callable::Method { receiver, .. } => *receiver,
+                    _ => Receiver::None,
+                };
                 // `target = staticmethod(target)` rebinds the method's own
                 // name rather than adding a second one. The wrapper decides
                 // how the one name is called, so it belongs on the signature
@@ -3547,7 +3554,7 @@ impl Checker<'_> {
                     .find(|alias| alias.name == function.name.as_str())
                 {
                     if let Callable::Method { receiver, .. } = &mut signature.kind {
-                        *receiver = alias_receiver(rebound.kind, *receiver);
+                        *receiver = alias_receiver(rebound.kind, declared);
                     }
                 }
                 self.signatures.extend(aliases.iter().filter_map(|alias| {
@@ -3559,7 +3566,7 @@ impl Checker<'_> {
                     let mut alias_signature = signature.clone();
                     alias_signature.name.clone_from(&alias.name);
                     if let Callable::Method { receiver, .. } = &mut alias_signature.kind {
-                        *receiver = alias_receiver(alias.kind, *receiver);
+                        *receiver = alias_receiver(alias.kind, declared);
                     }
                     Some(alias_signature)
                 }));

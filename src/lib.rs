@@ -3536,9 +3536,15 @@ impl Checker<'_> {
             class: ClassScope::None,
             kept_default: false,
         };
+        let outer_repeated_functions = self.repeated_functions.clone();
+        let mut function_names = BTreeSet::new();
+        let mut repeated_functions = BTreeSet::new();
+        collect_repeated_functions(&function.body, &mut function_names, &mut repeated_functions);
+        self.repeated_functions = repeated_functions;
         self.lexical_scope.push(function.name.to_string());
         walk_stmt(self, statement);
         self.lexical_scope.pop();
+        self.repeated_functions = outer_repeated_functions;
         self.aliases = outer_aliases;
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
@@ -4400,7 +4406,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         && !collector.removed.is_empty()
                     {
                         self.signatures.push(Signature {
-                            name: collector.name,
+                            name: qualified_lexical_name(&self.lexical_scope, &collector.name),
                             path: self.path.to_path_buf(),
                             positional: collector.fields,
                             positional_only: 0,
@@ -5769,6 +5775,7 @@ fn rewrite_calls(
         known,
         classes: Vec::new(),
         class_scope_depths: Vec::new(),
+        lexical_is_class: Vec::new(),
         implicit_receivers: Vec::new(),
         lexical_scope: Vec::new(),
         called: BTreeSet::new(),
@@ -6310,6 +6317,9 @@ struct Rewriter<'a> {
     /// Scope-stack depth immediately inside each class body, distinguishing a
     /// direct method from a function nested inside one.
     class_scope_depths: Vec<usize>,
+    /// Whether each `lexical_scope` entry is a class body rather than a
+    /// function, so a lookup can pass over the ones that are not closures.
+    lexical_is_class: Vec<bool>,
     /// The implicit receiver name of each enclosing function. Static methods
     /// and module functions contribute `None`.
     implicit_receivers: Vec<Option<String>>,
@@ -6539,6 +6549,55 @@ impl Rewriter<'_> {
 
     /// The callable an expression names, when the file's own imports say so,
     /// and how many parameters the call has already been given implicitly.
+    /// The signature a bare nested name refers to at this call site.
+    ///
+    /// A nested definition is visible throughout the scope holding it, so the
+    /// search runs outwards from the call site. It stops at the nearest scope
+    /// that binds the name, whether or not anything was recorded for it, and
+    /// passes over class bodies, which are not closure scopes.
+    fn nested_signature(&self, name: &str) -> Option<&Signature> {
+        let symbols = self.definitions.symbols.get(self.physical)?;
+        // A lambda or comprehension written in a class body has a scope of its
+        // own that the class namespace is not part of, so a name bound beside
+        // it is out of reach from in there.
+        if self
+            .scopes
+            .iter()
+            .skip(self.lexical_scope.len())
+            .any(|scope| scope.names.contains(name))
+        {
+            return None;
+        }
+        // A nested function is never reached by its bare name, so that last
+        // step is only for the other callables.
+        let outermost = usize::from(self.nested_function(name));
+        let innermost_class_applies = self.in_class_scope();
+        for depth in (outermost..=self.lexical_scope.len()).rev() {
+            if depth > 0
+                && self.lexical_is_class.get(depth - 1) == Some(&true)
+                && !(depth == self.lexical_scope.len() && innermost_class_applies)
+            {
+                continue;
+            }
+            if let Some(signature) =
+                symbols.get(&qualified_lexical_name(&self.lexical_scope[..depth], name))
+            {
+                return signature.as_ref();
+            }
+            // Nothing was recorded here, but a scope that binds the name still
+            // hides whatever the scopes outside it call by the same name.
+            if depth > 0
+                && self
+                    .scopes
+                    .get(depth - 1)
+                    .is_some_and(|scope| scope.names.contains(name))
+            {
+                return None;
+            }
+        }
+        None
+    }
+
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
             Expr::Name(name)
@@ -6557,17 +6616,7 @@ impl Rewriter<'_> {
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
-                let key = if self.nested_function(name.id.as_str()) {
-                    qualified_lexical_name(&self.lexical_scope, name.id.as_str())
-                } else {
-                    name.id.to_string()
-                };
-                let signature = self
-                    .definitions
-                    .symbols
-                    .get(self.physical)?
-                    .get(&key)?
-                    .as_ref()?;
+                let signature = self.nested_signature(name.id.as_str())?;
                 Some((signature, signature.kind.implicit_bound()))
             }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
@@ -7352,6 +7401,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     qualified_name(self.classes.last().map(String::as_str), class.name.as_str());
                 self.classes.push(qualified);
                 self.lexical_scope.push(class.name.to_string());
+                self.lexical_is_class.push(true);
                 self.scopes.push(BoundNames::default());
                 self.class_bindings.push(BTreeMap::new());
                 self.class_scope_depths.push(self.scopes.len());
@@ -7359,6 +7409,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.class_scope_depths.pop();
                 self.class_bindings.pop();
                 self.scopes.pop();
+                self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.classes.pop();
                 self.bind_definition_in_class(class.name.as_str(), true);
@@ -7405,7 +7456,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.bindings.push(local);
                 self.scopes.push(BoundNames::of_function(function));
                 self.lexical_scope.push(function.name.to_string());
+                self.lexical_is_class.push(false);
                 self.visit_body(&function.body);
+                self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.scopes.pop();
                 self.bindings.pop();
@@ -7717,6 +7770,16 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_dataclass_is_reached_from_a_deeper_scope() -> Result<(), String> {
+        // `C` inside `inner` is the class `outer` holds, not the module-level
+        // one that happens to share its name.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    other: int = 2\n\ndef outer():\n    @dataclass\n    class C:\n        value: int = 1\n    def inner():\n        return C()\n    return inner()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
     fn a_wrapper_alias_under_the_method_name_keeps_its_signature() -> Result<(), String> {
         // `target = staticmethod(target)` renames nothing: the wrapper decides
         // how the one name is called, so the call still has to be rewritten.
@@ -7816,6 +7879,49 @@ mod tests {
             assert_eq!(checked.diagnostics.len(), 1);
             assert!(checked.diagnostics[0].fix.is_none(), "{source}");
         }
+    }
+
+    #[test]
+    fn a_nearer_binding_hides_an_outer_callable() -> Result<(), String> {
+        // `inner` binds `C` itself, so the dataclass in `outer` is not what
+        // the call reaches, even though nothing was recorded for the inner one.
+        let source = "from dataclasses import dataclass\n\ndef outer():\n    @dataclass\n    class C:\n        value: int = 1\n    def inner():\n        class C:\n            pass\n        return C()\n    return inner()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C()"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_does_not_see_a_class_nested_callable() -> Result<(), String> {
+        // A class body is not a closure scope: `C` inside the method is the
+        // module-level class, not the one nested beside the method.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n\nclass Holder:\n    @dataclass\n    class C:\n        other: int = 2\n    def method(self):\n        return C()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_expression_scope_in_a_class_body_looks_past_the_class() -> Result<(), String> {
+        // A lambda and a comprehension each have a scope the class namespace
+        // is not part of, so `C` in them is the module-level class. Written
+        // directly in the body it is the nested one.
+        let holder = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n\nclass Holder:\n    @dataclass\n    class C:\n        other: int = 2\n";
+        for (written, expected) in [
+            (
+                "    factory = lambda: C()\n",
+                "    factory = lambda: C(value=1)\n",
+            ),
+            (
+                "    items = [C() for _ in range(1)]\n",
+                "    items = [C(value=1) for _ in range(1)]\n",
+            ),
+            ("    made = C()\n", "    made = C(other=2)\n"),
+        ] {
+            let updated = fixed(&format!("{holder}{written}"))?;
+            assert!(updated.ends_with(expected), "{updated}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -11691,6 +11797,37 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(module_default)?,
             "def target(value): return value\ndef outer():\n    def target(): return 9\n    return target()\nassert outer() == 9\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn same_named_nested_callables_do_not_collide() -> Result<(), String> {
+        let functions = "def first():\n    def target(value=1): return value\n    return target()\ndef second():\n    def target(value=2): return value\n    return target()\n";
+        let result = fixed(functions)?;
+        assert!(result.contains("target(value=1)"), "{result}");
+        assert!(result.contains("target(value=2)"), "{result}");
+
+        let repeated = "def outer():\n    def target(value=1): return value\n    def target(value=2): return value\n    return target()\n";
+        let checked = check_source(
+            Path::new("example.py"),
+            repeated,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.fix.is_none()));
+        assert!(checked.signatures.is_empty());
+
+        let dataclasses = "from dataclasses import dataclass\ndef first():\n    @dataclass\n    class C:\n        value: int = 1\n    return C()\ndef second():\n    @dataclass\n    class C:\n        value: int = 2\n    return C()\n";
+        let result = fixed(dataclasses)?;
+        assert!(result.contains("C(value=1)"), "{result}");
+        assert!(result.contains("C(value=2)"), "{result}");
         Ok(())
     }
 

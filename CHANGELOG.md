@@ -60,6 +60,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- Annotated assignments, statically paired destructuring, and named expressions in class bodies record method aliases for call rewriting.
 - Transitive class-body method aliases resolve to the original method signature, so calls through every alias receive removed defaults.
 - Staticmethod and classmethod aliases imported inside `match` cases are available to call rewriting.
 - Staticmethod and classmethod aliases imported inside a `while` body or its `else` suite are available to call rewriting.

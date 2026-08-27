@@ -4763,13 +4763,11 @@ fn method_alias_origin(
                 "property" => MethodAliasKind::Property,
                 _ => return None,
             };
-            let Expr::Name(original) = &call.arguments.args[0] else {
-                return None;
-            };
-            let (root, original_class) = origins.get(original.id.as_str()).map_or_else(
-                || (original.id.to_string(), None),
-                |(root, _, original_class)| (root.clone(), original_class.clone()),
-            );
+            // The wrapper decides how the alias is called; what it wraps
+            // decides which method it names, so resolve that the same way a
+            // bare value is resolved. `staticmethod(Base.target)` names the
+            // same method as a plain `Base.target`.
+            let (root, _, original_class) = method_alias_origin(&call.arguments.args[0], origins)?;
             Some((root, kind, original_class))
         }
         _ => None,
@@ -7215,6 +7213,25 @@ mod tests {
             (
                 "class C:\n    def target(cls, value=1): pass\n    target = classmethod(target)\n\nC.target()\n",
                 "class C:\n    def target(cls, value): pass\n    target = classmethod(target)\n\nC.target(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrapped_inherited_attribute_alias_is_indexed() -> Result<(), String> {
+        // The wrapper says how the alias is called; `Base.target` inside it
+        // still names the method the signature was collected for.
+        for (source, expected) in [
+            (
+                "class Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = staticmethod(Base.target)\n\nChild.alias()\n",
+                "class Base:\n    def target(value): pass\n\nclass Child:\n    alias = staticmethod(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+            (
+                "class Base:\n    def target(cls, value=1): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias()\n",
+                "class Base:\n    def target(cls, value): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias(value=1)\n",
             ),
         ] {
             assert_eq!(fixed(source)?, expected);

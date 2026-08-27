@@ -297,6 +297,9 @@ enum MethodAliasKind {
 struct MethodAlias {
     name: String,
     kind: MethodAliasKind,
+    /// A statically named class whose method was copied into this namespace.
+    /// `None` means the original is a method defined by this class itself.
+    original_class: Option<String>,
 }
 
 impl Callable {
@@ -3558,7 +3561,8 @@ impl Checker<'_> {
                     }
                 }
                 self.signatures.extend(aliases.iter().filter_map(|alias| {
-                    if alias.kind == MethodAliasKind::Property
+                    if alias.original_class.is_some()
+                        || alias.kind == MethodAliasKind::Property
                         || alias.name == function.name.as_str()
                     {
                         return None;
@@ -3688,6 +3692,50 @@ impl Checker<'_> {
                 });
             }
         }
+    }
+
+    /// Index aliases copied from a same-file class whose signature has already
+    /// been collected. Unknown and forward-referenced classes stay unresolved.
+    fn record_inherited_method_aliases(&mut self) {
+        let (Some(class), Some(aliases)) = (self.classes.last(), self.method_aliases.last()) else {
+            return;
+        };
+        let mut inherited = Vec::new();
+        for (method, aliases) in aliases {
+            for alias in aliases {
+                let Some(original_class) = &alias.original_class else {
+                    continue;
+                };
+                // Signatures record the class chain alone, so qualifying the
+                // source class through `lexical_scope` would name an enclosing
+                // function too and match nothing. Resolve it as a sibling of
+                // the class being collected instead.
+                let original_class = qualified_name(
+                    self.classes
+                        .len()
+                        .checked_sub(2)
+                        .and_then(|parent| self.classes.get(parent))
+                        .map(|parent| parent.qualified.as_str()),
+                    original_class,
+                );
+                let Some(signature) = self.signatures.iter().find(|signature| {
+                    signature.name == *method
+                        && matches!(
+                            &signature.kind,
+                            Callable::Method { class, .. } if class == &original_class
+                        )
+                }) else {
+                    continue;
+                };
+                let mut signature = signature.clone();
+                signature.name.clone_from(&alias.name);
+                if let Callable::Method { class: owner, .. } = &mut signature.kind {
+                    owner.clone_from(&class.qualified);
+                }
+                inherited.push(signature);
+            }
+        }
+        self.signatures.extend(inherited);
     }
 }
 
@@ -3894,6 +3942,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         fields,
                         removed,
                     });
+                    self.record_inherited_method_aliases();
                 }
                 let shape_name = qualified_class_name(&self.lexical_scope, class.name.as_str());
                 self.lexical_scope.push(class.name.to_string());
@@ -4555,7 +4604,7 @@ fn alias_receiver(kind: MethodAliasKind, original: Receiver) -> Receiver {
 
 fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<MethodAlias>> {
     let mut aliases = BTreeMap::<String, Vec<MethodAlias>>::new();
-    let mut origins = BTreeMap::<String, (String, MethodAliasKind)>::new();
+    let mut origins = BTreeMap::<String, (String, MethodAliasKind, Option<String>)>::new();
     collect_class_method_aliases(&class.body, &mut aliases, &mut origins);
     aliases
 }
@@ -4563,7 +4612,7 @@ fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<Metho
 fn collect_class_method_aliases(
     statements: &[Stmt],
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
-    origins: &mut BTreeMap<String, (String, MethodAliasKind)>,
+    origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     for statement in statements {
         match statement {
@@ -4638,7 +4687,7 @@ fn collect_class_method_aliases(
 fn collect_alias_branches<'a>(
     branches: impl IntoIterator<Item = &'a [Stmt]>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
-    origins: &BTreeMap<String, (String, MethodAliasKind)>,
+    origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     for branch in branches {
         let mut branch_origins = origins.clone();
@@ -4650,11 +4699,11 @@ fn record_method_alias(
     target: &Expr,
     value: &Expr,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
-    origins: &mut BTreeMap<String, (String, MethodAliasKind)>,
+    origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     match (target, value) {
         (Expr::Name(alias), value) => {
-            let Some((original, kind)) = method_alias_origin(value, origins) else {
+            let Some((original, kind, original_class)) = method_alias_origin(value, origins) else {
                 return;
             };
             aliases
@@ -4663,8 +4712,9 @@ fn record_method_alias(
                 .push(MethodAlias {
                     name: alias.id.to_string(),
                     kind,
+                    original_class: original_class.clone(),
                 });
-            origins.insert(alias.id.to_string(), (original, kind));
+            origins.insert(alias.id.to_string(), (original, kind, original_class));
         }
         (Expr::Tuple(targets), Expr::Tuple(values)) if targets.elts.len() == values.elts.len() => {
             for (target, value) in targets.elts.iter().zip(&values.elts) {
@@ -4682,15 +4732,25 @@ fn record_method_alias(
 
 fn method_alias_origin(
     value: &Expr,
-    origins: &BTreeMap<String, (String, MethodAliasKind)>,
-) -> Option<(String, MethodAliasKind)> {
+    origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
+) -> Option<(String, MethodAliasKind, Option<String>)> {
     match value {
         Expr::Name(original) => Some(
             origins
                 .get(original.id.as_str())
                 .cloned()
-                .unwrap_or_else(|| (original.id.to_string(), MethodAliasKind::Direct)),
+                .unwrap_or_else(|| (original.id.to_string(), MethodAliasKind::Direct, None)),
         ),
+        Expr::Attribute(attribute) => {
+            let Expr::Name(class) = attribute.value.as_ref() else {
+                return None;
+            };
+            Some((
+                attribute.attr.to_string(),
+                MethodAliasKind::Direct,
+                Some(class.id.to_string()),
+            ))
+        }
         Expr::Call(call)
             if call.arguments.args.len() == 1 && call.arguments.keywords.is_empty() =>
         {
@@ -4703,13 +4763,12 @@ fn method_alias_origin(
                 "property" => MethodAliasKind::Property,
                 _ => return None,
             };
-            let Expr::Name(original) = &call.arguments.args[0] else {
-                return None;
-            };
-            let root = origins
-                .get(original.id.as_str())
-                .map_or_else(|| original.id.to_string(), |(root, _)| root.clone());
-            Some((root, kind))
+            // The wrapper decides how the alias is called; what it wraps
+            // decides which method it names, so resolve that the same way a
+            // bare value is resolved. `staticmethod(Base.target)` names the
+            // same method as a plain `Base.target`.
+            let (root, _, original_class) = method_alias_origin(&call.arguments.args[0], origins)?;
+            Some((root, kind, original_class))
         }
         _ => None,
     }
@@ -7154,6 +7213,25 @@ mod tests {
             (
                 "class C:\n    def target(cls, value=1): pass\n    target = classmethod(target)\n\nC.target()\n",
                 "class C:\n    def target(cls, value): pass\n    target = classmethod(target)\n\nC.target(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrapped_inherited_attribute_alias_is_indexed() -> Result<(), String> {
+        // The wrapper says how the alias is called; `Base.target` inside it
+        // still names the method the signature was collected for.
+        for (source, expected) in [
+            (
+                "class Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = staticmethod(Base.target)\n\nChild.alias()\n",
+                "class Base:\n    def target(value): pass\n\nclass Child:\n    alias = staticmethod(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+            (
+                "class Base:\n    def target(cls, value=1): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias()\n",
+                "class Base:\n    def target(cls, value): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias(value=1)\n",
             ),
         ] {
             assert_eq!(fixed(source)?, expected);
@@ -9926,6 +10004,23 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return self.target(value=1)\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_of_inherited_methods_are_indexed() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    alias = Base.target\n\nassert Child().alias() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    alias = Base.target\n\nassert Child().alias(value=1) == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_of_unknown_inherited_methods_are_left_unresolved() -> Result<(), String> {
+        let source = "class Child(External):\n    alias = External.target\n\nChild().alias()\n";
+        assert_eq!(fixed(source)?, source);
         Ok(())
     }
 

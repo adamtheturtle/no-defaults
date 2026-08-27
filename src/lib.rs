@@ -6398,6 +6398,10 @@ impl Rewriter<'_> {
             .enumerate()
             .rev()
             .find_map(|(index, scope)| {
+                let class_frame = self.class_scope_depths.contains(&(index + 1));
+                if class_frame && !(self.in_class_scope() && index + 1 == self.scopes.len()) {
+                    return None;
+                }
                 scope.names.contains(name).then(|| {
                     (
                         scope.functions.contains(name) || scope.classes.contains(name),
@@ -12206,13 +12210,30 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn a_class_body_binding_shadows_a_module_level_definition() -> Result<(), String> {
+    fn a_class_body_binding_does_not_shadow_a_method_global() -> Result<(), String> {
         let source = "def connect(host, timeout=30):\n    pass\n\n\n\
                       class Client:\n    connect = staticmethod(open)\n\n    \
                       def run(self):\n        connect(\"h\")\n";
         assert_eq!(
             fixed(source)?,
-            source.replace("host, timeout=30", "host, timeout")
+            source
+                .replace("host, timeout=30", "host, timeout")
+                .replace("connect(\"h\")", "connect(\"h\", timeout=30)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn class_namespaces_do_not_enclose_methods_or_comprehensions() -> Result<(), String> {
+        let method = "def target(value=1): return value\nclass C:\n    target = lambda: 9\n    def run(self): return target()\nassert C().run() == 1\n";
+        let result = fixed(method)?;
+        assert!(result.contains("return target(value=1)"), "{result}");
+
+        let comprehension = "def target(value=1): return value\nclass C:\n    target = lambda: 9\n    values = [target() for _ in [0]]\nassert C.values == [1]\n";
+        let result = fixed(comprehension)?;
+        assert!(
+            result.contains("values = [target(value=1) for _ in [0]]"),
+            "{result}"
         );
         Ok(())
     }

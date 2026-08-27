@@ -6162,15 +6162,21 @@ impl Rewriter<'_> {
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
                 let symbols = self.definitions.symbols.get(self.physical)?;
-                let qualified = qualified_lexical_name(&self.lexical_scope, name.id.as_str());
-                let signature = if self.nested_function(name.id.as_str()) {
-                    symbols.get(&qualified)?
-                } else {
-                    symbols
-                        .get(&qualified)
-                        .or_else(|| symbols.get(name.id.as_str()))?
-                }
-                .as_ref()?;
+                // A nested definition is visible throughout the scope holding
+                // it, including from scopes nested deeper still, so look
+                // outwards from the call site rather than at its own scope
+                // alone. A nested function is never reached by its bare name,
+                // so that last step is only for the other callables.
+                let outermost = usize::from(self.nested_function(name.id.as_str()));
+                let signature = (outermost..=self.lexical_scope.len())
+                    .rev()
+                    .find_map(|depth| {
+                        symbols.get(&qualified_lexical_name(
+                            &self.lexical_scope[..depth],
+                            name.id.as_str(),
+                        ))
+                    })?
+                    .as_ref()?;
                 Some((signature, signature.kind.implicit_bound()))
             }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
@@ -7317,6 +7323,16 @@ mod tests {
             .into_iter()
             .map(|skip| skip.reason)
             .collect())
+    }
+
+    #[test]
+    fn a_nested_dataclass_is_reached_from_a_deeper_scope() -> Result<(), String> {
+        // `C` inside `inner` is the class `outer` holds, not the module-level
+        // one that happens to share its name.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    other: int = 2\n\ndef outer():\n    @dataclass\n    class C:\n        value: int = 1\n    def inner():\n        return C()\n    return inner()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C(value=1)"), "{updated}");
+        Ok(())
     }
 
     #[test]

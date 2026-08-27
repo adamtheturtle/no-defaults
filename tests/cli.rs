@@ -3269,6 +3269,24 @@ fn aliased_staticmethod_decorators_have_no_implicit_receiver(
 }
 
 #[test]
+fn staticmethod_aliases_imported_inside_while_reach_the_rewriter(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(
+        &path,
+        "while True:\n    from builtins import staticmethod as sm\n    break\nclass Other:\n    def target(self): return 9\nclass C:\n    def target(self, value=1): return value\n    @sm\n    def run(self): return self.target()\nassert C.run(Other()) == 9\n",
+    )?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(path)?;
+    assert!(fixed.contains("def target(self, value):"), "{fixed}");
+    assert!(fixed.contains("return self.target()"), "{fixed}");
+    Ok(())
+}
+
+#[test]
 fn nested_classes_have_qualified_method_identities() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

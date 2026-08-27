@@ -4758,10 +4758,20 @@ impl<'a> Visitor<'a> for Checker<'a> {
         if let Some(type_) = &handler.type_ {
             self.visit_expr(type_);
         }
-        if let Some(name) = &handler.name {
-            self.aliases.invalidate(name.as_str());
-        }
+        let Some(name) = &handler.name else {
+            self.visit_body(&handler.body);
+            return;
+        };
+        // The handler body sees the exception under `name`, so an import the
+        // name held is shadowed there. Python deletes the name when the
+        // handler ends, whatever the body did with it, so a later statement
+        // either reaches the binding from before the handler, because the
+        // handler never ran, or reaches nothing at all. Only the earlier
+        // binding survives, and the rest of what the body established stays.
+        let before = self.aliases.clone();
+        self.aliases.invalidate(name.as_str());
         self.visit_body(&handler.body);
+        self.aliases.restore(name.as_str(), &before);
     }
 
     fn visit_expr(&mut self, expression: &'a Expr) {
@@ -5059,6 +5069,56 @@ impl Aliases {
         self.type_checking.remove(name);
         self.kw_only_markers.remove(name);
         self.parameter_bindings.remove(name);
+    }
+
+    /// Give `name` back every record it held in `before`, undoing an
+    /// [`Aliases::invalidate`] call once the binding that shadowed it is gone.
+    fn restore(&mut self, name: &str, before: &Self) {
+        fn copy(current: &mut BTreeSet<String>, before: &BTreeSet<String>, name: &str) {
+            if before.contains(name) {
+                current.insert(name.to_owned());
+            } else {
+                current.remove(name);
+            }
+        }
+
+        if let Some(renamed) = before.renamed.get(name) {
+            self.renamed.insert(name.to_owned(), renamed.clone());
+        } else {
+            self.renamed.remove(name);
+        }
+        for (current, before) in [
+            (&mut self.import_bindings, &before.import_bindings),
+            (&mut self.dataclasses_members, &before.dataclasses_members),
+            (&mut self.dataclass_fields, &before.dataclass_fields),
+            (
+                &mut self.invalidated_field_helpers,
+                &before.invalidated_field_helpers,
+            ),
+            (&mut self.dataclass_decorators, &before.dataclass_decorators),
+            (&mut self.pydantic_fields, &before.pydantic_fields),
+            (
+                &mut self.pydantic_private_attrs,
+                &before.pydantic_private_attrs,
+            ),
+            (&mut self.dataclasses_modules, &before.dataclasses_modules),
+            (&mut self.pydantic_modules, &before.pydantic_modules),
+            (&mut self.enum_classes, &before.enum_classes),
+            (&mut self.enum_modules, &before.enum_modules),
+            (&mut self.staticmethods, &before.staticmethods),
+            (&mut self.classmethods, &before.classmethods),
+            (&mut self.supers, &before.supers),
+            (&mut self.builtins_modules, &before.builtins_modules),
+            (&mut self.class_vars, &before.class_vars),
+            (&mut self.typing_modules, &before.typing_modules),
+            (&mut self.abc_modules, &before.abc_modules),
+            (&mut self.structural_bases, &before.structural_bases),
+            (&mut self.type_checking, &before.type_checking),
+            (&mut self.kw_only_markers, &before.kw_only_markers),
+            (&mut self.parameter_bindings, &before.parameter_bindings),
+        ] {
+            copy(current, before, name);
+        }
     }
 
     fn invalidate_parameter(&mut self, name: &str) {
@@ -9944,6 +10004,14 @@ mod tests {
     fn except_targets_shadow_dataclass_decorator_imports() {
         let source = "from dataclasses import dataclass\n\nclass DecoratorError(Exception):\n    def __call__(self, cls): return cls\n\ntry:\n    raise DecoratorError()\nexcept DecoratorError as dataclass:\n    @dataclass\n    class C:\n        x: int = 1\n";
         assert!(messages(source, false).is_empty());
+    }
+
+    #[test]
+    fn except_target_shadowing_ends_with_the_handler() {
+        // The handler deletes `dataclass` when it ends, so a later decorator
+        // either reaches the import or reaches nothing at all.
+        let source = "from dataclasses import dataclass\n\nclass DecoratorError(Exception):\n    def __call__(self, cls): return cls\n\ntry:\n    raise DecoratorError()\nexcept DecoratorError as dataclass:\n    pass\n\n@dataclass\nclass C:\n    x: int = 1\n";
+        assert_eq!(messages(source, false).len(), 1);
     }
 
     #[test]

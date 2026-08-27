@@ -6570,15 +6570,35 @@ impl Rewriter<'_> {
                 // alone. A nested function is never reached by its bare name,
                 // so that last step is only for the other callables.
                 let outermost = usize::from(self.nested_function(name.id.as_str()));
-                let signature = (outermost..=self.lexical_scope.len())
-                    .rev()
-                    .find_map(|depth| {
-                        symbols.get(&qualified_lexical_name(
-                            &self.lexical_scope[..depth],
-                            name.id.as_str(),
-                        ))
-                    })?
-                    .as_ref()?;
+                let mut found = None;
+                for depth in (outermost..=self.lexical_scope.len()).rev() {
+                    // A class body is not a closure scope. A call written in
+                    // one sees the names beside it, but a call in a method
+                    // reaches straight past the class that holds it.
+                    if depth < self.lexical_scope.len() && self.class_scope_depths.contains(&depth)
+                    {
+                        continue;
+                    }
+                    if let Some(signature) = symbols.get(&qualified_lexical_name(
+                        &self.lexical_scope[..depth],
+                        name.id.as_str(),
+                    )) {
+                        found = Some(signature);
+                        break;
+                    }
+                    // Nothing was recorded here, but a scope that binds the
+                    // name still hides whatever the scopes outside it call by
+                    // the same name.
+                    if depth > 0
+                        && self
+                            .scopes
+                            .get(depth - 1)
+                            .is_some_and(|scope| scope.names.contains(name.id.as_str()))
+                    {
+                        return None;
+                    }
+                }
+                let signature = found?.as_ref()?;
                 Some((signature, signature.kind.implicit_bound()))
             }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
@@ -7837,6 +7857,26 @@ mod tests {
             assert_eq!(checked.diagnostics.len(), 1);
             assert!(checked.diagnostics[0].fix.is_none(), "{source}");
         }
+    }
+
+    #[test]
+    fn a_nearer_binding_hides_an_outer_callable() -> Result<(), String> {
+        // `inner` binds `C` itself, so the dataclass in `outer` is not what
+        // the call reaches, even though nothing was recorded for the inner one.
+        let source = "from dataclasses import dataclass\n\ndef outer():\n    @dataclass\n    class C:\n        value: int = 1\n    def inner():\n        class C:\n            pass\n        return C()\n    return inner()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C()"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_does_not_see_a_class_nested_callable() -> Result<(), String> {
+        // A class body is not a closure scope: `C` inside the method is the
+        // module-level class, not the one nested beside the method.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n\nclass Holder:\n    @dataclass\n    class C:\n        other: int = 2\n    def method(self):\n        return C()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C(value=1)"), "{updated}");
+        Ok(())
     }
 
     #[test]

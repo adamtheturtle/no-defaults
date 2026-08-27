@@ -815,51 +815,68 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         // of the same name, so a subclass written after it is built on the
         // local class. One written before it still reaches the import.
         let mut local_classes = BTreeMap::<String, TextSize>::new();
+        collect_local_class_offsets(parsed.suite(), None, &mut local_classes);
+        let mut class_aliases = BTreeMap::new();
         for statement in parsed.suite() {
-            if let Stmt::ClassDef(class) = statement {
-                local_classes
-                    .entry(class.name.to_string())
-                    .or_insert_with(|| statement.start());
-            }
-        }
-        for statement in parsed.suite() {
-            let Stmt::ClassDef(class) = statement else {
-                continue;
-            };
             let defined_at = statement.start();
-            let bases = class
-                .arguments
-                .iter()
-                .flat_map(|arguments| arguments.args.iter())
-                .filter_map(|base| match base {
-                    Expr::Name(name) => {
-                        if local_classes
-                            .get(name.id.as_str())
-                            .is_some_and(|local| *local < defined_at)
-                        {
-                            return Some((importer.clone(), name.id.to_string()));
+            match statement {
+                Stmt::ClassDef(class) => {
+                    let bases = class
+                        .arguments
+                        .iter()
+                        .flat_map(|arguments| arguments.args.iter())
+                        .filter_map(|base| {
+                            method_base_identity(
+                                base,
+                                &importer,
+                                &bindings,
+                                &local_classes,
+                                defined_at,
+                                &class_aliases,
+                                &definitions.methods,
+                            )
+                        })
+                        .collect();
+                    definitions
+                        .bases
+                        .insert((importer.clone(), class.name.to_string()), bases);
+                }
+                // An annotated binding names a class just as a plain one
+                // does, so a subclass reaching the original through it is
+                // linked the same way.
+                Stmt::Assign(_) | Stmt::AnnAssign(_) => {
+                    let bound: Option<(&Expr, &[Expr])> = match statement {
+                        Stmt::Assign(assign) => {
+                            Some((assign.value.as_ref(), assign.targets.as_slice()))
                         }
-                        match bindings.get(name.id.as_str()) {
-                            Some(Binding::Symbol(file, class)) => {
-                                Some((file.clone(), class.clone()))
-                            }
-                            Some(Binding::Module(_)) => None,
-                            None => Some((importer.clone(), name.id.to_string())),
+                        Stmt::AnnAssign(assign) => assign
+                            .value
+                            .as_deref()
+                            .map(|value| (value, std::slice::from_ref(&*assign.target))),
+                        _ => None,
+                    };
+                    let Some((value, targets)) = bound else {
+                        continue;
+                    };
+                    let Some(identity) = method_base_identity(
+                        value,
+                        &importer,
+                        &bindings,
+                        &local_classes,
+                        defined_at,
+                        &class_aliases,
+                        &definitions.methods,
+                    ) else {
+                        continue;
+                    };
+                    for target in targets {
+                        if let Expr::Name(alias) = target {
+                            class_aliases.insert(alias.id.to_string(), identity.clone());
                         }
                     }
-                    Expr::Attribute(attribute) => {
-                        let dotted = dotted_name(&attribute.value)?;
-                        let Binding::Module(file) = bindings.get(&dotted)? else {
-                            return None;
-                        };
-                        Some((file.clone(), attribute.attr.to_string()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            definitions
-                .bases
-                .insert((importer.clone(), class.name.to_string()), bases);
+                }
+                _ => {}
+            }
         }
         definitions.bindings.extend(
             bindings
@@ -902,6 +919,114 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
     Ok(call_sites)
+}
+
+/// Resolve the class identity denoted by a base expression for method lookup.
+/// Where each class this file defines is written, under the name a base
+/// expression would spell it with — nested classes included, so `Outer.Inner`
+/// is found as readily as a class at the top level.
+fn collect_local_class_offsets(
+    statements: &[Stmt],
+    prefix: Option<&str>,
+    found: &mut BTreeMap<String, TextSize>,
+) {
+    for statement in statements {
+        match statement {
+            Stmt::ClassDef(class) => {
+                let qualified = qualified_name(prefix, class.name.as_str());
+                found.entry(qualified.clone()).or_insert(statement.start());
+                collect_local_class_offsets(&class.body, Some(&qualified), found);
+            }
+            // A suite does not open a namespace, so a class written inside one
+            // is spelled the same as a class beside it. A function body does
+            // open one, and a class in there is out of reach of these names.
+            Stmt::If(branch) => {
+                collect_local_class_offsets(&branch.body, prefix, found);
+                for clause in &branch.elif_else_clauses {
+                    collect_local_class_offsets(&clause.body, prefix, found);
+                }
+            }
+            Stmt::For(loop_) => {
+                collect_local_class_offsets(&loop_.body, prefix, found);
+                collect_local_class_offsets(&loop_.orelse, prefix, found);
+            }
+            Stmt::While(loop_) => {
+                collect_local_class_offsets(&loop_.body, prefix, found);
+                collect_local_class_offsets(&loop_.orelse, prefix, found);
+            }
+            Stmt::With(block) => collect_local_class_offsets(&block.body, prefix, found),
+            Stmt::Try(block) => {
+                collect_local_class_offsets(&block.body, prefix, found);
+                collect_local_class_offsets(&block.orelse, prefix, found);
+                collect_local_class_offsets(&block.finalbody, prefix, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_local_class_offsets(&handler.body, prefix, found);
+                }
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_local_class_offsets(&case.body, prefix, found);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn method_base_identity(
+    expression: &Expr,
+    importer: &Path,
+    bindings: &BTreeMap<String, Binding>,
+    local_classes: &BTreeMap<String, TextSize>,
+    defined_at: TextSize,
+    aliases: &BTreeMap<String, (PathBuf, String)>,
+    methods: &BTreeMap<(PathBuf, String), BTreeMap<String, Option<Signature>>>,
+) -> Option<(PathBuf, String)> {
+    match expression {
+        Expr::Subscript(subscript) => method_base_identity(
+            &subscript.value,
+            importer,
+            bindings,
+            local_classes,
+            defined_at,
+            aliases,
+            methods,
+        ),
+        Expr::Name(name) => aliases.get(name.id.as_str()).cloned().or_else(|| {
+            let local = local_classes.get(name.id.as_str());
+            // A class already defined here holds the name, whatever an import
+            // of the same name bound earlier.
+            if local.is_some_and(|local| *local < defined_at) {
+                return Some((importer.to_path_buf(), name.id.to_string()));
+            }
+            match bindings.get(name.id.as_str()) {
+                Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
+                _ => local.map(|_| (importer.to_path_buf(), name.id.to_string())),
+            }
+        }),
+        Expr::Attribute(attribute) => {
+            let qualified = dotted_name(expression)?;
+            // A nested class holds the dotted name only once it is written,
+            // the same rule a simple name follows above. Before that the
+            // prefix still names whatever an import bound.
+            if local_classes
+                .get(&qualified)
+                .is_some_and(|local| *local < defined_at)
+                && methods
+                    .keys()
+                    .any(|(file, class)| file == importer && class == &qualified)
+            {
+                return Some((importer.to_path_buf(), qualified));
+            }
+            let module = dotted_name(&attribute.value)?;
+            let Binding::Module(file) = bindings.get(&module)? else {
+                return None;
+            };
+            Some((file.clone(), attribute.attr.to_string()))
+        }
+        _ => None,
+    }
 }
 
 /// Find the checked file a dotted module name refers to.
@@ -10393,6 +10518,20 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return self.target(value=1)\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn statically_resolvable_base_expressions_preserve_inherited_calls() -> Result<(), String> {
+        for source in [
+            "class Base:\n    def target(self, value=1): return value\nAlias = Base\nclass Child(Alias):\n    def run(self): return self.target()\n",
+            "class Base:\n    @classmethod\n    def __class_getitem__(cls, item): return cls\n    def target(self, value=1): return value\nclass Child(Base[int]):\n    def run(self): return self.target()\n",
+            "class Outer:\n    class Base:\n        def target(self, value=1): return value\nclass Child(Outer.Base):\n    def run(self): return self.target()\n",
+        ] {
+            let fixed = fixed(source)?;
+            assert!(fixed.contains("def target(self, value):"), "{fixed}");
+            assert!(fixed.contains("self.target(value=1)"), "{fixed}");
+        }
         Ok(())
     }
 

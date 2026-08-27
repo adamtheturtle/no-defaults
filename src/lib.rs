@@ -3706,7 +3706,18 @@ impl Checker<'_> {
                 let Some(original_class) = &alias.original_class else {
                     continue;
                 };
-                let original_class = qualified_class_name(&self.lexical_scope, original_class);
+                // Signatures record the class chain alone, so qualifying the
+                // source class through `lexical_scope` would name an enclosing
+                // function too and match nothing. Resolve it as a sibling of
+                // the class being collected instead.
+                let original_class = qualified_name(
+                    self.classes
+                        .len()
+                        .checked_sub(2)
+                        .and_then(|parent| self.classes.get(parent))
+                        .map(|parent| parent.qualified.as_str()),
+                    original_class,
+                );
                 let Some(signature) = self.signatures.iter().find(|signature| {
                     signature.name == *method
                         && matches!(

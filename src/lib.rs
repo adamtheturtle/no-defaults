@@ -3928,7 +3928,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 );
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
-                self.method_aliases.push(class_method_aliases(class));
+                let context = AliasContext {
+                    aliases: &self.aliases,
+                    module_bindings: &self.module_bindings,
+                };
+                self.method_aliases
+                    .push(class_method_aliases(class, context));
                 if self.collect_signatures {
                     let inherited = self.inherited_fields(class, style);
                     // A base of this file's own contributes its fields ahead of
@@ -4613,15 +4618,27 @@ fn alias_receiver(kind: MethodAliasKind, original: Receiver) -> Receiver {
     }
 }
 
-fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<MethodAlias>> {
+/// What class-body alias collection reads to recognise a descriptor wrapper
+/// written under an alias or qualified through a `builtins` import.
+#[derive(Clone, Copy)]
+struct AliasContext<'a> {
+    aliases: &'a Aliases,
+    module_bindings: &'a BTreeSet<String>,
+}
+
+fn class_method_aliases(
+    class: &ast::StmtClassDef,
+    context: AliasContext<'_>,
+) -> BTreeMap<String, Vec<MethodAlias>> {
     let mut aliases = BTreeMap::<String, Vec<MethodAlias>>::new();
     let mut origins = BTreeMap::<String, (String, MethodAliasKind, Option<String>)>::new();
-    collect_class_method_aliases(&class.body, &mut aliases, &mut origins);
+    collect_class_method_aliases(&class.body, context, &mut aliases, &mut origins);
     aliases
 }
 
 fn collect_class_method_aliases(
     statements: &[Stmt],
+    context: AliasContext<'_>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
     origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
@@ -4629,17 +4646,17 @@ fn collect_class_method_aliases(
         match statement {
             Stmt::Assign(assign) => {
                 for target in &assign.targets {
-                    record_method_alias(target, &assign.value, aliases, origins);
+                    record_method_alias(target, &assign.value, context, aliases, origins);
                 }
             }
             Stmt::AnnAssign(assign) => {
                 if let Some(value) = &assign.value {
-                    record_method_alias(&assign.target, value, aliases, origins);
+                    record_method_alias(&assign.target, value, context, aliases, origins);
                 }
             }
             Stmt::Expr(expression) => {
                 if let Expr::Named(named) = expression.value.as_ref() {
-                    record_method_alias(&named.target, &named.value, aliases, origins);
+                    record_method_alias(&named.target, &named.value, context, aliases, origins);
                 }
             }
             Stmt::If(branch) => {
@@ -4650,23 +4667,26 @@ fn collect_class_method_aliases(
                             .iter()
                             .map(|clause| clause.body.as_slice()),
                     ),
+                    context,
                     aliases,
                     origins,
                 );
             }
             Stmt::For(loop_) => collect_alias_branches(
                 [loop_.body.as_slice(), loop_.orelse.as_slice()],
+                context,
                 aliases,
                 origins,
             ),
             Stmt::While(loop_) => collect_alias_branches(
                 [loop_.body.as_slice(), loop_.orelse.as_slice()],
+                context,
                 aliases,
                 origins,
             ),
             Stmt::With(block) => {
                 let mut branch_origins = origins.clone();
-                collect_class_method_aliases(&block.body, aliases, &mut branch_origins);
+                collect_class_method_aliases(&block.body, context, aliases, &mut branch_origins);
             }
             Stmt::Try(block) => {
                 let handlers = block.handlers.iter().map(|handler| {
@@ -4681,12 +4701,14 @@ fn collect_class_method_aliases(
                     ]
                     .into_iter()
                     .chain(handlers),
+                    context,
                     aliases,
                     origins,
                 );
             }
             Stmt::Match(block) => collect_alias_branches(
                 block.cases.iter().map(|case| case.body.as_slice()),
+                context,
                 aliases,
                 origins,
             ),
@@ -4697,24 +4719,28 @@ fn collect_class_method_aliases(
 
 fn collect_alias_branches<'a>(
     branches: impl IntoIterator<Item = &'a [Stmt]>,
+    context: AliasContext<'_>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
     origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     for branch in branches {
         let mut branch_origins = origins.clone();
-        collect_class_method_aliases(branch, aliases, &mut branch_origins);
+        collect_class_method_aliases(branch, context, aliases, &mut branch_origins);
     }
 }
 
 fn record_method_alias(
     target: &Expr,
     value: &Expr,
+    context: AliasContext<'_>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
     origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     match (target, value) {
         (Expr::Name(alias), value) => {
-            let Some((original, kind, original_class)) = method_alias_origin(value, origins) else {
+            let Some((original, kind, original_class)) =
+                method_alias_origin(value, context, origins)
+            else {
                 return;
             };
             aliases
@@ -4729,12 +4755,12 @@ fn record_method_alias(
         }
         (Expr::Tuple(targets), Expr::Tuple(values)) if targets.elts.len() == values.elts.len() => {
             for (target, value) in targets.elts.iter().zip(&values.elts) {
-                record_method_alias(target, value, aliases, origins);
+                record_method_alias(target, value, context, aliases, origins);
             }
         }
         (Expr::List(targets), Expr::List(values)) if targets.elts.len() == values.elts.len() => {
             for (target, value) in targets.elts.iter().zip(&values.elts) {
-                record_method_alias(target, value, aliases, origins);
+                record_method_alias(target, value, context, aliases, origins);
             }
         }
         _ => {}
@@ -4743,6 +4769,7 @@ fn record_method_alias(
 
 fn method_alias_origin(
     value: &Expr,
+    context: AliasContext<'_>,
     origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) -> Option<(String, MethodAliasKind, Option<String>)> {
     match value {
@@ -4765,20 +4792,14 @@ fn method_alias_origin(
         Expr::Call(call)
             if call.arguments.args.len() == 1 && call.arguments.keywords.is_empty() =>
         {
-            let Expr::Name(wrapper) = call.func.as_ref() else {
-                return None;
-            };
-            let kind = match wrapper.id.as_str() {
-                "staticmethod" => MethodAliasKind::Static,
-                "classmethod" => MethodAliasKind::Class,
-                "property" => MethodAliasKind::Property,
-                _ => return None,
-            };
+            let kind =
+                descriptor_wrapper_kind(&call.func, context.aliases, context.module_bindings)?;
             // The wrapper decides how the alias is called; what it wraps
             // decides which method it names, so resolve that the same way a
             // bare value is resolved. `staticmethod(Base.target)` names the
             // same method as a plain `Base.target`.
-            let (root, _, original_class) = method_alias_origin(&call.arguments.args[0], origins)?;
+            let (root, _, original_class) =
+                method_alias_origin(&call.arguments.args[0], context, origins)?;
             Some((root, kind, original_class))
         }
         _ => None,
@@ -5161,6 +5182,51 @@ fn field_argument_removal_range(
         return range;
     }
     TextRange::new(target.start(), target.end() + text_size(comma + 1))
+}
+
+/// The descriptor a class-body wrapper call applies, written bare, under an
+/// alias, or qualified through a `builtins` import — the same spellings the
+/// decorator forms accept.
+fn descriptor_wrapper_kind(
+    expression: &Expr,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> Option<MethodAliasKind> {
+    match expression {
+        Expr::Name(name) => {
+            let bare = !module_bindings.contains(name.id.as_str());
+            match name.id.as_str() {
+                "staticmethod" if bare => Some(MethodAliasKind::Static),
+                "classmethod" if bare => Some(MethodAliasKind::Class),
+                "property" if bare => Some(MethodAliasKind::Property),
+                _ if aliases.staticmethods.contains(name.id.as_str()) => {
+                    Some(MethodAliasKind::Static)
+                }
+                _ if aliases.classmethods.contains(name.id.as_str()) => {
+                    Some(MethodAliasKind::Class)
+                }
+                _ if aliases.properties.contains(name.id.as_str()) => {
+                    Some(MethodAliasKind::Property)
+                }
+                _ => None,
+            }
+        }
+        Expr::Attribute(attribute) => {
+            let Expr::Name(module) = attribute.value.as_ref() else {
+                return None;
+            };
+            if !aliases.builtins_modules.contains(module.id.as_str()) {
+                return None;
+            }
+            match attribute.attr.as_str() {
+                "staticmethod" => Some(MethodAliasKind::Static),
+                "classmethod" => Some(MethodAliasKind::Class),
+                "property" => Some(MethodAliasKind::Property),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// What a method is given ahead of its written arguments, from its decorators.
@@ -7253,6 +7319,25 @@ mod tests {
             (
                 "class Base:\n    def target(cls, value=1): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias()\n",
                 "class Base:\n    def target(cls, value): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn aliased_and_qualified_wrappers_index_class_aliases() -> Result<(), String> {
+        // The decorator forms already accept these spellings, so a class-body
+        // wrapper call has to recognise them too.
+        for (source, expected) in [
+            (
+                "from builtins import staticmethod as sm\n\nclass Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = sm(Base.target)\n\nChild.alias()\n",
+                "from builtins import staticmethod as sm\n\nclass Base:\n    def target(value): pass\n\nclass Child:\n    alias = sm(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+            (
+                "import builtins\n\nclass Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = builtins.staticmethod(Base.target)\n\nChild.alias()\n",
+                "import builtins\n\nclass Base:\n    def target(value): pass\n\nclass Child:\n    alias = builtins.staticmethod(Base.target)\n\nChild.alias(value=1)\n",
             ),
         ] {
             assert_eq!(fixed(source)?, expected);

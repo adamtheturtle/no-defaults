@@ -5775,6 +5775,7 @@ fn rewrite_calls(
         known,
         classes: Vec::new(),
         class_scope_depths: Vec::new(),
+        lexical_is_class: Vec::new(),
         implicit_receivers: Vec::new(),
         lexical_scope: Vec::new(),
         called: BTreeSet::new(),
@@ -6316,6 +6317,9 @@ struct Rewriter<'a> {
     /// Scope-stack depth immediately inside each class body, distinguishing a
     /// direct method from a function nested inside one.
     class_scope_depths: Vec<usize>,
+    /// Whether each `lexical_scope` entry is a class body rather than a
+    /// function, so a lookup can pass over the ones that are not closures.
+    lexical_is_class: Vec<bool>,
     /// The implicit receiver name of each enclosing function. Static methods
     /// and module functions contribute `None`.
     implicit_receivers: Vec<Option<String>>,
@@ -6545,6 +6549,55 @@ impl Rewriter<'_> {
 
     /// The callable an expression names, when the file's own imports say so,
     /// and how many parameters the call has already been given implicitly.
+    /// The signature a bare nested name refers to at this call site.
+    ///
+    /// A nested definition is visible throughout the scope holding it, so the
+    /// search runs outwards from the call site. It stops at the nearest scope
+    /// that binds the name, whether or not anything was recorded for it, and
+    /// passes over class bodies, which are not closure scopes.
+    fn nested_signature(&self, name: &str) -> Option<&Signature> {
+        let symbols = self.definitions.symbols.get(self.physical)?;
+        // A lambda or comprehension written in a class body has a scope of its
+        // own that the class namespace is not part of, so a name bound beside
+        // it is out of reach from in there.
+        if self
+            .scopes
+            .iter()
+            .skip(self.lexical_scope.len())
+            .any(|scope| scope.names.contains(name))
+        {
+            return None;
+        }
+        // A nested function is never reached by its bare name, so that last
+        // step is only for the other callables.
+        let outermost = usize::from(self.nested_function(name));
+        let innermost_class_applies = self.in_class_scope();
+        for depth in (outermost..=self.lexical_scope.len()).rev() {
+            if depth > 0
+                && self.lexical_is_class.get(depth - 1) == Some(&true)
+                && !(depth == self.lexical_scope.len() && innermost_class_applies)
+            {
+                continue;
+            }
+            if let Some(signature) =
+                symbols.get(&qualified_lexical_name(&self.lexical_scope[..depth], name))
+            {
+                return signature.as_ref();
+            }
+            // Nothing was recorded here, but a scope that binds the name still
+            // hides whatever the scopes outside it call by the same name.
+            if depth > 0
+                && self
+                    .scopes
+                    .get(depth - 1)
+                    .is_some_and(|scope| scope.names.contains(name))
+            {
+                return None;
+            }
+        }
+        None
+    }
+
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
             Expr::Name(name)
@@ -6563,42 +6616,7 @@ impl Rewriter<'_> {
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
-                let symbols = self.definitions.symbols.get(self.physical)?;
-                // A nested definition is visible throughout the scope holding
-                // it, including from scopes nested deeper still, so look
-                // outwards from the call site rather than at its own scope
-                // alone. A nested function is never reached by its bare name,
-                // so that last step is only for the other callables.
-                let outermost = usize::from(self.nested_function(name.id.as_str()));
-                let mut found = None;
-                for depth in (outermost..=self.lexical_scope.len()).rev() {
-                    // A class body is not a closure scope. A call written in
-                    // one sees the names beside it, but a call in a method
-                    // reaches straight past the class that holds it.
-                    if depth < self.lexical_scope.len() && self.class_scope_depths.contains(&depth)
-                    {
-                        continue;
-                    }
-                    if let Some(signature) = symbols.get(&qualified_lexical_name(
-                        &self.lexical_scope[..depth],
-                        name.id.as_str(),
-                    )) {
-                        found = Some(signature);
-                        break;
-                    }
-                    // Nothing was recorded here, but a scope that binds the
-                    // name still hides whatever the scopes outside it call by
-                    // the same name.
-                    if depth > 0
-                        && self
-                            .scopes
-                            .get(depth - 1)
-                            .is_some_and(|scope| scope.names.contains(name.id.as_str()))
-                    {
-                        return None;
-                    }
-                }
-                let signature = found?.as_ref()?;
+                let signature = self.nested_signature(name.id.as_str())?;
                 Some((signature, signature.kind.implicit_bound()))
             }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
@@ -7383,6 +7401,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     qualified_name(self.classes.last().map(String::as_str), class.name.as_str());
                 self.classes.push(qualified);
                 self.lexical_scope.push(class.name.to_string());
+                self.lexical_is_class.push(true);
                 self.scopes.push(BoundNames::default());
                 self.class_bindings.push(BTreeMap::new());
                 self.class_scope_depths.push(self.scopes.len());
@@ -7390,6 +7409,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.class_scope_depths.pop();
                 self.class_bindings.pop();
                 self.scopes.pop();
+                self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.classes.pop();
                 self.bind_definition_in_class(class.name.as_str(), true);
@@ -7436,7 +7456,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.bindings.push(local);
                 self.scopes.push(BoundNames::of_function(function));
                 self.lexical_scope.push(function.name.to_string());
+                self.lexical_is_class.push(false);
                 self.visit_body(&function.body);
+                self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.scopes.pop();
                 self.bindings.pop();
@@ -7876,6 +7898,29 @@ mod tests {
         let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n\nclass Holder:\n    @dataclass\n    class C:\n        other: int = 2\n    def method(self):\n        return C()\n";
         let updated = fixed(source)?;
         assert!(updated.contains("return C(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_expression_scope_in_a_class_body_looks_past_the_class() -> Result<(), String> {
+        // A lambda and a comprehension each have a scope the class namespace
+        // is not part of, so `C` in them is the module-level class. Written
+        // directly in the body it is the nested one.
+        let holder = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n\nclass Holder:\n    @dataclass\n    class C:\n        other: int = 2\n";
+        for (written, expected) in [
+            (
+                "    factory = lambda: C()\n",
+                "    factory = lambda: C(value=1)\n",
+            ),
+            (
+                "    items = [C() for _ in range(1)]\n",
+                "    items = [C(value=1) for _ in range(1)]\n",
+            ),
+            ("    made = C()\n", "    made = C(other=2)\n"),
+        ] {
+            let updated = fixed(&format!("{holder}{written}"))?;
+            assert!(updated.ends_with(expected), "{updated}");
+        }
         Ok(())
     }
 

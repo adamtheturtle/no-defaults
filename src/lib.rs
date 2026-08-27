@@ -931,12 +931,46 @@ fn collect_local_class_offsets(
     found: &mut BTreeMap<String, TextSize>,
 ) {
     for statement in statements {
-        let Stmt::ClassDef(class) = statement else {
-            continue;
-        };
-        let qualified = qualified_name(prefix, class.name.as_str());
-        found.entry(qualified.clone()).or_insert(statement.start());
-        collect_local_class_offsets(&class.body, Some(&qualified), found);
+        match statement {
+            Stmt::ClassDef(class) => {
+                let qualified = qualified_name(prefix, class.name.as_str());
+                found.entry(qualified.clone()).or_insert(statement.start());
+                collect_local_class_offsets(&class.body, Some(&qualified), found);
+            }
+            // A suite does not open a namespace, so a class written inside one
+            // is spelled the same as a class beside it. A function body does
+            // open one, and a class in there is out of reach of these names.
+            Stmt::If(branch) => {
+                collect_local_class_offsets(&branch.body, prefix, found);
+                for clause in &branch.elif_else_clauses {
+                    collect_local_class_offsets(&clause.body, prefix, found);
+                }
+            }
+            Stmt::For(loop_) => {
+                collect_local_class_offsets(&loop_.body, prefix, found);
+                collect_local_class_offsets(&loop_.orelse, prefix, found);
+            }
+            Stmt::While(loop_) => {
+                collect_local_class_offsets(&loop_.body, prefix, found);
+                collect_local_class_offsets(&loop_.orelse, prefix, found);
+            }
+            Stmt::With(block) => collect_local_class_offsets(&block.body, prefix, found),
+            Stmt::Try(block) => {
+                collect_local_class_offsets(&block.body, prefix, found);
+                collect_local_class_offsets(&block.orelse, prefix, found);
+                collect_local_class_offsets(&block.finalbody, prefix, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_local_class_offsets(&handler.body, prefix, found);
+                }
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_local_class_offsets(&case.body, prefix, found);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

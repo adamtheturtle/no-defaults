@@ -2281,6 +2281,79 @@ fn source_error(path: &Path, error: String) -> Checked {
 /// `with`, a `try` — holds definitions that compete for the same name just as
 /// two definitions written side by side do. Only one of them survives, and
 /// which one is not knowable, so neither may have its defaults removed.
+/// Methods that some class body hands to `property()` under another name,
+/// as `(class, method)`.
+///
+/// Attribute access runs a property's getter, so a default on the method
+/// behind such an alias has no call site a fixer could update — and the class
+/// holding the alias may be written after the one defining the method, so this
+/// is gathered before checking starts.
+fn collect_property_aliased_methods(statements: &[Stmt], found: &mut BTreeSet<(String, String)>) {
+    for statement in statements {
+        match statement {
+            Stmt::ClassDef(class) => {
+                for inner in &class.body {
+                    let value = match inner {
+                        Stmt::Assign(assign) => Some(assign.value.as_ref()),
+                        Stmt::AnnAssign(assign) => assign.value.as_deref(),
+                        _ => None,
+                    };
+                    let Some(Expr::Call(call)) = value else {
+                        continue;
+                    };
+                    let names_property = match call.func.as_ref() {
+                        Expr::Name(name) => name.id.as_str() == "property",
+                        Expr::Attribute(attribute) => attribute.attr.as_str() == "property",
+                        _ => false,
+                    };
+                    if !names_property || call.arguments.args.len() != 1 {
+                        continue;
+                    }
+                    if let Expr::Attribute(source) = &call.arguments.args[0] {
+                        if let Expr::Name(owner) = source.value.as_ref() {
+                            found.insert((owner.id.to_string(), source.attr.to_string()));
+                        }
+                    }
+                }
+                collect_property_aliased_methods(&class.body, found);
+            }
+            Stmt::FunctionDef(function) => {
+                collect_property_aliased_methods(&function.body, found);
+            }
+            Stmt::If(branch) => {
+                collect_property_aliased_methods(&branch.body, found);
+                for clause in &branch.elif_else_clauses {
+                    collect_property_aliased_methods(&clause.body, found);
+                }
+            }
+            Stmt::For(loop_) => {
+                collect_property_aliased_methods(&loop_.body, found);
+                collect_property_aliased_methods(&loop_.orelse, found);
+            }
+            Stmt::While(loop_) => {
+                collect_property_aliased_methods(&loop_.body, found);
+                collect_property_aliased_methods(&loop_.orelse, found);
+            }
+            Stmt::With(block) => collect_property_aliased_methods(&block.body, found),
+            Stmt::Try(block) => {
+                collect_property_aliased_methods(&block.body, found);
+                collect_property_aliased_methods(&block.orelse, found);
+                collect_property_aliased_methods(&block.finalbody, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_property_aliased_methods(&handler.body, found);
+                }
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_property_aliased_methods(&case.body, found);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_repeated_functions(
     suite: &[Stmt],
     seen: &mut BTreeSet<String>,
@@ -2383,6 +2456,8 @@ fn check_source(
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
     collect_repeated_functions(parsed.suite(), &mut function_names, &mut repeated_functions);
+    let mut property_aliased_methods = BTreeSet::new();
+    collect_property_aliased_methods(parsed.suite(), &mut property_aliased_methods);
     let mut checker = Checker {
         path,
         source,
@@ -2396,6 +2471,7 @@ fn check_source(
         metaclass_classes: BTreeSet::new(),
         metaclass_definitions: BTreeSet::new(),
         repeated_functions,
+        property_aliased_methods,
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
         shape_namespaces: BTreeSet::new(),
@@ -2688,6 +2764,8 @@ struct Checker<'a> {
     /// Module-level functions defined more than once cannot share one safe
     /// call-site signature, so their defaults are reported but retained.
     repeated_functions: BTreeSet<String>,
+    /// Methods another class aliases as a property, by `(class, method)`.
+    property_aliased_methods: BTreeSet<(String, String)>,
     /// Classes already visited in this scope that carry fields through a
     /// configured base, so their local subclasses carry fields too.
     base_field_classes: BTreeSet<String>,
@@ -3410,6 +3488,28 @@ impl Checker<'_> {
         });
     }
 
+    /// Whether reading an attribute runs `function`, leaving no call site a
+    /// fixer could update. That holds for a `@property`, for a property alias
+    /// in the same class body, and for one in another class that names this
+    /// method.
+    fn descriptor_invokes(&self, function: &ast::StmtFunctionDef) -> bool {
+        if self.scope.class == ClassScope::None {
+            return false;
+        }
+        is_property(function, &self.aliases, &self.module_bindings)
+            || self.method_aliases.last().is_some_and(|aliases| {
+                aliases.get(function.name.as_str()).is_some_and(|aliases| {
+                    aliases
+                        .iter()
+                        .any(|alias| alias.kind == MethodAliasKind::Property)
+                })
+            })
+            || self.classes.last().is_some_and(|class| {
+                self.property_aliased_methods
+                    .contains(&(class.name.clone(), function.name.to_string()))
+            })
+    }
+
     fn check_function(&mut self, function: &ast::StmtFunctionDef) {
         if !self.enabled(function.name.as_str()) {
             return;
@@ -3418,15 +3518,7 @@ impl Checker<'_> {
         // locates the `def` line that a signature-wide directive sits on.
         let enclosing = self.header;
         self.header = Some(line_start(self.source, function.name.start()));
-        let descriptor_invoked = self.scope.class != ClassScope::None
-            && (is_property(function, &self.aliases, &self.module_bindings)
-                || self.method_aliases.last().is_some_and(|aliases| {
-                    aliases.get(function.name.as_str()).is_some_and(|aliases| {
-                        aliases
-                            .iter()
-                            .any(|alias| alias.kind == MethodAliasKind::Property)
-                    })
-                }));
+        let descriptor_invoked = self.descriptor_invokes(function);
         let implicitly_called = self.scope.class != ClassScope::None
             && self.scope.fields == Some(FieldStyle::Dataclass)
             && function.name.as_str() == "__post_init__";
@@ -3717,6 +3809,11 @@ impl Checker<'_> {
                 let Some(original_class) = &alias.original_class else {
                     continue;
                 };
+                // Reading the attribute runs the getter, so a property alias
+                // names no call for the fixer to rewrite.
+                if alias.kind == MethodAliasKind::Property {
+                    continue;
+                }
                 // Signatures record the class chain alone, so qualifying the
                 // source class through `lexical_scope` would name an enclosing
                 // function too and match nothing. Resolve it as a sibling of
@@ -3740,8 +3837,13 @@ impl Checker<'_> {
                 };
                 let mut signature = signature.clone();
                 signature.name.clone_from(&alias.name);
-                if let Callable::Method { class: owner, .. } = &mut signature.kind {
+                if let Callable::Method {
+                    class: owner,
+                    receiver,
+                } = &mut signature.kind
+                {
                     owner.clone_from(&class.qualified);
+                    *receiver = alias_receiver(alias.kind, *receiver);
                 }
                 inherited.push(signature);
             }
@@ -7343,6 +7445,28 @@ mod tests {
             assert_eq!(fixed(source)?, expected);
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_property_alias_in_another_class_retains_the_default() {
+        // Reading `Child.alias` runs `Base.target`, so there is no call site
+        // to carry the default to — wherever the alias is written.
+        for source in [
+            "class Base:\n    def target(self, value=1): pass\n    alias = property(target)\n",
+            "class Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = property(Base.target)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
     }
 
     #[test]

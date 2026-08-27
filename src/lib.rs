@@ -6015,7 +6015,12 @@ fn collect_star_bindings(
                     continue;
                 };
                 if let Some(symbols) = definitions.symbols.get(&file) {
-                    for name in symbols.keys().filter(|name| !name.starts_with('_')) {
+                    let explicit = explicit_all_names(&file);
+                    for name in symbols.keys().filter(|name| {
+                        explicit
+                            .as_ref()
+                            .map_or_else(|| !name.starts_with('_'), |all| all.contains(*name))
+                    }) {
                         bindings.insert(name.clone(), Binding::Symbol(file.clone(), name.clone()));
                     }
                 }
@@ -6038,6 +6043,56 @@ fn collect_star_bindings(
             _ => {}
         }
     }
+}
+
+/// A module's final literal `__all__`, when one is statically declared.
+fn explicit_all_names(path: &Path) -> Option<BTreeSet<String>> {
+    let source = read_source(path).ok()?;
+    let parsed = parse_module(&source).ok()?;
+    let mut names = None;
+    for statement in parsed.suite() {
+        let (value, replace) = match statement {
+            Stmt::Assign(assign) if assign.targets.iter().any(is_dunder_all) => {
+                (assign.value.as_ref(), true)
+            }
+            Stmt::AnnAssign(assign) if is_dunder_all(&assign.target) => {
+                (assign.value.as_deref()?, true)
+            }
+            Stmt::AugAssign(assign) if is_dunder_all(&assign.target) => {
+                (assign.value.as_ref(), false)
+            }
+            Stmt::Delete(delete) if delete.targets.iter().any(is_dunder_all) => {
+                names = None;
+                continue;
+            }
+            _ => continue,
+        };
+        let elements = match value {
+            Expr::List(list) => &list.elts,
+            Expr::Tuple(tuple) => &tuple.elts,
+            _ => {
+                names = None;
+                continue;
+            }
+        };
+        let literal: Option<BTreeSet<String>> = elements
+            .iter()
+            .map(|element| match element {
+                Expr::StringLiteral(string) => Some(string.value.to_string()),
+                _ => None,
+            })
+            .collect();
+        let Some(literal) = literal else {
+            names = None;
+            continue;
+        };
+        if replace {
+            names = Some(literal);
+        } else if let Some(names) = &mut names {
+            names.extend(literal);
+        }
+    }
+    names
 }
 
 /// The names a function or class body binds.

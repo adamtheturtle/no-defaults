@@ -2839,6 +2839,27 @@ fn star_imported_functions_have_their_calls_updated() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn star_imports_honor_literal_dunder_all() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    std::fs::write(&api, "__all__ = []\ndef target(value=1): return value\n")?;
+    let caller = directory.path().join("caller.py");
+    let source = "def target(): return 9\nfrom api import *\nassert target() == 9\n";
+    std::fs::write(&caller, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(&caller)?, source);
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "__all__ = []\ndef target(value): return value\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

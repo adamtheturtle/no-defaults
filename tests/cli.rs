@@ -781,6 +781,34 @@ fn methods_of_an_imported_class_are_updated() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+#[test]
+fn inherited_methods_of_imported_bases_are_updated() -> Result<(), Box<dyn std::error::Error>> {
+    for (import, base) in [("from api import Base", "Base"), ("import api", "api.Base")] {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("api.py"),
+            "class Base:\n    def target(self, value=1): return value\n",
+        )?;
+        let caller = directory.path().join("caller.py");
+        std::fs::write(
+            &caller,
+            format!(
+                "{import}\n\nclass Child({base}):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n"
+            ),
+        )?;
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{import}");
+        assert!(
+            std::fs::read_to_string(&caller)?.contains("self.target(value=1)"),
+            "{import}"
+        );
+    }
+    Ok(())
+}
+
 /// Two modules may each define `helper`. Resolving through the calling file's
 /// imports tells them apart, where matching on the bare name could not.
 #[test]

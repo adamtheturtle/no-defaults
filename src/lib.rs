@@ -815,13 +815,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         // of the same name, so a subclass written after it is built on the
         // local class. One written before it still reaches the import.
         let mut local_classes = BTreeMap::<String, TextSize>::new();
-        for statement in parsed.suite() {
-            if let Stmt::ClassDef(class) = statement {
-                local_classes
-                    .entry(class.name.to_string())
-                    .or_insert_with(|| statement.start());
-            }
-        }
+        collect_local_class_offsets(parsed.suite(), None, &mut local_classes);
         let mut class_aliases = BTreeMap::new();
         for statement in parsed.suite() {
             let defined_at = statement.start();
@@ -847,9 +841,25 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                         .bases
                         .insert((importer.clone(), class.name.to_string()), bases);
                 }
-                Stmt::Assign(assign) => {
+                // An annotated binding names a class just as a plain one
+                // does, so a subclass reaching the original through it is
+                // linked the same way.
+                Stmt::Assign(_) | Stmt::AnnAssign(_) => {
+                    let bound: Option<(&Expr, &[Expr])> = match statement {
+                        Stmt::Assign(assign) => {
+                            Some((assign.value.as_ref(), assign.targets.as_slice()))
+                        }
+                        Stmt::AnnAssign(assign) => assign
+                            .value
+                            .as_deref()
+                            .map(|value| (value, std::slice::from_ref(&*assign.target))),
+                        _ => None,
+                    };
+                    let Some((value, targets)) = bound else {
+                        continue;
+                    };
                     let Some(identity) = method_base_identity(
-                        &assign.value,
+                        value,
                         &importer,
                         &bindings,
                         &local_classes,
@@ -859,7 +869,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                     ) else {
                         continue;
                     };
-                    for target in &assign.targets {
+                    for target in targets {
                         if let Expr::Name(alias) = target {
                             class_aliases.insert(alias.id.to_string(), identity.clone());
                         }
@@ -912,6 +922,24 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
 }
 
 /// Resolve the class identity denoted by a base expression for method lookup.
+/// Where each class this file defines is written, under the name a base
+/// expression would spell it with — nested classes included, so `Outer.Inner`
+/// is found as readily as a class at the top level.
+fn collect_local_class_offsets(
+    statements: &[Stmt],
+    prefix: Option<&str>,
+    found: &mut BTreeMap<String, TextSize>,
+) {
+    for statement in statements {
+        let Stmt::ClassDef(class) = statement else {
+            continue;
+        };
+        let qualified = qualified_name(prefix, class.name.as_str());
+        found.entry(qualified.clone()).or_insert(statement.start());
+        collect_local_class_offsets(&class.body, Some(&qualified), found);
+    }
+}
+
 fn method_base_identity(
     expression: &Expr,
     importer: &Path,
@@ -945,9 +973,15 @@ fn method_base_identity(
         }),
         Expr::Attribute(attribute) => {
             let qualified = dotted_name(expression)?;
-            if methods
-                .keys()
-                .any(|(file, class)| file == importer && class == &qualified)
+            // A nested class holds the dotted name only once it is written,
+            // the same rule a simple name follows above. Before that the
+            // prefix still names whatever an import bound.
+            if local_classes
+                .get(&qualified)
+                .is_some_and(|local| *local < defined_at)
+                && methods
+                    .keys()
+                    .any(|(file, class)| file == importer && class == &qualified)
             {
                 return Some((importer.to_path_buf(), qualified));
             }

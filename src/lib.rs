@@ -3533,8 +3533,9 @@ impl Checker<'_> {
     /// reaches them only after that scope has been pushed, which recorded a
     /// module-level rebinding against the definition's own name and left the
     /// stale module shape to write a vanished base's fields into a subclass's
-    /// constructor. The walk below stops at a nested lambda, whose body binds
-    /// its own names.
+    /// constructor. The walk below stops at the body of a nested lambda, which
+    /// binds its own names; the defaults of that lambda's parameters are
+    /// evaluated in the header itself and count as part of it.
     fn invalidate_function_header(&mut self, function: &ast::StmtFunctionDef) {
         let mut bound = BoundNames::default();
         for decorator in &function.decorator_list {
@@ -7311,8 +7312,24 @@ impl<'a> Visitor<'a> for BoundNames {
         match expression {
             Expr::Named(named) => self.bind(&named.target),
             // As with a nested `def`, a lambda's parameters belong to the
-            // lambda, and the rewriter pushes a scope for it.
-            Expr::Lambda(_) => return,
+            // lambda, and the rewriter pushes a scope for it. Only the body
+            // runs in that scope: the parameter defaults are evaluated where
+            // the lambda is written, so a walrus among them binds out here and
+            // is collected before the body is left alone.
+            Expr::Lambda(lambda) => {
+                if let Some(parameters) = &lambda.parameters {
+                    for default in parameters
+                        .posonlyargs
+                        .iter()
+                        .chain(&parameters.args)
+                        .chain(&parameters.kwonlyargs)
+                        .filter_map(|parameter| parameter.default.as_deref())
+                    {
+                        self.visit_expr(default);
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         walk_expr(self, expression);
@@ -15695,6 +15712,59 @@ def b(x=1): pass  # type: ignore  # noqa
                 "{body}\n{updated}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_header_lambda_default_walrus_rebinds_the_enclosing_name() -> Result<(), String> {
+        // A lambda written in a `def` or `class` header keeps its body to
+        // itself, but the defaults of its parameters are evaluated where the
+        // lambda is, which is the enclosing namespace. Stopping at the lambda
+        // while collecting what a header rebinds left the alias table saved on
+        // the way into the definition holding the old name, and the table put
+        // back on the way out brought it with it, so the subclass below was
+        // built on a base the rebinding had taken away.
+        let shape_head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n\ndef deco(value):\n    return lambda target: target\n\ndef pick(value):\n    return object\n";
+        let shape_tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for header in [
+            "def helper(value=(lambda inner=(Alias := object): inner)):\n    pass\n",
+            "def helper() -> (lambda inner=(Alias := object): inner):\n    pass\n",
+            "@deco(lambda inner=(Alias := object): inner)\ndef helper():\n    pass\n",
+            "@deco(lambda inner=(Alias := object): inner)\nclass Holder:\n    pass\n",
+            "class Holder(pick(lambda inner=(Alias := object): inner)):\n    pass\n",
+        ] {
+            let updated = fixed(&format!("{shape_head}{header}{shape_tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{header}\n{updated}");
+        }
+        // A structural base is imported rather than assigned, so what the
+        // header takes away is the import itself.
+        let structural_head = "from dataclasses import dataclass\nfrom typing import Protocol\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\ndef deco(value):\n    return lambda target: target\n";
+        let structural_tail =
+            "\n@dataclass\nclass Child(Protocol):\n    value: int = 2\n\nChild()\n";
+        for header in [
+            "def helper(value=(lambda inner=(Protocol := Base): inner)):\n    pass\n",
+            "@deco(lambda inner=(Protocol := Base): inner)\ndef helper():\n    pass\n",
+            "@deco(lambda inner=(Protocol := Base): inner)\nclass Holder:\n    pass\n",
+        ] {
+            let updated = fixed(&format!("{structural_head}{header}{structural_tail}"))?;
+            assert!(!updated.contains("Child(value=2)"), "{header}\n{updated}");
+        }
+        // The lambda's body is another scope, so a walrus there leaves the
+        // enclosing name standing, as does a header with nothing rebound in
+        // it at all.
+        for header in [
+            "@deco(lambda: (Alias := object))\ndef helper():\n    pass\n",
+            "def helper(value=(lambda: (Alias := object))):\n    pass\n",
+            "",
+        ] {
+            let updated = fixed(&format!("{shape_head}{header}{shape_tail}"))?;
+            assert!(
+                updated.contains("Child(inherited=1, value=2)"),
+                "{header}\n{updated}"
+            );
+        }
+        let updated = fixed(&format!("{structural_head}{structural_tail}"))?;
+        assert!(updated.contains("Child(value=2)"), "{updated}");
         Ok(())
     }
 }

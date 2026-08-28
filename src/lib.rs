@@ -5780,6 +5780,7 @@ fn rewrite_calls(
         bindings: vec![BTreeMap::new()],
         class_bindings: Vec::new(),
         invalidated_bindings: BTreeSet::new(),
+        rebound_classes: BTreeSet::new(),
         known,
         classes: Vec::new(),
         class_scope_depths: Vec::new(),
@@ -6555,6 +6556,8 @@ struct Rewriter<'a> {
     class_bindings: Vec<BTreeMap<String, Binding>>,
     /// Imported module-scope names replaced by an assignment already visited.
     invalidated_bindings: BTreeSet<String>,
+    /// Module names that can no longer be assumed to denote an earlier class.
+    rebound_classes: BTreeSet<String>,
     known: &'a BTreeSet<&'a Path>,
     /// The class bodies being walked, so `self.method(...)` can be resolved.
     classes: Vec<String>,
@@ -6617,6 +6620,16 @@ impl Rewriter<'_> {
 
     /// Whether the nearest lexical binding for `name` is a nested callable.
     /// `None` means no enclosing scope binds it at all.
+    /// Record that a module-level name has been rebound: later calls reach
+    /// whatever replaced the import, and no longer the same-file class that
+    /// was defined under that name.
+    fn rebind_module_name(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            self.invalidated_bindings.insert(name.clone());
+            self.rebound_classes.insert(name);
+        }
+    }
+
     fn nested_callable(&self, name: &str) -> Option<bool> {
         self.nested_binding(name).map(|(callable, _)| callable)
     }
@@ -6790,6 +6803,9 @@ impl Rewriter<'_> {
                 .iter()
                 .any(|scope| scope.names.contains(name.id.as_str()))
             {
+                return None;
+            }
+            if self.rebound_classes.contains(name.id.as_str()) {
                 return None;
             }
             return match self.binding(name.id.as_str()) {
@@ -7243,7 +7259,13 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
     let mut bound = BoundNames::default();
     match statement {
         Stmt::Assign(assign) => assign.targets.iter().for_each(|target| bound.bind(target)),
-        Stmt::AnnAssign(assign) => bound.bind(&assign.target),
+        // `name: int` declares a type without binding anything, so whatever
+        // the name already refers to still stands.
+        Stmt::AnnAssign(assign) => {
+            if assign.value.is_some() {
+                bound.bind(&assign.target);
+            }
+        }
         Stmt::AugAssign(assign) => bound.bind(&assign.target),
         Stmt::For(loop_statement) => bound.bind(&loop_statement.target),
         Stmt::With(block) => {
@@ -7493,7 +7515,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // The assigned value is evaluated before its module-level
                 // target replaces whatever an import bound there.
                 walk_stmt(self, statement);
-                self.invalidated_bindings.extend(rebound_names(statement));
+                let rebound = rebound_names(statement);
+                self.invalidated_bindings.extend(rebound.iter().cloned());
+                self.rebound_classes.extend(rebound);
             }
             Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) => {
                 walk_stmt(self, statement);
@@ -7520,7 +7544,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     return;
                 }
                 self.visit_expr(&loop_statement.target);
-                self.invalidated_bindings.extend(rebound_names(statement));
+                self.rebind_module_name(rebound_names(statement));
                 self.visit_body(&loop_statement.body);
                 let statically_nonempty = match loop_statement.iter.as_ref() {
                     Expr::Tuple(tuple) => !tuple.elts.is_empty(),
@@ -7547,7 +7571,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         self.visit_expr(target);
                         let mut rebound = BoundNames::default();
                         rebound.bind(target);
-                        self.invalidated_bindings.extend(rebound.names);
+                        self.rebind_module_name(rebound.names);
                     }
                 }
                 self.visit_body(&block.body);
@@ -7689,7 +7713,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_pattern(&case.pattern);
                     let mut captures = BoundNames::default();
                     captures.visit_pattern(&case.pattern);
-                    self.invalidated_bindings.extend(captures.names);
+                    self.rebind_module_name(captures.names);
                     if let Some(guard) = &case.guard {
                         self.visit_expr(guard);
                         if matches!(
@@ -7791,6 +7815,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                 }
                 self.bind_definition_in_class(function.name.as_str(), false);
+                if module_scope {
+                    self.rebound_classes.insert(function.name.to_string());
+                }
                 if module_scope
                     && self
                         .bindings
@@ -7834,7 +7861,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&named.value);
                 let mut rebound = BoundNames::default();
                 rebound.bind(&named.target);
-                self.invalidated_bindings.extend(rebound.names);
+                self.rebind_module_name(rebound.names);
                 return;
             }
             Expr::Call(call) => {
@@ -8097,6 +8124,16 @@ mod tests {
     }
 
     #[test]
+    fn an_annotation_does_not_replace_a_class() -> Result<(), String> {
+        // `C: object` declares a type and binds nothing, so `C` is still the
+        // class defined above it.
+        let source = "class C:\n    def method(self, value=1): pass\n\nC: object\n\nC().method()\n";
+        let updated = fixed(source)?;
+        assert!(updated.ends_with("C().method(value=1)\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
     fn a_dead_branch_import_does_not_replace_a_function_binding() -> Result<(), String> {
         // The `if False:` suite never runs, so `target` is still the one the
         // function imported above it.
@@ -8114,6 +8151,24 @@ mod tests {
         fix_all(&[api, other, user.clone()])?;
         let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
         assert!(updated.ends_with("    target(alpha=1)\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebound_name_is_no_longer_the_class() -> Result<(), String> {
+        // A loop, context-manager, or walrus target replaces the class, so a
+        // later call through the name must not be rewritten against it.
+        for rebinding in [
+            "for C in items:\n    pass\n",
+            "with open(path) as C:\n    pass\n",
+            "if (C := make()):\n    pass\n",
+        ] {
+            let source = format!(
+                "class C:\n    def method(self, value=1): pass\n\n{rebinding}\nC().method()\n"
+            );
+            let updated = fixed(&source)?;
+            assert!(updated.ends_with("C().method()\n"), "{updated}");
+        }
         Ok(())
     }
 

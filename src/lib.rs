@@ -6095,6 +6095,16 @@ impl Rewriter<'_> {
 
     /// Whether the nearest lexical binding for `name` is a nested callable.
     /// `None` means no enclosing scope binds it at all.
+    /// Record that a module-level name has been rebound: later calls reach
+    /// whatever replaced the import, and no longer the same-file class that
+    /// was defined under that name.
+    fn rebind_module_name(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            self.invalidated_bindings.insert(name.clone());
+            self.rebound_classes.insert(name);
+        }
+    }
+
     fn nested_callable(&self, name: &str) -> Option<bool> {
         self.nested_binding(name).map(|(callable, _)| callable)
     }
@@ -6689,7 +6699,13 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
     let mut bound = BoundNames::default();
     match statement {
         Stmt::Assign(assign) => assign.targets.iter().for_each(|target| bound.bind(target)),
-        Stmt::AnnAssign(assign) => bound.bind(&assign.target),
+        // `name: int` declares a type without binding anything, so whatever
+        // the name already refers to still stands.
+        Stmt::AnnAssign(assign) => {
+            if assign.value.is_some() {
+                bound.bind(&assign.target);
+            }
+        }
         Stmt::AugAssign(assign) => bound.bind(&assign.target),
         Stmt::For(loop_statement) => bound.bind(&loop_statement.target),
         Stmt::With(block) => {
@@ -6952,7 +6968,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     return;
                 }
                 self.visit_expr(&loop_statement.target);
-                self.invalidated_bindings.extend(rebound_names(statement));
+                self.rebind_module_name(rebound_names(statement));
                 self.visit_body(&loop_statement.body);
                 let statically_nonempty = match loop_statement.iter.as_ref() {
                     Expr::Tuple(tuple) => !tuple.elts.is_empty(),
@@ -6979,7 +6995,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         self.visit_expr(target);
                         let mut rebound = BoundNames::default();
                         rebound.bind(target);
-                        self.invalidated_bindings.extend(rebound.names);
+                        self.rebind_module_name(rebound.names);
                     }
                 }
                 self.visit_body(&block.body);
@@ -7121,7 +7137,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_pattern(&case.pattern);
                     let mut captures = BoundNames::default();
                     captures.visit_pattern(&case.pattern);
-                    self.invalidated_bindings.extend(captures.names);
+                    self.rebind_module_name(captures.names);
                     if let Some(guard) = &case.guard {
                         self.visit_expr(guard);
                         if matches!(
@@ -7265,7 +7281,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&named.value);
                 let mut rebound = BoundNames::default();
                 rebound.bind(&named.target);
-                self.invalidated_bindings.extend(rebound.names);
+                self.rebind_module_name(rebound.names);
                 return;
             }
             Expr::Call(call) => {
@@ -7525,6 +7541,34 @@ mod tests {
             .into_iter()
             .map(|skip| skip.reason)
             .collect())
+    }
+
+    #[test]
+    fn an_annotation_does_not_replace_a_class() -> Result<(), String> {
+        // `C: object` declares a type and binds nothing, so `C` is still the
+        // class defined above it.
+        let source = "class C:\n    def method(self, value=1): pass\n\nC: object\n\nC().method()\n";
+        let updated = fixed(source)?;
+        assert!(updated.ends_with("C().method(value=1)\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebound_name_is_no_longer_the_class() -> Result<(), String> {
+        // A loop, context-manager, or walrus target replaces the class, so a
+        // later call through the name must not be rewritten against it.
+        for rebinding in [
+            "for C in items:\n    pass\n",
+            "with open(path) as C:\n    pass\n",
+            "if (C := make()):\n    pass\n",
+        ] {
+            let source = format!(
+                "class C:\n    def method(self, value=1): pass\n\n{rebinding}\nC().method()\n"
+            );
+            let updated = fixed(&source)?;
+            assert!(updated.ends_with("C().method()\n"), "{updated}");
+        }
+        Ok(())
     }
 
     #[test]

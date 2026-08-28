@@ -3424,6 +3424,28 @@ impl Checker<'_> {
         }
     }
 
+    /// Forget the recorded truth of every name `body` declares `global` and
+    /// then binds, because such a binding lands in the module namespace and
+    /// not in the body's own.
+    ///
+    /// A function body and a class body both need this, for opposite reasons.
+    /// A function body may never run at all, so nothing there can be trusted
+    /// to leave the module flag as it was; a class body always runs when the
+    /// class statement does, so its rebinding definitely happens. Either way
+    /// what a later module-level test would read is no longer the value
+    /// recorded here, and a branch settled by the stale flag picked a base the
+    /// subclass never had.
+    fn forget_globals_rebound_in<'b>(&mut self, body: &'b [Stmt])
+    where
+        BoundNames: Visitor<'b>,
+    {
+        let mut declared = BoundNames::default();
+        declared.visit_body(body);
+        for name in declared.globals.intersection(&declared.names) {
+            self.known_truthiness.remove(name);
+        }
+    }
+
     fn invalidate_target_aliases(&mut self, target: &Expr) {
         let mut bound = BoundNames::default();
         bound.bind(target);
@@ -3614,14 +3636,7 @@ impl Checker<'_> {
         Self: Visitor<'a>,
     {
         self.check_function(function);
-        // `global` sends a binding in the body to the module namespace rather
-        // than to the function's own, so a flag rebound under one is no longer
-        // the value a later module-level test would read.
-        let mut declared = BoundNames::default();
-        declared.visit_body(&function.body);
-        for name in declared.globals.intersection(&declared.names) {
-            self.known_truthiness.remove(name);
-        }
+        self.forget_globals_rebound_in(&function.body);
         let outer = self.scope;
         let outer_aliases = self.aliases.clone();
         let outer_local_classes = self.local_classes.clone();
@@ -4506,6 +4521,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
             Stmt::ClassDef(class) => {
+                self.forget_globals_rebound_in(&class.body);
                 let outer = self.scope;
                 let outer_aliases = self.aliases.clone();
                 let outer_local_classes = self.local_classes.clone();
@@ -15204,6 +15220,31 @@ def b(x=1): pass  # type: ignore  # noqa
             let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
             assert!(updated.contains(expected), "{caller}\n{updated}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_global_rebinding_drops_module_truthiness() -> Result<(), String> {
+        // A class body runs when its statement does, so a `global` binding
+        // there lands in the module namespace straight away and the flag a
+        // later module-level test reads is the one the body wrote. Keeping the
+        // recorded truth took the branch the class body had already ruled out,
+        // writing the wrong base's fields into `Child()`.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nFLAG = True\n";
+        let tail = "\nif FLAG:\n    Alias = Base\nelse:\n    Alias = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in [
+            "class Holder:\n    global FLAG\n    FLAG = False\n",
+            "class Holder:\n    global FLAG\n    for FLAG in [False]:\n        pass\n",
+            "class Holder:\n    global FLAG\n    print(FLAG := False)\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        // Without `global` the body binds a class attribute and the module
+        // flag stands, so the calls above are left alone by the rebinding
+        // rather than by the class body alone.
+        let updated = fixed(&format!("{head}class Holder:\n    FLAG = False\n{tail}"))?;
+        assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
         Ok(())
     }
 }

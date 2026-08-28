@@ -1915,6 +1915,50 @@ fn module_named_expressions_invalidate_imported_callable_bindings(
 }
 
 #[test]
+fn module_comprehension_walruses_invalidate_imports() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let api_source = "def target(value=1): return value\n";
+    std::fs::write(&api, api_source)?;
+    let caller = directory.path().join("caller.py");
+    let caller_source =
+        "from api import target\n[(target := lambda: 2) for _ in [0]]\nassert target() == 2\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(api)?, api_source);
+    assert_eq!(std::fs::read_to_string(caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
+fn lambda_walruses_do_not_invalidate_module_imports() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(
+        &caller,
+        "from api import target\nlocal = lambda: (target := lambda: 2)()\nassert target() == 1\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import target\nlocal = lambda: (target := lambda: 2)()\nassert target(value=1) == 1\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn module_for_targets_invalidate_imported_bindings_inside_the_body(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

@@ -4393,6 +4393,39 @@ fn later_class_methods_do_not_shadow_earlier_calls() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn conditional_class_deletes_preserve_prior_local_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for control_flow in [
+        "    condition = False\n    if condition:\n        del target",
+        "    try:\n        pass\n    except Exception:\n        del target",
+        "    values = []\n    for _ in values:\n        del target",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        let api_source = "def target(value=1): return value\n";
+        let caller_source = format!(
+            "from api import target\nclass C:\n    target = lambda: 9\n{control_flow}\n    result = target()\nassert C.result == 9\n"
+        );
+        std::fs::write(&api, api_source)?;
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(1), "{control_flow}");
+        assert_eq!(std::fs::read_to_string(api)?, api_source, "{control_flow}");
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            caller_source,
+            "{control_flow}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn later_class_imports_do_not_shadow_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(directory.path().join("api.py"), "def target(): return 5\n")?;

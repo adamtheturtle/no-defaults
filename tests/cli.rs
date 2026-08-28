@@ -3064,6 +3064,32 @@ fn dotted_imports_derive_the_top_package_from_the_resolved_module(
 }
 
 #[test]
+fn dotted_submodules_take_precedence_over_same_named_package_classes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("a");
+    std::fs::create_dir(&package)?;
+    std::fs::write(
+        package.join("__init__.py"),
+        "class b:\n    @staticmethod\n    def func(value=1): return value\n",
+    )?;
+    std::fs::write(package.join("b.py"), "def func(value=2): return value\n")?;
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&caller, "import a.b\nassert a.b.func() == 2\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import a.b\nassert a.b.func(value=2) == 2\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn local_imports_resolve_before_later_assignments() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

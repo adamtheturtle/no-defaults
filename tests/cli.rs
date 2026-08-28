@@ -2567,6 +2567,46 @@ fn unresolved_dotted_imports_invalidate_the_top_level_binding(
 }
 
 #[test]
+fn stale_dotted_keys_do_not_resolve_replacement_imports() -> Result<(), Box<dyn std::error::Error>>
+{
+    for replacement in ["from external import pkg", "import external as pkg"] {
+        let directory = tempfile::tempdir()?;
+        let package = directory.path().join("pkg");
+        let external = directory.path().join("external.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::create_dir(&package)?;
+        let api_source = "def target(value=1): return value\n";
+        let caller_source =
+            format!("import pkg.api\n{replacement}\nassert pkg.api.target() == 9\n");
+        std::fs::write(package.join("__init__.py"), "")?;
+        std::fs::write(package.join("api.py"), api_source)?;
+        std::fs::write(
+            &external,
+            "class pkg:\n    class api:\n        target = lambda: 9\n",
+        )?;
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(&package)
+            .arg(&caller)
+            .output()?;
+        assert_eq!(output.status.code(), Some(1), "{replacement}");
+        assert_eq!(
+            std::fs::read_to_string(package.join("api.py"))?,
+            api_source,
+            "{replacement}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            caller_source,
+            "{replacement}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn class_for_targets_shadow_imported_callables_inside_the_body(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

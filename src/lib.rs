@@ -851,6 +851,15 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
             let defined_at = statement.start();
             match statement {
                 Stmt::ClassDef(class) => {
+                    let methods = definitions
+                        .methods
+                        .entry((importer.clone(), class.name.to_string()))
+                        .or_default();
+                    for statement in &class.body {
+                        if let Stmt::FunctionDef(function) = statement {
+                            methods.entry(function.name.to_string()).or_insert(None);
+                        }
+                    }
                     let bases = class
                         .arguments
                         .iter()

@@ -5069,3 +5069,67 @@ fn match_captures_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn 
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
+
+// A rebinding nested in class-body control flow may or may not run, so unlike
+// a nested `del` — which at worst leaves the earlier binding standing — it can
+// leave the name pointing at something else entirely. Module and function
+// scopes both decline to rewrite such a call, and a class body matches them.
+#[test]
+fn conditional_class_rebindings_leave_prior_import_calls_alone(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for body in [
+        "    condition = False\n    if condition:\n        target = lambda: 9",
+        "    try:\n        pass\n    except Exception:\n        target = lambda: 9",
+        "    values = []\n    for _ in values:\n        target = lambda: 9",
+        "    values = []\n    if values:\n        for target in values:\n            pass",
+        "    subject = 0\n    match subject:\n        case 1:\n            target = lambda: 9",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        let api_source = "def target(value=1):\n    return value\n";
+        let caller_source =
+            format!("class C:\n    from api import target\n{body}\n    result = target()\n");
+        std::fs::write(&api, api_source)?;
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(1), "{body}");
+        assert_eq!(std::fs::read_to_string(api)?, api_source, "{body}");
+        assert_eq!(std::fs::read_to_string(caller)?, caller_source, "{body}");
+    }
+    Ok(())
+}
+
+// `target: int` in a class body annotates without binding, so the import above
+// it is still what the call below it reaches.
+#[test]
+fn class_annotations_without_values_keep_import_bindings() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1):\n    return value\n")?;
+    std::fs::write(
+        &caller,
+        "class C:\n    from api import target\n    target: int\n    result = target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value):\n    return value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "class C:\n    from api import target\n    target: int\n    result = target(value=1)\n"
+    );
+    Ok(())
+}

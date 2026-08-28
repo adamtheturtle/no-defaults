@@ -4423,6 +4423,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer_local_classes = self.local_classes.clone();
                 let outer_metaclass_classes = self.metaclass_classes.clone();
                 let outer_metaclass_definitions = self.metaclass_definitions.clone();
+                let outer_repeated_functions = self.repeated_functions.clone();
+                let mut method_names = BTreeSet::new();
+                let mut repeated_methods = BTreeSet::new();
+                collect_repeated_functions(&class.body, &mut method_names, &mut repeated_methods);
+                self.repeated_functions = repeated_methods;
                 let old_header = self.header;
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
@@ -4506,6 +4511,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.metaclass_classes = outer_metaclass_classes;
                 self.record_metaclass_construction(class);
                 self.metaclass_definitions = outer_metaclass_definitions;
+                self.repeated_functions = outer_repeated_functions;
                 if defines_metaclass(class, &self.metaclass_definitions) {
                     self.metaclass_definitions.insert(class.name.to_string());
                 } else {

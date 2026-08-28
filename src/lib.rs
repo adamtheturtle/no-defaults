@@ -841,16 +841,14 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
-        let local_classes: BTreeSet<String> = parsed
-            .suite()
-            .iter()
-            .filter_map(|statement| match statement {
-                Stmt::ClassDef(class) => Some(class.name.to_string()),
-                _ => None,
-            })
-            .collect();
+        // A class the file defines itself takes the name over from an import
+        // of the same name, so a subclass written after it is built on the
+        // local class. One written before it still reaches the import.
+        let mut local_classes = BTreeMap::<String, TextSize>::new();
+        collect_local_class_offsets(parsed.suite(), None, &mut local_classes);
         let mut class_aliases = BTreeMap::new();
         for statement in parsed.suite() {
+            let defined_at = statement.start();
             match statement {
                 Stmt::ClassDef(class) => {
                     let bases = class
@@ -863,6 +861,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                                 &importer,
                                 &bindings,
                                 &local_classes,
+                                defined_at,
                                 &class_aliases,
                                 &definitions.methods,
                             )
@@ -872,18 +871,35 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                         .bases
                         .insert((importer.clone(), class.name.to_string()), bases);
                 }
-                Stmt::Assign(assign) => {
+                // An annotated binding names a class just as a plain one
+                // does, so a subclass reaching the original through it is
+                // linked the same way.
+                Stmt::Assign(_) | Stmt::AnnAssign(_) => {
+                    let bound: Option<(&Expr, &[Expr])> = match statement {
+                        Stmt::Assign(assign) => {
+                            Some((assign.value.as_ref(), assign.targets.as_slice()))
+                        }
+                        Stmt::AnnAssign(assign) => assign
+                            .value
+                            .as_deref()
+                            .map(|value| (value, std::slice::from_ref(&*assign.target))),
+                        _ => None,
+                    };
+                    let Some((value, targets)) = bound else {
+                        continue;
+                    };
                     let Some(identity) = method_base_identity(
-                        &assign.value,
+                        value,
                         &importer,
                         &bindings,
                         &local_classes,
+                        defined_at,
                         &class_aliases,
                         &definitions.methods,
                     ) else {
                         continue;
                     };
-                    for target in &assign.targets {
+                    for target in targets {
                         if let Expr::Name(alias) = target {
                             class_aliases.insert(alias.id.to_string(), identity.clone());
                         }
@@ -937,11 +953,64 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
 }
 
 /// Resolve the class identity denoted by a base expression for method lookup.
+/// Where each class this file defines is written, under the name a base
+/// expression would spell it with — nested classes included, so `Outer.Inner`
+/// is found as readily as a class at the top level.
+fn collect_local_class_offsets(
+    statements: &[Stmt],
+    prefix: Option<&str>,
+    found: &mut BTreeMap<String, TextSize>,
+) {
+    for statement in statements {
+        match statement {
+            Stmt::ClassDef(class) => {
+                let qualified = qualified_name(prefix, class.name.as_str());
+                found.entry(qualified.clone()).or_insert(statement.start());
+                collect_local_class_offsets(&class.body, Some(&qualified), found);
+            }
+            // A suite does not open a namespace, so a class written inside one
+            // is spelled the same as a class beside it. A function body does
+            // open one, and a class in there is out of reach of these names.
+            Stmt::If(branch) => {
+                collect_local_class_offsets(&branch.body, prefix, found);
+                for clause in &branch.elif_else_clauses {
+                    collect_local_class_offsets(&clause.body, prefix, found);
+                }
+            }
+            Stmt::For(loop_) => {
+                collect_local_class_offsets(&loop_.body, prefix, found);
+                collect_local_class_offsets(&loop_.orelse, prefix, found);
+            }
+            Stmt::While(loop_) => {
+                collect_local_class_offsets(&loop_.body, prefix, found);
+                collect_local_class_offsets(&loop_.orelse, prefix, found);
+            }
+            Stmt::With(block) => collect_local_class_offsets(&block.body, prefix, found),
+            Stmt::Try(block) => {
+                collect_local_class_offsets(&block.body, prefix, found);
+                collect_local_class_offsets(&block.orelse, prefix, found);
+                collect_local_class_offsets(&block.finalbody, prefix, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_local_class_offsets(&handler.body, prefix, found);
+                }
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_local_class_offsets(&case.body, prefix, found);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn method_base_identity(
     expression: &Expr,
     importer: &Path,
     bindings: &BTreeMap<String, Binding>,
-    local_classes: &BTreeSet<String>,
+    local_classes: &BTreeMap<String, TextSize>,
+    defined_at: TextSize,
     aliases: &BTreeMap<String, (PathBuf, String)>,
     methods: &BTreeMap<(PathBuf, String), BTreeMap<String, Option<Signature>>>,
 ) -> Option<(PathBuf, String)> {
@@ -951,22 +1020,33 @@ fn method_base_identity(
             importer,
             bindings,
             local_classes,
+            defined_at,
             aliases,
             methods,
         ),
         Expr::Name(name) => aliases.get(name.id.as_str()).cloned().or_else(|| {
+            let local = local_classes.get(name.id.as_str());
+            // A class already defined here holds the name, whatever an import
+            // of the same name bound earlier.
+            if local.is_some_and(|local| *local < defined_at) {
+                return Some((importer.to_path_buf(), name.id.to_string()));
+            }
             match bindings.get(name.id.as_str()) {
                 Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
-                _ => local_classes
-                    .contains(name.id.as_str())
-                    .then(|| (importer.to_path_buf(), name.id.to_string())),
+                _ => local.map(|_| (importer.to_path_buf(), name.id.to_string())),
             }
         }),
         Expr::Attribute(attribute) => {
             let qualified = dotted_name(expression)?;
-            if methods
-                .keys()
-                .any(|(file, class)| file == importer && class == &qualified)
+            // A nested class holds the dotted name only once it is written,
+            // the same rule a simple name follows above. Before that the
+            // prefix still names whatever an import bound.
+            if local_classes
+                .get(&qualified)
+                .is_some_and(|local| *local < defined_at)
+                && methods
+                    .keys()
+                    .any(|(file, class)| file == importer && class == &qualified)
             {
                 return Some((importer.to_path_buf(), qualified));
             }
@@ -2379,6 +2459,187 @@ fn source_error(path: &Path, error: String) -> Checked {
 /// `with`, a `try` — holds definitions that compete for the same name just as
 /// two definitions written side by side do. Only one of them survives, and
 /// which one is not knowable, so neither may have its defaults removed.
+/// The local names that mean the `property` builtin: the name itself and
+/// anything an import bound it to.
+///
+/// This runs before the alias table exists, so the import statements are read
+/// directly. A module-qualified `builtins.property` needs no entry — the
+/// attribute is matched by its own name.
+fn property_alias_names(statements: &[Stmt], names: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            Stmt::ImportFrom(import) => {
+                for alias in &import.names {
+                    if alias.name.as_str() == "property" {
+                        names.insert(
+                            alias
+                                .asname
+                                .as_ref()
+                                .map_or_else(|| alias.name.to_string(), ToString::to_string),
+                        );
+                    }
+                }
+            }
+            Stmt::ClassDef(class) => property_alias_names(&class.body, names),
+            Stmt::FunctionDef(function) => property_alias_names(&function.body, names),
+            Stmt::If(branch) => {
+                property_alias_names(&branch.body, names);
+                for clause in &branch.elif_else_clauses {
+                    property_alias_names(&clause.body, names);
+                }
+            }
+            Stmt::For(loop_) => {
+                property_alias_names(&loop_.body, names);
+                property_alias_names(&loop_.orelse, names);
+            }
+            Stmt::While(loop_) => {
+                property_alias_names(&loop_.body, names);
+                property_alias_names(&loop_.orelse, names);
+            }
+            Stmt::With(block) => property_alias_names(&block.body, names),
+            Stmt::Try(block) => {
+                property_alias_names(&block.body, names);
+                property_alias_names(&block.orelse, names);
+                property_alias_names(&block.finalbody, names);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    property_alias_names(&handler.body, names);
+                }
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    property_alias_names(&case.body, names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The methods a single class body hands to `property()` under another name,
+/// including the ones written inside its control flow.
+fn class_property_aliases(
+    statements: &[Stmt],
+    names: &BTreeSet<String>,
+    found: &mut BTreeSet<(String, String)>,
+) {
+    for statement in statements {
+        let value = match statement {
+            Stmt::Assign(assign) => Some(assign.value.as_ref()),
+            Stmt::AnnAssign(assign) => assign.value.as_deref(),
+            Stmt::If(branch) => {
+                class_property_aliases(&branch.body, names, found);
+                for clause in &branch.elif_else_clauses {
+                    class_property_aliases(&clause.body, names, found);
+                }
+                None
+            }
+            Stmt::For(loop_) => {
+                class_property_aliases(&loop_.body, names, found);
+                class_property_aliases(&loop_.orelse, names, found);
+                None
+            }
+            Stmt::While(loop_) => {
+                class_property_aliases(&loop_.body, names, found);
+                class_property_aliases(&loop_.orelse, names, found);
+                None
+            }
+            Stmt::With(block) => {
+                class_property_aliases(&block.body, names, found);
+                None
+            }
+            Stmt::Try(block) => {
+                class_property_aliases(&block.body, names, found);
+                class_property_aliases(&block.orelse, names, found);
+                class_property_aliases(&block.finalbody, names, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    class_property_aliases(&handler.body, names, found);
+                }
+                None
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    class_property_aliases(&case.body, names, found);
+                }
+                None
+            }
+            _ => None,
+        };
+        let Some(Expr::Call(call)) = value else {
+            continue;
+        };
+        let names_property = match call.func.as_ref() {
+            Expr::Name(name) => names.contains(name.id.as_str()),
+            Expr::Attribute(attribute) => attribute.attr.as_str() == "property",
+            _ => false,
+        };
+        if !names_property || call.arguments.args.len() != 1 {
+            continue;
+        }
+        if let Expr::Attribute(source) = &call.arguments.args[0] {
+            if let Expr::Name(owner) = source.value.as_ref() {
+                found.insert((owner.id.to_string(), source.attr.to_string()));
+            }
+        }
+    }
+}
+
+/// Methods that some class body hands to `property()` under another name,
+/// as `(class, method)`.
+///
+/// Attribute access runs a property's getter, so a default on the method
+/// behind such an alias has no call site a fixer could update — and the class
+/// holding the alias may be written after the one defining the method, so this
+/// is gathered before checking starts.
+fn collect_property_aliased_methods(
+    statements: &[Stmt],
+    names: &BTreeSet<String>,
+    found: &mut BTreeSet<(String, String)>,
+) {
+    for statement in statements {
+        match statement {
+            Stmt::ClassDef(class) => {
+                class_property_aliases(&class.body, names, found);
+                collect_property_aliased_methods(&class.body, names, found);
+            }
+            Stmt::FunctionDef(function) => {
+                collect_property_aliased_methods(&function.body, names, found);
+            }
+            Stmt::If(branch) => {
+                collect_property_aliased_methods(&branch.body, names, found);
+                for clause in &branch.elif_else_clauses {
+                    collect_property_aliased_methods(&clause.body, names, found);
+                }
+            }
+            Stmt::For(loop_) => {
+                collect_property_aliased_methods(&loop_.body, names, found);
+                collect_property_aliased_methods(&loop_.orelse, names, found);
+            }
+            Stmt::While(loop_) => {
+                collect_property_aliased_methods(&loop_.body, names, found);
+                collect_property_aliased_methods(&loop_.orelse, names, found);
+            }
+            Stmt::With(block) => collect_property_aliased_methods(&block.body, names, found),
+            Stmt::Try(block) => {
+                collect_property_aliased_methods(&block.body, names, found);
+                collect_property_aliased_methods(&block.orelse, names, found);
+                collect_property_aliased_methods(&block.finalbody, names, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_property_aliased_methods(&handler.body, names, found);
+                }
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_property_aliased_methods(&case.body, names, found);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_repeated_functions(
     suite: &[Stmt],
     seen: &mut BTreeSet<String>,
@@ -2481,6 +2742,14 @@ fn check_source(
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
     collect_repeated_functions(parsed.suite(), &mut function_names, &mut repeated_functions);
+    let mut property_names = BTreeSet::from(["property".to_owned()]);
+    property_alias_names(parsed.suite(), &mut property_names);
+    let mut property_aliased_methods = BTreeSet::new();
+    collect_property_aliased_methods(
+        parsed.suite(),
+        &property_names,
+        &mut property_aliased_methods,
+    );
     let mut checker = Checker {
         path,
         source,
@@ -2494,6 +2763,7 @@ fn check_source(
         metaclass_classes: BTreeSet::new(),
         metaclass_definitions: BTreeSet::new(),
         repeated_functions,
+        property_aliased_methods,
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
         shape_namespaces: BTreeSet::new(),
@@ -2786,6 +3056,8 @@ struct Checker<'a> {
     /// Module-level functions defined more than once cannot share one safe
     /// call-site signature, so their defaults are reported but retained.
     repeated_functions: BTreeSet<String>,
+    /// Methods another class aliases as a property, by `(class, method)`.
+    property_aliased_methods: BTreeSet<(String, String)>,
     /// Classes already visited in this scope that carry fields through a
     /// configured base, so their local subclasses carry fields too.
     base_field_classes: BTreeSet<String>,
@@ -3514,6 +3786,28 @@ impl Checker<'_> {
         });
     }
 
+    /// Whether reading an attribute runs `function`, leaving no call site a
+    /// fixer could update. That holds for a `@property`, for a property alias
+    /// in the same class body, and for one in another class that names this
+    /// method.
+    fn descriptor_invokes(&self, function: &ast::StmtFunctionDef) -> bool {
+        if self.scope.class == ClassScope::None {
+            return false;
+        }
+        is_property(function, &self.aliases, &self.module_bindings)
+            || self.method_aliases.last().is_some_and(|aliases| {
+                aliases.get(function.name.as_str()).is_some_and(|aliases| {
+                    aliases
+                        .iter()
+                        .any(|alias| alias.kind == MethodAliasKind::Property)
+                })
+            })
+            || self.classes.last().is_some_and(|class| {
+                self.property_aliased_methods
+                    .contains(&(class.name.clone(), function.name.to_string()))
+            })
+    }
+
     fn check_function(&mut self, function: &ast::StmtFunctionDef) {
         if !self.enabled(function.name.as_str()) {
             return;
@@ -3522,15 +3816,7 @@ impl Checker<'_> {
         // locates the `def` line that a signature-wide directive sits on.
         let enclosing = self.header;
         self.header = Some(line_start(self.source, function.name.start()));
-        let descriptor_invoked = self.scope.class != ClassScope::None
-            && (is_property(function, &self.aliases, &self.module_bindings)
-                || self.method_aliases.last().is_some_and(|aliases| {
-                    aliases.get(function.name.as_str()).is_some_and(|aliases| {
-                        aliases
-                            .iter()
-                            .any(|alias| alias.kind == MethodAliasKind::Property)
-                    })
-                }));
+        let descriptor_invoked = self.descriptor_invokes(function);
         let implicitly_called = self.scope.class != ClassScope::None
             && self.scope.fields == Some(FieldStyle::Dataclass)
             && function.name.as_str() == "__post_init__";
@@ -3626,7 +3912,7 @@ impl Checker<'_> {
     fn record_signature(&mut self, function: &ast::StmtFunctionDef, removed: Vec<Removed>) {
         let parameter_name =
             |parameter: &ast::ParameterWithDefault| parameter.parameter.name.to_string();
-        let signature = Signature {
+        let mut signature = Signature {
             name: if self.scope.class == ClassScope::None {
                 qualified_lexical_name(&self.lexical_scope, function.name.as_str())
             } else {
@@ -3656,20 +3942,40 @@ impl Checker<'_> {
                 .method_aliases
                 .last()
                 .and_then(|aliases| aliases.get(function.name.as_str()))
+                .cloned()
             {
+                // Another name still takes the receiver the method itself
+                // declared, so read that before a same-name wrapper rewrites
+                // it below.
+                let declared = match &signature.kind {
+                    Callable::Method { receiver, .. } => *receiver,
+                    _ => Receiver::None,
+                };
+                // `target = staticmethod(target)` rebinds the method's own
+                // name rather than adding a second one. The wrapper decides
+                // how the one name is called, so it belongs on the signature
+                // already being emitted: a second signature under that name
+                // would collide with it and lose both.
+                if let Some(rebound) = aliases
+                    .iter()
+                    .rev()
+                    .find(|alias| alias.name == function.name.as_str())
+                {
+                    if let Callable::Method { receiver, .. } = &mut signature.kind {
+                        *receiver = alias_receiver(rebound.kind, declared);
+                    }
+                }
                 self.signatures.extend(aliases.iter().filter_map(|alias| {
-                    if alias.original_class.is_some() || alias.kind == MethodAliasKind::Property {
+                    if alias.original_class.is_some()
+                        || alias.kind == MethodAliasKind::Property
+                        || alias.name == function.name.as_str()
+                    {
                         return None;
                     }
                     let mut alias_signature = signature.clone();
                     alias_signature.name.clone_from(&alias.name);
                     if let Callable::Method { receiver, .. } = &mut alias_signature.kind {
-                        *receiver = match alias.kind {
-                            MethodAliasKind::Direct => *receiver,
-                            MethodAliasKind::Static => Receiver::None,
-                            MethodAliasKind::Class => Receiver::Class,
-                            MethodAliasKind::Property => unreachable!(),
-                        };
+                        *receiver = alias_receiver(alias.kind, declared);
                     }
                     Some(alias_signature)
                 }));
@@ -3805,7 +4111,23 @@ impl Checker<'_> {
                 let Some(original_class) = &alias.original_class else {
                     continue;
                 };
-                let original_class = qualified_class_name(&self.lexical_scope, original_class);
+                // Reading the attribute runs the getter, so a property alias
+                // names no call for the fixer to rewrite.
+                if alias.kind == MethodAliasKind::Property {
+                    continue;
+                }
+                // Signatures record the class chain alone, so qualifying the
+                // source class through `lexical_scope` would name an enclosing
+                // function too and match nothing. Resolve it as a sibling of
+                // the class being collected instead.
+                let original_class = qualified_name(
+                    self.classes
+                        .len()
+                        .checked_sub(2)
+                        .and_then(|parent| self.classes.get(parent))
+                        .map(|parent| parent.qualified.as_str()),
+                    original_class,
+                );
                 let Some(signature) = self.signatures.iter().find(|signature| {
                     signature.name == *method
                         && matches!(
@@ -3817,8 +4139,13 @@ impl Checker<'_> {
                 };
                 let mut signature = signature.clone();
                 signature.name.clone_from(&alias.name);
-                if let Callable::Method { class: owner, .. } = &mut signature.kind {
+                if let Callable::Method {
+                    class: owner,
+                    receiver,
+                } = &mut signature.kind
+                {
                     owner.clone_from(&class.qualified);
+                    *receiver = alias_receiver(alias.kind, *receiver);
                 }
                 inherited.push(signature);
             }
@@ -4005,7 +4332,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 );
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
-                self.method_aliases.push(class_method_aliases(class));
+                let context = AliasContext {
+                    aliases: &self.aliases,
+                    module_bindings: &self.module_bindings,
+                };
+                self.method_aliases
+                    .push(class_method_aliases(class, context));
                 if self.collect_signatures {
                     let inherited = self.inherited_fields(class, style);
                     // A base of this file's own contributes its fields ahead of
@@ -4695,15 +5027,38 @@ fn generates_init(
 /// Direct method aliases created in a class namespace. Python applies the
 /// descriptor protocol to both names, so calls through either spelling have
 /// the same implicit receiver and parameters.
-fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<MethodAlias>> {
+/// How a call through an alias passes its receiver. A `staticmethod` wrapper
+/// takes none and a `classmethod` wrapper takes the class, whatever the
+/// original method declared.
+fn alias_receiver(kind: MethodAliasKind, original: Receiver) -> Receiver {
+    match kind {
+        MethodAliasKind::Direct | MethodAliasKind::Property => original,
+        MethodAliasKind::Static => Receiver::None,
+        MethodAliasKind::Class => Receiver::Class,
+    }
+}
+
+/// What class-body alias collection reads to recognise a descriptor wrapper
+/// written under an alias or qualified through a `builtins` import.
+#[derive(Clone, Copy)]
+struct AliasContext<'a> {
+    aliases: &'a Aliases,
+    module_bindings: &'a BTreeSet<String>,
+}
+
+fn class_method_aliases(
+    class: &ast::StmtClassDef,
+    context: AliasContext<'_>,
+) -> BTreeMap<String, Vec<MethodAlias>> {
     let mut aliases = BTreeMap::<String, Vec<MethodAlias>>::new();
     let mut origins = BTreeMap::<String, (String, MethodAliasKind, Option<String>)>::new();
-    collect_class_method_aliases(&class.body, &mut aliases, &mut origins);
+    collect_class_method_aliases(&class.body, context, &mut aliases, &mut origins);
     aliases
 }
 
 fn collect_class_method_aliases(
     statements: &[Stmt],
+    context: AliasContext<'_>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
     origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
@@ -4711,17 +5066,17 @@ fn collect_class_method_aliases(
         match statement {
             Stmt::Assign(assign) => {
                 for target in &assign.targets {
-                    record_method_alias(target, &assign.value, aliases, origins);
+                    record_method_alias(target, &assign.value, context, aliases, origins);
                 }
             }
             Stmt::AnnAssign(assign) => {
                 if let Some(value) = &assign.value {
-                    record_method_alias(&assign.target, value, aliases, origins);
+                    record_method_alias(&assign.target, value, context, aliases, origins);
                 }
             }
             Stmt::Expr(expression) => {
                 if let Expr::Named(named) = expression.value.as_ref() {
-                    record_method_alias(&named.target, &named.value, aliases, origins);
+                    record_method_alias(&named.target, &named.value, context, aliases, origins);
                 }
             }
             Stmt::If(branch) => {
@@ -4732,23 +5087,26 @@ fn collect_class_method_aliases(
                             .iter()
                             .map(|clause| clause.body.as_slice()),
                     ),
+                    context,
                     aliases,
                     origins,
                 );
             }
             Stmt::For(loop_) => collect_alias_branches(
                 [loop_.body.as_slice(), loop_.orelse.as_slice()],
+                context,
                 aliases,
                 origins,
             ),
             Stmt::While(loop_) => collect_alias_branches(
                 [loop_.body.as_slice(), loop_.orelse.as_slice()],
+                context,
                 aliases,
                 origins,
             ),
             Stmt::With(block) => {
                 let mut branch_origins = origins.clone();
-                collect_class_method_aliases(&block.body, aliases, &mut branch_origins);
+                collect_class_method_aliases(&block.body, context, aliases, &mut branch_origins);
             }
             Stmt::Try(block) => {
                 let handlers = block.handlers.iter().map(|handler| {
@@ -4763,12 +5121,14 @@ fn collect_class_method_aliases(
                     ]
                     .into_iter()
                     .chain(handlers),
+                    context,
                     aliases,
                     origins,
                 );
             }
             Stmt::Match(block) => collect_alias_branches(
                 block.cases.iter().map(|case| case.body.as_slice()),
+                context,
                 aliases,
                 origins,
             ),
@@ -4779,24 +5139,28 @@ fn collect_class_method_aliases(
 
 fn collect_alias_branches<'a>(
     branches: impl IntoIterator<Item = &'a [Stmt]>,
+    context: AliasContext<'_>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
     origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     for branch in branches {
         let mut branch_origins = origins.clone();
-        collect_class_method_aliases(branch, aliases, &mut branch_origins);
+        collect_class_method_aliases(branch, context, aliases, &mut branch_origins);
     }
 }
 
 fn record_method_alias(
     target: &Expr,
     value: &Expr,
+    context: AliasContext<'_>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
     origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     match (target, value) {
         (Expr::Name(alias), value) => {
-            let Some((original, kind, original_class)) = method_alias_origin(value, origins) else {
+            let Some((original, kind, original_class)) =
+                method_alias_origin(value, context, origins)
+            else {
                 return;
             };
             aliases
@@ -4811,12 +5175,12 @@ fn record_method_alias(
         }
         (Expr::Tuple(targets), Expr::Tuple(values)) if targets.elts.len() == values.elts.len() => {
             for (target, value) in targets.elts.iter().zip(&values.elts) {
-                record_method_alias(target, value, aliases, origins);
+                record_method_alias(target, value, context, aliases, origins);
             }
         }
         (Expr::List(targets), Expr::List(values)) if targets.elts.len() == values.elts.len() => {
             for (target, value) in targets.elts.iter().zip(&values.elts) {
-                record_method_alias(target, value, aliases, origins);
+                record_method_alias(target, value, context, aliases, origins);
             }
         }
         _ => {}
@@ -4825,6 +5189,7 @@ fn record_method_alias(
 
 fn method_alias_origin(
     value: &Expr,
+    context: AliasContext<'_>,
     origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) -> Option<(String, MethodAliasKind, Option<String>)> {
     match value {
@@ -4847,22 +5212,14 @@ fn method_alias_origin(
         Expr::Call(call)
             if call.arguments.args.len() == 1 && call.arguments.keywords.is_empty() =>
         {
-            let Expr::Name(wrapper) = call.func.as_ref() else {
-                return None;
-            };
-            let kind = match wrapper.id.as_str() {
-                "staticmethod" => MethodAliasKind::Static,
-                "classmethod" => MethodAliasKind::Class,
-                "property" => MethodAliasKind::Property,
-                _ => return None,
-            };
-            let Expr::Name(original) = &call.arguments.args[0] else {
-                return None;
-            };
-            let (root, original_class) = origins.get(original.id.as_str()).map_or_else(
-                || (original.id.to_string(), None),
-                |(root, _, original_class)| (root.clone(), original_class.clone()),
-            );
+            let kind =
+                descriptor_wrapper_kind(&call.func, context.aliases, context.module_bindings)?;
+            // The wrapper decides how the alias is called; what it wraps
+            // decides which method it names, so resolve that the same way a
+            // bare value is resolved. `staticmethod(Base.target)` names the
+            // same method as a plain `Base.target`.
+            let (root, _, original_class) =
+                method_alias_origin(&call.arguments.args[0], context, origins)?;
             Some((root, kind, original_class))
         }
         _ => None,
@@ -5247,6 +5604,51 @@ fn field_argument_removal_range(
     TextRange::new(target.start(), target.end() + text_size(comma + 1))
 }
 
+/// The descriptor a class-body wrapper call applies, written bare, under an
+/// alias, or qualified through a `builtins` import — the same spellings the
+/// decorator forms accept.
+fn descriptor_wrapper_kind(
+    expression: &Expr,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> Option<MethodAliasKind> {
+    match expression {
+        Expr::Name(name) => {
+            let bare = !module_bindings.contains(name.id.as_str());
+            match name.id.as_str() {
+                "staticmethod" if bare => Some(MethodAliasKind::Static),
+                "classmethod" if bare => Some(MethodAliasKind::Class),
+                "property" if bare => Some(MethodAliasKind::Property),
+                _ if aliases.staticmethods.contains(name.id.as_str()) => {
+                    Some(MethodAliasKind::Static)
+                }
+                _ if aliases.classmethods.contains(name.id.as_str()) => {
+                    Some(MethodAliasKind::Class)
+                }
+                _ if aliases.properties.contains(name.id.as_str()) => {
+                    Some(MethodAliasKind::Property)
+                }
+                _ => None,
+            }
+        }
+        Expr::Attribute(attribute) => {
+            let Expr::Name(module) = attribute.value.as_ref() else {
+                return None;
+            };
+            if !aliases.builtins_modules.contains(module.id.as_str()) {
+                return None;
+            }
+            match attribute.attr.as_str() {
+                "staticmethod" => Some(MethodAliasKind::Static),
+                "classmethod" => Some(MethodAliasKind::Class),
+                "property" => Some(MethodAliasKind::Property),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// What a method is given ahead of its written arguments, from its decorators.
 fn method_receiver(
     function: &ast::StmtFunctionDef,
@@ -5381,6 +5783,7 @@ fn rewrite_calls(
         known,
         classes: Vec::new(),
         class_scope_depths: Vec::new(),
+        lexical_is_class: Vec::new(),
         implicit_receivers: Vec::new(),
         lexical_scope: Vec::new(),
         called: BTreeSet::new(),
@@ -5468,7 +5871,15 @@ fn collect_bindings(
                         .as_ref()
                         .filter(|file| source_binds_name(file, name))
                         .cloned();
-                    let implicit_sibling = import.module.is_none() && import.level > 0;
+                    // `from . import name` reaches the submodule, unless the
+                    // package defines `name` itself: the package attribute is
+                    // already set by the time the submodule would be imported,
+                    // so that is what Python hands out.
+                    let implicit_sibling = import.module.is_none()
+                        && import.level > 0
+                        && !parent
+                            .as_ref()
+                            .is_some_and(|file| source_defines_symbol(file, name));
                     let binding = match (package_member, submodule, &parent) {
                         (_, Some(file), _) if implicit_sibling => Binding::Module(file),
                         (Some(file), _, _) => Binding::Symbol(file, name.to_owned()),
@@ -5484,18 +5895,10 @@ fn collect_bindings(
                     bindings.insert(bound, binding);
                 }
             }
-            Stmt::Assign(assign) => {
-                let binding = assignment_binding(&assign.value, bindings);
-                for target in &assign.targets {
-                    let Expr::Name(target) = target else {
-                        continue;
-                    };
-                    if let Some(binding) = &binding {
-                        bindings.insert(target.id.to_string(), binding.clone());
-                    } else {
-                        bindings.remove(target.id.as_str());
-                    }
-                }
+            // An annotated binding names the same thing a plain one does, so
+            // `target: Final = api.target` has to be followed too.
+            Stmt::Assign(_) | Stmt::AnnAssign(_) => {
+                collect_assignment_binding(statement, bindings);
             }
             Stmt::If(branch) => {
                 collect_conditional_bindings(branch, importer, known, bindings);
@@ -5627,6 +6030,69 @@ fn reconcile_suite_bindings(
             }
         }
     }
+}
+
+/// Follow an assignment, annotated or not, into the binding index.
+fn collect_assignment_binding(statement: &Stmt, bindings: &mut BTreeMap<String, Binding>) {
+    let bound: Option<(&Expr, &[Expr])> = match statement {
+        Stmt::Assign(assign) => Some((assign.value.as_ref(), assign.targets.as_slice())),
+        Stmt::AnnAssign(assign) => assign
+            .value
+            .as_deref()
+            .map(|value| (value, std::slice::from_ref(&*assign.target))),
+        _ => None,
+    };
+    let Some((value, targets)) = bound else {
+        return;
+    };
+    let binding = assignment_binding(value, bindings);
+    for target in targets {
+        let Expr::Name(target) = target else {
+            continue;
+        };
+        if let Some(binding) = &binding {
+            bindings.insert(target.id.to_string(), binding.clone());
+        } else {
+            bindings.remove(target.id.as_str());
+        }
+    }
+}
+
+/// Whether a module defines `name` itself, rather than merely binding it by
+/// importing something of that name.
+///
+/// A package whose `__init__.py` re-exports its own submodule still hands out
+/// the submodule, so only a definition or an assignment counts here.
+fn source_defines_symbol(path: &Path, name: &str) -> bool {
+    let Some(parsed) = read_source(path)
+        .ok()
+        .and_then(|source| parse_module(&source).ok())
+    else {
+        return false;
+    };
+    parsed.suite().iter().any(|statement| match statement {
+        Stmt::FunctionDef(function) => function.name.as_str() == name,
+        Stmt::ClassDef(class) => class.name.as_str() == name,
+        Stmt::Assign(assign) => assign
+            .targets
+            .iter()
+            .any(|target| matches!(target, Expr::Name(target) if target.id.as_str() == name)),
+        Stmt::AnnAssign(assign) => {
+            assign.value.is_some()
+                && matches!(assign.target.as_ref(), Expr::Name(target) if target.id.as_str() == name)
+        }
+        // `from .impl import name` puts a symbol under the name just as an
+        // assignment would. `from . import name` is the submodule itself, and
+        // is what the caller is deciding against.
+        Stmt::ImportFrom(import) => {
+            import.module.is_some()
+                && import.names.iter().any(|alias| {
+                    alias.asname.as_ref().unwrap_or(&alias.name).as_str() == name
+                        && alias.name.as_str() != "*"
+                })
+        }
+        _ => false,
+    })
 }
 
 fn source_binds_name(path: &Path, name: &str) -> bool {
@@ -6090,6 +6556,9 @@ struct Rewriter<'a> {
     /// Scope-stack depth immediately inside each class body, distinguishing a
     /// direct method from a function nested inside one.
     class_scope_depths: Vec<usize>,
+    /// Whether each `lexical_scope` entry is a class body rather than a
+    /// function, so a lookup can pass over the ones that are not closures.
+    lexical_is_class: Vec<bool>,
     /// The implicit receiver name of each enclosing function. Static methods
     /// and module functions contribute `None`.
     implicit_receivers: Vec<Option<String>>,
@@ -6329,6 +6798,55 @@ impl Rewriter<'_> {
 
     /// The callable an expression names, when the file's own imports say so,
     /// and how many parameters the call has already been given implicitly.
+    /// The signature a bare nested name refers to at this call site.
+    ///
+    /// A nested definition is visible throughout the scope holding it, so the
+    /// search runs outwards from the call site. It stops at the nearest scope
+    /// that binds the name, whether or not anything was recorded for it, and
+    /// passes over class bodies, which are not closure scopes.
+    fn nested_signature(&self, name: &str) -> Option<&Signature> {
+        let symbols = self.definitions.symbols.get(self.physical)?;
+        // A lambda or comprehension written in a class body has a scope of its
+        // own that the class namespace is not part of, so a name bound beside
+        // it is out of reach from in there.
+        if self
+            .scopes
+            .iter()
+            .skip(self.lexical_scope.len())
+            .any(|scope| scope.names.contains(name))
+        {
+            return None;
+        }
+        // A nested function is never reached by its bare name, so that last
+        // step is only for the other callables.
+        let outermost = usize::from(self.nested_function(name));
+        let innermost_class_applies = self.in_class_scope();
+        for depth in (outermost..=self.lexical_scope.len()).rev() {
+            if depth > 0
+                && self.lexical_is_class.get(depth - 1) == Some(&true)
+                && !(depth == self.lexical_scope.len() && innermost_class_applies)
+            {
+                continue;
+            }
+            if let Some(signature) =
+                symbols.get(&qualified_lexical_name(&self.lexical_scope[..depth], name))
+            {
+                return signature.as_ref();
+            }
+            // Nothing was recorded here, but a scope that binds the name still
+            // hides whatever the scopes outside it call by the same name.
+            if depth > 0
+                && self
+                    .scopes
+                    .get(depth - 1)
+                    .is_some_and(|scope| scope.names.contains(name))
+            {
+                return None;
+            }
+        }
+        None
+    }
+
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
             Expr::Name(name)
@@ -6347,21 +6865,7 @@ impl Rewriter<'_> {
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
-                let symbols = self.definitions.symbols.get(self.physical)?;
-                let (_, owner) = self.nested_binding(name.id.as_str())?;
-                let owner_scope = self
-                    .lexical_scope
-                    .get(..=owner)
-                    .unwrap_or(&self.lexical_scope);
-                let qualified = qualified_lexical_name(owner_scope, name.id.as_str());
-                let signature = if self.nested_function(name.id.as_str()) {
-                    symbols.get(&qualified)?
-                } else {
-                    symbols
-                        .get(&qualified)
-                        .or_else(|| symbols.get(name.id.as_str()))?
-                }
-                .as_ref()?;
+                let signature = self.nested_signature(name.id.as_str())?;
                 Some((signature, signature.kind.implicit_bound()))
             }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
@@ -7193,6 +7697,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     qualified_name(self.classes.last().map(String::as_str), class.name.as_str());
                 self.classes.push(qualified);
                 self.lexical_scope.push(class.name.to_string());
+                self.lexical_is_class.push(true);
                 self.scopes.push(BoundNames::default());
                 self.class_bindings.push(BTreeMap::new());
                 self.class_scope_depths.push(self.scopes.len());
@@ -7200,6 +7705,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.class_scope_depths.pop();
                 self.class_bindings.pop();
                 self.scopes.pop();
+                self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.classes.pop();
                 self.bind_definition_in_class(class.name.as_str(), true);
@@ -7249,7 +7755,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
                 self.lexical_scope.push(function.name.to_string());
+                self.lexical_is_class.push(false);
                 self.visit_body(&function.body);
+                self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.scopes.pop();
                 self.bindings.pop();
@@ -7578,6 +8086,229 @@ mod tests {
         fix_all(&[api, other, user.clone()])?;
         let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
         assert!(updated.ends_with("    target(alpha=1)\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_package_definition_outranks_a_sibling_submodule() -> Result<(), String> {
+        // `from . import helper` reaches the package's own `helper`, since the
+        // attribute is already set when the submodule would be imported.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let init = package.join("__init__.py");
+        let submodule = package.join("helper.py");
+        let user = package.join("user.py");
+        std::fs::write(&init, "def helper(value=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&submodule, "OTHER = 1\n").map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from . import helper\n\nhelper()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[init, submodule, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from . import helper\n\nhelper(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_dataclass_is_reached_from_a_deeper_scope() -> Result<(), String> {
+        // `C` inside `inner` is the class `outer` holds, not the module-level
+        // one that happens to share its name.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    other: int = 2\n\ndef outer():\n    @dataclass\n    class C:\n        value: int = 1\n    def inner():\n        return C()\n    return inner()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrapper_alias_under_the_method_name_keeps_its_signature() -> Result<(), String> {
+        // `target = staticmethod(target)` renames nothing: the wrapper decides
+        // how the one name is called, so the call still has to be rewritten.
+        for (source, expected) in [
+            (
+                "class C:\n    def target(value=1): pass\n    target = staticmethod(target)\n\nC.target()\n",
+                "class C:\n    def target(value): pass\n    target = staticmethod(target)\n\nC.target(value=1)\n",
+            ),
+            (
+                "class C:\n    def target(cls, value=1): pass\n    target = classmethod(target)\n\nC.target()\n",
+                "class C:\n    def target(cls, value): pass\n    target = classmethod(target)\n\nC.target(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrapped_inherited_attribute_alias_is_indexed() -> Result<(), String> {
+        // The wrapper says how the alias is called; `Base.target` inside it
+        // still names the method the signature was collected for.
+        for (source, expected) in [
+            (
+                "class Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = staticmethod(Base.target)\n\nChild.alias()\n",
+                "class Base:\n    def target(value): pass\n\nclass Child:\n    alias = staticmethod(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+            (
+                "class Base:\n    def target(cls, value=1): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias()\n",
+                "class Base:\n    def target(cls, value): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn aliased_and_qualified_wrappers_index_class_aliases() -> Result<(), String> {
+        // The decorator forms already accept these spellings, so a class-body
+        // wrapper call has to recognise them too.
+        for (source, expected) in [
+            (
+                "from builtins import staticmethod as sm\n\nclass Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = sm(Base.target)\n\nChild.alias()\n",
+                "from builtins import staticmethod as sm\n\nclass Base:\n    def target(value): pass\n\nclass Child:\n    alias = sm(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+            (
+                "import builtins\n\nclass Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = builtins.staticmethod(Base.target)\n\nChild.alias()\n",
+                "import builtins\n\nclass Base:\n    def target(value): pass\n\nclass Child:\n    alias = builtins.staticmethod(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_property_alias_in_another_class_retains_the_default() {
+        // Reading `Child.alias` runs `Base.target`, so there is no call site
+        // to carry the default to — wherever the alias is written.
+        for source in [
+            "class Base:\n    def target(self, value=1): pass\n    alias = property(target)\n",
+            "class Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = property(Base.target)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn property_aliases_are_found_however_they_are_written() {
+        // The wrapper spellings the decorator path accepts, and a class body
+        // suite, all still mean the getter runs on attribute access.
+        for source in [
+            "from builtins import property as prop\n\nclass Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = prop(Base.target)\n",
+            "import builtins\n\nclass Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = builtins.property(Base.target)\n",
+            "class Base:\n    def target(self, value=1): pass\n\nclass Child:\n    if cond:\n        alias = property(Base.target)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_nearer_binding_hides_an_outer_callable() -> Result<(), String> {
+        // `inner` binds `C` itself, so the dataclass in `outer` is not what
+        // the call reaches, even though nothing was recorded for the inner one.
+        let source = "from dataclasses import dataclass\n\ndef outer():\n    @dataclass\n    class C:\n        value: int = 1\n    def inner():\n        class C:\n            pass\n        return C()\n    return inner()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C()"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_does_not_see_a_class_nested_callable() -> Result<(), String> {
+        // A class body is not a closure scope: `C` inside the method is the
+        // module-level class, not the one nested beside the method.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n\nclass Holder:\n    @dataclass\n    class C:\n        other: int = 2\n    def method(self):\n        return C()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_expression_scope_in_a_class_body_looks_past_the_class() -> Result<(), String> {
+        // A lambda and a comprehension each have a scope the class namespace
+        // is not part of, so `C` in them is the module-level class. Written
+        // directly in the body it is the nested one.
+        let holder = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n\nclass Holder:\n    @dataclass\n    class C:\n        other: int = 2\n";
+        for (written, expected) in [
+            (
+                "    factory = lambda: C()\n",
+                "    factory = lambda: C(value=1)\n",
+            ),
+            (
+                "    items = [C() for _ in range(1)]\n",
+                "    items = [C(value=1) for _ in range(1)]\n",
+            ),
+            ("    made = C()\n", "    made = C(other=2)\n"),
+        ] {
+            let updated = fixed(&format!("{holder}{written}"))?;
+            assert!(updated.ends_with(expected), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_package_reexport_outranks_a_sibling_submodule() -> Result<(), String> {
+        // `__init__.py` puts a symbol under `helper`, so that is the package
+        // attribute even though a `helper` submodule sits beside it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let init = package.join("__init__.py");
+        let implementation = package.join("impl.py");
+        let submodule = package.join("helper.py");
+        let user = package.join("user.py");
+        std::fs::write(&init, "from .impl import helper\n").map_err(|error| error.to_string())?;
+        std::fs::write(&implementation, "def helper(value=1): pass\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&submodule, "OTHER = 1\n").map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from . import helper\n\nhelper()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[init, implementation, submodule, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from . import helper\n\nhelper(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotated_cross_file_alias_is_followed() -> Result<(), String> {
+        // `target: object = api.target` names the same callable a plain
+        // assignment would.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let reexport = directory.path().join("re_export.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(value=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&reexport, "import api\n\ntarget: object = api.target\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from re_export import target\n\ntarget()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[api, reexport, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from re_export import target\n\ntarget(value=1)\n"
+        );
         Ok(())
     }
 

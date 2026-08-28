@@ -4812,54 +4812,59 @@ fn defines_metaclass(class: &ast::StmtClassDef, known: &BTreeSet<String>) -> boo
     })
 }
 
-type LexicalClass<'a> = (&'a ast::StmtClassDef, String, Vec<String>);
+/// A class the file defines, the name it is spelled with from the module, the
+/// scopes holding it, and whether a function body defers its creation — one
+/// written in a function is built when that function runs, so it sees names
+/// the module binds after it.
+type LexicalClass<'a> = (&'a ast::StmtClassDef, String, Vec<String>, bool);
 
 fn collect_lexical_classes<'a>(
     suite: &'a [Stmt],
     scope: &mut Vec<String>,
+    deferred: bool,
     classes: &mut Vec<LexicalClass<'a>>,
 ) {
     for statement in suite {
         match statement {
             Stmt::ClassDef(class) => {
                 let qualified = qualified_class_name(scope, class.name.as_str());
-                classes.push((class, qualified, scope.clone()));
+                classes.push((class, qualified, scope.clone(), deferred));
                 scope.push(class.name.to_string());
-                collect_lexical_classes(&class.body, scope, classes);
+                collect_lexical_classes(&class.body, scope, deferred, classes);
                 scope.pop();
             }
             Stmt::FunctionDef(function) => {
                 scope.push(function.name.to_string());
-                collect_lexical_classes(&function.body, scope, classes);
+                collect_lexical_classes(&function.body, scope, true, classes);
                 scope.pop();
             }
             Stmt::If(branch) => {
-                collect_lexical_classes(&branch.body, scope, classes);
+                collect_lexical_classes(&branch.body, scope, deferred, classes);
                 for clause in &branch.elif_else_clauses {
-                    collect_lexical_classes(&clause.body, scope, classes);
+                    collect_lexical_classes(&clause.body, scope, deferred, classes);
                 }
             }
             Stmt::For(loop_) => {
-                collect_lexical_classes(&loop_.body, scope, classes);
-                collect_lexical_classes(&loop_.orelse, scope, classes);
+                collect_lexical_classes(&loop_.body, scope, deferred, classes);
+                collect_lexical_classes(&loop_.orelse, scope, deferred, classes);
             }
             Stmt::While(loop_) => {
-                collect_lexical_classes(&loop_.body, scope, classes);
-                collect_lexical_classes(&loop_.orelse, scope, classes);
+                collect_lexical_classes(&loop_.body, scope, deferred, classes);
+                collect_lexical_classes(&loop_.orelse, scope, deferred, classes);
             }
-            Stmt::With(block) => collect_lexical_classes(&block.body, scope, classes),
+            Stmt::With(block) => collect_lexical_classes(&block.body, scope, deferred, classes),
             Stmt::Try(block) => {
-                collect_lexical_classes(&block.body, scope, classes);
+                collect_lexical_classes(&block.body, scope, deferred, classes);
                 for handler in &block.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                    collect_lexical_classes(&handler.body, scope, classes);
+                    collect_lexical_classes(&handler.body, scope, deferred, classes);
                 }
-                collect_lexical_classes(&block.orelse, scope, classes);
-                collect_lexical_classes(&block.finalbody, scope, classes);
+                collect_lexical_classes(&block.orelse, scope, deferred, classes);
+                collect_lexical_classes(&block.finalbody, scope, deferred, classes);
             }
             Stmt::Match(block) => {
                 for case in &block.cases {
-                    collect_lexical_classes(&case.body, scope, classes);
+                    collect_lexical_classes(&case.body, scope, deferred, classes);
                 }
             }
             _ => {}
@@ -4870,13 +4875,13 @@ fn collect_lexical_classes<'a>(
 /// Same-file classes whose metaclass can replace attributes read on the class.
 fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
     let mut classes = Vec::new();
-    collect_lexical_classes(suite, &mut Vec::new(), &mut classes);
+    collect_lexical_classes(suite, &mut Vec::new(), false, &mut classes);
     let resolve = |name: &str, scope: &[String], before: usize| {
         (0..=scope.len()).rev().find_map(|length| {
             let candidate = qualified_class_name(&scope[..length], name);
             classes[..before]
                 .iter()
-                .rposition(|(_, qualified, _)| qualified == &candidate)
+                .rposition(|(_, qualified, _, _)| qualified == &candidate)
         })
     };
     let mut metaclasses = BTreeSet::new();
@@ -4885,7 +4890,10 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
     let mut changed = true;
     while changed {
         changed = false;
-        for (index, (class, _, scope)) in classes.iter().enumerate() {
+        for (index, (class, _, scope, deferred)) in classes.iter().enumerate() {
+            // A class built when a function runs sees every module-level name,
+            // including those bound after the function was written.
+            let visible = if *deferred { classes.len() } else { index };
             let bases = class
                 .arguments
                 .as_deref()
@@ -4895,7 +4903,7 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
             let base_names: Vec<String> = bases.collect();
             let is_metaclass = base_names.iter().any(|base| {
                 base == "type"
-                    || resolve(base, scope, index).is_some_and(|base| metaclasses.contains(&base))
+                    || resolve(base, scope, visible).is_some_and(|base| metaclasses.contains(&base))
             });
             if is_metaclass && metaclasses.insert(index) {
                 changed = true;
@@ -4906,7 +4914,7 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
             if is_metaclass
                 && (defines_getattribute
                     || base_names.iter().any(|base| {
-                        resolve(base, scope, index)
+                        resolve(base, scope, visible)
                             .is_some_and(|base| intercepting_metaclasses.contains(&base))
                     }))
                 && intercepting_metaclasses.insert(index)
@@ -4920,13 +4928,13 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
                         .as_ref()
                         .is_some_and(|name| name.as_str() == "metaclass")
                         && dotted_name(&keyword.value)
-                            .and_then(|name| resolve(&name, scope, index))
+                            .and_then(|name| resolve(&name, scope, visible))
                             .is_some_and(|name| intercepting_metaclasses.contains(&name))
                 })
             });
             if (declared_interceptor
                 || base_names.iter().any(|base| {
-                    resolve(base, scope, index).is_some_and(|base| intercepted.contains(&base))
+                    resolve(base, scope, visible).is_some_and(|base| intercepted.contains(&base))
                 }))
                 && intercepted.insert(index)
             {
@@ -13257,5 +13265,27 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(settings[0].private_only, Some(true));
         assert_eq!(settings[1].private_only, Some(false));
         Ok(())
+    }
+
+    #[test]
+    fn a_class_built_in_a_function_sees_a_later_base() {
+        // `build()` runs after the module is executed, so `Parent` exists by
+        // then and its metaclass may replace what a call reads.
+        for source in [
+            "class Meta(type):\n    def __getattribute__(self, name): pass\n\nclass Parent(metaclass=Meta):\n    pass\n\ndef build():\n    class Child(Parent):\n        def run(self, value=1): pass\n    return Child\n",
+            "def build():\n    class Child(Parent):\n        def run(self, value=1): pass\n    return Child\n\nclass Meta(type):\n    def __getattribute__(self, name): pass\n\nclass Parent(metaclass=Meta):\n    pass\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
     }
 }

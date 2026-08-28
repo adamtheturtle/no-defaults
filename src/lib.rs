@@ -7519,11 +7519,25 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                                     self.known,
                                 )
                                 .is_some();
-                                if alias.asname.is_some() {
+                                // `import pkg as pkg` binds the same package
+                                // the dotted imports are under, so what they
+                                // reached through that name is still there.
+                                let rebinds = alias
+                                    .asname
+                                    .as_ref()
+                                    .is_some_and(|asname| asname.as_str() != alias.name.as_str());
+                                if rebinds {
                                     resolutions.insert(name, (module_resolved, true));
                                     continue;
                                 }
-                                let sibling_resolved = alias.name.contains('.')
+                                // Once an alias has taken the head over, the
+                                // dotted keys under it name what it used to
+                                // be, so they say nothing about this import.
+                                let aliased = resolutions
+                                    .get(&name)
+                                    .is_some_and(|(_, last_was_alias)| *last_was_alias);
+                                let sibling_resolved = !aliased
+                                    && alias.name.contains('.')
                                     && self.bindings.first().is_some_and(|bindings| {
                                         bindings.keys().any(|binding| {
                                             binding.contains('.')
@@ -7535,8 +7549,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                                     Entry::Occupied(mut entry) => {
                                         let (known, last_was_alias) = entry.get_mut();
                                         if *last_was_alias {
-                                            *known = resolved;
-                                            *last_was_alias = false;
+                                            // An import that resolves to
+                                            // nothing rebinds nothing, so the
+                                            // alias before it still stands.
+                                            if resolved {
+                                                *known = resolved;
+                                                *last_was_alias = false;
+                                            }
                                         } else {
                                             *known |= resolved;
                                         }
@@ -13522,6 +13541,48 @@ def b(x=1): pass  # type: ignore  # noqa
         let settings = settings_for_files(&[root_file, nested_file], false, false)?;
         assert_eq!(settings[0].private_only, Some(true));
         assert_eq!(settings[1].private_only, Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn an_alias_only_drops_what_it_really_rebinds() -> Result<(), String> {
+        // `import pkg as pkg` names the same package, so the dotted imports
+        // under it still stand. A different module taking the name does
+        // replace them, and an import resolving to nothing rebinds nothing.
+        for (caller, rewritten) in [
+            ("import pkg.api\n\npkg.api.target()\n", true),
+            (
+                "import pkg.api\nimport pkg as pkg\n\npkg.api.target()\n",
+                true,
+            ),
+            (
+                "import pkg.api\nimport external as pkg\n\npkg.api.target()\n",
+                false,
+            ),
+            (
+                "import pkg.api\nimport external as pkg, pkg.missing\n\npkg.api.target()\n",
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let package = directory.path().join("pkg");
+            std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+            std::fs::write(package.join("__init__.py"), "").map_err(|error| error.to_string())?;
+            std::fs::write(package.join("api.py"), "def target(value=1): pass\n")
+                .map_err(|error| error.to_string())?;
+            let external = directory.path().join("external.py");
+            std::fs::write(&external, "").map_err(|error| error.to_string())?;
+            let user = directory.path().join("user.py");
+            std::fs::write(&user, caller).map_err(|error| error.to_string())?;
+            fix_all(&[
+                package.join("__init__.py"),
+                package.join("api.py"),
+                external,
+                user.clone(),
+            ])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert_eq!(updated.contains("target(value=1)"), rewritten, "{caller}");
+        }
         Ok(())
     }
 }

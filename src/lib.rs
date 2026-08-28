@@ -9,7 +9,7 @@ use clap::{Parser, ValueEnum};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use ruff_python_ast::comparable::ComparableLiteral;
+use ruff_python_ast::comparable::{ComparableLiteral, ComparableNumber};
 use ruff_python_ast::helpers::Truthiness;
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::{walk_except_handler, walk_expr, walk_pattern, walk_stmt, Visitor};
@@ -7943,6 +7943,69 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
     bound.names
 }
 
+fn python_int_equals_float(integer: &ast::Int, float: f64) -> bool {
+    float.is_finite()
+        && float >= 0.0
+        && float.fract() == 0.0
+        && integer.to_string() == format!("{float:.0}")
+}
+
+#[allow(
+    clippy::float_cmp,
+    reason = "Python literal equality is exact, including signed zero"
+)]
+fn python_floats_equal(left: f64, right: f64) -> bool {
+    left == right
+}
+
+fn python_number_equals(left: &ComparableNumber<'_>, right: &ComparableNumber<'_>) -> bool {
+    match (left, right) {
+        (ComparableNumber::Int(left), ComparableNumber::Int(right)) => left == right,
+        (ComparableNumber::Float(left), ComparableNumber::Float(right)) => {
+            python_floats_equal(f64::from_bits(*left), f64::from_bits(*right))
+        }
+        (ComparableNumber::Int(integer), ComparableNumber::Float(float))
+        | (ComparableNumber::Float(float), ComparableNumber::Int(integer)) => {
+            python_int_equals_float(integer, f64::from_bits(*float))
+        }
+        (
+            ComparableNumber::Complex {
+                real: left_real,
+                imag: left_imag,
+            },
+            ComparableNumber::Complex {
+                real: right_real,
+                imag: right_imag,
+            },
+        ) => {
+            python_floats_equal(f64::from_bits(*left_real), f64::from_bits(*right_real))
+                && python_floats_equal(f64::from_bits(*left_imag), f64::from_bits(*right_imag))
+        }
+        (
+            ComparableNumber::Float(real),
+            ComparableNumber::Complex {
+                real: complex_real,
+                imag,
+            },
+        )
+        | (
+            ComparableNumber::Complex {
+                real: complex_real,
+                imag,
+            },
+            ComparableNumber::Float(real),
+        ) => {
+            python_floats_equal(f64::from_bits(*imag), 0.0)
+                && python_floats_equal(f64::from_bits(*real), f64::from_bits(*complex_real))
+        }
+        (ComparableNumber::Int(integer), ComparableNumber::Complex { real, imag })
+        | (ComparableNumber::Complex { real, imag }, ComparableNumber::Int(integer)) => {
+            python_floats_equal(f64::from_bits(*imag), 0.0)
+                && python_int_equals_float(integer, f64::from_bits(*real))
+        }
+    }
+}
+
 impl<'a> Rewriter<'a> {
     /// Walk a `match` case body without letting what it binds stand for the
     /// cases after it.
@@ -7964,6 +8027,33 @@ impl<'a> Rewriter<'a> {
         for name in changed {
             after.remove(&name);
         }
+    }
+}
+
+fn python_number_equals_bool(number: &ComparableNumber<'_>, value: bool) -> bool {
+    let value = u8::from(value);
+    match number {
+        ComparableNumber::Int(integer) => **integer == value,
+        ComparableNumber::Float(float) => {
+            python_floats_equal(f64::from_bits(*float), f64::from(value))
+        }
+        ComparableNumber::Complex { real, imag } => {
+            python_floats_equal(f64::from_bits(*imag), 0.0)
+                && python_floats_equal(f64::from_bits(*real), f64::from(value))
+        }
+    }
+}
+
+fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral<'_>) -> bool {
+    match (left, right) {
+        (ComparableLiteral::Number(left), ComparableLiteral::Number(right)) => {
+            python_number_equals(left, right)
+        }
+        (ComparableLiteral::Bool(value), ComparableLiteral::Number(number))
+        | (ComparableLiteral::Number(number), ComparableLiteral::Bool(value)) => {
+            python_number_equals_bool(number, **value)
+        }
+        _ => left == right,
     }
 }
 
@@ -8414,7 +8504,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                                 self.visit_body(&case.body);
                                 continue;
                             };
-                            ComparableLiteral::from(pattern) == *subject
+                            python_literals_equal(subject, &ComparableLiteral::from(pattern))
                         }
                         (_, Pattern::MatchAs(pattern)) if pattern.pattern.is_none() => true,
                         _ => {
@@ -8480,7 +8570,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                                 self.visit_body(&case.body);
                                 continue;
                             };
-                            ComparableLiteral::from(pattern) == *subject
+                            python_literals_equal(subject, &ComparableLiteral::from(pattern))
                         }
                         (_, Pattern::MatchAs(pattern)) if pattern.pattern.is_none() => true,
                         _ => {

@@ -2314,6 +2314,68 @@ fn unknown_class_match_guards_do_not_hide_later_case_imports(
 }
 
 #[test]
+fn selected_module_singleton_patterns_stop_later_case_imports(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for singleton in ["None", "True", "False"] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1): return value\n")?;
+        std::fs::write(&other, "def target(value=2): return value\n")?;
+        let caller_source = format!(
+            "from api import target\nmatch {singleton}:\n    case {singleton}:\n        pass\n    case _:\n        from other import target\nassert target() == 1\n"
+        );
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{singleton}");
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!(
+                "from api import target\nmatch {singleton}:\n    case {singleton}:\n        pass\n    case _:\n        from other import target\nassert target(value=1) == 1\n"
+            ),
+            "{singleton}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn selected_class_singleton_patterns_stop_later_case_imports(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for singleton in ["None", "True", "False"] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1): return value\n")?;
+        std::fs::write(&other, "def target(value=2): return value\n")?;
+        let caller_source = format!(
+            "from api import target\nclass C:\n    match {singleton}:\n        case {singleton}:\n            pass\n        case _:\n            from other import target\n    result = target()\nassert C.result == 1\n"
+        );
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{singleton}");
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!(
+                "from api import target\nclass C:\n    match {singleton}:\n        case {singleton}:\n            pass\n        case _:\n            from other import target\n    result = target(value=1)\nassert C.result == 1\n"
+            ),
+            "{singleton}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn module_match_captures_invalidate_imported_callable_bindings(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

@@ -8205,58 +8205,120 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.invalidated_bindings.remove(&name);
                     self.rebound_classes.remove(&name);
                 }
-                let resolutions: Vec<(String, bool)> = match statement {
-                    Stmt::Import(import) => {
-                        let mut resolutions = BTreeMap::new();
-                        for alias in &import.names {
-                            let name = alias.asname.as_ref().map_or_else(
-                                || {
-                                    alias
-                                        .name
-                                        .split('.')
-                                        .next()
-                                        .unwrap_or(alias.name.as_str())
-                                        .to_owned()
-                                },
-                                ToString::to_string,
-                            );
-                            let module_resolved =
-                                resolve_module(alias.name.as_str(), 0, self.physical, self.known)
-                                    .is_some();
-                            let sibling_resolved = alias.asname.is_none()
-                                && alias.name.contains('.')
-                                && self.bindings.first().is_some_and(|bindings| {
-                                    bindings.keys().any(|binding| {
-                                        binding.contains('.')
-                                            && binding.split('.').next() == Some(name.as_str())
-                                    })
-                                });
-                            let resolved = module_resolved || sibling_resolved;
-                            resolutions
-                                .entry(name)
-                                .and_modify(|known| *known |= resolved)
-                                .or_insert(resolved);
+                let (resolutions, replaced_heads): (Vec<(String, bool)>, BTreeSet<String>) =
+                    match statement {
+                        Stmt::Import(import) => {
+                            let mut resolutions: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+                            for alias in &import.names {
+                                let name = alias.asname.as_ref().map_or_else(
+                                    || {
+                                        alias
+                                            .name
+                                            .split('.')
+                                            .next()
+                                            .unwrap_or(alias.name.as_str())
+                                            .to_owned()
+                                    },
+                                    ToString::to_string,
+                                );
+                                let module_resolved = resolve_module(
+                                    alias.name.as_str(),
+                                    0,
+                                    self.physical,
+                                    self.known,
+                                )
+                                .is_some();
+                                // `import pkg as pkg` binds the same package
+                                // the dotted imports are under, so what they
+                                // reached through that name is still there.
+                                let rebinds = alias
+                                    .asname
+                                    .as_ref()
+                                    .is_some_and(|asname| asname.as_str() != alias.name.as_str());
+                                if rebinds {
+                                    resolutions.insert(name, (module_resolved, true));
+                                    continue;
+                                }
+                                // Once an alias has taken the head over, the
+                                // dotted keys under it name what it used to
+                                // be, so they say nothing about this import.
+                                let aliased = resolutions
+                                    .get(&name)
+                                    .is_some_and(|(_, last_was_alias)| *last_was_alias);
+                                let sibling_resolved = !aliased
+                                    && alias.name.contains('.')
+                                    && self.bindings.first().is_some_and(|bindings| {
+                                        bindings.keys().any(|binding| {
+                                            binding.contains('.')
+                                                && binding.split('.').next() == Some(name.as_str())
+                                        })
+                                    });
+                                let resolved = module_resolved || sibling_resolved;
+                                match resolutions.entry(name) {
+                                    Entry::Occupied(mut entry) => {
+                                        let (known, last_was_alias) = entry.get_mut();
+                                        if *last_was_alias {
+                                            // An import that resolves to
+                                            // nothing rebinds nothing, so the
+                                            // alias before it still stands.
+                                            if resolved {
+                                                *known = resolved;
+                                                *last_was_alias = false;
+                                            }
+                                        } else {
+                                            *known |= resolved;
+                                        }
+                                    }
+                                    Entry::Vacant(entry) => {
+                                        entry.insert((resolved, false));
+                                    }
+                                }
+                            }
+                            let replaced = resolutions
+                                .iter()
+                                .filter(|(_, (_, last_was_alias))| *last_was_alias)
+                                .map(|(name, _)| name.clone())
+                                .collect();
+                            (
+                                resolutions
+                                    .into_iter()
+                                    .map(|(name, (resolved, _))| (name, resolved))
+                                    .collect(),
+                                replaced,
+                            )
                         }
-                        resolutions.into_iter().collect()
-                    }
-                    Stmt::ImportFrom(import) => import
-                        .names
-                        .iter()
-                        .filter(|alias| alias.name.as_str() != "*")
-                        .map(|alias| {
-                            let name = alias
-                                .asname
-                                .as_ref()
-                                .map_or_else(|| alias.name.to_string(), ToString::to_string);
-                            let resolved = self
-                                .bindings
-                                .first()
-                                .is_some_and(|bindings| bindings.contains_key(&name));
-                            (name, resolved)
+                        Stmt::ImportFrom(import) => {
+                            let resolutions: Vec<_> = import
+                                .names
+                                .iter()
+                                .filter(|alias| alias.name.as_str() != "*")
+                                .map(|alias| {
+                                    let name = alias.asname.as_ref().map_or_else(
+                                        || alias.name.to_string(),
+                                        ToString::to_string,
+                                    );
+                                    let resolved = self
+                                        .bindings
+                                        .first()
+                                        .is_some_and(|bindings| bindings.contains_key(&name));
+                                    (name, resolved)
+                                })
+                                .collect();
+                            let replaced =
+                                resolutions.iter().map(|(name, _)| name.clone()).collect();
+                            (resolutions, replaced)
+                        }
+                        _ => (Vec::new(), BTreeSet::new()),
+                    };
+                if let Some(bindings) = self.bindings.first_mut() {
+                    bindings.retain(|binding, _| {
+                        !replaced_heads.iter().any(|head| {
+                            binding
+                                .strip_prefix(head)
+                                .is_some_and(|suffix| suffix.starts_with('.'))
                         })
-                        .collect(),
-                    _ => Vec::new(),
-                };
+                    });
+                }
                 for (name, resolved) in resolutions {
                     if resolved {
                         self.invalidated_bindings.remove(&name);
@@ -14700,6 +14762,48 @@ def b(x=1): pass  # type: ignore  # noqa
         fix_all(&[api, other, user.clone()])?;
         let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
         assert!(!updated.contains("target(beta=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_alias_only_drops_what_it_really_rebinds() -> Result<(), String> {
+        // `import pkg as pkg` names the same package, so the dotted imports
+        // under it still stand. A different module taking the name does
+        // replace them, and an import resolving to nothing rebinds nothing.
+        for (caller, rewritten) in [
+            ("import pkg.api\n\npkg.api.target()\n", true),
+            (
+                "import pkg.api\nimport pkg as pkg\n\npkg.api.target()\n",
+                true,
+            ),
+            (
+                "import pkg.api\nimport external as pkg\n\npkg.api.target()\n",
+                false,
+            ),
+            (
+                "import pkg.api\nimport external as pkg, pkg.missing\n\npkg.api.target()\n",
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let package = directory.path().join("pkg");
+            std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+            std::fs::write(package.join("__init__.py"), "").map_err(|error| error.to_string())?;
+            std::fs::write(package.join("api.py"), "def target(value=1): pass\n")
+                .map_err(|error| error.to_string())?;
+            let external = directory.path().join("external.py");
+            std::fs::write(&external, "").map_err(|error| error.to_string())?;
+            let user = directory.path().join("user.py");
+            std::fs::write(&user, caller).map_err(|error| error.to_string())?;
+            fix_all(&[
+                package.join("__init__.py"),
+                package.join("api.py"),
+                external,
+                user.clone(),
+            ])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert_eq!(updated.contains("target(value=1)"), rewritten, "{caller}");
+        }
         Ok(())
     }
 }

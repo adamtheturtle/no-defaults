@@ -2684,6 +2684,53 @@ fn unresolved_sibling_imports_keep_a_resolved_package_head(
 }
 
 #[test]
+fn the_last_same_statement_import_controls_a_shared_head() -> Result<(), Box<dyn std::error::Error>>
+{
+    for (imports, fixed) in [
+        ("import pkg.api, external as pkg", false),
+        ("import external as pkg, pkg.api", true),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let package = directory.path().join("pkg");
+        let external = directory.path().join("external.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::create_dir(&package)?;
+        std::fs::write(package.join("__init__.py"), "")?;
+        let api_source = "def target(value=1): return value\n";
+        std::fs::write(package.join("api.py"), api_source)?;
+        std::fs::write(&external, "class api:\n    target = lambda: 9\n")?;
+        let caller_source = format!("{imports}\nassert pkg.api.target()\n");
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(package.join("api.py"))
+            .arg(&caller)
+            .output()?;
+        assert_eq!(output.status.code(), Some(i32::from(!fixed)), "{imports}");
+        assert_eq!(
+            std::fs::read_to_string(package.join("api.py"))?,
+            if fixed {
+                "def target(value): return value\n"
+            } else {
+                api_source
+            },
+            "{imports}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            if fixed {
+                format!("{imports}\nassert pkg.api.target(value=1)\n")
+            } else {
+                caller_source
+            },
+            "{imports}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn class_for_targets_shadow_imported_callables_inside_the_body(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

@@ -6455,7 +6455,12 @@ fn explicit_all_names(path: &Path) -> Option<BTreeSet<String>> {
     let source = read_source(path).ok()?;
     let parsed = parse_module(&source).ok()?;
     let mut names = None;
-    for statement in parsed.suite() {
+    collect_explicit_all(parsed.suite(), &mut names);
+    names
+}
+
+fn collect_explicit_all(suite: &[Stmt], names: &mut Option<BTreeSet<String>>) {
+    for statement in suite {
         let (value, replace) = match statement {
             Stmt::Assign(assign) if assign.targets.iter().any(is_dunder_all) => {
                 (assign.value.as_ref(), true)
@@ -6472,7 +6477,60 @@ fn explicit_all_names(path: &Path) -> Option<BTreeSet<String>> {
                 (assign.value.as_ref(), false)
             }
             Stmt::Delete(delete) if delete.targets.iter().any(is_dunder_all) => {
-                names = None;
+                *names = None;
+                continue;
+            }
+            Stmt::If(branch) => {
+                collect_conditional_all(branch, names);
+                continue;
+            }
+            Stmt::Try(block) => {
+                collect_try_all(block, names);
+                continue;
+            }
+            Stmt::For(loop_) => {
+                let initial = names.clone();
+                let truth = Truthiness::from_expr(&loop_.iter, |_| false);
+                let mut iterated = initial.clone();
+                collect_explicit_all(&loop_.body, &mut iterated);
+                collect_explicit_all(&loop_.orelse, &mut iterated);
+                let mut empty = initial;
+                collect_explicit_all(&loop_.orelse, &mut empty);
+                *names = match truth {
+                    Truthiness::False | Truthiness::Falsey | Truthiness::None => empty,
+                    Truthiness::True | Truthiness::Truthy => iterated,
+                    Truthiness::Unknown => common_all_state(&[iterated, empty]),
+                };
+                continue;
+            }
+            Stmt::While(loop_) => {
+                let initial = names.clone();
+                let truth = Truthiness::from_expr(&loop_.test, |_| false);
+                let mut iterated = initial.clone();
+                collect_explicit_all(&loop_.body, &mut iterated);
+                collect_explicit_all(&loop_.orelse, &mut iterated);
+                let mut skipped = initial;
+                collect_explicit_all(&loop_.orelse, &mut skipped);
+                *names = match truth {
+                    Truthiness::False | Truthiness::Falsey | Truthiness::None => skipped,
+                    Truthiness::True | Truthiness::Truthy => iterated,
+                    Truthiness::Unknown => common_all_state(&[iterated, skipped]),
+                };
+                continue;
+            }
+            Stmt::With(block) => {
+                collect_explicit_all(&block.body, names);
+                continue;
+            }
+            Stmt::Match(block) => {
+                let initial = names.clone();
+                let mut outcomes = vec![initial.clone()];
+                for case in &block.cases {
+                    let mut outcome = initial.clone();
+                    collect_explicit_all(&case.body, &mut outcome);
+                    outcomes.push(outcome);
+                }
+                *names = common_all_state(&outcomes);
                 continue;
             }
             _ => continue,
@@ -6481,7 +6539,7 @@ fn explicit_all_names(path: &Path) -> Option<BTreeSet<String>> {
             Expr::List(list) => &list.elts,
             Expr::Tuple(tuple) => &tuple.elts,
             _ => {
-                names = None;
+                *names = None;
                 continue;
             }
         };
@@ -6493,16 +6551,80 @@ fn explicit_all_names(path: &Path) -> Option<BTreeSet<String>> {
             })
             .collect();
         let Some(literal) = literal else {
-            names = None;
+            *names = None;
             continue;
         };
         if replace {
-            names = Some(literal);
-        } else if let Some(names) = &mut names {
+            *names = Some(literal);
+        } else if let Some(names) = names {
             names.extend(literal);
         }
     }
-    names
+}
+
+fn collect_try_all(block: &ast::StmtTry, names: &mut Option<BTreeSet<String>>) {
+    let initial = names.clone();
+    let mut success = initial.clone();
+    collect_explicit_all(&block.body, &mut success);
+    collect_explicit_all(&block.orelse, &mut success);
+    let mut outcomes = vec![success];
+    for handler in &block.handlers {
+        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+        let mut outcome = initial.clone();
+        collect_explicit_all(&handler.body, &mut outcome);
+        outcomes.push(outcome);
+    }
+    for outcome in &mut outcomes {
+        collect_explicit_all(&block.finalbody, outcome);
+    }
+    *names = common_all_state(&outcomes);
+}
+
+fn collect_conditional_all(branch: &ast::StmtIf, names: &mut Option<BTreeSet<String>>) {
+    let initial = names.clone();
+    let mut fallthrough = Some(initial.clone());
+    let mut outcomes = Vec::new();
+    let clauses = std::iter::once((Some(branch.test.as_ref()), branch.body.as_slice())).chain(
+        branch
+            .elif_else_clauses
+            .iter()
+            .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
+    );
+    for (test, body) in clauses {
+        let Some(base) = fallthrough.take() else {
+            break;
+        };
+        match test.map_or(Truthiness::True, |test| {
+            Truthiness::from_expr(test, |_| false)
+        }) {
+            Truthiness::True | Truthiness::Truthy => {
+                let mut outcome = base;
+                collect_explicit_all(body, &mut outcome);
+                outcomes.push(outcome);
+            }
+            Truthiness::False | Truthiness::Falsey | Truthiness::None => {
+                fallthrough = Some(base);
+            }
+            Truthiness::Unknown => {
+                let mut outcome = base.clone();
+                collect_explicit_all(body, &mut outcome);
+                outcomes.push(outcome);
+                fallthrough = Some(base);
+            }
+        }
+    }
+    if let Some(outcome) = fallthrough {
+        outcomes.push(outcome);
+    }
+    *names = common_all_state(&outcomes);
+}
+
+fn common_all_state(outcomes: &[Option<BTreeSet<String>>]) -> Option<BTreeSet<String>> {
+    let first = outcomes.first()?.clone();
+    outcomes
+        .iter()
+        .all(|outcome| outcome == &first)
+        .then_some(first)?
 }
 
 /// The names a function or class body binds.
@@ -9560,6 +9682,39 @@ mod tests {
             explicit_all_names(&path),
             Some(BTreeSet::from(["new".to_owned()]))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_dunder_all_follows_module_control_flow() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(
+            &path,
+            "if False:\n    __all__ = ['unreachable']\nelif True:\n    __all__ = ['if_name']\nfor _ in [0]:\n    __all__ += ['loop_name']\nwith manager():\n    __all__ += ['with_name']\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            explicit_all_names(&path),
+            Some(BTreeSet::from([
+                "if_name".to_owned(),
+                "loop_name".to_owned(),
+                "with_name".to_owned(),
+            ]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_dunder_all_branches_are_not_assumed() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("__init__.py");
+        std::fs::write(
+            &path,
+            "if condition:\n    __all__ = ['left']\nelse:\n    __all__ = ['right']\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(explicit_all_names(&path), None);
         Ok(())
     }
 

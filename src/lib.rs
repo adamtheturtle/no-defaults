@@ -2780,6 +2780,7 @@ fn check_source(
         classes: Vec::new(),
         class_constructs: Vec::new(),
         delegation_protocols: Vec::new(),
+        attribute_interceptors: Vec::new(),
         class_deletions: Vec::new(),
         class_assignments: Vec::new(),
         method_aliases: Vec::new(),
@@ -3090,6 +3091,8 @@ struct Checker<'a> {
     /// Whether each enclosing class directly defines the iterator methods that
     /// make `yield from` forward protocol calls to it.
     delegation_protocols: Vec<bool>,
+    /// Whether each enclosing class can replace ordinary method attributes.
+    attribute_interceptors: Vec<bool>,
     class_deletions: Vec<BTreeSet<String>>,
     class_assignments: Vec<BTreeMap<String, Vec<TextSize>>>,
     /// Direct `alias = method` bindings for each enclosing class, keyed by the
@@ -3569,6 +3572,7 @@ impl Checker<'_> {
     fn leave_class(&mut self) {
         self.class_constructs.pop();
         self.delegation_protocols.pop();
+        self.attribute_interceptors.pop();
         self.class_deletions.pop();
         self.class_assignments.pop();
         self.method_aliases.pop();
@@ -3867,6 +3871,8 @@ impl Checker<'_> {
                 || self.is_stub()
                 || (self.scope.class != ClassScope::None
                     && implicitly_called_method(function.name.as_str()))
+                || (self.scope.class != ClassScope::None
+                    && self.attribute_interceptors.last() == Some(&true))
                 || (self.delegation_protocols.last() == Some(&true)
                     && matches!(function.name.as_str(), "close" | "send" | "throw"))
                 || (self.scope.class == ClassScope::Metaclass
@@ -4330,6 +4336,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.delegation_protocols.push(
                     defines_iterator_method("__iter__") && defines_iterator_method("__next__"),
                 );
+                self.attribute_interceptors
+                    .push(defines_iterator_method("__getattribute__"));
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
                 let context = AliasContext {

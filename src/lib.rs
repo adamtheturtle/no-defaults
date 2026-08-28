@@ -6009,10 +6009,15 @@ fn reconcile_suite_bindings(
 ) {
     let unreachable = match statement {
         Stmt::If(branch) => if_cannot_run(branch),
-        Stmt::While(loop_) => matches!(
-            Truthiness::from_expr(&loop_.test, |_| false),
-            Truthiness::False | Truthiness::Falsey | Truthiness::None
-        ),
+        // A loop that never iterates still runs its `else`, so only one
+        // without that suite leaves nothing behind.
+        Stmt::While(loop_) => {
+            loop_.orelse.is_empty()
+                && matches!(
+                    Truthiness::from_expr(&loop_.test, |_| false),
+                    Truthiness::False | Truthiness::Falsey | Truthiness::None
+                )
+        }
         _ => false,
     };
     let changed: Vec<String> = after
@@ -7386,8 +7391,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             // what it leaves behind has to be reconciled with what came before
             // it: an import in a branch that never runs must not replace the
             // binding the rest of the function is written against.
+            // A class body has arms of its own further down that bind loop
+            // targets and match captures, and a class nested in a function
+            // would otherwise be caught here first.
             Stmt::If(_) | Stmt::Try(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_)
-                if self.bindings.len() > 1 =>
+                if self.bindings.len() > 1 && !self.in_class_scope() =>
             {
                 let before = self.bindings.last().cloned();
                 walk_stmt(self, statement);
@@ -8309,6 +8317,27 @@ mod tests {
             std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
             "from re_export import target\n\ntarget(value=1)\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_else_import_is_not_discarded() -> Result<(), String> {
+        // `while False:` never iterates, which is exactly when its `else`
+        // runs, so the import in there is the one that stands.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def run():\n    from api import target\n    while False:\n        pass\n    else:\n        from other import target\n    target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("target(alpha=1)"), "{updated}");
         Ok(())
     }
 

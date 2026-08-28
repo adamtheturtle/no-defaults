@@ -406,6 +406,28 @@ impl Definitions {
         self.inherited(file, class, name, &mut BTreeSet::new())
     }
 
+    fn class_identity(&self, file: &Path, class: &str) -> Option<(PathBuf, String)> {
+        let mut file = file.to_path_buf();
+        let mut class = class.to_owned();
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert((file.clone(), class.clone())) {
+                return None;
+            }
+            let key = (file.clone(), class.clone());
+            if self.methods.contains_key(&key) || self.bases.contains_key(&key) {
+                return Some(key);
+            }
+            let Binding::Symbol(next_file, next_class) =
+                self.bindings.get(&(file.clone(), class.clone()))?
+            else {
+                return None;
+            };
+            file.clone_from(next_file);
+            class.clone_from(next_class);
+        }
+    }
+
     /// The method a zero-argument `super()` call reaches.
     ///
     /// Python starts that lookup after the class the call appears in, so a
@@ -7079,7 +7101,8 @@ impl Rewriter<'_> {
             return match self.binding(name.id.as_str()) {
                 // `from api import Client` names a class of another file.
                 Some(Binding::Symbol(file, symbol)) => {
-                    Some((file.clone(), symbol.clone(), false, false))
+                    let (file, class) = self.definitions.class_identity(file, symbol)?;
+                    Some((file, class, false, false))
                 }
                 Some(Binding::Module(_)) => None,
                 None => Some((

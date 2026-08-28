@@ -8121,7 +8121,21 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                 }
                 self.visit_body(&loop_statement.body);
+                // The `else` runs only where the loop was not broken out of,
+                // so what it binds is uncertain and is left alone rather than
+                // taken as replacing what the body left behind.
+                let before = self.bindings.last().cloned();
                 self.visit_body(&loop_statement.orelse);
+                if let (Some(before), Some(after)) = (before, self.bindings.last_mut()) {
+                    let changed: Vec<String> = after
+                        .iter()
+                        .filter(|(name, binding)| before.get(name.as_str()) != Some(binding))
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    for name in changed {
+                        after.remove(&name);
+                    }
+                }
             }
             Stmt::With(block) => {
                 // With-items enter left to right, and each optional target is
@@ -14146,5 +14160,27 @@ def b(x=1): pass  # type: ignore  # noqa
             assert_eq!(checked.diagnostics.len(), 1);
             assert_eq!(checked.diagnostics[0].fix.is_some(), fixable, "{source}");
         }
+    }
+
+    #[test]
+    fn an_unreachable_loop_else_import_does_not_take_over() -> Result<(), String> {
+        // The `else` runs only where the loop was not broken out of, so an
+        // import in there must not replace what the function was written
+        // against.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def run():\n    from api import target\n    for _ in [1]:\n        break\n    else:\n        from other import target\n    target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("target(beta=2)"), "{updated}");
+        Ok(())
     }
 }

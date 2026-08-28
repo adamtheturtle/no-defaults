@@ -8117,6 +8117,75 @@ impl<'a> Rewriter<'a> {
             after.remove(&name);
         }
     }
+
+    /// Walk a class-body `match` case that cannot be selected statically,
+    /// letting what its pattern captures take those names over, and report
+    /// which names those were.
+    ///
+    /// A capture rebinds its name for the whole case body, so an import the
+    /// class body made earlier no longer stands there. Walking the body
+    /// without recording the capture would let a call in it resolve to that
+    /// import and be rewritten against the wrong callable. A case after this
+    /// one runs only where this pattern did not match, though, and there the
+    /// import does still stand: the capture is undone once its own body has
+    /// been walked, and it is only what follows the whole `match` that has to
+    /// treat the captured names as uncertain.
+    ///
+    /// Undoing a capture puts the name back exactly as the case found it,
+    /// dropping the binding again where there was none to displace. An import
+    /// the body wrote for a captured name reached the later case no more than
+    /// the capture itself did, so leaving that import in place would let the
+    /// later case resolve the name to something it cannot see.
+    fn visit_uncertain_class_case(&mut self, case: &'a ast::MatchCase) -> BTreeSet<String> {
+        self.visit_pattern(&case.pattern);
+        let mut captures = BoundNames::default();
+        captures.visit_pattern(&case.pattern);
+        let displaced: Vec<(String, Option<Binding>)> = self
+            .class_bindings
+            .last()
+            .into_iter()
+            .flat_map(|bindings| {
+                captures
+                    .names
+                    .iter()
+                    .map(|name| (name.clone(), bindings.get(name).cloned()))
+            })
+            .collect();
+        let shadowed: Vec<String> = self
+            .scopes
+            .last()
+            .into_iter()
+            .flat_map(|scope| {
+                captures
+                    .names
+                    .iter()
+                    .filter(|name| !scope.names.contains(*name))
+                    .cloned()
+            })
+            .collect();
+        self.invalidate_class_bindings(captures.names.iter().cloned());
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.names.extend(captures.names.iter().cloned());
+        }
+        if let Some(guard) = &case.guard {
+            self.visit_expr(guard);
+        }
+        self.visit_body(&case.body);
+        if let Some(bindings) = self.class_bindings.last_mut() {
+            for (name, binding) in displaced {
+                match binding {
+                    Some(binding) => bindings.insert(name, binding),
+                    None => bindings.remove(&name),
+                };
+            }
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            for name in shadowed {
+                scope.names.remove(&name);
+            }
+        }
+        captures.names
+    }
 }
 
 fn python_number_equals_bool(number: &ComparableNumber<'_>, value: bool) -> bool {
@@ -8690,6 +8759,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     .subject
                     .as_literal_expr()
                     .map(ComparableLiteral::from);
+                // A capture in a case that cannot be selected statically holds
+                // only for that case's own body, but the class body after the
+                // `match` is reached whichever case ran, so there every name
+                // any of them captured is uncertain.
+                let mut uncertain = BTreeSet::new();
                 for case in &match_statement.cases {
                     let selected = match (&subject, &case.pattern) {
                         (Some(subject), Pattern::MatchSingleton(pattern)) => match pattern.value {
@@ -8703,22 +8777,14 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         },
                         (Some(subject), Pattern::MatchValue(pattern)) => {
                             let Some(pattern) = pattern.value.as_literal_expr() else {
-                                self.visit_pattern(&case.pattern);
-                                if let Some(guard) = &case.guard {
-                                    self.visit_expr(guard);
-                                }
-                                self.visit_body(&case.body);
+                                uncertain.extend(self.visit_uncertain_class_case(case));
                                 continue;
                             };
                             python_literals_equal(subject, &ComparableLiteral::from(pattern))
                         }
                         (_, Pattern::MatchAs(pattern)) if pattern.pattern.is_none() => true,
                         _ => {
-                            self.visit_pattern(&case.pattern);
-                            if let Some(guard) = &case.guard {
-                                self.visit_expr(guard);
-                            }
-                            self.visit_body(&case.body);
+                            uncertain.extend(self.visit_uncertain_class_case(case));
                             continue;
                         }
                     };
@@ -8747,6 +8813,10 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                     self.visit_body(&case.body);
                     break;
+                }
+                self.invalidate_class_bindings(uncertain.iter().cloned());
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.names.extend(uncertain);
                 }
             }
             Stmt::Match(match_statement) if self.scopes.is_empty() => {
@@ -15018,6 +15088,121 @@ def b(x=1): pass  # type: ignore  # noqa
         ] {
             let updated = fixed(&format!("{head}{rebind}{tail}"))?;
             assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_match_capture_shadows_an_import_before_a_case_is_chosen() -> Result<(), String> {
+        // A pattern that cannot be selected statically still binds its
+        // captures for its own body, so a capture named after an earlier class
+        // import takes that name over there. Only a case capturing some other
+        // name leaves the import standing.
+        for (case, rewritten) in [
+            ("case [other]:", true),
+            ("case [target]:", false),
+            ("case [_] as target:", false),
+            ("case Wrapper(inner=target):", false),
+            ("case target if flag():", false),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(value=1): return value\n")
+                .map_err(|error| error.to_string())?;
+            let caller = format!(
+                "class C:\n    from api import target\n    match subject:\n        {case}\n            result = target()\n"
+            );
+            std::fs::write(&user, &caller).map_err(|error| error.to_string())?;
+            fix_all(&[api, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert_eq!(updated.contains("target(value=1)"), rewritten, "{caller}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_match_capture_ends_with_its_own_case() -> Result<(), String> {
+        // A case after one whose pattern cannot be selected statically runs
+        // only where that pattern did not match, so a capture that one made is
+        // not in force there and the class import it displaced still stands.
+        // The class body after the whole match is reached whichever case ran,
+        // so there a captured name does stay uncertain.
+        for (cases, rewritten) in [
+            (
+                "        case [target]:\n            result = target()\n",
+                false,
+            ),
+            (
+                "        case [target]:\n            pass\n        case [other]:\n            result = target()\n",
+                true,
+            ),
+            (
+                "        case [other]:\n            pass\n        case [another]:\n            result = target()\n",
+                true,
+            ),
+            (
+                "        case [target]:\n            pass\n    result = target()\n",
+                false,
+            ),
+            (
+                "        case [other]:\n            pass\n    result = target()\n",
+                true,
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(value=1): return value\n")
+                .map_err(|error| error.to_string())?;
+            let caller =
+                format!("class C:\n    from api import target\n    match subject:\n{cases}");
+            std::fs::write(&user, &caller).map_err(|error| error.to_string())?;
+            fix_all(&[api, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert_eq!(
+                updated.contains("result = target(value=1)"),
+                rewritten,
+                "{caller}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_match_capture_undoes_a_reimport_in_its_case() -> Result<(), String> {
+        // Undoing a capture has to undo an import the case body wrote for that
+        // same name, because a later case runs only where the pattern did not
+        // match and so reaches neither the capture nor the import. The name
+        // there is whatever the case found, an earlier class import or a
+        // module-level one, and never the re-import. An import of a name the
+        // pattern did not capture is left alone.
+        for (caller, expected) in [
+            (
+                "class C:\n    from api import target\n    match subject:\n        case [target]:\n            from other import target\n        case [x]:\n            result = target()\n",
+                "result = target(value=1)",
+            ),
+            (
+                "from api import target\nclass C:\n    match subject:\n        case [target]:\n            from other import target\n        case [x]:\n            result = target()\n",
+                "result = target(value=1)",
+            ),
+            (
+                "class C:\n    from api import target\n    match subject:\n        case [x]:\n            from other import target\n        case [y]:\n            result = target()\n",
+                "result = target(value=2)",
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let other = directory.path().join("other.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(value=1): return value\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&other, "def target(value=2): return value\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, caller).map_err(|error| error.to_string())?;
+            fix_all(&[api, other, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(updated.contains(expected), "{caller}\n{updated}");
         }
         Ok(())
     }

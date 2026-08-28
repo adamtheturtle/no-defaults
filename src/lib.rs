@@ -5578,6 +5578,57 @@ fn retain_common_bindings(
     });
 }
 
+/// Whether none of an `if` statement's suites can run.
+fn if_cannot_run(branch: &ast::StmtIf) -> bool {
+    let falsey = |test: &Expr| {
+        matches!(
+            Truthiness::from_expr(test, |_| false),
+            Truthiness::False | Truthiness::Falsey | Truthiness::None
+        )
+    };
+    falsey(&branch.test)
+        && branch
+            .elif_else_clauses
+            .iter()
+            .all(|clause| clause.test.as_ref().is_some_and(falsey))
+}
+
+/// Reconcile the bindings a suite inside a function changed against the ones
+/// it started from.
+///
+/// A suite that cannot run leaves the earlier bindings standing. One that may
+/// or may not run leaves every name it rebinds uncertain, and an uncertain
+/// name is better left alone than rewritten against a guess.
+fn reconcile_suite_bindings(
+    statement: &Stmt,
+    before: &BTreeMap<String, Binding>,
+    after: &mut BTreeMap<String, Binding>,
+) {
+    let unreachable = match statement {
+        Stmt::If(branch) => if_cannot_run(branch),
+        Stmt::While(loop_) => matches!(
+            Truthiness::from_expr(&loop_.test, |_| false),
+            Truthiness::False | Truthiness::Falsey | Truthiness::None
+        ),
+        _ => false,
+    };
+    let changed: Vec<String> = after
+        .iter()
+        .filter(|(name, binding)| before.get(name.as_str()) != Some(binding))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in changed {
+        match before.get(&name) {
+            Some(binding) if unreachable => {
+                after.insert(name, binding.clone());
+            }
+            _ => {
+                after.remove(&name);
+            }
+        }
+    }
+}
+
 fn source_binds_name(path: &Path, name: &str) -> bool {
     read_source(path)
         .ok()
@@ -6827,6 +6878,19 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 }
                 self.bind_statement_in_class(statement);
             }
+            // A suite inside a function records its imports as it walks, so
+            // what it leaves behind has to be reconciled with what came before
+            // it: an import in a branch that never runs must not replace the
+            // binding the rest of the function is written against.
+            Stmt::If(_) | Stmt::Try(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_)
+                if self.bindings.len() > 1 =>
+            {
+                let before = self.bindings.last().cloned();
+                walk_stmt(self, statement);
+                if let (Some(before), Some(after)) = (before, self.bindings.last_mut()) {
+                    reconcile_suite_bindings(statement, &before, after);
+                }
+            }
             Stmt::Import(_) | Stmt::ImportFrom(_) => {
                 if let Some(bindings) = self.bindings.last_mut() {
                     collect_bindings(
@@ -7494,6 +7558,27 @@ mod tests {
             .into_iter()
             .map(|skip| skip.reason)
             .collect())
+    }
+
+    #[test]
+    fn a_dead_branch_import_does_not_replace_a_function_binding() -> Result<(), String> {
+        // The `if False:` suite never runs, so `target` is still the one the
+        // function imported above it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def run():\n    from api import target\n    if False:\n        from other import target\n    target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.ends_with("    target(alpha=1)\n"), "{updated}");
+        Ok(())
     }
 
     #[test]

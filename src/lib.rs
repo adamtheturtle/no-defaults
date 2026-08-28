@@ -2786,6 +2786,7 @@ fn check_source(
         instance_attributes: Vec::new(),
         class_deletions: Vec::new(),
         class_assignments: Vec::new(),
+        class_rewraps: Vec::new(),
         method_aliases: Vec::new(),
         signatures: Vec::new(),
         skipped: Vec::new(),
@@ -3102,6 +3103,9 @@ struct Checker<'a> {
     instance_attributes: Vec<BTreeSet<String>>,
     class_deletions: Vec<BTreeSet<String>>,
     class_assignments: Vec<BTreeMap<String, Vec<TextSize>>>,
+    /// Class-body assignments that put the same function back under its own
+    /// name, which replace nothing.
+    class_rewraps: Vec<BTreeMap<String, Vec<TextSize>>>,
     /// Direct `alias = method` bindings for each enclosing class, keyed by the
     /// original method name.
     method_aliases: Vec<BTreeMap<String, Vec<MethodAlias>>>,
@@ -3583,6 +3587,7 @@ impl Checker<'_> {
         self.instance_attributes.pop();
         self.class_deletions.pop();
         self.class_assignments.pop();
+        self.class_rewraps.pop();
         self.method_aliases.pop();
     }
 
@@ -3935,21 +3940,22 @@ impl Checker<'_> {
             return false;
         }
         // `target = staticmethod(target)` assigns the name a second time but
-        // keeps the same function behind it, so the default is still the one a
-        // call has to be given back.
-        let rewrapped = self.method_aliases.last().is_some_and(|aliases| {
-            aliases.get(function.name.as_str()).is_some_and(|aliases| {
-                aliases
-                    .iter()
-                    .any(|alias| alias.name == function.name.as_str())
-            })
-        });
-        !rewrapped
-            && self.class_assignments.last().is_some_and(|assignments| {
-                assignments
-                    .get(function.name.as_str())
-                    .is_some_and(|offsets| offsets.iter().any(|offset| *offset > function.start()))
-            })
+        // keeps the same function behind it, so it replaces nothing. Every
+        // other later assignment does, including one that follows a rewrap.
+        let rewraps = self
+            .class_rewraps
+            .last()
+            .and_then(|rewraps| rewraps.get(function.name.as_str()));
+        self.class_assignments.last().is_some_and(|assignments| {
+            assignments
+                .get(function.name.as_str())
+                .is_some_and(|offsets| {
+                    offsets.iter().any(|offset| {
+                        *offset > function.start()
+                            && !rewraps.is_some_and(|rewraps| rewraps.contains(offset))
+                    })
+                })
+        })
     }
 
     /// Record what a call to this function has to be given back, under every
@@ -4451,6 +4457,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.instance_attributes.push(instance_attributes(class));
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
+                self.class_rewraps.push(class_rewraps(&class.body));
                 let context = AliasContext {
                     aliases: &self.aliases,
                     module_bindings: &self.module_bindings,
@@ -6464,6 +6471,47 @@ fn explicit_all_names(path: &Path) -> Option<BTreeSet<String>> {
 /// A nested `def` or `class` is a scope of its own, and the rewriter pushes one
 /// for it on the way in, so what it binds is left to it. Only its own name is
 /// taken, because that is what the body being collected binds.
+/// The class-body assignments that put the same function back under its own
+/// name, such as `target = staticmethod(target)`.
+///
+/// These are not overwrites: a call still reaches the function defined above,
+/// so its default is still the one to give back. Anything else assigned to the
+/// name is a replacement, including a later one that follows a rewrap.
+fn class_rewraps(body: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
+    #[derive(Default)]
+    struct Collector(BTreeMap<String, Vec<TextSize>>);
+
+    impl<'a> Visitor<'a> for Collector {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            match statement {
+                Stmt::Assign(assign) => {
+                    let [Expr::Name(target)] = assign.targets.as_slice() else {
+                        return;
+                    };
+                    let Expr::Call(call) = assign.value.as_ref() else {
+                        return;
+                    };
+                    let wraps_itself = call.arguments.args.len() == 1
+                        && call.arguments.keywords.is_empty()
+                        && matches!(&call.arguments.args[0], Expr::Name(wrapped) if wrapped.id == target.id);
+                    if wraps_itself {
+                        self.0
+                            .entry(target.id.to_string())
+                            .or_default()
+                            .push(statement.start());
+                    }
+                }
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                _ => walk_stmt(self, statement),
+            }
+        }
+    }
+
+    let mut collector = Collector::default();
+    collector.visit_body(body);
+    collector.0
+}
+
 fn class_assignments(body: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
     #[derive(Default)]
     struct Collector(BTreeMap<String, Vec<TextSize>>);
@@ -13643,6 +13691,39 @@ def b(x=1): pass  # type: ignore  # noqa
                 checked.diagnostics.iter().all(|d| d.fix.is_none()),
                 "{base}"
             );
+        }
+    }
+
+    #[test]
+    fn a_rewrap_is_not_an_overwrite_but_what_follows_one_is() {
+        // `target = staticmethod(target)` keeps the same function behind the
+        // name, so the default is still what a call needs. Anything else
+        // assigned to the name replaces it, including after a rewrap.
+        for (source, fixable) in [
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = staticmethod(target)\n",
+                true,
+            ),
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = staticmethod(target)\n    target = lambda self: 9\n",
+                false,
+            ),
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = lambda self: 9\n",
+                false,
+            ),
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert_eq!(checked.diagnostics[0].fix.is_some(), fixable, "{source}");
         }
     }
 }

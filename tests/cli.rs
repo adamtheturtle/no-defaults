@@ -3000,6 +3000,30 @@ fn ambiguous_star_imports_shadow_local_callables() -> Result<(), Box<dyn std::er
 }
 
 #[test]
+fn ambiguous_star_import_receivers_retain_method_defaults() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    std::fs::write(
+        &api,
+        "from dataclasses import dataclass\ndef C(value=1): return value\n@dataclass\nclass C:\n    field: int = 3\n    @staticmethod\n    def target(value=2): return value\n",
+    )?;
+    let caller = directory.path().join("caller.py");
+    let caller_source = "from api import *\nassert C.target() == 2\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let fixed = std::fs::read_to_string(api)?;
+    assert!(fixed.contains("def target(value=2)"), "{fixed}");
+    assert_eq!(std::fs::read_to_string(caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
 fn dotted_imports_bind_the_top_level_package() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let package = directory.path().join("a");

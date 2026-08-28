@@ -7251,6 +7251,14 @@ impl Rewriter<'_> {
                     if through_instance {
                         return None;
                     }
+                    // A class attribute may itself be a nested class. Its
+                    // constructor is indexed under the qualified definition
+                    // name, so `Outer.Inner()` must look for `Outer.Inner`
+                    // after determining which `Outer` the receiver names.
+                    let nested = format!("{class}.{}", attribute.attr);
+                    if let Some(signature) = self.definitions.symbol(&file, &nested) {
+                        return Some((signature, signature.kind.implicit_bound()));
+                    }
                 }
                 let dotted = dotted_name(&attribute.value)?;
                 let Some(Binding::Module(file)) = self.binding(&dotted) else {

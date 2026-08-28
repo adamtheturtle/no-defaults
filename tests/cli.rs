@@ -3790,6 +3790,29 @@ fn nested_classes_have_qualified_method_identities() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn imported_nested_class_constructors_update_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let module = directory.path().join("m.py");
+    std::fs::write(
+        &module,
+        "class Outer:\n    class Inner:\n        def __init__(self, value=1):\n            self.value = value\n",
+    )?;
+    let caller = directory.path().join("c.py");
+    std::fs::write(&caller, "from m import Outer\nprint(Outer.Inner().value)\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from m import Outer\nprint(Outer.Inner(value=1).value)\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn package_attributes_take_precedence_over_same_named_submodules(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

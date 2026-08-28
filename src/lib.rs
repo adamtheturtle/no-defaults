@@ -5008,9 +5008,11 @@ impl Aliases {
                     for alias in &import.names {
                         let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                         if dataclasses && alias.name.as_str() == "field" {
+                            self.invalidated_field_helpers.remove(&local);
                             self.dataclass_fields.insert(local.clone());
                         }
                         if pydantic && alias.name.as_str() == "Field" {
+                            self.invalidated_field_helpers.remove(&local);
                             self.pydantic_fields.insert(local.clone());
                         }
                         if pydantic && alias.name.as_str() == "PrivateAttr" {
@@ -6139,6 +6141,7 @@ fn rewrite_calls(
         binding_scope_depths: vec![0],
         lambda_scope_depths: Vec::new(),
         class_bindings: Vec::new(),
+        conditional_class_definitions: Vec::new(),
         invalidated_bindings: BTreeSet::new(),
         rebound_classes: BTreeSet::new(),
         known,
@@ -7178,6 +7181,10 @@ struct Rewriter<'a> {
     lambda_scope_depths: Vec<usize>,
     /// Imports bound directly in each enclosing class namespace.
     class_bindings: Vec<BTreeMap<String, Binding>>,
+    /// Imports in each enclosing class namespace that a `def` or a `class`
+    /// nested in control flow may have taken the name of. A call below reaches
+    /// the definition or the import, so the import's default has to stay.
+    conditional_class_definitions: Vec<BTreeSet<String>>,
     /// Imported module-scope names replaced by an assignment already visited.
     invalidated_bindings: BTreeSet<String>,
     /// Module names that can no longer be assumed to denote an earlier class.
@@ -7239,10 +7246,32 @@ impl Rewriter<'_> {
         }
     }
 
-    fn bind_definition_in_class(&mut self, name: &str, is_class: bool) {
+    fn bind_definition_in_class(&mut self, name: &str, is_class: bool, start: TextSize) {
         if !self.in_class_scope() {
             return;
         }
+        // A `def` or `class` takes the name over in the class namespace, so an
+        // import that bound it earlier is no longer what a call below reaches.
+        // A definition nested in class-body control flow may never run, but
+        // then the name is whichever of the two the branch left behind, and
+        // that is still not knowable from the source alone.
+        let replaced_import = self
+            .class_bindings
+            .last()
+            .is_some_and(|bindings| bindings.contains_key(name));
+        let direct = self
+            .class_direct_statements
+            .last()
+            .is_some_and(|statements| statements.contains(&start));
+        // Declining to rewrite the call is only half of it: the import is
+        // still one of the two things the name can hold, so removing its
+        // default would leave that call short an argument.
+        if replaced_import && !direct {
+            if let Some(names) = self.conditional_class_definitions.last_mut() {
+                names.insert(name.to_owned());
+            }
+        }
+        self.invalidate_class_bindings([name.to_owned()]);
         if let Some(scope) = self.scopes.last_mut() {
             scope.names.insert(name.to_owned());
             if is_class {
@@ -7664,7 +7693,12 @@ impl Rewriter<'_> {
                     .is_some_and(|binding| self.binding_is_replaced(&binding));
                 let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
                 let ambiguous_import = self.has_unknown_receiver_binding(&call.func);
-                if replaced_import || local_shadow || ambiguous_import {
+                let conditional_definition = matches!(call.func.as_ref(), Expr::Name(name) if self.in_class_scope()
+                    && self
+                        .conditional_class_definitions
+                        .last()
+                        .is_some_and(|names| names.contains(name.id.as_str())));
+                if replaced_import || local_shadow || ambiguous_import || conditional_definition {
                     if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
                         self.retained.extend(fixes.iter().cloned());
                     }
@@ -8879,18 +8913,20 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.lexical_is_class.push(true);
                 self.scopes.push(BoundNames::default());
                 self.class_bindings.push(BTreeMap::new());
+                self.conditional_class_definitions.push(BTreeSet::new());
                 self.class_scope_depths.push(self.scopes.len());
                 self.class_direct_statements
                     .push(class.body.iter().map(Ranged::start).collect());
                 self.visit_body(&class.body);
                 self.class_direct_statements.pop();
                 self.class_scope_depths.pop();
+                self.conditional_class_definitions.pop();
                 self.class_bindings.pop();
                 self.scopes.pop();
                 self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.classes.pop();
-                self.bind_definition_in_class(class.name.as_str(), true);
+                self.bind_definition_in_class(class.name.as_str(), true, class.start());
                 if !module_scope && !self.in_class_scope() {
                     if let Some(bindings) = self.bindings.last_mut() {
                         bindings.remove(class.name.as_str());
@@ -8956,7 +8992,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         bindings.remove(function.name.as_str());
                     }
                 }
-                self.bind_definition_in_class(function.name.as_str(), false);
+                self.bind_definition_in_class(function.name.as_str(), false, function.start());
                 if module_scope {
                     self.rebound_classes.insert(function.name.to_string());
                 }

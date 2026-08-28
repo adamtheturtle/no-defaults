@@ -6556,6 +6556,17 @@ impl Rewriter<'_> {
     }
 
     fn function_binding(&self, name: &str) -> Option<&Binding> {
+        // `global name` sends the name to the module namespace, so an import
+        // an enclosing function made under it is not what the call reaches.
+        // `nonlocal` is the opposite: that enclosing binding is exactly it.
+        if self
+            .scopes
+            .last()
+            .is_some_and(|scope| scope.globals.contains(name))
+        {
+            let binding = self.bindings.first()?.get(name)?;
+            return (!self.binding_is_replaced(name)).then_some(binding);
+        }
         let owner = self.nested_binding(name).map(|(_, index)| index);
         self.bindings
             .iter()
@@ -13092,6 +13103,37 @@ def b(x=1): pass  # type: ignore  # noqa
         let settings = settings_for_files(&[root_file, nested_file], false, false)?;
         assert_eq!(settings[0].private_only, Some(true));
         assert_eq!(settings[1].private_only, Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn a_global_declaration_reaches_the_module_binding() -> Result<(), String> {
+        // `global target` names the module's binding, not the import an
+        // enclosing function made under the same name. `nonlocal` does name
+        // that enclosing one.
+        for (body, expected) in [
+            (
+                "from api import target\n\ndef outer():\n    from other import target\n    def inner():\n        global target\n        target()\n    return inner\n",
+                "target(alpha=1)",
+            ),
+            (
+                "def outer():\n    from other import target\n    def inner():\n        nonlocal target\n        target()\n    return inner\n",
+                "target(beta=2)",
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let other = directory.path().join("other.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(alpha=1): pass\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&other, "def target(beta=2): pass\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, body).map_err(|error| error.to_string())?;
+            fix_all(&[api, other, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(updated.contains(expected), "{updated}");
+        }
         Ok(())
     }
 }

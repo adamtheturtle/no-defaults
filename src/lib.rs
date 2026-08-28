@@ -4457,7 +4457,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.instance_attributes.push(instance_attributes(class));
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
-                self.class_rewraps.push(class_rewraps(&class.body));
+                self.class_rewraps.push(class_rewraps(
+                    &class.body,
+                    &self.aliases,
+                    &self.module_bindings,
+                ));
                 let context = AliasContext {
                     aliases: &self.aliases,
                     module_bindings: &self.module_bindings,
@@ -6477,11 +6481,18 @@ fn explicit_all_names(path: &Path) -> Option<BTreeSet<String>> {
 /// These are not overwrites: a call still reaches the function defined above,
 /// so its default is still the one to give back. Anything else assigned to the
 /// name is a replacement, including a later one that follows a rewrap.
-fn class_rewraps(body: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
-    #[derive(Default)]
-    struct Collector(BTreeMap<String, Vec<TextSize>>);
+fn class_rewraps(
+    body: &[Stmt],
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> BTreeMap<String, Vec<TextSize>> {
+    struct Collector<'a> {
+        found: BTreeMap<String, Vec<TextSize>>,
+        aliases: &'a Aliases,
+        module_bindings: &'a BTreeSet<String>,
+    }
 
-    impl<'a> Visitor<'a> for Collector {
+    impl<'a> Visitor<'a> for Collector<'_> {
         fn visit_stmt(&mut self, statement: &'a Stmt) {
             match statement {
                 Stmt::Assign(assign) => {
@@ -6491,11 +6502,16 @@ fn class_rewraps(body: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
                     let Expr::Call(call) = assign.value.as_ref() else {
                         return;
                     };
+                    // Only the descriptor wrappers are known to leave the
+                    // function's own parameters behind the name. Any other
+                    // call may return something taking anything at all.
                     let wraps_itself = call.arguments.args.len() == 1
                         && call.arguments.keywords.is_empty()
+                        && descriptor_wrapper_kind(&call.func, self.aliases, self.module_bindings)
+                            .is_some()
                         && matches!(&call.arguments.args[0], Expr::Name(wrapped) if wrapped.id == target.id);
                     if wraps_itself {
-                        self.0
+                        self.found
                             .entry(target.id.to_string())
                             .or_default()
                             .push(statement.start());
@@ -6507,9 +6523,13 @@ fn class_rewraps(body: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
         }
     }
 
-    let mut collector = Collector::default();
+    let mut collector = Collector {
+        found: BTreeMap::new(),
+        aliases,
+        module_bindings,
+    };
     collector.visit_body(body);
-    collector.0
+    collector.found
 }
 
 fn class_assignments(body: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
@@ -13710,6 +13730,34 @@ def b(x=1): pass  # type: ignore  # noqa
             ),
             (
                 "class C:\n    def target(self, value=1): pass\n    target = lambda self: 9\n",
+                false,
+            ),
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert_eq!(checked.diagnostics[0].fix.is_some(), fixable, "{source}");
+        }
+    }
+
+    #[test]
+    fn only_a_descriptor_wrapper_counts_as_a_rewrap() {
+        // `staticmethod` leaves the function's own parameters behind the name.
+        // An unknown call may return anything, so the default stays put.
+        for (source, fixable) in [
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = staticmethod(target)\n",
+                true,
+            ),
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = memoize(target)\n",
                 false,
             ),
         ] {

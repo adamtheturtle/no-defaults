@@ -3407,9 +3407,18 @@ impl Checker<'_> {
     /// fields into a subclass's constructor, and stale truthiness would take
     /// a branch the rebinding decided against.
     fn invalidate_bound_names<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+        // Truthiness is recorded for module-level names and consulted only
+        // where a module-level test can see them. A binding in a function or
+        // class body names something else that leaves the module name alone,
+        // so forgetting the flag there would make a later module branch
+        // uncertain about a value still true when it runs.
+        let rebinds_module_name =
+            self.scope.class == ClassScope::None && self.lexical_scope.is_empty();
         for name in names {
             self.aliases.invalidate(name);
-            self.known_truthiness.remove(name);
+            if rebinds_module_name {
+                self.known_truthiness.remove(name);
+            }
             self.shapes
                 .remove(&qualified_class_name(&self.lexical_scope, name));
         }
@@ -3605,6 +3614,14 @@ impl Checker<'_> {
         Self: Visitor<'a>,
     {
         self.check_function(function);
+        // `global` sends a binding in the body to the module namespace rather
+        // than to the function's own, so a flag rebound under one is no longer
+        // the value a later module-level test would read.
+        let mut declared = BoundNames::default();
+        declared.visit_body(&function.body);
+        for name in declared.globals.intersection(&declared.names) {
+            self.known_truthiness.remove(name);
+        }
         let outer = self.scope;
         let outer_aliases = self.aliases.clone();
         let outer_local_classes = self.local_classes.clone();
@@ -14971,6 +14988,37 @@ def b(x=1): pass  # type: ignore  # noqa
         }
         let updated = fixed(&format!("{head}{tail}"))?;
         assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_rebinding_leaves_module_truthiness_alone() -> Result<(), String> {
+        // A loop or walrus target in a function or class body binds that
+        // scope's own name, leaving the module-level flag it happens to share
+        // a name with untouched. Dropping the recorded truth made the branch
+        // below uncertain, so the base was unknown and `Child()` kept its
+        // arguments while the fields it needed lost their defaults.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nFLAG = True\n";
+        let tail = "\nif FLAG:\n    Alias = Base\nelse:\n    Alias = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for nested in [
+            "def helper():\n    for FLAG in [False]:\n        pass\n",
+            "def helper():\n    print(FLAG := False)\n",
+            "class Holder:\n    for FLAG in [False]:\n        pass\n",
+        ] {
+            let updated = fixed(&format!("{head}{nested}{tail}"))?;
+            assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        }
+        // `global` sends the body's binding to the module namespace, so the
+        // flag there does stop being known, as it does when the rebinding is
+        // written at module level.
+        for rebind in [
+            "def helper():\n    global FLAG\n    for FLAG in [False]:\n        pass\n\nhelper()\n",
+            "def helper():\n    global FLAG\n    FLAG = False\n\nhelper()\n",
+            "for FLAG in [False]:\n    pass\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
         Ok(())
     }
 }

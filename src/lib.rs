@@ -8354,6 +8354,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.lexical_scope.pop();
                 self.classes.pop();
                 self.bind_definition_in_class(class.name.as_str(), true);
+                if !module_scope && !self.in_class_scope() {
+                    if let Some(bindings) = self.bindings.last_mut() {
+                        bindings.remove(class.name.as_str());
+                    }
+                }
                 if module_scope
                     && self
                         .bindings

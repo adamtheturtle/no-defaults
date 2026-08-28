@@ -6286,13 +6286,20 @@ fn collect_assignment_binding(statement: &Stmt, bindings: &mut BTreeMap<String, 
     };
     let binding = assignment_binding(value, bindings);
     for target in targets {
-        let Expr::Name(target) = target else {
-            continue;
-        };
-        if let Some(binding) = &binding {
-            bindings.insert(target.id.to_string(), binding.clone());
+        if let Expr::Name(target) = target {
+            if let Some(binding) = &binding {
+                bindings.insert(target.id.to_string(), binding.clone());
+            } else {
+                bindings.remove(target.id.as_str());
+            }
         } else {
-            bindings.remove(target.id.as_str());
+            // Unpacking binds names this cannot be followed through, so what
+            // they held before is no longer what they hold.
+            let mut bound = BoundNames::default();
+            bound.bind(target);
+            for name in bound.names {
+                bindings.remove(&name);
+            }
         }
     }
 }

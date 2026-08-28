@@ -3353,7 +3353,14 @@ impl Checker<'_> {
                     bound.bind(target);
                 }
             }
-            Stmt::AnnAssign(assign) => bound.bind(&assign.target),
+            // `name: int` declares a type without rebinding anything, so the
+            // alias, truthiness and dataclass shape already recorded for the
+            // name still describe it.
+            Stmt::AnnAssign(assign) => {
+                if assign.value.is_some() {
+                    bound.bind(&assign.target);
+                }
+            }
             Stmt::AugAssign(assign) => bound.bind(&assign.target),
             _ => return,
         }
@@ -14911,6 +14918,28 @@ def b(x=1): pass  # type: ignore  # noqa
             let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
             assert_eq!(updated.contains("target(value=1)"), rewritten, "{caller}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotation_without_a_value_keeps_a_dataclass_alias_shape() -> Result<(), String> {
+        // `Alias: object` declares a type and binds nothing, so `Child` still
+        // inherits `Base`'s field and its call needs that argument.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\nAlias: object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int\n\nAlias = Base\nAlias: object\n\n@dataclass\nclass Child(Alias):\n    value: int\n\nChild(inherited=1, value=2)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotated_assignment_drops_a_dataclass_alias_shape() -> Result<(), String> {
+        // `Alias: object = object` does rebind, so nothing is known about what
+        // `Child` inherits and its call is left alone.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\nAlias: object = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        let updated = fixed(source)?;
+        assert!(updated.ends_with("\nChild()\n"), "{updated}");
         Ok(())
     }
 }

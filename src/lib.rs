@@ -3357,12 +3357,7 @@ impl Checker<'_> {
             Stmt::AugAssign(assign) => bound.bind(&assign.target),
             _ => return,
         }
-        for name in &bound.names {
-            self.aliases.invalidate(name);
-            self.known_truthiness.remove(name);
-            self.shapes
-                .remove(&qualified_class_name(&self.lexical_scope, name));
-        }
+        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
         if let Stmt::Assign(assign) = statement {
             if let Some(Expr::Name(target)) =
                 assign.targets.first().filter(|_| assign.targets.len() == 1)
@@ -3407,12 +3402,23 @@ impl Checker<'_> {
         }
     }
 
+    /// Forget everything a name was known to stand for, because something
+    /// else now stands there. A stale shape would write a rebound base's old
+    /// fields into a subclass's constructor, and stale truthiness would take
+    /// a branch the rebinding decided against.
+    fn invalidate_bound_names<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+        for name in names {
+            self.aliases.invalidate(name);
+            self.known_truthiness.remove(name);
+            self.shapes
+                .remove(&qualified_class_name(&self.lexical_scope, name));
+        }
+    }
+
     fn invalidate_target_aliases(&mut self, target: &Expr) {
         let mut bound = BoundNames::default();
         bound.bind(target);
-        for name in bound.names {
-            self.aliases.invalidate(&name);
-        }
+        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
     }
 
     fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, statement: &'a Stmt)
@@ -3460,9 +3466,7 @@ impl Checker<'_> {
             self.visit_pattern(&case.pattern);
             let mut captures = BoundNames::default();
             captures.visit_pattern(&case.pattern);
-            for name in captures.names {
-                self.aliases.invalidate(&name);
-            }
+            self.invalidate_bound_names(captures.names.iter().map(String::as_str));
             if let Some(guard) = &case.guard {
                 self.visit_expr(guard);
             }
@@ -8926,6 +8930,10 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&named.target);
                 let mut bound = BoundNames::default();
                 bound.bind(&named.target);
+                // The class namespace resolves a name to an import bound in
+                // the same body before anything else, so a target that took
+                // the name over has to drop that import as an assignment does.
+                self.invalidate_class_bindings(bound.names.iter().cloned());
                 if let Some(scope) = self.scopes.last_mut() {
                     scope.names.extend(bound.names);
                 }
@@ -14887,6 +14895,82 @@ def b(x=1): pass  # type: ignore  # noqa
             let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
             assert_eq!(updated.contains("target(value=1)"), rewritten, "{caller}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_scope_walrus_replaces_an_earlier_import() -> Result<(), String> {
+        // The class namespace resolves a name to an import bound in the same
+        // body ahead of everything else, so a walrus that took the name over
+        // has to drop it. Rewriting past one wrote `target(value=1)` against
+        // a lambda that takes nothing.
+        for body in [
+            "class C:\n    from api import target\n\n    (target := staticmethod(lambda: 9))\n    result = target()\n",
+            "class C:\n    from api import target\n\n    holder = [(target := staticmethod(lambda: 9))]\n    result = target()\n",
+            "class C:\n    from api import target\n\n    flag = True\n    if flag:\n        (target := staticmethod(lambda: 9))\n    result = target()\n",
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(value=1):\n    return value\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, body).map_err(|error| error.to_string())?;
+            fix_all(&[api, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(!updated.contains("target(value=1)"), "{updated}");
+        }
+        // The same class body without the walrus is rewritten, so the calls
+        // above are left alone by the rebinding rather than by nothing.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(value=1):\n    return value\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "class C:\n    from api import target\n\n    result = target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.contains("target(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebound_base_name_loses_its_dataclass_shape() -> Result<(), String> {
+        // A loop, context-manager, walrus, or match target replaces the class
+        // the name stood for just as an assignment does. Keeping the shape
+        // wrote the old base's fields into a subclass's constructor.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n";
+        let tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in [
+            "for Alias in [object]:\n    pass\n",
+            "class Ctx:\n    def __enter__(self):\n        return object\n\n    def __exit__(self, *args):\n        return False\n\nwith Ctx() as Alias:\n    pass\n",
+            "print(Alias := object)\n",
+            "match object:\n    case Alias:\n        pass\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        // Without a rebinding the alias still carries the fields through.
+        let updated = fixed(&format!("{head}{tail}"))?;
+        assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebound_flag_is_no_longer_known_to_be_true() -> Result<(), String> {
+        // The same rebindings decide a branch the recorded truthiness would
+        // otherwise settle, so a stale value picked the wrong base entirely.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nFLAG = True\n";
+        let tail = "\nif FLAG:\n    Alias = Base\nelse:\n    Alias = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in ["for FLAG in [False]:\n    pass\n", "print(FLAG := False)\n"] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        let updated = fixed(&format!("{head}{tail}"))?;
+        assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
         Ok(())
     }
 }

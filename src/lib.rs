@@ -6040,6 +6040,7 @@ fn rewrite_calls(
         aliases,
         module_bindings: BoundNames::of_body(parsed.suite()).names,
         bindings: vec![BTreeMap::new()],
+        binding_scope_depths: vec![0],
         class_bindings: Vec::new(),
         invalidated_bindings: BTreeSet::new(),
         rebound_classes: BTreeSet::new(),
@@ -7048,6 +7049,8 @@ struct Rewriter<'a> {
     module_bindings: BTreeSet<String>,
     /// What each imported name in this file refers to.
     bindings: Vec<BTreeMap<String, Binding>>,
+    /// Lexical scope index owning each non-module binding table.
+    binding_scope_depths: Vec<usize>,
     /// Imports bound directly in each enclosing class namespace.
     class_bindings: Vec<BTreeMap<String, Binding>>,
     /// Imported module-scope names replaced by an assignment already visited.
@@ -7173,11 +7176,27 @@ impl Rewriter<'_> {
     }
 
     fn function_binding(&self, name: &str) -> Option<&Binding> {
+        // `global name` sends the name to the module namespace, so an import
+        // an enclosing function made under it is not what the call reaches.
+        // `nonlocal` is the opposite: that enclosing binding is exactly it.
+        if self
+            .scopes
+            .last()
+            .is_some_and(|scope| scope.globals.contains(name))
+        {
+            let binding = self.bindings.first()?.get(name)?;
+            return (!self.binding_is_replaced(name)).then_some(binding);
+        }
+        let owner = self.nested_binding(name).map(|(_, index)| index);
         self.bindings
             .iter()
+            .zip(&self.binding_scope_depths)
             .skip(1)
             .rev()
-            .find_map(|bindings| bindings.get(name))
+            .find_map(|(bindings, depth)| {
+                let binding = bindings.get(name)?;
+                owner.is_none_or(|owner| owner == *depth).then_some(binding)
+            })
     }
 
     fn function_symbol(&self, name: &str) -> Option<&Signature> {
@@ -8380,6 +8399,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.implicit_receivers.push(receiver);
                 self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
+                self.binding_scope_depths.push(self.scopes.len() - 1);
                 self.lexical_scope.push(function.name.to_string());
                 self.lexical_is_class.push(false);
                 self.visit_body(&function.body);
@@ -8387,6 +8407,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.lexical_scope.pop();
                 self.scopes.pop();
                 self.bindings.pop();
+                self.binding_scope_depths.pop();
                 self.implicit_receivers.pop();
                 if !module_scope && !self.in_class_scope() {
                     if let Some(bindings) = self.bindings.last_mut() {
@@ -14074,6 +14095,37 @@ def b(x=1): pass  # type: ignore  # noqa
         let settings = settings_for_files(&[root_file, nested_file], false, false)?;
         assert_eq!(settings[0].private_only, Some(true));
         assert_eq!(settings[1].private_only, Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn a_global_declaration_reaches_the_module_binding() -> Result<(), String> {
+        // `global target` names the module's binding, not the import an
+        // enclosing function made under the same name. `nonlocal` does name
+        // that enclosing one.
+        for (body, expected) in [
+            (
+                "from api import target\n\ndef outer():\n    from other import target\n    def inner():\n        global target\n        target()\n    return inner\n",
+                "target(alpha=1)",
+            ),
+            (
+                "def outer():\n    from other import target\n    def inner():\n        nonlocal target\n        target()\n    return inner\n",
+                "target(beta=2)",
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let other = directory.path().join("other.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(alpha=1): pass\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&other, "def target(beta=2): pass\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, body).map_err(|error| error.to_string())?;
+            fix_all(&[api, other, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(updated.contains(expected), "{updated}");
+        }
         Ok(())
     }
 

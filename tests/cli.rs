@@ -3134,6 +3134,26 @@ fn function_binding_targets_invalidate_local_imports() -> Result<(), Box<dyn std
 }
 
 #[test]
+fn nearer_function_locals_shadow_outer_imports() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let api_source = "def target(value=1): return value\n";
+    std::fs::write(&api, api_source)?;
+    let caller = directory.path().join("caller.py");
+    let caller_source = "def outer():\n    from api import target\n    def parameter(target):\n        target()\n    def assignment():\n        target = lambda: 3\n        target()\n    (lambda target: target())(lambda: 4)\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(api)?, api_source);
+    assert_eq!(std::fs::read_to_string(caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
 fn local_imports_resolve_before_later_definitions() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

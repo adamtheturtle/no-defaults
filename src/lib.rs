@@ -3931,7 +3931,20 @@ impl Checker<'_> {
     }
 
     fn method_is_rebound_later(&self, function: &ast::StmtFunctionDef) -> bool {
-        self.scope.class != ClassScope::None
+        if self.scope.class == ClassScope::None {
+            return false;
+        }
+        // `target = staticmethod(target)` assigns the name a second time but
+        // keeps the same function behind it, so the default is still the one a
+        // call has to be given back.
+        let rewrapped = self.method_aliases.last().is_some_and(|aliases| {
+            aliases.get(function.name.as_str()).is_some_and(|aliases| {
+                aliases
+                    .iter()
+                    .any(|alias| alias.name == function.name.as_str())
+            })
+        });
+        !rewrapped
             && self.class_assignments.last().is_some_and(|assignments| {
                 assignments
                     .get(function.name.as_str())

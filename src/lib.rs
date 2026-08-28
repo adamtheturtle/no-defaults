@@ -3424,9 +3424,9 @@ impl Checker<'_> {
         }
     }
 
-    /// Forget the recorded truth and the recorded field shape of every name
-    /// `body` declares `global` and then binds, because such a binding lands
-    /// in the module namespace and not in the body's own.
+    /// Forget everything recorded about every name `body` declares `global`
+    /// and then binds, because such a binding lands in the module namespace
+    /// and not in the body's own.
     ///
     /// A function body and a class body both need this, for opposite reasons.
     /// A function body may never run at all, so nothing there can be trusted
@@ -3441,6 +3441,12 @@ impl Checker<'_> {
     /// so shapes are keyed by the enclosing scope and the module entry rightly
     /// survives; `global` breaks that, and a module-level class built on the
     /// stale entry inherited fields the rebound base no longer has.
+    ///
+    /// So does what the name was imported as. Both callers take this before
+    /// saving the alias table they restore afterwards, so the forgetting
+    /// outlives the body: otherwise an imported `Protocol` or `ABC` came back
+    /// as a structural base, and a dataclass built on the rebound name was
+    /// called with only the fields its own body wrote.
     fn forget_globals_rebound_in<'b>(&mut self, body: &'b [Stmt])
     where
         BoundNames: Visitor<'b>,
@@ -3448,6 +3454,7 @@ impl Checker<'_> {
         let mut declared = BoundNames::default();
         declared.visit_body(body);
         for name in declared.globals.intersection(&declared.names) {
+            self.aliases.invalidate(name);
             self.known_truthiness.remove(name);
             self.shapes.remove(name);
         }
@@ -15316,6 +15323,41 @@ def b(x=1): pass  # type: ignore  # noqa
         ] {
             let updated = fixed(&format!("{head}{kept}{tail}"))?;
             assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_global_rebinding_drops_a_structural_base_alias() -> Result<(), String> {
+        // A structural base declares no fields, so a dataclass built on one
+        // has exactly the fields its own body writes and its constructor is
+        // known from the file that defines it. `global` sends a body's binding
+        // to the module namespace, so the imported name stands for the
+        // rebinding by the time a later subclass names it, and `Child()` was
+        // rewritten without the fields that binding brought with it.
+        for (imported, base) in [
+            ("from typing import Protocol", "Protocol"),
+            ("from abc import ABC", "ABC"),
+        ] {
+            let head = format!(
+                "from dataclasses import dataclass\n{imported}\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\n"
+            );
+            let tail =
+                format!("\n@dataclass\nclass Child({base}):\n    value: int = 2\n\nChild()\n");
+            for rebind in [
+                format!("class Holder:\n    global {base}\n    {base} = Base\n"),
+                format!("def helper():\n    global {base}\n    {base} = Base\n\nhelper()\n"),
+            ] {
+                let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+                assert!(!updated.contains("Child(value=2)"), "{updated}");
+            }
+            // Without `global` the body binds a name only it can see, the
+            // import still stands, and the structural base contributes nothing
+            // beyond what the subclass writes itself.
+            for kept in [format!("class Holder:\n    {base} = Base\n"), String::new()] {
+                let updated = fixed(&format!("{head}{kept}{tail}"))?;
+                assert!(updated.contains("Child(value=2)"), "{updated}");
+            }
         }
         Ok(())
     }

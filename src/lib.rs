@@ -5247,9 +5247,14 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
     let resolve = |name: &str, scope: &[String], before: usize| {
         (0..=scope.len()).rev().find_map(|length| {
             let candidate = qualified_class_name(&scope[..length], name);
-            classes[..before]
+            let matches: Vec<usize> = classes[..before]
                 .iter()
-                .rposition(|(_, qualified, _, _)| qualified == &candidate)
+                .enumerate()
+                .filter_map(|(index, (_, qualified, _, _))| {
+                    (qualified == &candidate).then_some(index)
+                })
+                .collect();
+            (!matches.is_empty()).then_some(matches)
         })
     };
     let mut metaclasses = BTreeSet::new();
@@ -5271,7 +5276,8 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
             let base_names: Vec<String> = bases.collect();
             let is_metaclass = base_names.iter().any(|base| {
                 base == "type"
-                    || resolve(base, scope, visible).is_some_and(|base| metaclasses.contains(&base))
+                    || resolve(base, scope, visible)
+                        .is_some_and(|bases| bases.iter().any(|base| metaclasses.contains(base)))
             });
             if is_metaclass && metaclasses.insert(index) {
                 changed = true;
@@ -5282,8 +5288,11 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
             if is_metaclass
                 && (defines_getattribute
                     || base_names.iter().any(|base| {
-                        resolve(base, scope, visible)
-                            .is_some_and(|base| intercepting_metaclasses.contains(&base))
+                        resolve(base, scope, visible).is_some_and(|bases| {
+                            bases
+                                .iter()
+                                .any(|base| intercepting_metaclasses.contains(base))
+                        })
                     }))
                 && intercepting_metaclasses.insert(index)
             {
@@ -5295,14 +5304,19 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
                         .arg
                         .as_ref()
                         .is_some_and(|name| name.as_str() == "metaclass")
-                        && dotted_name(&keyword.value)
-                            .and_then(|name| resolve(&name, scope, visible))
-                            .is_some_and(|name| intercepting_metaclasses.contains(&name))
+                        && dotted_name(&keyword.value).is_some_and(|name| {
+                            resolve(&name, scope, visible).is_some_and(|bases| {
+                                bases
+                                    .iter()
+                                    .any(|base| intercepting_metaclasses.contains(base))
+                            })
+                        })
                 })
             });
             if (declared_interceptor
                 || base_names.iter().any(|base| {
-                    resolve(base, scope, visible).is_some_and(|base| intercepted.contains(&base))
+                    resolve(base, scope, visible)
+                        .is_some_and(|bases| bases.iter().any(|base| intercepted.contains(base)))
                 }))
                 && intercepted.insert(index)
             {

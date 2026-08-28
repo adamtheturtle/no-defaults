@@ -3107,6 +3107,22 @@ fn assigned_instance_attributes_keep_method_defaults() -> Result<(), Box<dyn std
 }
 
 #[test]
+fn later_class_assignments_keep_overwritten_method_defaults(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "class C:\n    def target(self, value=1): return value\n    target = lambda self: 9\nassert C().target() == 9\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(case)?, source);
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

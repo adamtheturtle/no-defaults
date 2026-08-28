@@ -2830,6 +2830,7 @@ fn check_source(
         shapes: BTreeMap::new(),
         shape_namespaces: BTreeSet::new(),
         known_truthiness: BTreeMap::new(),
+        rebound_globals: BTreeSet::new(),
         lexical_scope: Vec::new(),
         conditional_depth: 0,
         scope: Scope {
@@ -3136,6 +3137,12 @@ struct Checker<'a> {
     shape_namespaces: BTreeSet<String>,
     /// Unconditional module assignments whose truth value is statically known.
     known_truthiness: BTreeMap<String, Truthiness>,
+    /// Names some body has declared `global` and then rebound. What they were
+    /// imported as is gone from the module namespace from then on, and unlike
+    /// the shapes and the truthiness flags the alias table is saved and put
+    /// back around every nested body, so the loss has to be recorded to
+    /// outlive that.
+    rebound_globals: BTreeSet<String>,
     /// Enclosing definitions, used to keep same-named nested class shapes
     /// separate from classes in other lexical scopes.
     lexical_scope: Vec<String>,
@@ -3442,11 +3449,13 @@ impl Checker<'_> {
     /// survives; `global` breaks that, and a module-level class built on the
     /// stale entry inherited fields the rebound base no longer has.
     ///
-    /// So does what the name was imported as. Both callers take this before
-    /// saving the alias table they restore afterwards, so the forgetting
-    /// outlives the body: otherwise an imported `Protocol` or `ABC` came back
-    /// as a structural base, and a dataclass built on the rebound name was
-    /// called with only the fields its own body wrote.
+    /// So does what the name was imported as, except that the alias table is
+    /// the one piece of this state a nested body saves and puts back. Dropping
+    /// the name here is therefore not enough on its own, so the name is also
+    /// recorded for `restore_aliases` to drop again; otherwise an imported
+    /// `Protocol` or `ABC` came back as a structural base, and a dataclass
+    /// built on the rebound name was called with only the fields its own body
+    /// wrote.
     fn forget_globals_rebound_in<'b>(&mut self, body: &'b [Stmt])
     where
         BoundNames: Visitor<'b>,
@@ -3457,6 +3466,22 @@ impl Checker<'_> {
             self.aliases.invalidate(name);
             self.known_truthiness.remove(name);
             self.shapes.remove(name);
+            self.rebound_globals.insert(name.clone());
+        }
+    }
+
+    /// Put back the alias table a nested body was entered with, minus every
+    /// name a `global` rebinding has taken away in the meantime.
+    ///
+    /// A rebinding directly inside the body is forgotten before the table is
+    /// saved, so the saved copy already lacks it. One a scope deeper is not:
+    /// the enclosing body saved its table before the inner body was reached,
+    /// so restoring it verbatim handed a later module-level subclass an
+    /// import the module namespace no longer holds.
+    fn restore_aliases(&mut self, outer: Aliases) {
+        self.aliases = outer;
+        for name in &self.rebound_globals {
+            self.aliases.invalidate(name);
         }
     }
 
@@ -3671,7 +3696,7 @@ impl Checker<'_> {
         walk_stmt(self, statement);
         self.lexical_scope.pop();
         self.repeated_functions = outer_repeated_functions;
-        self.aliases = outer_aliases;
+        self.restore_aliases(outer_aliases);
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
         self.metaclass_definitions = outer_metaclass_definitions;
@@ -4669,7 +4694,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     }
                 }
                 self.header = old_header;
-                self.aliases = outer_aliases;
+                self.restore_aliases(outer_aliases);
                 self.aliases.invalidate(class.name.as_str());
                 self.scope = outer;
             }
@@ -15355,6 +15380,55 @@ def b(x=1): pass  # type: ignore  # noqa
             // import still stands, and the structural base contributes nothing
             // beyond what the subclass writes itself.
             for kept in [format!("class Holder:\n    {base} = Base\n"), String::new()] {
+                let updated = fixed(&format!("{head}{kept}{tail}"))?;
+                assert!(updated.contains("Child(value=2)"), "{updated}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_twice_nested_global_rebinding_drops_a_structural_base_alias() -> Result<(), String> {
+        // `global` sends a binding to the module namespace from however deep
+        // in the file it is written, so the import the name arrived under is
+        // gone once the body runs. A body one scope down is reached after its
+        // enclosing body has saved the alias table it puts back on the way
+        // out, so the import used to reappear and `Child()` was rewritten as a
+        // subclass of a structural base, without the fields the rebinding
+        // brought with it.
+        for (imported, base) in [
+            ("from typing import Protocol", "Protocol"),
+            ("from abc import ABC", "ABC"),
+        ] {
+            let head = format!(
+                "from dataclasses import dataclass\n{imported}\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\n"
+            );
+            let tail =
+                format!("\n@dataclass\nclass Child({base}):\n    value: int = 2\n\nChild()\n");
+            for rebind in [
+                format!(
+                    "def outer():\n    class Holder:\n        global {base}\n        {base} = Base\n\nouter()\n"
+                ),
+                format!(
+                    "def outer():\n    def inner():\n        global {base}\n        {base} = Base\n\n    inner()\n\nouter()\n"
+                ),
+                format!(
+                    "class Holder:\n    def inner():\n        global {base}\n        {base} = Base\n\nHolder.inner()\n"
+                ),
+                format!(
+                    "class Holder:\n    class Inner:\n        global {base}\n        {base} = Base\n"
+                ),
+            ] {
+                let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+                assert!(!updated.contains("Child(value=2)"), "{updated}");
+            }
+            // The same nesting without `global` binds a name only the inner
+            // body can see, so the import stands and the structural base still
+            // contributes nothing of its own.
+            for kept in [
+                format!("def outer():\n    class Holder:\n        {base} = Base\n\nouter()\n"),
+                String::new(),
+            ] {
                 let updated = fixed(&format!("{head}{kept}{tail}"))?;
                 assert!(updated.contains("Child(value=2)"), "{updated}");
             }

@@ -2438,6 +2438,42 @@ fn rounded_float_patterns_do_not_equal_distinct_large_integers(
 }
 
 #[test]
+fn nondecimal_large_integers_equal_their_exact_float_values(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for subject in [
+        "0x100000000000000000000",
+        "0b100000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "0o400000000000000000000000000",
+        "1_208_925_819_614_629_174_706_176",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1): return value\n")?;
+        std::fs::write(&other, "def target(value=2): return value\n")?;
+        let caller_source = format!(
+            "from api import target\nmatch {subject}:\n    case 1208925819614629174706176.0:\n        pass\n    case _:\n        from other import target\nassert target() == 1\n"
+        );
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{subject}");
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!(
+                "from api import target\nmatch {subject}:\n    case 1208925819614629174706176.0:\n        pass\n    case _:\n        from other import target\nassert target(value=1) == 1\n"
+            ),
+            "{subject}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn python_equal_class_literals_select_the_first_match_case(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (subject, pattern) in [("1", "1.0"), ("True", "1")] {

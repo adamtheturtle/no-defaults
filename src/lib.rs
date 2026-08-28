@@ -8054,7 +8054,8 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         self.invalidated_bindings.remove(&name);
                         self.rebound_classes.remove(&name);
                     } else {
-                        self.invalidated_bindings.insert(name);
+                        self.invalidated_bindings.insert(name.clone());
+                        self.rebound_classes.insert(name);
                     }
                 }
             }

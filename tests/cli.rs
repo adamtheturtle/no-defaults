@@ -2254,6 +2254,31 @@ fn unresolved_from_imports_invalidate_earlier_checked_bindings(
 }
 
 #[test]
+fn unresolved_imports_do_not_fall_back_to_same_file_classes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let external = directory.path().join("external.py");
+    let caller = directory.path().join("caller.py");
+    let caller_source = "class C:\n    @staticmethod\n    def target(value=1): return value\nfrom api import Other as C\nfrom external import C\nassert C.target() == 9\n";
+    std::fs::write(&api, "class Other: pass\n")?;
+    std::fs::write(
+        &external,
+        "class C:\n    @staticmethod\n    def target(): return 9\n",
+    )?;
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(&api)
+        .arg(&caller)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(caller)?, caller_source);
+    Ok(())
+}
+
+#[test]
 fn unresolved_dotted_imports_invalidate_the_top_level_binding(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

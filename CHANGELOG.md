@@ -120,6 +120,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - Rebinding a package name drops the dotted import under it. After `import pkg.api`, a later `pkg = …` left the `pkg.api` entry in place and calls through it were still rewritten as the original module's.
 - A module-level loop or `with` target replaces an imported name, as an assignment to it already did. Calls through the name were still being rewritten as the import's. An `except … as` target does not: the name is deleted when the handler ends, and if the handler never runs the import still binds.
 - Two definitions of one name in different branches of an `if`, loop, `with`, `try`, or `match` keep their defaults, as two written side by side already did. Which one survives is not knowable, and `--fix` was stripping both while leaving the call as written.
+- A call inside an annotation in a `.pyi` stub is left alone, as one under `from __future__ import annotations` already was. A stub postpones its annotations without the import, so the call is a type expression and rewriting it edited a file that needed no change.
 
 ## 2.1.0 - 2026-08-07
 

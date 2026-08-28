@@ -2431,6 +2431,12 @@ fn is_python(path: &Path) -> bool {
         .is_some_and(|extension| extension == "py" || extension == "pyi")
 }
 
+/// Whether `path` is a type stub, whose contents describe an interface rather
+/// than run.
+fn is_stub(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "pyi")
+}
+
 /// The UTF-8 byte-order mark, which Windows editors write and which is not part
 /// of the program.
 const BOM: &str = "\u{feff}";
@@ -3630,9 +3636,7 @@ impl Checker<'_> {
     }
 
     fn is_stub(&self) -> bool {
-        self.path
-            .extension()
-            .is_some_and(|extension| extension == "pyi")
+        is_stub(self.path)
     }
 
     fn qualified_class(&self, name: &str) -> String {
@@ -3740,11 +3744,7 @@ impl Checker<'_> {
     /// legitimately omit the argument. Nothing in the source code changes to
     /// match, because a stub has no runtime behaviour to change.
     fn fixable(&self, default: &Expr, fix: TextRange) -> Option<TextRange> {
-        let stub = self
-            .path
-            .extension()
-            .is_some_and(|extension| extension == "pyi");
-        if stub && matches!(default, Expr::EllipsisLiteral(_)) {
+        if self.is_stub() && matches!(default, Expr::EllipsisLiteral(_)) {
             return None;
         }
         Some(fix)
@@ -6139,11 +6139,12 @@ fn rewrite_calls(
         source,
         definitions,
         aliases,
-        future_annotations: parsed.suite().iter().any(|statement| {
-            matches!(statement, Stmt::ImportFrom(import)
-                if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
-                    && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
-        }),
+        postponed_annotations: is_stub(path)
+            || parsed.suite().iter().any(|statement| {
+                matches!(statement, Stmt::ImportFrom(import)
+                    if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
+                        && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+            }),
         module_bindings: BoundNames::of_body(parsed.suite()).names,
         bindings: vec![BTreeMap::new()],
         binding_scope_depths: vec![0],
@@ -7181,8 +7182,9 @@ struct Rewriter<'a> {
     definitions: &'a Definitions,
     aliases: Aliases,
     /// Annotation expressions are stored as strings and never evaluated when
-    /// the future annotations feature is active.
-    future_annotations: bool,
+    /// the future annotations feature is active. A stub postpones them the
+    /// same way without the import, because nothing in it runs.
+    postponed_annotations: bool,
     module_bindings: BTreeSet<String>,
     /// What each imported name in this file refers to.
     bindings: Vec<BTreeMap<String, Binding>>,
@@ -8239,7 +8241,7 @@ fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_annotation(&mut self, annotation: &'a Expr) {
-        if !self.future_annotations {
+        if !self.postponed_annotations {
             self.visit_expr(annotation);
         }
     }
@@ -15142,6 +15144,46 @@ def b(x=1): pass  # type: ignore  # noqa
             fix_all(&[api, other, user.clone()])?;
             let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
             assert!(updated.contains(expected), "{caller}\n{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stub_annotations_are_not_rewritten_as_calls() -> Result<(), String> {
+        // A stub postpones its annotations without the future import, so a
+        // call in one is a type expression rather than a call site. The two
+        // `.py` cases pin the surrounding behaviour: without the import the
+        // annotation runs and must be rewritten, with it it must not.
+        for (name, caller, expected) in [
+            (
+                "stub.pyi",
+                "from api import helper\n\ndef f(x: helper()) -> None: ...\n",
+                "def f(x: helper()) -> None: ...\n",
+            ),
+            (
+                "plain.py",
+                "from api import helper\n\ndef f(x: helper()) -> None: pass\n",
+                "def f(x: helper(value=1)) -> None: pass\n",
+            ),
+            (
+                "postponed.py",
+                "from __future__ import annotations\n\nfrom api import helper\n\ndef f(x: helper()) -> None: pass\n",
+                "def f(x: helper()) -> None: pass\n",
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let user = directory.path().join(name);
+            std::fs::write(&api, "def helper(value=1): return value\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, caller).map_err(|error| error.to_string())?;
+            fix_all(&[api.clone(), user.clone()])?;
+            assert_eq!(
+                std::fs::read_to_string(&api).map_err(|error| error.to_string())?,
+                "def helper(value): return value\n"
+            );
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(updated.ends_with(expected), "{name}\n{updated}");
         }
         Ok(())
     }

@@ -3076,6 +3076,22 @@ fn custom_getattribute_keeps_method_defaults() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn metaclass_getattribute_keeps_class_attribute_defaults() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "class Meta(type):\n    def __getattribute__(cls, name):\n        if name == \"target\": return lambda: 9\n        return super().__getattribute__(name)\nclass C(metaclass=Meta):\n    @staticmethod\n    def target(value=1): return value\nassert C.target() == 9\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(case)?, source);
+    Ok(())
+}
+
+#[test]
 fn later_imports_do_not_change_earlier_calls() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

@@ -3424,9 +3424,9 @@ impl Checker<'_> {
         }
     }
 
-    /// Forget the recorded truth of every name `body` declares `global` and
-    /// then binds, because such a binding lands in the module namespace and
-    /// not in the body's own.
+    /// Forget the recorded truth and the recorded field shape of every name
+    /// `body` declares `global` and then binds, because such a binding lands
+    /// in the module namespace and not in the body's own.
     ///
     /// A function body and a class body both need this, for opposite reasons.
     /// A function body may never run at all, so nothing there can be trusted
@@ -3435,6 +3435,12 @@ impl Checker<'_> {
     /// what a later module-level test would read is no longer the value
     /// recorded here, and a branch settled by the stale flag picked a base the
     /// subclass never had.
+    ///
+    /// The shape needs the same treatment for the same reason. A name bound
+    /// inside a body ordinarily stands for something only that body can see,
+    /// so shapes are keyed by the enclosing scope and the module entry rightly
+    /// survives; `global` breaks that, and a module-level class built on the
+    /// stale entry inherited fields the rebound base no longer has.
     fn forget_globals_rebound_in<'b>(&mut self, body: &'b [Stmt])
     where
         BoundNames: Visitor<'b>,
@@ -3443,6 +3449,7 @@ impl Checker<'_> {
         declared.visit_body(body);
         for name in declared.globals.intersection(&declared.names) {
             self.known_truthiness.remove(name);
+            self.shapes.remove(name);
         }
     }
 
@@ -15279,6 +15286,37 @@ def b(x=1): pass  # type: ignore  # noqa
         // rather than by the class body alone.
         let updated = fixed(&format!("{head}class Holder:\n    FLAG = False\n{tail}"))?;
         assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_global_rebinding_drops_the_module_dataclass_shape() -> Result<(), String> {
+        // `global` sends a body's binding to the module namespace, so the
+        // class the module name stood for is gone by the time a later
+        // subclass names it. Shapes are keyed by the enclosing scope, which
+        // left the module entry standing, and `Child()` was rewritten with an
+        // `inherited` argument the rebound base no longer accepts.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n";
+        let tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in [
+            "class Holder:\n    global Alias\n    Alias = object\n",
+            "class Holder:\n    global Alias\n    for Alias in [object]:\n        pass\n",
+            "def helper():\n    global Alias\n    Alias = object\n\nhelper()\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        // Without `global` the body binds its own name, the module alias still
+        // stands for the dataclass, and the fields come through as they do
+        // when no body intervenes at all.
+        for kept in [
+            "class Holder:\n    Alias = object\n",
+            "def helper():\n    Alias = object\n\nhelper()\n",
+            "",
+        ] {
+            let updated = fixed(&format!("{head}{kept}{tail}"))?;
+            assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        }
         Ok(())
     }
 }

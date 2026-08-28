@@ -8138,10 +8138,9 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.rebound_classes.remove(&name);
                 }
                 let resolutions: Vec<(String, bool)> = match statement {
-                    Stmt::Import(import) => import
-                        .names
-                        .iter()
-                        .map(|alias| {
+                    Stmt::Import(import) => {
+                        let mut resolutions = BTreeMap::new();
+                        for alias in &import.names {
                             let name = alias.asname.as_ref().map_or_else(
                                 || {
                                     alias
@@ -8153,12 +8152,25 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                                 },
                                 ToString::to_string,
                             );
-                            let resolved =
+                            let module_resolved =
                                 resolve_module(alias.name.as_str(), 0, self.physical, self.known)
                                     .is_some();
-                            (name, resolved)
-                        })
-                        .collect(),
+                            let sibling_resolved = alias.asname.is_none()
+                                && alias.name.contains('.')
+                                && self.bindings.first().is_some_and(|bindings| {
+                                    bindings.keys().any(|binding| {
+                                        binding.contains('.')
+                                            && binding.split('.').next() == Some(name.as_str())
+                                    })
+                                });
+                            let resolved = module_resolved || sibling_resolved;
+                            resolutions
+                                .entry(name)
+                                .and_modify(|known| *known |= resolved)
+                                .or_insert(resolved);
+                        }
+                        resolutions.into_iter().collect()
+                    }
                     Stmt::ImportFrom(import) => import
                         .names
                         .iter()

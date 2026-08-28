@@ -7943,6 +7943,30 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
     bound.names
 }
 
+impl<'a> Rewriter<'a> {
+    /// Walk a `match` case body without letting what it binds stand for the
+    /// cases after it.
+    ///
+    /// A later case runs only where this one did not, so an import or a
+    /// capture written here is not something those cases can be assumed to
+    /// see, and a name left uncertain is better than one taken on trust.
+    fn visit_unselected_case_body(&mut self, body: &'a [Stmt]) {
+        let before = self.bindings.first().cloned();
+        self.visit_body(body);
+        let (Some(before), Some(after)) = (before, self.bindings.first_mut()) else {
+            return;
+        };
+        let changed: Vec<String> = after
+            .iter()
+            .filter(|(name, binding)| before.get(name.as_str()) != Some(binding))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in changed {
+            after.remove(&name);
+        }
+    }
+}
+
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_except_handler(&mut self, except_handler: &'a ast::ExceptHandler) {
         if self.in_class_scope() {
@@ -8404,11 +8428,15 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                     if let Some(guard) = &case.guard {
                         self.visit_expr(guard);
-                        if matches!(
-                            Truthiness::from_expr(guard, |_| false),
-                            Truthiness::False | Truthiness::Falsey | Truthiness::None
-                        ) {
-                            continue;
+                        match Truthiness::from_expr(guard, |_| false) {
+                            Truthiness::False | Truthiness::Falsey | Truthiness::None => {
+                                continue;
+                            }
+                            Truthiness::Unknown => {
+                                self.visit_body(&case.body);
+                                continue;
+                            }
+                            Truthiness::True | Truthiness::Truthy => {}
                         }
                     }
                     self.visit_body(&case.body);
@@ -8457,11 +8485,15 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.rebind_module_name(captures.names);
                     if let Some(guard) = &case.guard {
                         self.visit_expr(guard);
-                        if matches!(
-                            Truthiness::from_expr(guard, |_| false),
-                            Truthiness::False | Truthiness::Falsey | Truthiness::None
-                        ) {
-                            continue;
+                        match Truthiness::from_expr(guard, |_| false) {
+                            Truthiness::False | Truthiness::Falsey | Truthiness::None => {
+                                continue;
+                            }
+                            Truthiness::Unknown => {
+                                self.visit_unselected_case_body(&case.body);
+                                continue;
+                            }
+                            Truthiness::True | Truthiness::Truthy => {}
                         }
                     }
                     self.visit_body(&case.body);
@@ -14460,5 +14492,26 @@ def b(x=1): pass  # type: ignore  # noqa
             assert_eq!(checked.diagnostics.len(), 1);
             assert!(checked.diagnostics[0].fix.is_none(), "{source}");
         }
+    }
+
+    #[test]
+    fn an_unknown_guard_does_not_bind_for_later_cases() -> Result<(), String> {
+        // The second case runs only where the first guard failed, so the
+        // import in that guarded body is not one it can be assumed to see.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from api import target\n\nmatch 1:\n    case 1 if unknown():\n        from other import target\n    case 2:\n        target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("target(beta=2)"), "{updated}");
+        Ok(())
     }
 }

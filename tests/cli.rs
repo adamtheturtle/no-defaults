@@ -2262,6 +2262,58 @@ fn imports_in_nonliteral_value_patterns_conservatively_replace_class_bindings(
 }
 
 #[test]
+fn unknown_module_match_guards_do_not_hide_later_case_imports(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let other = directory.path().join("other.py");
+    let third = directory.path().join("third.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&other, "def target(value=2): return value\n")?;
+    std::fs::write(&third, "def target(value=3): return value\n")?;
+    let caller_source = "from api import target\ncondition = False\nmatch 1:\n    case 1 if condition:\n        from other import target\n    case _:\n        from third import target\nassert target() == 3\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import target\ncondition = False\nmatch 1:\n    case 1 if condition:\n        from other import target\n    case _:\n        from third import target\nassert target(value=3) == 3\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_class_match_guards_do_not_hide_later_case_imports(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let other = directory.path().join("other.py");
+    let third = directory.path().join("third.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1): return value\n")?;
+    std::fs::write(&other, "def target(value=2): return value\n")?;
+    std::fs::write(&third, "def target(value=3): return value\n")?;
+    let caller_source = "from api import target\nclass C:\n    condition = False\n    match 1:\n        case 1 if condition:\n            from other import target\n        case _:\n            from third import target\n    result = target()\nassert C.result == 3\n";
+    std::fs::write(&caller, caller_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "from api import target\nclass C:\n    condition = False\n    match 1:\n        case 1 if condition:\n            from other import target\n        case _:\n            from third import target\n    result = target(value=3)\nassert C.result == 3\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn module_match_captures_invalidate_imported_callable_bindings(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

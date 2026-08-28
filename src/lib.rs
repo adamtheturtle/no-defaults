@@ -7950,7 +7950,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             // A class body has arms of its own further down that bind loop
             // targets and match captures, and a class nested in a function
             // would otherwise be caught here first.
-            Stmt::If(_) | Stmt::Try(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_)
+            // `for` and `with` have arms of their own below that invalidate
+            // what their targets bind, and their bodies do run, so an import
+            // written in one stands afterwards. Only the suites that may not
+            // run at all are reconciled here.
+            Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::Match(_)
                 if self.bindings.len() > 1 && !self.in_class_scope() =>
             {
                 let before = self.bindings.last().cloned();
@@ -8091,6 +8095,62 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         let mut rebound = BoundNames::default();
                         rebound.bind(target);
                         self.rebind_module_name(rebound.names);
+                    }
+                }
+                self.visit_body(&block.body);
+            }
+            Stmt::For(loop_statement) => {
+                // The iterable still sees the import; a non-empty loop target
+                // replaces it before the body and later function statements.
+                self.visit_expr(&loop_statement.iter);
+                let statically_empty = match loop_statement.iter.as_ref() {
+                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
+                    Expr::List(list) => list.elts.is_empty(),
+                    Expr::Set(set) => set.elts.is_empty(),
+                    Expr::Dict(dict) => dict.items.is_empty(),
+                    _ => false,
+                };
+                if statically_empty {
+                    self.visit_body(&loop_statement.orelse);
+                    return;
+                }
+                self.visit_expr(&loop_statement.target);
+                if let Some(bindings) = self.bindings.last_mut() {
+                    for name in rebound_names(statement) {
+                        bindings.remove(&name);
+                    }
+                }
+                self.visit_body(&loop_statement.body);
+                // The `else` runs only where the loop was not broken out of,
+                // so what it binds is uncertain and is left alone rather than
+                // taken as replacing what the body left behind.
+                let before = self.bindings.last().cloned();
+                self.visit_body(&loop_statement.orelse);
+                if let (Some(before), Some(after)) = (before, self.bindings.last_mut()) {
+                    let changed: Vec<String> = after
+                        .iter()
+                        .filter(|(name, binding)| before.get(name.as_str()) != Some(binding))
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    for name in changed {
+                        after.remove(&name);
+                    }
+                }
+            }
+            Stmt::With(block) => {
+                // With-items enter left to right, and each optional target is
+                // bound before the next context expression is evaluated.
+                for item in &block.items {
+                    self.visit_expr(&item.context_expr);
+                    if let Some(target) = &item.optional_vars {
+                        self.visit_expr(target);
+                        let mut rebound = BoundNames::default();
+                        rebound.bind(target);
+                        if let Some(bindings) = self.bindings.last_mut() {
+                            for name in rebound.names {
+                                bindings.remove(&name);
+                            }
+                        }
                     }
                 }
                 self.visit_body(&block.body);
@@ -8381,6 +8441,18 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 let mut rebound = BoundNames::default();
                 rebound.bind(&named.target);
                 self.rebind_module_name(rebound.names);
+                return;
+            }
+            Expr::Named(named) => {
+                self.visit_expr(&named.value);
+                self.visit_expr(&named.target);
+                let mut rebound = BoundNames::default();
+                rebound.bind(&named.target);
+                if let Some(bindings) = self.bindings.last_mut() {
+                    for name in rebound.names {
+                        bindings.remove(&name);
+                    }
+                }
                 return;
             }
             Expr::Call(call) => {
@@ -14088,5 +14160,27 @@ def b(x=1): pass  # type: ignore  # noqa
             assert_eq!(checked.diagnostics.len(), 1);
             assert_eq!(checked.diagnostics[0].fix.is_some(), fixable, "{source}");
         }
+    }
+
+    #[test]
+    fn an_unreachable_loop_else_import_does_not_take_over() -> Result<(), String> {
+        // The `else` runs only where the loop was not broken out of, so an
+        // import in there must not replace what the function was written
+        // against.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def run():\n    from api import target\n    for _ in [1]:\n        break\n    else:\n        from other import target\n    target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("target(beta=2)"), "{updated}");
+        Ok(())
     }
 }

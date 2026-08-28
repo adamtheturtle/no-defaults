@@ -7950,7 +7950,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             // A class body has arms of its own further down that bind loop
             // targets and match captures, and a class nested in a function
             // would otherwise be caught here first.
-            Stmt::If(_) | Stmt::Try(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_)
+            // `for` and `with` have arms of their own below that invalidate
+            // what their targets bind, and their bodies do run, so an import
+            // written in one stands afterwards. Only the suites that may not
+            // run at all are reconciled here.
+            Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::Match(_)
                 if self.bindings.len() > 1 && !self.in_class_scope() =>
             {
                 let before = self.bindings.last().cloned();

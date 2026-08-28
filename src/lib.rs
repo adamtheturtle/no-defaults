@@ -4513,11 +4513,10 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.delegation_protocols.push(
                     defines_iterator_method("__iter__") && defines_iterator_method("__next__"),
                 );
+                let shape_name = qualified_class_name(&self.lexical_scope, class.name.as_str());
                 self.attribute_interceptors.push(
                     defines_iterator_method("__getattribute__")
-                        || self
-                            .metaclass_intercepted_classes
-                            .contains(class.name.as_str()),
+                        || self.metaclass_intercepted_classes.contains(&shape_name),
                 );
                 self.instance_attributes.push(instance_attributes(class));
                 self.class_deletions.push(deleted_names(&class.body));
@@ -4559,7 +4558,6 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     });
                     self.record_inherited_method_aliases();
                 }
-                let shape_name = qualified_class_name(&self.lexical_scope, class.name.as_str());
                 self.lexical_scope.push(class.name.to_string());
                 walk_stmt(self, statement);
                 self.lexical_scope.pop();
@@ -5170,45 +5168,106 @@ fn defines_metaclass(class: &ast::StmtClassDef, known: &BTreeSet<String>) -> boo
     })
 }
 
+type LexicalClass<'a> = (&'a ast::StmtClassDef, String, Vec<String>);
+
+fn collect_lexical_classes<'a>(
+    suite: &'a [Stmt],
+    scope: &mut Vec<String>,
+    classes: &mut Vec<LexicalClass<'a>>,
+) {
+    for statement in suite {
+        match statement {
+            Stmt::ClassDef(class) => {
+                let qualified = qualified_class_name(scope, class.name.as_str());
+                classes.push((class, qualified, scope.clone()));
+                scope.push(class.name.to_string());
+                collect_lexical_classes(&class.body, scope, classes);
+                scope.pop();
+            }
+            Stmt::FunctionDef(function) => {
+                scope.push(function.name.to_string());
+                collect_lexical_classes(&function.body, scope, classes);
+                scope.pop();
+            }
+            Stmt::If(branch) => {
+                collect_lexical_classes(&branch.body, scope, classes);
+                for clause in &branch.elif_else_clauses {
+                    collect_lexical_classes(&clause.body, scope, classes);
+                }
+            }
+            Stmt::For(loop_) => {
+                collect_lexical_classes(&loop_.body, scope, classes);
+                collect_lexical_classes(&loop_.orelse, scope, classes);
+            }
+            Stmt::While(loop_) => {
+                collect_lexical_classes(&loop_.body, scope, classes);
+                collect_lexical_classes(&loop_.orelse, scope, classes);
+            }
+            Stmt::With(block) => collect_lexical_classes(&block.body, scope, classes),
+            Stmt::Try(block) => {
+                collect_lexical_classes(&block.body, scope, classes);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_lexical_classes(&handler.body, scope, classes);
+                }
+                collect_lexical_classes(&block.orelse, scope, classes);
+                collect_lexical_classes(&block.finalbody, scope, classes);
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_lexical_classes(&case.body, scope, classes);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Same-file classes whose metaclass can replace attributes read on the class.
-/// The name a base expression refers to, seeing through a subscript.
+/// The name a base expression is written with, seeing through a subscript.
 ///
 /// `Parent[int]` builds on `Parent`, so a subclass written that way inherits
-/// whatever `Parent` carries.
-fn base_class_name(base: &Expr) -> Option<&str> {
+/// whatever `Parent` carries, and `pkg.Parent[int]` keeps its dotted spelling
+/// for the scope lookup to resolve.
+fn base_dotted_name(base: &Expr) -> Option<String> {
     match base {
-        Expr::Name(name) => Some(name.id.as_str()),
-        Expr::Subscript(subscript) => base_class_name(&subscript.value),
-        _ => None,
+        Expr::Subscript(subscript) => base_dotted_name(&subscript.value),
+        _ => dotted_name(base),
     }
 }
 
 fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
-    let classes: Vec<&ast::StmtClassDef> = suite
+    let mut classes = Vec::new();
+    collect_lexical_classes(suite, &mut Vec::new(), &mut classes);
+    let identities: BTreeSet<String> = classes
         .iter()
-        .filter_map(|statement| match statement {
-            Stmt::ClassDef(class) => Some(class),
-            _ => None,
-        })
+        .map(|(_, qualified, _)| qualified.clone())
         .collect();
+    let resolve = |name: &str, scope: &[String]| {
+        (0..=scope.len()).rev().find_map(|length| {
+            let candidate = qualified_class_name(&scope[..length], name);
+            identities.contains(&candidate).then_some(candidate)
+        })
+    };
     let mut metaclasses = BTreeSet::new();
     let mut intercepting_metaclasses = BTreeSet::new();
     let mut intercepted = BTreeSet::new();
     let mut changed = true;
     while changed {
         changed = false;
-        for class in &classes {
+        for (class, qualified, scope) in &classes {
             let bases = class
                 .arguments
                 .as_deref()
                 .into_iter()
                 .flat_map(|arguments| &arguments.args)
-                .filter_map(base_class_name);
-            let base_names: Vec<&str> = bases.collect();
-            let is_metaclass = base_names
-                .iter()
-                .any(|base| *base == "type" || metaclasses.contains(*base));
-            if is_metaclass && metaclasses.insert(class.name.to_string()) {
+                .filter_map(base_dotted_name);
+            let base_names: Vec<String> = bases.collect();
+            let is_metaclass = base_names.iter().any(|base| {
+                base == "type"
+                    || resolve(base, scope).is_some_and(|base| metaclasses.contains(&base))
+            });
+            if is_metaclass && metaclasses.insert(qualified.clone()) {
                 changed = true;
             }
             let defines_getattribute = class.body.iter().any(|statement| {
@@ -5216,21 +5275,30 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
             });
             if is_metaclass
                 && (defines_getattribute
-                    || base_names
-                        .iter()
-                        .any(|base| intercepting_metaclasses.contains(*base)))
-                && intercepting_metaclasses.insert(class.name.to_string())
+                    || base_names.iter().any(|base| {
+                        resolve(base, scope)
+                            .is_some_and(|base| intercepting_metaclasses.contains(&base))
+                    }))
+                && intercepting_metaclasses.insert(qualified.clone())
             {
                 changed = true;
             }
             let declared_interceptor = class.arguments.as_deref().is_some_and(|arguments| {
                 arguments.keywords.iter().any(|keyword| {
-                    keyword.arg.as_ref().is_some_and(|name| name.as_str() == "metaclass")
-                        && matches!(&keyword.value, Expr::Name(name) if intercepting_metaclasses.contains(name.id.as_str()))
+                    keyword
+                        .arg
+                        .as_ref()
+                        .is_some_and(|name| name.as_str() == "metaclass")
+                        && dotted_name(&keyword.value)
+                            .and_then(|name| resolve(&name, scope))
+                            .is_some_and(|name| intercepting_metaclasses.contains(&name))
                 })
             });
-            if (declared_interceptor || base_names.iter().any(|base| intercepted.contains(*base)))
-                && intercepted.insert(class.name.to_string())
+            if (declared_interceptor
+                || base_names.iter().any(|base| {
+                    resolve(base, scope).is_some_and(|base| intercepted.contains(&base))
+                }))
+                && intercepted.insert(qualified.clone())
             {
                 changed = true;
             }
@@ -5245,8 +5313,8 @@ fn inherits_metaclass(class: &ast::StmtClassDef, metaclass_classes: &BTreeSet<St
         arguments
             .args
             .iter()
-            .filter_map(base_class_name)
-            .any(|base| metaclass_classes.contains(base))
+            .filter_map(base_dotted_name)
+            .any(|base| metaclass_classes.contains(&base))
     })
 }
 

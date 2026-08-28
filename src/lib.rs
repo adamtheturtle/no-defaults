@@ -4659,6 +4659,18 @@ fn defines_metaclass(class: &ast::StmtClassDef, known: &BTreeSet<String>) -> boo
 }
 
 /// Same-file classes whose metaclass can replace attributes read on the class.
+/// The name a base expression refers to, seeing through a subscript.
+///
+/// `Parent[int]` builds on `Parent`, so a subclass written that way inherits
+/// whatever `Parent` carries.
+fn base_class_name(base: &Expr) -> Option<&str> {
+    match base {
+        Expr::Name(name) => Some(name.id.as_str()),
+        Expr::Subscript(subscript) => base_class_name(&subscript.value),
+        _ => None,
+    }
+}
+
 fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
     let classes: Vec<&ast::StmtClassDef> = suite
         .iter()
@@ -4679,10 +4691,7 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
                 .as_deref()
                 .into_iter()
                 .flat_map(|arguments| &arguments.args)
-                .filter_map(|base| match base {
-                    Expr::Name(name) => Some(name.id.as_str()),
-                    _ => None,
-                });
+                .filter_map(base_class_name);
             let base_names: Vec<&str> = bases.collect();
             let is_metaclass = base_names
                 .iter()
@@ -4724,10 +4733,7 @@ fn inherits_metaclass(class: &ast::StmtClassDef, metaclass_classes: &BTreeSet<St
         arguments
             .args
             .iter()
-            .filter_map(|base| match base {
-                Expr::Name(name) => Some(name.id.as_str()),
-                _ => None,
-            })
+            .filter_map(base_class_name)
             .any(|base| metaclass_classes.contains(base))
     })
 }
@@ -7601,6 +7607,30 @@ mod tests {
             .into_iter()
             .map(|skip| skip.reason)
             .collect())
+    }
+
+    #[test]
+    fn a_subscripted_base_carries_its_metaclass() {
+        // `Child(Parent[int])` builds on `Parent` and inherits the metaclass
+        // intercepting attribute access, exactly as `Child(Parent)` does.
+        for base in ["Parent", "Parent[int]"] {
+            let source = format!(
+                "from dataclasses import dataclass\n\nclass Meta(type):\n    def __getattribute__(self, name): pass\n\n@dataclass\nclass Parent(metaclass=Meta):\n    a: int = 1\n\n@dataclass\nclass Child({base}):\n    b: int = 2\n"
+            );
+            let checked = check_source(
+                Path::new("fixture.py"),
+                &source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert!(
+                checked.diagnostics.iter().all(|d| d.fix.is_none()),
+                "{base}"
+            );
+        }
     }
 
     #[test]

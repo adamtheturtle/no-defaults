@@ -322,6 +322,9 @@ enum Binding {
     Module(PathBuf),
     /// A symbol imported from a module, so `name(...)` resolves to it.
     Symbol(PathBuf, String),
+    /// A name definitely bound by an import whose checked definition is
+    /// ambiguous. It shadows earlier candidates but cannot be resolved.
+    Unknown,
 }
 
 /// A replacement for a range of a file. Deletions carry an empty replacement;
@@ -6402,7 +6405,8 @@ fn collect_star_bindings(
     known: &BTreeSet<&Path>,
     definitions: &Definitions,
     bindings: &mut BTreeMap<String, Binding>,
-) {
+) -> BTreeSet<String> {
+    let mut bound = BTreeSet::new();
     for statement in suite {
         match statement {
             Stmt::ImportFrom(import)
@@ -6432,29 +6436,70 @@ fn collect_star_bindings(
                         .as_ref()
                         .map_or_else(|| !name.starts_with('_'), |all| all.contains(name))
                 }) {
-                    if definitions.symbol(&file, &name).is_some() {
-                        bindings.insert(name.clone(), Binding::Symbol(file.clone(), name));
-                    }
+                    let binding = if definitions.symbol(&file, &name).is_some() {
+                        Binding::Symbol(file.clone(), name.clone())
+                    } else {
+                        Binding::Unknown
+                    };
+                    bound.insert(name.clone());
+                    bindings.insert(name, binding);
                 }
             }
             Stmt::If(branch) => {
-                collect_star_bindings(&branch.body, importer, known, definitions, bindings);
+                bound.extend(collect_star_bindings(
+                    &branch.body,
+                    importer,
+                    known,
+                    definitions,
+                    bindings,
+                ));
                 for clause in &branch.elif_else_clauses {
-                    collect_star_bindings(&clause.body, importer, known, definitions, bindings);
+                    bound.extend(collect_star_bindings(
+                        &clause.body,
+                        importer,
+                        known,
+                        definitions,
+                        bindings,
+                    ));
                 }
             }
             Stmt::Try(block) => {
-                collect_star_bindings(&block.body, importer, known, definitions, bindings);
+                bound.extend(collect_star_bindings(
+                    &block.body,
+                    importer,
+                    known,
+                    definitions,
+                    bindings,
+                ));
                 for handler in &block.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                    collect_star_bindings(&handler.body, importer, known, definitions, bindings);
+                    bound.extend(collect_star_bindings(
+                        &handler.body,
+                        importer,
+                        known,
+                        definitions,
+                        bindings,
+                    ));
                 }
-                collect_star_bindings(&block.orelse, importer, known, definitions, bindings);
-                collect_star_bindings(&block.finalbody, importer, known, definitions, bindings);
+                bound.extend(collect_star_bindings(
+                    &block.orelse,
+                    importer,
+                    known,
+                    definitions,
+                    bindings,
+                ));
+                bound.extend(collect_star_bindings(
+                    &block.finalbody,
+                    importer,
+                    known,
+                    definitions,
+                    bindings,
+                ));
             }
             _ => {}
         }
     }
+    bound
 }
 
 /// A module's final literal `__all__`, when one is statically declared.
@@ -7238,7 +7283,7 @@ impl Rewriter<'_> {
                     let (file, class) = self.definitions.class_identity(file, symbol)?;
                     Some((file, class, false, false))
                 }
-                Some(Binding::Module(_)) => None,
+                Some(Binding::Module(_) | Binding::Unknown) => None,
                 None => Some((
                     self.physical.to_path_buf(),
                     name.id.to_string(),
@@ -7253,7 +7298,7 @@ impl Rewriter<'_> {
         let dotted = dotted_name(&attribute.value)?;
         match self.binding(&dotted)? {
             Binding::Module(file) => Some((file.clone(), attribute.attr.to_string(), false, false)),
-            Binding::Symbol(..) => None,
+            Binding::Symbol(..) | Binding::Unknown => None,
         }
     }
 
@@ -7345,7 +7390,7 @@ impl Rewriter<'_> {
                     let signature = self.definitions.symbol(file, symbol)?;
                     Some((signature, signature.kind.implicit_bound()))
                 }
-                Some(Binding::Module(_)) => None,
+                Some(Binding::Module(_) | Binding::Unknown) => None,
                 None => {
                     let signature = self
                         .definitions
@@ -7420,7 +7465,9 @@ impl Rewriter<'_> {
                 let replaced_import = dotted_name(&call.func)
                     .is_some_and(|binding| self.binding_is_replaced(&binding));
                 let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
-                if replaced_import || local_shadow {
+                let ambiguous_import = dotted_name(&call.func)
+                    .is_some_and(|name| matches!(self.binding(&name), Some(Binding::Unknown)));
+                if replaced_import || local_shadow || ambiguous_import {
                     if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
                         self.retained.extend(fixes.iter().cloned());
                     }
@@ -7776,6 +7823,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
         match statement {
             Stmt::Import(_) | Stmt::ImportFrom(_) if self.scopes.is_empty() => {
                 // An import affects only calls reached after it executes.
+                let mut star_names = BTreeSet::new();
                 if let Some(bindings) = self.bindings.last_mut() {
                     collect_bindings(
                         std::slice::from_ref(statement),
@@ -7783,13 +7831,16 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         self.known,
                         bindings,
                     );
-                    collect_star_bindings(
+                    star_names = collect_star_bindings(
                         std::slice::from_ref(statement),
                         self.physical,
                         self.known,
                         self.definitions,
                         bindings,
                     );
+                }
+                for name in star_names {
+                    self.invalidated_bindings.remove(&name);
                 }
                 let resolutions: Vec<(String, bool)> = match statement {
                     Stmt::Import(import) => import

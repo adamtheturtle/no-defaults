@@ -7245,6 +7245,12 @@ impl Rewriter<'_> {
         if !self.in_class_scope() {
             return;
         }
+        // A `def` or `class` takes the name over in the class namespace, so an
+        // import that bound it earlier is no longer what a call below reaches.
+        // A definition nested in class-body control flow may never run, but
+        // then the name is whichever of the two the branch left behind, and
+        // that is still not knowable from the source alone.
+        self.invalidate_class_bindings([name.to_owned()]);
         if let Some(scope) = self.scopes.last_mut() {
             scope.names.insert(name.to_owned());
             if is_class {

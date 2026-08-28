@@ -5133,3 +5133,79 @@ fn class_annotations_without_values_keep_import_bindings() -> Result<(), Box<dyn
     );
     Ok(())
 }
+
+// A `def` or a `class` takes the name over in the class namespace just as an
+// assignment does, so a call below it reaches the definition rather than the
+// import above it and cannot be given the imported function's default. A
+// definition nested in class-body control flow is covered too: which of the
+// two the name ends up holding is not knowable from the source.
+#[test]
+fn class_definitions_replace_earlier_class_body_imports() -> Result<(), Box<dyn std::error::Error>>
+{
+    for body in [
+        "    def target():\n        return 5",
+        "    class target:\n        pass",
+        "    condition = False\n    if condition:\n\n        def target():\n            return 5",
+        "    condition = False\n    if condition:\n\n        class target:\n            pass",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        let caller_source =
+            format!("class C:\n    from api import target\n{body}\n\n    result = target()\n");
+        std::fs::write(&api, "def target(value=1):\n    return value\n")?;
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(api)?,
+            "def target(value):\n    return value\n",
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(caller)?, caller_source, "{body}");
+    }
+    Ok(())
+}
+
+// The same class bodies with a definition under a different name leave the
+// import standing, so the call below it is still the imported function's.
+#[test]
+fn class_definitions_under_other_names_keep_import_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for body in [
+        "    def other():\n        return 5",
+        "    class other:\n        pass",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1):\n    return value\n")?;
+        std::fs::write(
+            &caller,
+            format!("class C:\n    from api import target\n{body}\n\n    result = target()\n"),
+        )?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(api)?,
+            "def target(value):\n    return value\n",
+            "{body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!(
+                "class C:\n    from api import target\n{body}\n\n    result = target(value=1)\n"
+            ),
+            "{body}"
+        );
+    }
+    Ok(())
+}

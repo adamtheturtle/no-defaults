@@ -3360,49 +3360,72 @@ impl Checker<'_> {
                     bound.bind(target);
                 }
             }
-            Stmt::AnnAssign(assign) => bound.bind(&assign.target),
+            // `name: int` declares a type without rebinding anything, so the
+            // alias, truthiness and dataclass shape already recorded for the
+            // name still describe it.
+            Stmt::AnnAssign(assign) => {
+                if assign.value.is_some() {
+                    bound.bind(&assign.target);
+                }
+            }
             Stmt::AugAssign(assign) => bound.bind(&assign.target),
             _ => return,
         }
         self.invalidate_bound_names(bound.names.iter().map(String::as_str));
-        if let Stmt::Assign(assign) = statement {
-            if let Some(Expr::Name(target)) =
-                assign.targets.first().filter(|_| assign.targets.len() == 1)
-            {
-                if self.conditional_depth == 0 && self.lexical_scope.is_empty() {
-                    let truth = Truthiness::from_expr(&assign.value, |_| false);
-                    if truth != Truthiness::Unknown {
-                        self.known_truthiness.insert(target.id.to_string(), truth);
-                    }
+        // An annotated assignment binds its target every bit as much as a plain
+        // one does, so an annotation is no reason to forget what the name was
+        // just given. Reading only plain assignments left `Alias: object = Base`
+        // cleared above and never restored, handing every subclass of `Alias` an
+        // unknown constructor.
+        let assigned = match statement {
+            Stmt::Assign(assign) => assign
+                .targets
+                .first()
+                .filter(|_| assign.targets.len() == 1)
+                .and_then(|target| match target {
+                    Expr::Name(name) => Some((name, assign.value.as_ref())),
+                    _ => None,
+                }),
+            Stmt::AnnAssign(assign) => match (assign.target.as_ref(), assign.value.as_deref()) {
+                (Expr::Name(name), Some(value)) => Some((name, value)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((target, value)) = assigned {
+            if self.conditional_depth == 0 && self.lexical_scope.is_empty() {
+                let truth = Truthiness::from_expr(value, |_| false);
+                if truth != Truthiness::Unknown {
+                    self.known_truthiness.insert(target.id.to_string(), truth);
                 }
-                let target = qualified_class_name(&self.lexical_scope, target.id.as_str());
-                if let Expr::Name(value) = assign.value.as_ref() {
-                    let qualified = qualified_class_name(&self.lexical_scope, value.id.as_str());
-                    if let Some(shape) = self
-                        .shapes
-                        .get(&qualified)
-                        .or_else(|| self.shapes.get(value.id.as_str()))
-                        .cloned()
-                    {
-                        self.shapes.insert(target, shape);
-                    }
-                } else if self.lexical_scope.is_empty() {
-                    if let Expr::Call(call) = assign.value.as_ref() {
-                        if let Expr::Name(namespace) = call.func.as_ref() {
-                            let prefix = format!("{}.", namespace.id);
-                            let aliases: Vec<(String, Option<Shape>)> = self
-                                .shapes
-                                .iter()
-                                .filter_map(|(name, shape)| {
-                                    name.strip_prefix(&prefix)
-                                        .map(|member| (format!("{target}.{member}"), shape.clone()))
-                                })
-                                .collect();
-                            if !aliases.is_empty() {
-                                self.shape_namespaces.insert(target.clone());
-                            }
-                            self.shapes.extend(aliases);
+            }
+            let target = qualified_class_name(&self.lexical_scope, target.id.as_str());
+            if let Expr::Name(value) = value {
+                let qualified = qualified_class_name(&self.lexical_scope, value.id.as_str());
+                if let Some(shape) = self
+                    .shapes
+                    .get(&qualified)
+                    .or_else(|| self.shapes.get(value.id.as_str()))
+                    .cloned()
+                {
+                    self.shapes.insert(target, shape);
+                }
+            } else if self.lexical_scope.is_empty() {
+                if let Expr::Call(call) = value {
+                    if let Expr::Name(namespace) = call.func.as_ref() {
+                        let prefix = format!("{}.", namespace.id);
+                        let aliases: Vec<(String, Option<Shape>)> = self
+                            .shapes
+                            .iter()
+                            .filter_map(|(name, shape)| {
+                                name.strip_prefix(&prefix)
+                                    .map(|member| (format!("{target}.{member}"), shape.clone()))
+                            })
+                            .collect();
+                        if !aliases.is_empty() {
+                            self.shape_namespaces.insert(target.clone());
                         }
+                        self.shapes.extend(aliases);
                     }
                 }
             }
@@ -15432,6 +15455,32 @@ def b(x=1): pass  # type: ignore  # noqa
                 let updated = fixed(&format!("{head}{kept}{tail}"))?;
                 assert!(updated.contains("Child(value=2)"), "{updated}");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotation_does_not_lose_a_live_shape_alias() -> Result<(), String> {
+        // A bare annotation binds nothing, and an annotated assignment names
+        // its value just as a plain one does, so both leave `Alias` describing
+        // `Base` and its field reaches the subclass constructor. Only a real
+        // rebinding takes those fields away.
+        for (middle, inherits) in [
+            ("", true),
+            ("Alias: object\n", true),
+            ("Alias: object = Base\n", true),
+            ("Alias = object\n", false),
+            ("Alias: object = object\n", false),
+        ] {
+            let source = format!(
+                "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n{middle}\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n"
+            );
+            let updated = fixed(&source)?;
+            assert_eq!(
+                updated.contains("Child(inherited=1, value=2)"),
+                inherits,
+                "{middle}"
+            );
         }
         Ok(())
     }

@@ -5275,3 +5275,54 @@ fn conditional_definitions_in_a_nested_class_leave_the_outer_import(
     );
     Ok(())
 }
+
+#[test]
+fn a_class_body_annotation_keeps_a_live_import() -> Result<(), Box<dyn std::error::Error>> {
+    // `target: int` declares a type and binds nothing, so the class-body
+    // import above it still names the imported function and the call under it
+    // is rewritten against that import.
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def target(value=1):\n    return value\n",
+    )?;
+    let user = directory.path().join("user.py");
+    std::fs::write(
+        &user,
+        "class C:\n    from api import target\n\n    target: int\n    result = target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(user)?;
+    assert!(fixed.contains("result = target(value=1)"), "{fixed}");
+    Ok(())
+}
+
+#[test]
+fn a_conditionally_rebound_class_body_import_keeps_its_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The guarded assignment may leave `target` naming something that takes no
+    // arguments, so the call under it cannot be tied to the import. Dropping
+    // the default anyway would leave that call raising `TypeError` whenever
+    // the branch did run, so the whole fix is declined instead.
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let api_source = "def target(value=1):\n    return value\n";
+    std::fs::write(&api, api_source)?;
+    let user = directory.path().join("user.py");
+    let user_source = "def unknown():\n    return True\n\n\nclass C:\n    from api import target\n\n    if unknown():\n        target = staticmethod(lambda: 9)\n    result = target()\n";
+    std::fs::write(&user, user_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(api)?, api_source);
+    assert_eq!(std::fs::read_to_string(user)?, user_source);
+    Ok(())
+}

@@ -6308,6 +6308,11 @@ fn rewrite_calls(
         source,
         definitions,
         aliases,
+        future_annotations: parsed.suite().iter().any(|statement| {
+            matches!(statement, Stmt::ImportFrom(import)
+                if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
+                    && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+        }),
         module_bindings: BoundNames::of_body(parsed.suite()).names,
         bindings: vec![BTreeMap::new()],
         binding_scope_depths: vec![0],
@@ -7380,6 +7385,9 @@ struct Rewriter<'a> {
     source: &'a str,
     definitions: &'a Definitions,
     aliases: Aliases,
+    /// Annotation expressions are stored as strings and never evaluated when
+    /// the future annotations feature is active.
+    future_annotations: bool,
     module_bindings: BTreeSet<String>,
     /// What each imported name in this file refers to.
     bindings: Vec<BTreeMap<String, Binding>>,
@@ -8432,6 +8440,12 @@ fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral
 }
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
+    fn visit_annotation(&mut self, annotation: &'a Expr) {
+        if !self.future_annotations {
+            self.visit_expr(annotation);
+        }
+    }
+
     fn visit_except_handler(&mut self, except_handler: &'a ast::ExceptHandler) {
         if self.in_class_scope() {
             let ast::ExceptHandler::ExceptHandler(handler) = except_handler;
@@ -14002,6 +14016,16 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn future_annotations_are_not_rewritten_as_calls() -> Result<(), String> {
+        let source = "from __future__ import annotations\n\ndef value(x=1): return x\ndef f(x: value()) -> value(): pass\ny: value()\nresult = value()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from __future__ import annotations\n\ndef value(x): return x\ndef f(x: value()) -> value(): pass\ny: value()\nresult = value(x=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn lambda_defaults_use_the_enclosing_scope() -> Result<(), String> {
         let source = "def target(value=1):\n    return 5\n\nhandler = lambda target=target(): target  # noqa: NOD001\n";
         assert_eq!(
@@ -15204,6 +15228,18 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn an_annotation_without_a_value_keeps_a_dataclass_alias_shape() -> Result<(), String> {
+        // `Alias: object` declares a type and binds nothing, so `Child` still
+        // inherits `Base`'s field and its call needs that argument.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\nAlias: object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int\n\nAlias = Base\nAlias: object\n\n@dataclass\nclass Child(Alias):\n    value: int\n\nChild(inherited=1, value=2)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_class_scope_walrus_replaces_an_earlier_import() -> Result<(), String> {
         // The class namespace resolves a name to an import bound in the same
         // body ahead of everything else, so a walrus that took the name over
@@ -15239,6 +15275,16 @@ def b(x=1): pass  # type: ignore  # noqa
         fix_all(&[api, user.clone()])?;
         let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
         assert!(updated.contains("target(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotated_assignment_drops_a_dataclass_alias_shape() -> Result<(), String> {
+        // `Alias: object = object` does rebind, so nothing is known about what
+        // `Child` inherits and its call is left alone.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\nAlias: object = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        let updated = fixed(source)?;
+        assert!(updated.ends_with("\nChild()\n"), "{updated}");
         Ok(())
     }
 

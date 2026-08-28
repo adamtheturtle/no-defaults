@@ -3028,6 +3028,42 @@ fn dotted_imports_bind_the_top_level_package() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn dotted_imports_derive_the_top_package_from_the_resolved_module(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let client = directory.path().join("client");
+    let package = directory.path().join("vendor/pkg");
+    std::fs::create_dir_all(&client)?;
+    std::fs::create_dir_all(&package)?;
+    let namesake = client.join("pkg.py");
+    std::fs::write(&namesake, "def target(value=2): return value\n")?;
+    let initializer = package.join("__init__.py");
+    std::fs::write(&initializer, "def target(value=1): return value\n")?;
+    std::fs::write(package.join("api.py"), "")?;
+    let caller = client.join("caller.py");
+    std::fs::write(&caller, "import pkg.api\nassert pkg.target() == 1\n")?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "import pkg.api\nassert pkg.target(value=1) == 1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(initializer)?,
+        "def target(value): return value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(namesake)?,
+        "def target(value): return value\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn local_imports_resolve_before_later_assignments() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     std::fs::write(

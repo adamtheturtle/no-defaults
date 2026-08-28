@@ -6663,6 +6663,21 @@ impl Rewriter<'_> {
         None
     }
 
+    fn function_binding(&self, name: &str) -> Option<&Binding> {
+        self.bindings
+            .iter()
+            .skip(1)
+            .rev()
+            .find_map(|bindings| bindings.get(name))
+    }
+
+    fn function_symbol(&self, name: &str) -> Option<&Signature> {
+        let Binding::Symbol(file, symbol) = self.function_binding(name)? else {
+            return None;
+        };
+        self.definitions.symbol(file, symbol)
+    }
+
     /// Whether a module-scope import has been replaced by a later binding.
     ///
     /// `import pkg.api` is keyed by the whole dotted path, but Python binds
@@ -6867,6 +6882,10 @@ impl Rewriter<'_> {
                 let signature = self.definitions.symbol(file, symbol)?;
                 Some((signature, signature.kind.implicit_bound()))
             }
+            Expr::Name(name) if self.function_binding(name.id.as_str()).is_some() => {
+                let signature = self.function_symbol(name.id.as_str())?;
+                Some((signature, signature.kind.implicit_bound()))
+            }
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
@@ -6876,11 +6895,7 @@ impl Rewriter<'_> {
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
             Expr::Name(name)
                 if self.nested_callable(name.id.as_str()) == Some(false)
-                    && !self
-                        .bindings
-                        .iter()
-                        .skip(1)
-                        .any(|bindings| bindings.contains_key(name.id.as_str())) =>
+                    && self.function_binding(name.id.as_str()).is_none() =>
             {
                 None
             }
@@ -7770,6 +7785,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.scopes.pop();
                 self.bindings.pop();
                 self.implicit_receivers.pop();
+                if !module_scope && !self.in_class_scope() {
+                    if let Some(bindings) = self.bindings.last_mut() {
+                        bindings.remove(function.name.as_str());
+                    }
+                }
                 self.bind_definition_in_class(function.name.as_str(), false);
                 if module_scope
                     && self

@@ -5981,11 +5981,62 @@ fn retain_common_bindings(
     });
 }
 
-/// Whether a module defines `name` itself, rather than merely binding it by
-/// importing something of that name.
+/// Whether none of an `if` statement's suites can run.
+fn if_cannot_run(branch: &ast::StmtIf) -> bool {
+    let falsey = |test: &Expr| {
+        matches!(
+            Truthiness::from_expr(test, |_| false),
+            Truthiness::False | Truthiness::Falsey | Truthiness::None
+        )
+    };
+    falsey(&branch.test)
+        && branch
+            .elif_else_clauses
+            .iter()
+            .all(|clause| clause.test.as_ref().is_some_and(falsey))
+}
+
+/// Reconcile the bindings a suite inside a function changed against the ones
+/// it started from.
 ///
-/// A package whose `__init__.py` re-exports its own submodule still hands out
-/// the submodule, so only a definition or an assignment counts here.
+/// A suite that cannot run leaves the earlier bindings standing. One that may
+/// or may not run leaves every name it rebinds uncertain, and an uncertain
+/// name is better left alone than rewritten against a guess.
+fn reconcile_suite_bindings(
+    statement: &Stmt,
+    before: &BTreeMap<String, Binding>,
+    after: &mut BTreeMap<String, Binding>,
+) {
+    let unreachable = match statement {
+        Stmt::If(branch) => if_cannot_run(branch),
+        // A loop that never iterates still runs its `else`, so only one
+        // without that suite leaves nothing behind.
+        Stmt::While(loop_) => {
+            loop_.orelse.is_empty()
+                && matches!(
+                    Truthiness::from_expr(&loop_.test, |_| false),
+                    Truthiness::False | Truthiness::Falsey | Truthiness::None
+                )
+        }
+        _ => false,
+    };
+    let changed: Vec<String> = after
+        .iter()
+        .filter(|(name, binding)| before.get(name.as_str()) != Some(binding))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in changed {
+        match before.get(&name) {
+            Some(binding) if unreachable => {
+                after.insert(name, binding.clone());
+            }
+            _ => {
+                after.remove(&name);
+            }
+        }
+    }
+}
+
 /// Follow an assignment, annotated or not, into the binding index.
 fn collect_assignment_binding(statement: &Stmt, bindings: &mut BTreeMap<String, Binding>) {
     let bound: Option<(&Expr, &[Expr])> = match statement {
@@ -6012,6 +6063,11 @@ fn collect_assignment_binding(statement: &Stmt, bindings: &mut BTreeMap<String, 
     }
 }
 
+/// Whether a module defines `name` itself, rather than merely binding it by
+/// importing something of that name.
+///
+/// A package whose `__init__.py` re-exports its own submodule still hands out
+/// the submodule, so only a definition or an assignment counts here.
 fn source_defines_symbol(path: &Path, name: &str) -> bool {
     let Some(parsed) = read_source(path)
         .ok()
@@ -6818,7 +6874,16 @@ impl Rewriter<'_> {
                 Some((signature, signature.kind.implicit_bound()))
             }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
-            Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false) => None,
+            Expr::Name(name)
+                if self.nested_callable(name.id.as_str()) == Some(false)
+                    && !self
+                        .bindings
+                        .iter()
+                        .skip(1)
+                        .any(|bindings| bindings.contains_key(name.id.as_str())) =>
+            {
+                None
+            }
             Expr::Name(name) => match self.binding(name.id.as_str()) {
                 Some(Binding::Symbol(file, symbol)) => {
                     let signature = self.definitions.symbol(file, symbol)?;
@@ -7322,6 +7387,39 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 }
                 self.bind_statement_in_class(statement);
             }
+            // A suite inside a function records its imports as it walks, so
+            // what it leaves behind has to be reconciled with what came before
+            // it: an import in a branch that never runs must not replace the
+            // binding the rest of the function is written against.
+            // A class body has arms of its own further down that bind loop
+            // targets and match captures, and a class nested in a function
+            // would otherwise be caught here first.
+            Stmt::If(_) | Stmt::Try(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_)
+                if self.bindings.len() > 1 && !self.in_class_scope() =>
+            {
+                let before = self.bindings.last().cloned();
+                walk_stmt(self, statement);
+                if let (Some(before), Some(after)) = (before, self.bindings.last_mut()) {
+                    reconcile_suite_bindings(statement, &before, after);
+                }
+            }
+            Stmt::Import(_) | Stmt::ImportFrom(_) => {
+                if let Some(bindings) = self.bindings.last_mut() {
+                    collect_bindings(
+                        std::slice::from_ref(statement),
+                        self.physical,
+                        self.known,
+                        bindings,
+                    );
+                    collect_star_bindings(
+                        std::slice::from_ref(statement),
+                        self.physical,
+                        self.known,
+                        self.definitions,
+                        bindings,
+                    );
+                }
+            }
             Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) if self.in_class_scope() => {
                 walk_stmt(self, statement);
                 self.bind_statement_in_class(statement);
@@ -7381,6 +7479,14 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // target replaces whatever an import bound there.
                 walk_stmt(self, statement);
                 self.invalidated_bindings.extend(rebound_names(statement));
+            }
+            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) => {
+                walk_stmt(self, statement);
+                if let Some(bindings) = self.bindings.last_mut() {
+                    for name in rebound_names(statement) {
+                        bindings.remove(&name);
+                    }
+                }
             }
             Stmt::For(loop_statement) if self.scopes.is_empty() => {
                 // The iterable is evaluated before the first target binding.
@@ -7654,9 +7760,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         .filter(|name| !function_scope.names.contains(name))
                 };
                 self.implicit_receivers.push(receiver);
-                let mut local = BTreeMap::new();
-                collect_bindings(&function.body, self.physical, self.known, &mut local);
-                self.bindings.push(local);
+                self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
                 self.lexical_scope.push(function.name.to_string());
                 self.lexical_is_class.push(false);
@@ -7973,6 +8077,27 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_branch_import_does_not_replace_a_function_binding() -> Result<(), String> {
+        // The `if False:` suite never runs, so `target` is still the one the
+        // function imported above it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def run():\n    from api import target\n    if False:\n        from other import target\n    target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.ends_with("    target(alpha=1)\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
     fn a_package_definition_outranks_a_sibling_submodule() -> Result<(), String> {
         // `from . import helper` reaches the package's own `helper`, since the
         // attribute is already set when the submodule would be imported.
@@ -8192,6 +8317,27 @@ mod tests {
             std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
             "from re_export import target\n\ntarget(value=1)\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_else_import_is_not_discarded() -> Result<(), String> {
+        // `while False:` never iterates, which is exactly when its `else`
+        // runs, so the import in there is the one that stands.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def run():\n    from api import target\n    while False:\n        pass\n    else:\n        from other import target\n    target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("target(alpha=1)"), "{updated}");
         Ok(())
     }
 

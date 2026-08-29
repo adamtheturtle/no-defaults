@@ -3470,8 +3470,12 @@ impl Checker<'_> {
 
     fn unknown_base_may_end_in_default(&self, class: &ast::StmtClassDef) -> bool {
         class_bases(class).any(|base| {
-            if base_root_name(base).is_some_and(|name| self.aliases.import_bindings.contains(name))
-            {
+            // A parameter shadowing the import hides the base further rather
+            // than revealing it, so the name it took over counts too.
+            if base_root_name(base).is_some_and(|name| {
+                self.aliases.import_bindings.contains(name)
+                    || self.aliases.invalidated_import_bindings.contains(name)
+            }) {
                 return true;
             }
             // `Middle[int]` names the class `Middle` names, so a local base
@@ -5206,6 +5210,7 @@ struct Aliases {
     abc_modules: BTreeSet<String>,
     structural_bases: BTreeSet<String>,
     invalidated_structural_bases: BTreeSet<String>,
+    invalidated_import_bindings: BTreeSet<String>,
     type_checking: BTreeSet<String>,
     kw_only_markers: BTreeSet<String>,
 }
@@ -5244,6 +5249,12 @@ impl Aliases {
             || self.structural_bases.contains(name)
         {
             self.invalidated_structural_bases.insert(name.to_owned());
+        }
+        // Whatever the caller passes is no more visible than the import it
+        // covers, so a base spelled with the parameter's name is still one
+        // whose fields this file cannot see.
+        if self.import_bindings.contains(name) {
+            self.invalidated_import_bindings.insert(name.to_owned());
         }
         self.invalidate(name);
     }
@@ -16850,5 +16861,30 @@ def b(x=1): pass  # type: ignore  # noqa
                 "{base}"
             );
         }
+    }
+
+    #[test]
+    fn a_parameter_shadowing_an_imported_base_keeps_child_defaults() {
+        // The parameter hides the import rather than revealing what it named,
+        // so the base is still one whose fields this file cannot see and may
+        // end in a positional default. Removing the child's would leave a
+        // field without one behind it, which `dataclasses` rejects outright,
+        // and no call could be rewritten to make up for it because the
+        // inherited fields are unknown. A keyword-only field is exempt as it
+        // is without the shadow: `dataclasses` moves it past the `*`, where
+        // nothing the base contributes constrains its order.
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\n\ndef build(Parent):\n    @dataclass\n    class Child(Parent):\n        positional: int = 2\n        keyword: int = field(default=3, kw_only=True)\n\n    return Child()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
     }
 }

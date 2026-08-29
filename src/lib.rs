@@ -9998,6 +9998,9 @@ impl Rewriter<'_> {
                 .iter()
                 .map(|removed| fix_key(&signature.path, removed.fix))
                 .collect();
+            if held.is_empty() {
+                return;
+            }
             let reason = if matches!(signature.kind, Callable::Dataclass) {
                 "the dataclass inherits fields, so its constructor is not known from the file \
                  that defines it"
@@ -10005,9 +10008,6 @@ impl Rewriter<'_> {
                 "the class makes its own instances, so the constructor it inherits is not what \
                  this call reaches"
             };
-            if held.is_empty() {
-                return;
-            }
             self.retained.extend(held);
             self.skip(call.start(), name, reason.to_owned());
             return;

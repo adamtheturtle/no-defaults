@@ -5354,3 +5354,21 @@ fn a_conditionally_rebound_class_body_import_keeps_its_default(
     assert_eq!(std::fs::read_to_string(user)?, user_source);
     Ok(())
 }
+
+#[test]
+fn suites_that_disagree_on_a_class_keep_the_defaults_behind_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Only one of the two suites runs, and nothing in the source says which,
+    // so the call under either of them cannot be tied to a base. Dropping the
+    // defaults anyway would leave whichever `Child` the module built calling
+    // `target` short an argument.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass BaseA:\n    def target(self, value=1):\n        return value\n\n\nclass BaseB:\n    def target(self, value=2):\n        return value\n\n\nif os.environ.get(\"PICK\"):\n\n    class Child(BaseA):\n        def run(self):\n            return self.target()\n\nelse:\n\n    class Child(BaseB):\n        def run(self):\n            return self.target()\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}

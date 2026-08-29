@@ -3495,6 +3495,13 @@ impl Checker<'_> {
             }) {
                 return true;
             }
+            // `Middle[int]` names the class `Middle` names, so a local base
+            // that may end in a default is one whether or not the subclass
+            // parameterizes it.
+            let base = match base {
+                Expr::Subscript(subscript) => subscript.value.as_ref(),
+                expression => expression,
+            };
             let Expr::Name(name) = base else {
                 return false;
             };
@@ -6599,6 +6606,7 @@ fn rewrite_calls(
         class_direct_statements: Vec::new(),
         lexical_is_class: Vec::new(),
         implicit_receivers: Vec::new(),
+        implicit_receiver_classes: Vec::new(),
         lexical_scope: Vec::new(),
         called: BTreeSet::new(),
         scopes: Vec::new(),
@@ -7795,6 +7803,9 @@ struct Rewriter<'a> {
     /// The implicit receiver of each enclosing function. Static methods and
     /// module functions contribute `None`.
     implicit_receivers: Vec<Option<ImplicitReceiver>>,
+    /// The class cell owned by each enclosing function, independently of
+    /// whether that function has an implicit descriptor receiver.
+    implicit_receiver_classes: Vec<Option<String>>,
     /// Enclosing class and function names, matching the checker's lexical
     /// identity for nested functions.
     lexical_scope: Vec<String>,
@@ -8138,7 +8149,7 @@ impl Rewriter<'_> {
     fn enclosing_class_cell(&self) -> Option<(PathBuf, String, bool, bool)> {
         Some((
             self.physical.to_path_buf(),
-            self.classes.last()?.clone(),
+            self.implicit_receiver_classes.last()?.clone()?,
             false,
             false,
         ))
@@ -9657,10 +9668,16 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_annotation(returns);
                 }
                 let function_scope = BoundNames::of_function(function);
-                let receiver_kind = if self.class_scope_depths.last() == Some(&self.scopes.len()) {
+                let direct_method = self.class_scope_depths.last() == Some(&self.scopes.len());
+                let receiver_kind = if direct_method {
                     method_receiver(function, &self.aliases, &self.module_bindings)
                 } else {
                     Receiver::None
+                };
+                let receiver_class = if direct_method {
+                    self.classes.last().cloned()
+                } else {
+                    self.implicit_receiver_classes.last().cloned().flatten()
                 };
                 let receiver = if receiver_kind == Receiver::None {
                     self.implicit_receivers
@@ -9682,6 +9699,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         })
                 };
                 self.implicit_receivers.push(receiver);
+                self.implicit_receiver_classes.push(receiver_class);
                 self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
                 self.binding_scope_depths.push(self.scopes.len() - 1);
@@ -9693,6 +9711,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.scopes.pop();
                 self.bindings.pop();
                 self.binding_scope_depths.pop();
+                self.implicit_receiver_classes.pop();
                 self.implicit_receivers.pop();
                 if !module_scope && !self.in_class_scope() {
                     if let Some(bindings) = self.bindings.last_mut() {
@@ -9802,12 +9821,24 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     .last()
                     .and_then(Clone::clone)
                     .filter(|receiver| !scope.names.contains(&receiver.name));
+                // A lambda written straight in a class body belongs to that
+                // class as much as a `def` there does, so Python hands it the
+                // class's own `__class__` cell. Written anywhere else it keeps
+                // the cell of whatever function holds it, which is why the
+                // stack is pushed either way.
+                let receiver_class = if self.class_scope_depths.last() == Some(&self.scopes.len()) {
+                    self.classes.last().cloned()
+                } else {
+                    self.implicit_receiver_classes.last().cloned().flatten()
+                };
                 self.implicit_receivers.push(receiver);
+                self.implicit_receiver_classes.push(receiver_class);
                 self.scopes.push(scope);
                 self.lambda_scope_depths.push(self.scopes.len() - 1);
                 self.visit_expr(&lambda.body);
                 self.lambda_scope_depths.pop();
                 self.scopes.pop();
+                self.implicit_receiver_classes.pop();
                 self.implicit_receivers.pop();
                 return;
             }
@@ -13474,6 +13505,16 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn class_cells_keep_their_owner_inside_nested_class_bodies() -> Result<(), String> {
+        let source = "class Outer:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self):\n        class Inner:\n            value = __class__.target()\n        return Inner.value\n\nassert Outer().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Outer:\n    @staticmethod\n    def target(value): return value\n\n    def run(self):\n        class Inner:\n            value = __class__.target(value=1)\n        return Inner.value\n\nassert Outer().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn type_self_calls_resolve_to_the_enclosing_class() -> Result<(), String> {
         let source = "class C:\n    def target(self, value=1): return value\n\n    def run(self): return type(self).target(self)\n\nassert C().run() == 1\n";
         assert_eq!(
@@ -16799,6 +16840,31 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn a_lambda_owns_the_class_cell_of_the_body_it_is_written_in() -> Result<(), String> {
+        // Python hands a lambda written straight in a class body that class's
+        // own `__class__` cell, exactly as it does a `def` there, so the
+        // nested class the lambda sits in is the one `__class__` names.
+        let nested = "class Outer:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value=2): return value\n            make = lambda: __class__.target()\n        return Inner.make()\n\nassert Outer().run() == 2\n";
+        assert_eq!(
+            fixed(nested)?,
+            "class Outer:\n    @staticmethod\n    def target(value): return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value): return value\n            make = lambda: __class__.target(value=2)\n        return Inner.make()\n\nassert Outer().run() == 2\n"
+        );
+        let module_level = "class Top:\n    @staticmethod\n    def target(value=3): return value\n    make = lambda: __class__.target()\n\nassert Top.make() == 3\n";
+        assert_eq!(
+            fixed(module_level)?,
+            "class Top:\n    @staticmethod\n    def target(value): return value\n    make = lambda: __class__.target(value=3)\n\nassert Top.make() == 3\n"
+        );
+        // A lambda in a method body owns no class of its own, so it still sees
+        // the cell of the method holding it.
+        let in_method = "class Outer:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self):\n        make = lambda: __class__.target()\n        return make()\n\nassert Outer().run() == 1\n";
+        assert_eq!(
+            fixed(in_method)?,
+            "class Outer:\n    @staticmethod\n    def target(value): return value\n\n    def run(self):\n        make = lambda: __class__.target(value=1)\n        return make()\n\nassert Outer().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn an_unaliased_imported_super_is_still_the_builtin() -> Result<(), String> {
         // `from builtins import super` binds `super` to the very builtin the
         // bare name reaches, so the call it stands in front of resolves as it
@@ -16816,6 +16882,33 @@ def b(x=1): pass  # type: ignore  # noqa
             "def super(): raise SystemExit\n\nclass Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n"
         );
         Ok(())
+    }
+
+    #[test]
+    fn parameterized_local_bases_carry_default_uncertainty() {
+        // `Middle` is built on an import, so whether its fields end in a
+        // default is unknown, and a subclass must keep its own defaults to
+        // stay constructible. Writing the base as `Middle[int]` names the same
+        // class, so it must reach the same conclusion as a bare `Middle`.
+        for base in ["Middle[int]", "Middle"] {
+            let source = format!(
+                "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\nfrom mixins import Mixin\n\nT = TypeVar(\"T\")\n\n@dataclass\nclass Middle(Mixin, Generic[T]):\n    first: int = 1\n\n@dataclass\nclass Child({base}):\n    second: int = 2\n"
+            );
+            let checked = check_source(
+                Path::new("fixture.py"),
+                &source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 2, "{base}");
+            assert!(
+                checked.diagnostics.iter().all(|item| item.fix.is_none()),
+                "{base}"
+            );
+        }
     }
 
     #[test]
@@ -16868,6 +16961,32 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 2);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_function_local_class_holds_a_base_name_against_an_import() -> Result<(), String> {
+        // The class written in the function body takes `Helper` over from the
+        // import for the rest of that body, so `Child` is built on the local
+        // class and `super().target()` reaches the parameter it declares. The
+        // imported class of the same name is never the base here, and passing
+        // the parameter it declares would raise `TypeError`.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Helper:\n    def target(self, imported=1): return imported\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from other import Helper\n\n\ndef outer():\n    class Helper:\n        def target(self, local=2): return local\n\n    class Child(Helper):\n        def run(self):\n            return super().target()\n\n    return Child().run()\n\n\nassert outer() == 2\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.contains("super().target(local=2)"), "{updated}");
+        Ok(())
     }
 
     #[test]

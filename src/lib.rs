@@ -3474,6 +3474,13 @@ impl Checker<'_> {
             {
                 return true;
             }
+            // `Middle[int]` names the class `Middle` names, so a local base
+            // that may end in a default is one whether or not the subclass
+            // parameterizes it.
+            let base = match base {
+                Expr::Subscript(subscript) => subscript.value.as_ref(),
+                expression => expression,
+            };
             let Expr::Name(name) = base else {
                 return false;
             };
@@ -9775,12 +9782,24 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     .last()
                     .and_then(Clone::clone)
                     .filter(|receiver| !scope.names.contains(&receiver.name));
+                // A lambda written straight in a class body belongs to that
+                // class as much as a `def` there does, so Python hands it the
+                // class's own `__class__` cell. Written anywhere else it keeps
+                // the cell of whatever function holds it, which is why the
+                // stack is pushed either way.
+                let receiver_class = if self.class_scope_depths.last() == Some(&self.scopes.len()) {
+                    self.classes.last().cloned()
+                } else {
+                    self.implicit_receiver_classes.last().cloned().flatten()
+                };
                 self.implicit_receivers.push(receiver);
+                self.implicit_receiver_classes.push(receiver_class);
                 self.scopes.push(scope);
                 self.lambda_scope_depths.push(self.scopes.len() - 1);
                 self.visit_expr(&lambda.body);
                 self.lambda_scope_depths.pop();
                 self.scopes.pop();
+                self.implicit_receiver_classes.pop();
                 self.implicit_receivers.pop();
                 return;
             }
@@ -16779,5 +16798,57 @@ def b(x=1): pass  # type: ignore  # noqa
             "class Base:\n    def method(self, value): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n\nassert Child().method() == 9\n"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_lambda_owns_the_class_cell_of_the_body_it_is_written_in() -> Result<(), String> {
+        // Python hands a lambda written straight in a class body that class's
+        // own `__class__` cell, exactly as it does a `def` there, so the
+        // nested class the lambda sits in is the one `__class__` names.
+        let nested = "class Outer:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value=2): return value\n            make = lambda: __class__.target()\n        return Inner.make()\n\nassert Outer().run() == 2\n";
+        assert_eq!(
+            fixed(nested)?,
+            "class Outer:\n    @staticmethod\n    def target(value): return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value): return value\n            make = lambda: __class__.target(value=2)\n        return Inner.make()\n\nassert Outer().run() == 2\n"
+        );
+        let module_level = "class Top:\n    @staticmethod\n    def target(value=3): return value\n    make = lambda: __class__.target()\n\nassert Top.make() == 3\n";
+        assert_eq!(
+            fixed(module_level)?,
+            "class Top:\n    @staticmethod\n    def target(value): return value\n    make = lambda: __class__.target(value=3)\n\nassert Top.make() == 3\n"
+        );
+        // A lambda in a method body owns no class of its own, so it still sees
+        // the cell of the method holding it.
+        let in_method = "class Outer:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self):\n        make = lambda: __class__.target()\n        return make()\n\nassert Outer().run() == 1\n";
+        assert_eq!(
+            fixed(in_method)?,
+            "class Outer:\n    @staticmethod\n    def target(value): return value\n\n    def run(self):\n        make = lambda: __class__.target(value=1)\n        return make()\n\nassert Outer().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parameterized_local_bases_carry_default_uncertainty() {
+        // `Middle` is built on an import, so whether its fields end in a
+        // default is unknown, and a subclass must keep its own defaults to
+        // stay constructible. Writing the base as `Middle[int]` names the same
+        // class, so it must reach the same conclusion as a bare `Middle`.
+        for base in ["Middle[int]", "Middle"] {
+            let source = format!(
+                "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\nfrom mixins import Mixin\n\nT = TypeVar(\"T\")\n\n@dataclass\nclass Middle(Mixin, Generic[T]):\n    first: int = 1\n\n@dataclass\nclass Child({base}):\n    second: int = 2\n"
+            );
+            let checked = check_source(
+                Path::new("fixture.py"),
+                &source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 2, "{base}");
+            assert!(
+                checked.diagnostics.iter().all(|item| item.fix.is_none()),
+                "{base}"
+            );
+        }
     }
 }

@@ -1138,32 +1138,124 @@ impl ClassNamespace<'_> {
 }
 
 /// A class a scope defines, and the stretch of that scope over which the
-/// spelling it is read by stands for it.
+/// spelling a base expression uses still names it.
+///
+/// The class takes the name over from an import of the same name where it is
+/// written, and an import written below it takes the name straight back, so
+/// the class only answers for the spelling between the two.
 struct LocalClass {
     /// The identity the class is indexed under, which the scopes around it
     /// name.
     identity: String,
-    /// Where the class statement is written. Nothing above it reads the
-    /// spelling as this class.
+    /// Where the class statement that binds the spelling is written.
     defined_at: TextSize,
-    /// Where an import takes the spelling back, if one does. The name is the
-    /// module's from there on, and the class is out of reach under it.
+    /// Where an import of the same name binds the spelling again, when one in
+    /// this scope does.
     superseded_at: Option<TextSize>,
 }
 
 impl LocalClass {
-    /// Whether an import has taken the spelling back by the time a base
-    /// written at `defined_at` reads it. The class is out of reach under that
-    /// name from there on, however the name would otherwise be resolved.
-    fn superseded_before(&self, defined_at: TextSize) -> bool {
-        self.superseded_at
-            .is_some_and(|superseded| superseded <= defined_at)
+    /// Whether this class is what the spelling names at `read_at`.
+    fn holds_at(&self, read_at: TextSize) -> bool {
+        self.defined_at < read_at && !self.superseded_before(read_at)
     }
 
-    /// Whether the spelling stands for this class where a base written at
-    /// `defined_at` reads it.
-    fn holds_at(&self, defined_at: TextSize) -> bool {
-        self.defined_at < defined_at && !self.superseded_before(defined_at)
+    /// Whether an import has already taken the spelling back by `read_at`.
+    ///
+    /// This is not the negation of `holds_at`: a class written below the base
+    /// that reads it holds neither, and the two are told apart where a name
+    /// nothing else binds still answers with the class the scope defines.
+    fn superseded_before(&self, read_at: TextSize) -> bool {
+        self.superseded_at.is_some_and(|offset| offset < read_at)
+    }
+}
+
+/// The names an import statement binds, each under the spelling the rest of
+/// the scope reads it as.
+///
+/// A dotted `import package.module` binds only the top package, so that is the
+/// name it takes over; an `as` clause binds the name it gives instead. A star
+/// import binds whatever the other module exports, which is not known here, so
+/// it takes no name over.
+fn imported_names(statement: &Stmt) -> Vec<&str> {
+    match statement {
+        Stmt::Import(import) => import
+            .names
+            .iter()
+            .map(|alias| {
+                alias.asname.as_ref().map_or_else(
+                    || alias.name.as_str().split('.').next().unwrap_or_default(),
+                    ast::Identifier::as_str,
+                )
+            })
+            .collect(),
+        Stmt::ImportFrom(import) => import
+            .names
+            .iter()
+            .filter(|alias| alias.name.as_str() != "*")
+            .map(|alias| {
+                alias
+                    .asname
+                    .as_ref()
+                    .map_or_else(|| alias.name.as_str(), ast::Identifier::as_str)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Where each spelling an import in this scope binds is taken back from a
+/// class defined above it.
+///
+/// An import written in a suite that may not run leaves the class standing for
+/// anything after the statement, and a class whose ancestry depends on which
+/// suite ran is not settled here. A suite the statement is certain to enter is
+/// read, though: it binds for the code after it exactly as a statement written
+/// beside that code would, which is the same rule `carry_suite_aliases`
+/// settles a name by. Every import of a name is kept, in the order they are
+/// written: a scope that imports a name, defines a class of it and imports it
+/// again is reclaimed by the second import, and only the offsets after the
+/// class can say which one that is.
+fn import_rebindings(statements: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
+    let mut rebindings = BTreeMap::new();
+    collect_import_rebindings(statements, &mut rebindings);
+    rebindings
+}
+
+fn collect_import_rebindings(statements: &[Stmt], found: &mut BTreeMap<String, Vec<TextSize>>) {
+    for statement in statements {
+        for bound in imported_names(statement) {
+            found
+                .entry(bound.to_owned())
+                .or_default()
+                .push(statement.start());
+        }
+        // A class body and a function body each bind their imports in a
+        // namespace of their own, and neither is among the suites below.
+        let suites = runnable_suites(statement);
+        if suites.len() == 1 && a_suite_certainly_runs(statement) {
+            for suite in suites {
+                collect_import_rebindings(suite, found);
+            }
+        }
+    }
+}
+
+/// Where the last class statement binding each name in this scope is written.
+///
+/// A scope that writes the name again below an import has taken it back from
+/// that import, and the offsets a single spelling carries cannot say so. The
+/// spelling is left to the import instead of being handed an answer the class
+/// written last contradicts.
+fn last_class_offsets(statements: &[Stmt], found: &mut BTreeMap<String, TextSize>) {
+    for statement in statements {
+        if let Stmt::ClassDef(class) = statement {
+            found.insert(class.name.to_string(), statement.start());
+            continue;
+        }
+        for suite in control_flow_suites(statement) {
+            last_class_offsets(suite, found);
+        }
     }
 }
 
@@ -1172,28 +1264,42 @@ impl LocalClass {
 ///
 /// A class this scope defines itself takes the name over from an import of the
 /// same name, so a subclass written after it is built on the local class. One
-/// written before it still reaches the import, which is what the offset each
-/// spelling carries decides. An import written below the class hands the name
-/// back the same way, so the stretch the class holds the spelling for ends
-/// there.
+/// written before it still reaches the import, which is what the offsets each
+/// spelling carries decide.
 fn local_class_identities(
     statements: &[Stmt],
     namespace: ClassNamespace<'_>,
 ) -> BTreeMap<String, LocalClass> {
     let mut spellings = BTreeMap::new();
     collect_local_class_offsets(statements, None, &mut spellings);
-    let mut rebindings = BTreeMap::new();
-    collect_import_rebindings(statements, &mut rebindings);
+    let rebindings = import_rebindings(statements);
+    let mut last_written = BTreeMap::new();
+    last_class_offsets(statements, &mut last_written);
     spellings
         .into_iter()
         .map(|(spelling, defined_at)| {
-            // A dotted spelling is reached through its top name, so an import
-            // of that name puts the whole chain out of reach.
-            let root = spelling.split('.').next().unwrap_or(spelling.as_str());
-            let superseded_at = rebindings.get(root).and_then(|offsets: &Vec<TextSize>| {
-                offsets.iter().copied().filter(|at| *at > defined_at).min()
-            });
             let identity = namespace.identity(&spelling);
+            // A dotted spelling is reclaimed by an import of its root, which
+            // is the name the import actually binds: once `package` is the
+            // module again, `package.module.Base` is read there rather than in
+            // the classes nested under the local `package`.
+            let root = spelling.split('.').next().unwrap_or(spelling.as_str());
+            // The import that takes the spelling back is the first one written
+            // below every class statement binding the name and below this
+            // class: a scope that writes the class again under an import has
+            // taken the name back from it, and it is the next import after
+            // that, if any, which reclaims it.
+            let claimed_until = last_written
+                .get(root)
+                .copied()
+                .unwrap_or(defined_at)
+                .max(defined_at);
+            let superseded_at = rebindings.get(root).and_then(|offsets| {
+                offsets
+                    .iter()
+                    .copied()
+                    .find(|offset| claimed_until < *offset)
+            });
             (
                 spelling,
                 LocalClass {
@@ -1257,10 +1363,10 @@ struct BaseScope<'a> {
     /// Names alternative suites bind to different classes, which therefore
     /// stand for no one class in the scope holding them.
     contested: BTreeSet<String>,
-    /// Names an import in this scope has taken back off whatever the scope had
-    /// put behind them. A class carries the offset that settles the same
-    /// question; an alias carries none, so the reclaim is recorded here for
-    /// the scope around a suite to read.
+    /// Names an import in this scope has taken back off whatever an assignment
+    /// had put behind them. The classes the scope defines carry the offsets
+    /// that settle the same question; an alias carries none, so the reclaim is
+    /// recorded here for the scope around a suite to read.
     reclaimed: BTreeSet<String>,
 }
 
@@ -1347,6 +1453,17 @@ fn index_scope_method_bases(
                     definitions,
                 );
             }
+            Stmt::Import(_) | Stmt::ImportFrom(_) => {
+                // An import binds its names afresh, so whatever class an
+                // assignment above had put behind one of them is no longer
+                // what a base written below reads there. The classes the
+                // scope defines are taken back by the same rule, which
+                // `local_class_identities` settles from the offsets.
+                for bound in imported_names(statement) {
+                    scope.aliases.remove(bound);
+                    scope.reclaimed.insert(bound.to_owned());
+                }
+            }
             Stmt::Assign(_) | Stmt::AnnAssign(_) => {
                 let Some((value, targets)) = assigned_value_and_targets(statement) else {
                     continue;
@@ -1380,16 +1497,6 @@ fn index_scope_method_bases(
                         }
                         scope.aliases.insert(alias.id.to_string(), identity.clone());
                     }
-                }
-            }
-            // An import takes its names back from whatever the scope had put
-            // behind them. The classes written here carry the offset that
-            // settles the same question; an alias carries none, so it is
-            // dropped as the import is reached.
-            Stmt::Import(_) | Stmt::ImportFrom(_) => {
-                for bound in imported_names(statement) {
-                    scope.aliases.remove(bound);
-                    scope.reclaimed.insert(bound.to_string());
                 }
             }
             _ => index_control_flow_method_bases(
@@ -1550,11 +1657,15 @@ fn carry_suite_aliases(scope: &mut BaseScope<'_>, suite: &BaseScope<'_>, settles
             scope.contested.insert(spelling.clone());
         }
     }
-    // An import in a suite that certainly runs takes the name back for the
-    // code after it, exactly as one written beside that code would. A suite
-    // that may not run is left alone: marking the name unsettled would only
-    // decline the base while the defaults behind it were still stripped, and
-    // the class the file may well end up with is the one already recorded.
+    // An import the suite makes takes a name back for the code after the
+    // statement too, where the suite is one that certainly runs. Only the
+    // names a suite binds travel out above; a name it unbound would otherwise
+    // be left standing, and a base spelled with it read as the class the
+    // assignment put there rather than the module the import names.
+    //
+    // A suite that may not run is left alone. Marking the name unsettled there
+    // would decline the base while the defaults behind it were still stripped,
+    // which turns a wrong argument into a call that cannot run at all.
     if settles {
         for spelling in &suite.reclaimed {
             scope.aliases.remove(spelling);
@@ -1693,71 +1804,6 @@ fn collect_local_class_offsets(
     }
 }
 
-/// The names an import statement binds in the scope holding it, under the
-/// spelling the rest of that scope reads them by. A dotted `import a.b` binds
-/// only the top package.
-fn imported_names(statement: &Stmt) -> Vec<&str> {
-    match statement {
-        Stmt::Import(import) => import
-            .names
-            .iter()
-            .map(|alias| {
-                alias.asname.as_ref().map_or_else(
-                    || alias.name.as_str().split('.').next().unwrap_or_default(),
-                    ast::Identifier::as_str,
-                )
-            })
-            .collect(),
-        Stmt::ImportFrom(import) => import
-            .names
-            .iter()
-            .filter(|alias| alias.name.as_str() != "*")
-            .map(|alias| {
-                alias
-                    .asname
-                    .as_ref()
-                    .map_or_else(|| alias.name.as_str(), ast::Identifier::as_str)
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Where each import in this scope takes a name back, under the name it binds.
-/// A class written above such an import no longer holds the spelling: the
-/// import hands it to whatever module it names, and a base spelled with it
-/// below reads that module instead.
-fn collect_import_rebindings(statements: &[Stmt], found: &mut BTreeMap<String, Vec<TextSize>>) {
-    for statement in statements {
-        match statement {
-            // A class or function body binds its imports in a namespace of its
-            // own, which the scope holding it never reads.
-            Stmt::ClassDef(_) | Stmt::FunctionDef(_) => {}
-            Stmt::Import(_) | Stmt::ImportFrom(_) => {
-                for bound in imported_names(statement) {
-                    found
-                        .entry(bound.to_string())
-                        .or_default()
-                        .push(statement.start());
-                }
-            }
-            _ => {
-                // A suite that may not run cannot be counted on to take the
-                // name back, and where several stand against each other only
-                // one of them runs. Only a suite the statement is certain to
-                // enter binds for the code written after it, which is the same
-                // rule `carry_suite_aliases` settles a name by.
-                let suites = runnable_suites(statement);
-                if suites.len() == 1 && a_suite_certainly_runs(statement) {
-                    for suite in suites {
-                        collect_import_rebindings(suite, found);
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Whether a class written in this file above `defined_at`, or a name this
 /// scope has already bound to a class, holds the spelling a base expression's
 /// prefix uses, so the prefix is that class rather than whatever a module of
@@ -1810,8 +1856,8 @@ fn method_base_identity(
         Expr::Name(name) => aliases.get(name.id.as_str()).cloned().or_else(|| {
             let local = local_classes.get(name.id.as_str());
             // A class already defined here holds the name, whatever an import
-            // of the same name bound earlier — and only until an import below
-            // it takes the name back.
+            // of the same name bound earlier, and only up to the import that
+            // takes the name back.
             if let Some(class) = local.filter(|class| class.holds_at(defined_at)) {
                 return Some((importer.to_path_buf(), class.identity.clone()));
             }
@@ -1822,10 +1868,14 @@ fn method_base_identity(
                 // of the same spelling written further down the scope would
                 // answer with one the subclass was never built on.
                 Some(Binding::Unknown) => None,
-                // A class written further down the scope still answers where
-                // nothing else holds the name — but not once an import below
-                // it has taken the name back, whether or not this run can see
-                // what that import bound.
+                // A class the scope defines answers for a name nothing else
+                // here binds, even where it is written below the base reading
+                // it. An import that has already taken the name over is not
+                // such a name: the base was built on whatever that import
+                // bound, and where this pass cannot follow it — an unchecked
+                // module, or a module bound rather than a symbol — the
+                // spelling is left unresolved rather than answered with a
+                // class the file has moved past.
                 _ => local
                     .filter(|class| !class.superseded_before(defined_at))
                     .map(|class| (importer.to_path_buf(), class.identity.clone())),
@@ -3629,9 +3679,9 @@ fn check_source(
         local_classes: BTreeSet::new(),
         metaclass_classes: BTreeSet::new(),
         entered_class_metaclass_classes: Vec::new(),
+        metaclass_definitions: BTreeSet::new(),
         local_enum_classes: BTreeSet::new(),
         entered_class_enum_classes: Vec::new(),
-        metaclass_definitions: BTreeSet::new(),
         metaclass_intercepted_classes,
         repeated_functions,
         property_aliased_methods,
@@ -3933,20 +3983,18 @@ struct Checker<'a> {
     /// for nothing inside a function or a class written there, which reads the
     /// names the class statement began with instead.
     entered_class_metaclass_classes: Vec<BTreeSet<String>>,
-    /// Same-file classes `Enum` builds the members of, directly or through a
-    /// base. Enum-ness is inherited like a metaclass is, and a member of a
-    /// subclass is built by calling `__init__` and `_missing_` with the value
-    /// alone, so those methods keep their defaults however far down the chain
-    /// the members are written.
-    local_enum_classes: BTreeSet<String>,
-    /// What `local_enum_classes` held as each enclosing class body was
-    /// entered, for the same reason `entered_class_metaclass_classes` records
-    /// it: a class written in a class body is out of reach from a definition
-    /// nested inside that body.
-    entered_class_enum_classes: Vec<BTreeSet<String>>,
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
+    /// The enumerations the file defines, whether they name an imported `Enum`
+    /// or another of these. Being an enumeration is inherited, so a subclass
+    /// of one creates its members the same implicit way.
+    local_enum_classes: BTreeSet<String>,
+    /// What `local_enum_classes` held as each enclosing class body was
+    /// entered, for the same reason `entered_class_metaclass_classes` keeps
+    /// its own: a class body binds names only for itself, so a function or a
+    /// class written in one reads the names the class statement began with.
+    entered_class_enum_classes: Vec<BTreeSet<String>>,
     /// Same-file classes whose metaclass can replace class attributes.
     metaclass_intercepted_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
@@ -4353,6 +4401,7 @@ impl Checker<'_> {
             }
             self.shapes
                 .remove(&qualified_class_name(&self.lexical_scope, name));
+            self.local_enum_classes.remove(name);
             if let Some(bindings) = self.lexical_bindings.last_mut() {
                 bindings.insert(name.to_owned());
             }
@@ -4591,6 +4640,25 @@ impl Checker<'_> {
         generates_init(class, &self.aliases, &self.metaclass_classes)
     }
 
+    /// Whether the class statement itself creates the class's members, which
+    /// it does for an enumeration: each member assignment calls the body's
+    /// initializer with the value assigned, through no call site the fixer can
+    /// rewrite. A base written in this file that is already an enumeration
+    /// makes this class one too, because that is inherited like any other
+    /// class behaviour.
+    fn is_enum_class(&self, class: &ast::StmtClassDef) -> bool {
+        class_bases(class).any(|base| match base {
+            Expr::Name(name) => {
+                self.aliases.enum_classes.contains(name.id.as_str())
+                    || self.local_enum_classes.contains(name.id.as_str())
+            }
+            Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
+                matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
+            }
+            _ => false,
+        })
+    }
+
     /// Note that a metaclass builds this class, so a later subclass of it is
     /// built by that metaclass too. An unseen imported base counts as one: the
     /// metaclass it may carry reaches every class beneath it alike, and a
@@ -4610,23 +4678,6 @@ impl Checker<'_> {
         } else {
             self.metaclass_classes.remove(class.name.as_str());
         }
-    }
-
-    /// Whether `Enum` builds this class's members, so writing one calls the
-    /// class's own `__init__` and `_missing_` with nothing but the member
-    /// value. A base written in this file carries that on: a subclass of a
-    /// local enum is an enum too, and its members are built the same way.
-    fn is_enum_class(&self, class: &ast::StmtClassDef) -> bool {
-        class_bases(class).any(|base| match base {
-            Expr::Name(name) => {
-                self.aliases.enum_classes.contains(name.id.as_str())
-                    || self.local_enum_classes.contains(name.id.as_str())
-            }
-            Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
-                matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
-            }
-            _ => false,
-        })
     }
 
     fn visit_conditional<'a>(&mut self, branch: &'a ast::StmtIf)
@@ -4712,8 +4763,8 @@ impl Checker<'_> {
         let outer_aliases = self.aliases.clone();
         let outer_local_classes = self.local_classes.clone();
         let outer_metaclass_classes = self.metaclass_classes.clone();
-        let outer_enum_classes = self.local_enum_classes.clone();
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
+        let outer_enum_classes = self.local_enum_classes.clone();
         // Written straight in a class body, this function sees none of the
         // names that body binds: a class written above it there is not in
         // scope here, and reading a base through it would answer with a class
@@ -4734,6 +4785,7 @@ impl Checker<'_> {
         let parameter_names = parameters.names.clone();
         for name in parameters.names {
             self.aliases.invalidate_parameter(&name);
+            self.local_enum_classes.remove(&name);
         }
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
@@ -4758,8 +4810,8 @@ impl Checker<'_> {
         self.restore_aliases(outer_aliases);
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
-        self.local_enum_classes = outer_enum_classes;
         self.metaclass_definitions = outer_metaclass_definitions;
+        self.local_enum_classes = outer_enum_classes;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
@@ -5663,8 +5715,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer_aliases = self.aliases.clone();
                 let outer_local_classes = self.local_classes.clone();
                 let outer_metaclass_classes = self.metaclass_classes.clone();
-                let outer_enum_classes = self.local_enum_classes.clone();
                 let outer_metaclass_definitions = self.metaclass_definitions.clone();
+                let outer_enum_classes = self.local_enum_classes.clone();
+                let enum_class = self.is_enum_class(class);
                 let outer_repeated_functions = self.repeated_functions.clone();
                 let mut method_names = BTreeSet::new();
                 let mut repeated_methods = BTreeSet::new();
@@ -5673,9 +5726,6 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let old_header = self.header;
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
-                // Read with the tables the class statement itself sees, which
-                // is where its bases were resolved.
-                let enum_class = self.is_enum_class(class);
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
                     fields: style,
@@ -5806,16 +5856,16 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 }
                 self.metaclass_classes = outer_metaclass_classes;
                 self.record_metaclass_construction(class, unseen_import_base);
-                // A later class of the same name that is no enum clears the
-                // spelling, so a sibling built on the new class is not taken
-                // for an enum.
+                self.metaclass_definitions = outer_metaclass_definitions;
                 self.local_enum_classes = outer_enum_classes;
+                // A later class of the same name that is no enumeration takes
+                // the name back, so a subclass written on it below is built
+                // the ordinary way.
                 if enum_class {
                     self.local_enum_classes.insert(class.name.to_string());
                 } else {
                     self.local_enum_classes.remove(class.name.as_str());
                 }
-                self.metaclass_definitions = outer_metaclass_definitions;
                 self.repeated_functions = outer_repeated_functions;
                 if defines_metaclass(class, &self.metaclass_definitions) {
                     self.metaclass_definitions.insert(class.name.to_string());
@@ -19222,129 +19272,6 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn inherited_enum_member_initializer_defaults_are_retained() {
-        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-    }
-
-    #[test]
-    fn a_nested_enum_base_is_read_from_the_class_body_holding_it() {
-        let source = "from enum import Enum\n\nclass Container:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-    }
-
-    #[test]
-    fn a_plain_redefinition_takes_enum_inheritance_back() {
-        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Base:\n    pass\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_some());
-    }
-
-    #[test]
-    fn local_class_owners_win_over_stale_module_bindings() -> Result<(), String> {
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let package = directory.path().join("package");
-        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
-        let initializer = package.join("__init__.py");
-        let module = package.join("module.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
-        std::fs::write(
-            &module,
-            "class Base:\n    def target(self, value=2): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "import package.module\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[initializer, module, case.clone()])?;
-        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("self.target(value=3)"), "{updated}");
-        Ok(())
-    }
-
-    #[test]
-    fn later_imports_reclaim_dotted_module_owners() -> Result<(), String> {
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let package = directory.path().join("package");
-        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
-        let initializer = package.join("__init__.py");
-        let module = package.join("module.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
-        std::fs::write(
-            &module,
-            "class Base:\n    def target(self, value=2): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "class package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nimport package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[initializer, module, case.clone()])?;
-        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("self.target(value=2)"), "{updated}");
-        Ok(())
-    }
-
-    #[test]
-    fn later_imports_reclaim_aliased_owners() -> Result<(), String> {
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let package = directory.path().join("package");
-        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
-        let initializer = package.join("__init__.py");
-        let module = package.join("module.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
-        std::fs::write(
-            &module,
-            "class Base:\n    def target(self, value=2): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "class Local:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\npackage = Local\n\nimport package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[initializer, module, case.clone()])?;
-        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("self.target(value=2)"), "{updated}");
-        Ok(())
-    }
-
-    #[test]
     fn a_self_named_base_uses_the_previous_metaclass_binding() {
         // The name a class statement writes is bound only once its body has
         // run, so a base spelled the same as the class being defined reaches
@@ -19365,114 +19292,6 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
-    }
-
-    #[test]
-    fn imported_metaclass_lookup_skips_enclosing_class_scopes() {
-        let source = "from dataclasses import dataclass, field\n\ndef build():\n    from base import Parent\n\n    class Base(Parent):\n        pass\n\n    class Outer:\n        class Base:\n            pass\n\n        class Container:\n            @dataclass\n            class Child(Base):\n                value: int = field(default=1, kw_only=True)\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-    }
-
-    #[test]
-    fn imported_metaclass_lookup_keeps_the_immediate_class_scope() {
-        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Container:\n    class Base(Parent):\n        pass\n\n    @dataclass\n    class Child(Base):\n        value: int = field(default=1, kw_only=True)\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-    }
-
-    #[test]
-    fn an_untracked_import_takes_a_local_base_name_back() -> Result<(), String> {
-        // The import binds nothing this run can follow, so what it put behind
-        // the name is unknown. Reading on to the class of that spelling
-        // written above it would answer with one the subclass is not built on,
-        // and the inherited call would be rewritten with its default.
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let package = directory.path().join("package");
-        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
-        let initializer = package.join("__init__.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "class Base:\n    def target(self, value=3): return value\n\nfrom unresolvable import Base\n\nclass Child(Base):\n    def run(self): return self.target()\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[initializer, case.clone()])?;
-        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("return self.target()\n"), "{updated}");
-        Ok(())
-    }
-
-    #[test]
-    fn an_import_in_a_suite_that_certainly_runs_reclaims_an_alias() -> Result<(), String> {
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let package = directory.path().join("package");
-        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
-        let initializer = package.join("__init__.py");
-        let module = package.join("module.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
-        std::fs::write(
-            &module,
-            "class Base:\n    def target(self, value=2): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "class Local:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\npackage = Local\n\nif True:\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[initializer, module, case.clone()])?;
-        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("self.target(value=2)"), "{updated}");
-        Ok(())
-    }
-
-    #[test]
-    fn a_conditional_import_does_not_reclaim_a_dotted_owner() -> Result<(), String> {
-        // The suite may not run, so the class written above it is still the
-        // one the file may end up with. Handing the name to the module here
-        // would resolve the subclass against a base it never had.
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let package = directory.path().join("package");
-        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
-        let initializer = package.join("__init__.py");
-        let module = package.join("module.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
-        std::fs::write(
-            &module,
-            "class Base:\n    def target(self, value=2): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "import os\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nif os.environ.get(\"USE_REAL\"):\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[initializer, module, case.clone()])?;
-        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("self.target(value=3)"), "{updated}");
-        Ok(())
     }
 
     #[test]
@@ -19517,5 +19336,448 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
         assert_eq!(checked.signatures.len(), 1);
+    }
+    #[test]
+    fn inherited_enum_member_initializer_defaults_are_retained() {
+        // Being an enumeration is inherited, so a subclass of one written in
+        // this file creates its own members the same implicit way, and reaches
+        // `_missing_` the same way too, however many classes and class bodies
+        // stand between it and the import.
+        for source in [
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Mid(Base):\n    pass\n\nclass Child(Mid):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "import enum\n\nclass Base(enum.Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_redefinition_that_is_no_enum_frees_its_subclasses() {
+        // A base resolves to the class the name holds where the subclass is
+        // written, not to the enumeration that name once stood for, and
+        // nothing creates members of an ordinary class.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Base:\n    pass\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn an_inherited_enum_body_keeps_only_its_implicit_initializer() {
+        // Reaching subclasses widens which bodies are enumerations, not which
+        // of their methods are called implicitly. Every other method is called
+        // through a call site the fixer can rewrite.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def describe(self, prefix='p'): return prefix\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+    #[test]
+    fn an_enum_hidden_by_a_nested_namesake_still_reaches_deeper_bodies() {
+        // A class body binds names for itself alone. A function written in one
+        // reads past it, so `Base` there is the module-level enumeration and
+        // not the plain class the body wrote, and a class written in a further
+        // class body reads past it the same way.
+        for source in [
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Outer:\n    class Base:\n        pass\n\n    def build():\n        class Child(Base):\n            A = 1\n            def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Outer:\n    class Base:\n        pass\n\n    class Holder:\n        class Child(Base):\n            A = 1\n            def __init__(self, value, label='x'): self.label = label\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn an_enum_in_a_class_body_does_not_reach_the_bodies_written_in_it() {
+        // The same rule the other way round: the enumeration this class body
+        // writes is no name at all to a function written below it there, which
+        // reaches the module-level plain class instead, so nothing creates
+        // members and the default is as removable as any other.
+        let source = "from enum import Enum\n\nclass Base:\n    pass\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    def build():\n        class Child(Base):\n            def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn an_enum_in_a_class_body_still_reaches_the_classes_beside_it() {
+        // Only the bodies written in it are out of reach. A class statement
+        // later in the same body reads the name the way anything else there
+        // does, so this subclass is an enumeration.
+        let source = "from enum import Enum\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+    #[test]
+    fn a_rebinding_takes_the_name_off_a_local_enum() {
+        // Whatever now stands under the name is what the base below spells, so
+        // this class is ordinary and nothing creates members of it.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nBase = object\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_parameter_takes_the_name_off_a_local_enum() {
+        // The parameter holds the name for the whole body, so the class
+        // written there is built on what the caller passed.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\ndef build(Base):\n    class Child(Base):\n        def __init__(self, value, label='x'): self.label = label\n    return Child\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_loop_target_takes_the_name_off_a_local_enum() {
+        // Every rebinding form goes through the same invalidation, so a loop
+        // target hides the enumeration exactly as an assignment does.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nfor Base in bases:\n    pass\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    /// Write a package whose `module.Base.target` defaults to `2` beside a
+    /// case file, fix them all, and hand back what the case file became.
+    fn reclaimed_owner_fixture(case_source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(&case, case_source).map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        std::fs::read_to_string(case).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn later_imports_reclaim_dotted_module_owners() -> Result<(), String> {
+        // `import package.module` binds `package` again, so the base names
+        // the imported class and not the classes nested under the local
+        // `package`, which CPython agrees on: the call returns 2.
+        let updated = reclaimed_owner_fixture(
+            "class package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nimport package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_above_a_reclaiming_import_still_owns_the_bases_beneath_it() -> Result<(), String> {
+        // The import takes the name back only from where it is written, so a
+        // subclass above it is still built on the local class. CPython gives
+        // the first call 3 and the second 2.
+        let updated = reclaimed_owner_fixture(
+            "class package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nclass Early(package.module.Base):\n    def run(self): return self.target()\n\nimport package.module\n\nclass Late(package.module.Base):\n    def run(self): return self.target()\n",
+        )?;
+        assert!(updated.contains("self.target(value=3)"), "{updated}");
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn later_imports_reclaim_assignment_aliases() -> Result<(), String> {
+        // `Widget` names the local class until the import binds it again, so
+        // the subclass below is built on the imported class. CPython gives the
+        // call 2.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Widget:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Local:\n    def target(self, value=3): return value\n\nWidget = Local\n\nfrom package.module import Widget\n\nclass Child(Widget):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn later_imports_reclaim_plain_class_names() -> Result<(), String> {
+        // The plain-name half of the same rule: `from api import Base` binds
+        // `Base` again, so the subclass below is built on the imported class,
+        // whose default CPython gives the call as 9.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Base:\n    def target(self, value=1): return value\n\nfrom api import Base\n\nclass Child(Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=9)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_written_again_below_an_import_keeps_the_name_from_it() -> Result<(), String> {
+        // The scope writes `Base` again below the import, so the import never
+        // ends up holding the name and the subclass is built on the second
+        // local class, which CPython gives the call as 4. The two same-named
+        // classes leave the file with no signature to rewrite against, which
+        // is #1102 and is unchanged here; what matters is that the import's
+        // default is not handed over in its place.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Base:\n    def target(self, value=1): return value\n\nfrom api import Base\n\nclass Base:\n    def target(self, value=4): return value\n\nclass Child(Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("self.target(value=9)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_import_reclaims_a_name_its_own_first_import_bound() -> Result<(), String> {
+        // The scope imports `Base`, defines a class of the name, and imports it
+        // again. It is the second import that takes the name back, so the
+        // subclass under it is built on the imported class and CPython gives
+        // the call 9. Reading only the first import of a name would leave the
+        // local class holding it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Base\n\nclass Base:\n    def target(self, value=1): return value\n\nfrom api import Base\n\nclass Child(Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=9)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_reclaiming_import_this_pass_cannot_follow_leaves_the_name_unresolved() -> Result<(), String>
+    {
+        // `external.py` is not among the checked files, so nothing here can say
+        // what the import bound. The class the import took the name from is
+        // still not the answer: CPython gives the call 9, and rewriting it
+        // against the local class would pass 1. The import's own default is
+        // left alone with its module, so leaving the call as it stands is what
+        // keeps running.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let external = directory.path().join("external.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &external,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Base:\n    def target(self, value=1): return value\n\nfrom external import Base\n\nclass Child(Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(std::slice::from_ref(&case))?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target()"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_import_in_a_suite_that_certainly_runs_reclaims_a_dotted_owner() -> Result<(), String> {
+        // A suite the statement is certain to enter binds for the code after
+        // it, so the import there hands `package` back to the module and the
+        // classes nested under the local namesake are out of reach beneath it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nif True:\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_import_in_a_suite_that_certainly_runs_reclaims_an_alias() -> Result<(), String> {
+        // The classes a scope defines carry offsets that settle this on their
+        // own; a name an assignment put behind a class carries none, so the
+        // suite has to hand the reclaim out to the scope around it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Local:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\npackage = Local\n\nif True:\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_conditional_import_does_not_reclaim_a_dotted_owner() -> Result<(), String> {
+        // The suite may not run, so the class written above it is still the
+        // one the file may end up with. Neither answer is safe here — see
+        // #1100 — and handing the name to the module would strip the local
+        // default while leaving the call unable to run without it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import os\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nif os.environ.get(\"USE_REAL\"):\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=3)"), "{updated}");
+        Ok(())
     }
 }

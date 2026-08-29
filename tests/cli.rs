@@ -5416,20 +5416,27 @@ fn suites_that_disagree_on_a_class_keep_the_default_behind_a_qualified_construct
 }
 
 #[test]
-fn suites_that_disagree_on_a_class_keep_the_defaults_a_descendant_declares(
+fn a_descendant_of_disagreeing_suites_keeps_its_own_calls_in_step(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // `own` belongs to `Descendant`, not to the class the two suites disagree
-    // on, but a call on `Descendant` still cannot be tied to a definition
-    // while an ancestor above it has two ancestries. Deleting the default of a
-    // method whose calls are all left alone would break every one of them.
+    // `own` is declared on `Descendant` itself, so which of the two ancestries
+    // `Middle` ends up with does not change which `own` the call reaches. The
+    // default may therefore go — but only together with the argument standing
+    // in for it. Removing it while leaving `Descendant().own()` as written is
+    // the one outcome that breaks a file that ran before.
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");
     let source = "import os\n\n\nclass BaseA:\n    pass\n\n\nclass BaseB:\n    pass\n\n\nif os.environ.get(\"PICK\"):\n\n    class Middle(BaseA):\n        pass\n\nelse:\n\n    class Middle(BaseB):\n        pass\n\n\nclass Descendant(Middle):\n    def own(self, value=3):\n        return value\n\n\nassert Descendant().own() == 3\n";
     std::fs::write(&path, source)?;
 
     let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(std::fs::read_to_string(path)?, source);
+    let updated = std::fs::read_to_string(&path)?;
+    if updated.contains("def own(self, value=3):") {
+        assert_eq!(updated, source);
+        assert_eq!(output.status.code(), Some(1));
+    } else {
+        assert!(updated.contains("Descendant().own(value=3)"), "{updated}");
+        assert_eq!(output.status.code(), Some(0));
+    }
     Ok(())
 }
 
@@ -5471,5 +5478,91 @@ fn an_alias_reaches_the_enclosing_functions_class() -> Result<(), Box<dyn std::e
         "{updated}"
     );
     assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_subscripted_contested_base_keeps_the_inherited_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // `Alias[int]` names the same class `Alias` does, so a subclass spelled
+    // that way is as much in doubt as one spelled without the parameter.
+    // Stripping either `target`'s default would leave the `self.target()` that
+    // was left alone short of the argument it stood in for.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\nfrom typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n\n\nclass First(Generic[T]):\n    def target(self, value=1):\n        return value\n\n\nclass Second(Generic[T]):\n    def target(self, other=2):\n        return other\n\n\nif os.environ.get(\"PICK\"):\n    Alias = Second\nelse:\n    Alias = First\n\n\nclass Child(Alias[int]):\n    def run(self):\n        return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_if_without_an_else_contests_the_name_it_binds() -> Result<(), Box<dyn std::error::Error>> {
+    // The suite may not run, so `Alias` stands for `Second` or for the `First`
+    // bound above it, and `Child` has an ancestry for each. Resolving against
+    // either strips the other's default while the call keeps the arguments it
+    // was written with.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass First:\n    def target(self, value=1):\n        return value\n\n\nclass Second:\n    def target(self, other=2):\n        return other\n\n\nAlias = First\nif os.environ.get(\"PICK\"):\n    Alias = Second\n\n\nclass Child(Alias):\n    def run(self):\n        return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_contest_inside_a_wrapper_reaches_the_scope_around_it() -> Result<(), Box<dyn std::error::Error>>
+{
+    // The wrapper runs, but it settles nothing the branches inside it left
+    // open, so the contest they found has to travel out to the class written
+    // after it.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass First:\n    def target(self, value=1):\n        return value\n\n\nclass Second:\n    def target(self, other=2):\n        return other\n\n\nAlias = First\nif True:\n    if os.environ.get(\"PICK\"):\n        Alias = Second\n    else:\n        Alias = First\n\n\nclass Child(Alias):\n    def run(self):\n        return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_copy_of_a_contested_name_keeps_the_inherited_default() -> Result<(), Box<dyn std::error::Error>>
+{
+    // `Other` is read from a name that stands for either class, so it stands
+    // for either one too. Resolving `Child` against the candidate the copy
+    // happened to read rewrote the call with `First`'s parameter, which the
+    // `Second` the module may have built does not take.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass First:\n    def target(self, value=1):\n        return value\n\n\nclass Second:\n    def target(self, other=2):\n        return other\n\n\nAlias = First\nif os.environ.get(\"PICK\"):\n    Alias = Second\n\nOther = Alias\n\n\nclass Child(Other):\n    def run(self):\n        return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_subscripted_copy_of_a_contested_name_keeps_the_inherited_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The parameter changes nothing about which class the copy reads, so the
+    // doubt travels through `Alias[int]` exactly as it does through `Alias`.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\nfrom typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n\n\nclass First(Generic[T]):\n    def target(self, value=1):\n        return value\n\n\nclass Second(Generic[T]):\n    def target(self, other=2):\n        return other\n\n\nAlias = First\nif os.environ.get(\"PICK\"):\n    Alias = Second\n\nOther = Alias[int]\n\n\nclass Child(Other):\n    def run(self):\n        return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
     Ok(())
 }

@@ -5609,6 +5609,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "reducer_override"
             | "persistent_load"
             | "find_class"
+            | "invalidate_caches"
             | "load_module"
             | "__call__"
             | "__enter__"
@@ -20286,6 +20287,68 @@ def b(x=1): pass  # type: ignore  # noqa
         // `find_classes` is nothing the unpickler ever reaches for.
         let source =
             "class U:\n    def find_classes(self, module, name, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn import_finder_invalidate_caches_defaults_are_retained() {
+        // `importlib.invalidate_caches()` walks `sys.meta_path` and calls each
+        // finder's `invalidate_caches()` with nothing at all, so a parameter
+        // beside `self` only ever arrives as its default. The interpreter's
+        // own import machinery makes that call, so dropping the default leaves
+        // the next invalidation raising `TypeError: Finder.invalidate_caches()
+        // missing 1 required positional argument` with nothing for the fixer
+        // to update.
+        let source =
+            "class Finder:\n    def invalidate_caches(self, extra=1):\n        self.stamp = extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_finder_method_beside_invalidate_caches_stays_fixable() {
+        // Retention is keyed to the hook name, so a sibling sharing the finder
+        // and the signature shape keeps its ordinary treatment.
+        let source = "class Finder:\n    def invalidate_caches(self, extra=1):\n        self.stamp = self.helper()\n    def helper(self, value=2):\n        return value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_invalidate_caches_stays_fixable() {
+        // The import system looks the hook up under its exact name, so a near
+        // miss is an ordinary method whose default the fixer removes.
+        let source = "class Finder:\n    def invalidate_caches_all(self, extra=1):\n        self.stamp = extra\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

@@ -4298,7 +4298,7 @@ impl Checker<'_> {
         self.invalidate_bound_names(bound.names.iter().map(String::as_str));
     }
 
-    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, statement: &'a Stmt)
+    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor)
     where
         Self: Visitor<'a>,
     {
@@ -4314,8 +4314,16 @@ impl Checker<'_> {
         if statically_empty {
             self.visit_body(&loop_.orelse);
         } else {
-            self.visit_uncertain(statement);
+            // The iterable is evaluated before the target is assigned. The
+            // body sees the target binding, and an import in that body may
+            // establish the name that remains after an iteration.
+            self.visit_expr(&loop_.iter);
             self.invalidate_target_aliases(&loop_.target);
+            self.conditional_depth += 1;
+            self.visit_expr(&loop_.target);
+            self.visit_body(&loop_.body);
+            self.visit_body(&loop_.orelse);
+            self.conditional_depth -= 1;
         }
     }
 
@@ -5449,7 +5457,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::If(branch) => self.visit_conditional(branch),
             Stmt::Try(_) => self.visit_uncertain(statement),
             Stmt::Match(block) => self.visit_match(block),
-            Stmt::For(loop_) => self.visit_loop(loop_, statement),
+            Stmt::For(loop_) => self.visit_loop(loop_),
             Stmt::While(loop_) => self.visit_while(loop_, statement),
             Stmt::With(block) => self.visit_with(block),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),

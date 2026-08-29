@@ -1543,9 +1543,20 @@ fn method_base_identity(
             // whatever the package initializer wrote under that name. So where
             // the prefix is a module this run resolved, the member belongs to
             // that module and not to a same-named class of the initializer.
+            //
+            // A class written here above the subclass takes the name back off
+            // the import, and with it everything spelled under it, so the
+            // module only answers while nothing local holds the name it starts
+            // from.
             if let Some(module) = dotted_name(&attribute.value) {
-                if let Some(Binding::Module(file)) = bindings.get(&module) {
-                    return Some((file.clone(), attribute.attr.to_string()));
+                let root = module.split('.').next().unwrap_or(&module);
+                let held_locally = local_classes
+                    .get(root)
+                    .is_some_and(|(_, offset)| *offset < defined_at);
+                if !held_locally {
+                    if let Some(Binding::Module(file)) = bindings.get(&module) {
+                        return Some((file.clone(), attribute.attr.to_string()));
+                    }
                 }
             }
             // The prefix may be a name this scope bound to a class rather than
@@ -3334,6 +3345,7 @@ fn check_source(
         rebound_globals: BTreeSet::new(),
         lexical_scope: Vec::new(),
         lexical_is_class: Vec::new(),
+        lexical_bindings: Vec::new(),
         lambda_bodies: 0,
         conditional_depth: 0,
         scope: Scope {
@@ -3653,6 +3665,10 @@ struct Checker<'a> {
     /// namespace is not a closure scope, so code in a nested definition never
     /// reads names from it.
     lexical_is_class: Vec<bool>,
+    /// The names each entry of `lexical_scope` binds. A scope that binds a
+    /// name hides whatever the scopes outside it call by the same name, even
+    /// where nothing about the class it now stands for is known.
+    lexical_bindings: Vec<BTreeSet<String>>,
     /// How many lambda bodies enclose the expression being visited. A walrus
     /// in one binds in the lambda's own scope, which nothing outside it sees,
     /// and `lexical_scope` has no entry to say so.
@@ -3850,6 +3866,12 @@ impl Checker<'_> {
     /// the module. A class namespace is not one of those scopes, so a body
     /// written inside a class sees nothing an outer class body bound; only the
     /// scope the name is written in answers when that scope is a class body.
+    ///
+    /// The search stops at the nearest scope that binds the name, whether or
+    /// not a shape was recorded there. A parameter or a rebinding stands
+    /// between the name and the enclosing class it would otherwise have
+    /// reached, and reading past it would give a subclass the fields of a
+    /// class its constructor never sees.
     fn visible_shape(&self, name: &str) -> Option<&Option<Shape>> {
         (0..=self.lexical_scope.len())
             .rev()
@@ -3859,9 +3881,20 @@ impl Checker<'_> {
                     || self.lexical_is_class.get(depth - 1) != Some(&true)
             })
             .find_map(|depth| {
-                self.shapes
+                if let Some(shape) = self
+                    .shapes
                     .get(&qualified_class_name(&self.lexical_scope[..depth], name))
+                {
+                    return Some(Some(shape));
+                }
+                let hidden = depth > 0
+                    && self
+                        .lexical_bindings
+                        .get(depth - 1)
+                        .is_some_and(|bindings| bindings.contains(name));
+                hidden.then_some(None)
             })
+            .flatten()
     }
 
     fn unknown_base_may_end_in_default(&self, class: &ast::StmtClassDef) -> bool {
@@ -4004,6 +4037,9 @@ impl Checker<'_> {
             }
             self.shapes
                 .remove(&qualified_class_name(&self.lexical_scope, name));
+            if let Some(bindings) = self.lexical_bindings.last_mut() {
+                bindings.insert(name.to_owned());
+            }
         }
     }
 
@@ -4338,6 +4374,9 @@ impl Checker<'_> {
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
         let mut parameters = BoundNames::default();
         parameters.parameters(&function.parameters);
+        // A parameter is bound the moment the body starts, so it hides an
+        // enclosing class of the same name for everything the body does.
+        let parameter_names = parameters.names.clone();
         for name in parameters.names {
             self.aliases.invalidate_parameter(&name);
         }
@@ -4354,7 +4393,9 @@ impl Checker<'_> {
         self.repeated_functions = repeated_functions;
         self.lexical_scope.push(function.name.to_string());
         self.lexical_is_class.push(false);
+        self.lexical_bindings.push(parameter_names);
         walk_stmt(self, statement);
+        self.lexical_bindings.pop();
         self.lexical_is_class.pop();
         self.lexical_scope.pop();
         self.repeated_functions = outer_repeated_functions;
@@ -5352,7 +5393,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 }
                 self.lexical_scope.push(class.name.to_string());
                 self.lexical_is_class.push(true);
+                self.lexical_bindings.push(BTreeSet::new());
                 walk_stmt(self, statement);
+                self.lexical_bindings.pop();
                 self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 // The class name becomes visible only after its body has
@@ -18153,6 +18196,68 @@ def b(x=1): pass  # type: ignore  # noqa
         fix_all(&[initializer, module, case.clone()])?;
         let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
         assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_class_holds_a_dotted_name_against_the_submodule_under_it() -> Result<(), String> {
+        // `class package` takes the name the import bound, and everything
+        // spelled under it goes with the name, so `package.module.Base` is the
+        // nested class written here. Preferring the submodule would rewrite the
+        // inherited call with the default of a class it never inherits.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import package.module\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=1): return value\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameter_hides_the_enclosing_class_of_the_same_name() -> Result<(), String> {
+        // `inner` takes its base as a parameter, so the `Base` the alias reads
+        // is that argument and not the class `outer` holds. Walking on to the
+        // enclosing class would give `Child` a `local` field the class it is
+        // really built on has no room for.
+        let source = "from dataclasses import dataclass\n\nclass Fallback:\n    pass\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    def inner(Base):\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n        return Child()\n\n    return inner(Fallback)\n\nouter()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("Child(local="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebinding_hides_the_enclosing_class_of_the_same_name() -> Result<(), String> {
+        // The rebinding is a call, so what it produces is unknown, but that it
+        // happened is not: `Base` in `inner` is whatever the call returned and
+        // the enclosing class is out of reach behind it.
+        let source = "from dataclasses import dataclass\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    def inner():\n        Base = type('Base', (), {})\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n        return Child()\n\n    return inner()\n\nouter()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("Child(local="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_target_hides_the_enclosing_class_of_the_same_name() -> Result<(), String> {
+        // A loop target binds its name for the rest of the body, so the same
+        // reasoning holds for it as for a plain assignment.
+        let source = "from dataclasses import dataclass\n\nclass Fallback:\n    pass\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    def inner():\n        for Base in [Fallback]:\n            pass\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n        return Child()\n\n    return inner()\n\nouter()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("Child(local="), "{updated}");
         Ok(())
     }
 }

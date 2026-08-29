@@ -320,7 +320,7 @@ enum MethodAliasKind {
     Property,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MethodAlias {
     name: String,
     kind: MethodAliasKind,
@@ -1570,7 +1570,6 @@ impl<'a> BaseScope<'a> {
     /// statement stands below the nested scope, what the name reaches by the
     /// time that scope runs is not something the written order settles, so the
     /// spelling is taken away rather than answered with the outer class.
-    ///
     /// Which spellings were taken away is returned beside the ones that
     /// remain, because a base written with one of them is not a base this file
     /// has no record of — it names a class the file can see and simply cannot
@@ -4895,16 +4894,7 @@ impl Checker<'_> {
     where
         Self: Visitor<'a>,
     {
-        let statically_empty = match loop_.iter.as_ref() {
-            Expr::Tuple(tuple) => tuple.elts.is_empty(),
-            Expr::List(list) => list.elts.is_empty(),
-            Expr::Set(set) => set.elts.is_empty(),
-            // `{}` is the empty mapping, and the only empty literal a set
-            // cannot be written as.
-            Expr::Dict(dict) => dict.items.is_empty(),
-            _ => false,
-        };
-        if statically_empty {
+        if display_is_empty(&loop_.iter) {
             self.visit_body(&loop_.orelse);
         } else {
             // The iterable is evaluated before the target is assigned. The
@@ -6154,6 +6144,18 @@ fn implicitly_called_method(name: &str) -> bool {
     )
 }
 
+/// The methods a buffering layer reaches on the raw stream underneath it,
+/// whichever raw base the subclass was written on.
+const IO_RAW_CALLBACKS: &[&str] = &[
+    "close", "readable", "readinto", "seek", "seekable", "tell", "writable", "write",
+];
+
+/// The methods the import machinery reaches on a source loader while it turns a
+/// module name into code, whichever source-loader base the subclass was written
+/// on.
+const IMPORTLIB_SOURCE_LOADER_CALLBACKS: &[&str] =
+    &["get_data", "path_mtime", "path_stats", "set_data"];
+
 /// The methods `logging` reaches on a handler it owns, whichever handler base
 /// the subclass was written on.
 const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
@@ -6183,6 +6185,18 @@ const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
 const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
+    (
+        "importlib.abc",
+        "SourceLoader",
+        IMPORTLIB_SOURCE_LOADER_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "SourceFileLoader",
+        IMPORTLIB_SOURCE_LOADER_CALLBACKS,
+    ),
+    ("io", "FileIO", IO_RAW_CALLBACKS),
+    ("io", "RawIOBase", IO_RAW_CALLBACKS),
     (
         "logging",
         "BufferingFormatter",
@@ -6388,17 +6402,13 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.instance_attributes.push(instance_attributes(class));
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
-                self.class_rewraps.push(class_rewraps(
-                    &class.body,
-                    &self.aliases,
-                    &self.module_bindings,
-                ));
                 let context = AliasContext {
                     aliases: &self.aliases,
                     module_bindings: &self.module_bindings,
                 };
-                self.method_aliases
-                    .push(class_method_aliases(class, context));
+                let collected = class_method_aliases(class, context);
+                self.class_rewraps.push(collected.rewraps);
+                self.method_aliases.push(collected.aliases);
                 if self.collect_signatures {
                     let inherited = self.inherited_fields(class, style);
                     // A base of this file's own contributes its fields ahead of
@@ -7679,38 +7689,103 @@ struct AliasContext<'a> {
     module_bindings: &'a BTreeSet<String>,
 }
 
-fn class_method_aliases(
-    class: &ast::StmtClassDef,
-    context: AliasContext<'_>,
-) -> BTreeMap<String, Vec<MethodAlias>> {
-    let mut aliases = BTreeMap::<String, Vec<MethodAlias>>::new();
+/// What the assignments in a class body say about the methods defined in it.
+#[derive(Default)]
+struct ClassAliases {
+    /// The other names each method is reachable through.
+    aliases: BTreeMap<String, Vec<MethodAlias>>,
+    /// The assignments that put a method back under its own name, by that name
+    /// and the offsets of the statements doing it.
+    ///
+    /// These are not overwrites: a call still reaches the function defined
+    /// above, so its default is still the one to give back. Anything else
+    /// assigned to the name is a replacement, including a later one that
+    /// follows a rewrap.
+    rewraps: BTreeMap<String, Vec<TextSize>>,
+}
+
+fn class_method_aliases(class: &ast::StmtClassDef, context: AliasContext<'_>) -> ClassAliases {
+    let mut collected = ClassAliases::default();
     let mut origins = BTreeMap::<String, (String, MethodAliasKind, Option<String>)>::new();
-    collect_class_method_aliases(&class.body, context, &mut aliases, &mut origins);
-    aliases
+    collect_class_method_aliases(&class.body, context, &mut collected, &mut origins);
+    collected
+}
+
+/// The names a class-body statement puts something new behind without saying
+/// what that is.
+///
+/// A `def`, a `class`, an import, a `del` or a loop target all rebind the name
+/// they take. Whatever the name was an alias of stops holding from there on,
+/// so a later alias of it names the new binding rather than the method the
+/// name used to stand for.
+fn rebound_alias_names(statement: &Stmt) -> BTreeSet<String> {
+    let mut bound = BoundNames::default();
+    match statement {
+        Stmt::Delete(delete) => {
+            for target in &delete.targets {
+                bound.bind(target);
+            }
+        }
+        Stmt::For(loop_) => bound.bind(&loop_.target),
+        Stmt::With(block) => {
+            for item in &block.items {
+                if let Some(target) = &item.optional_vars {
+                    bound.bind(target);
+                }
+            }
+        }
+        statement => bound.visit_stmt(statement),
+    }
+    bound.names
+}
+
+/// Read one assignment statement in a class body for what it says about the
+/// methods around it. The statement's own offset is what marks a rewrap,
+/// because that is the offset the assignment is otherwise known by.
+fn record_assigned_aliases(
+    statement: &Stmt,
+    context: AliasContext<'_>,
+    collected: &mut ClassAliases,
+    origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
+) {
+    let start = statement.start();
+    match statement {
+        Stmt::Assign(assign) => {
+            for target in &assign.targets {
+                record_method_alias(target, &assign.value, start, context, collected, origins);
+            }
+        }
+        Stmt::AnnAssign(assign) => {
+            if let Some(value) = &assign.value {
+                record_method_alias(&assign.target, value, start, context, collected, origins);
+            }
+        }
+        Stmt::Expr(expression) => {
+            if let Expr::Named(named) = expression.value.as_ref() {
+                record_method_alias(
+                    &named.target,
+                    &named.value,
+                    start,
+                    context,
+                    collected,
+                    origins,
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_class_method_aliases(
     statements: &[Stmt],
     context: AliasContext<'_>,
-    aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
+    collected: &mut ClassAliases,
     origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     for statement in statements {
         match statement {
-            Stmt::Assign(assign) => {
-                for target in &assign.targets {
-                    record_method_alias(target, &assign.value, context, aliases, origins);
-                }
-            }
-            Stmt::AnnAssign(assign) => {
-                if let Some(value) = &assign.value {
-                    record_method_alias(&assign.target, value, context, aliases, origins);
-                }
-            }
-            Stmt::Expr(expression) => {
-                if let Expr::Named(named) = expression.value.as_ref() {
-                    record_method_alias(&named.target, &named.value, context, aliases, origins);
-                }
+            Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::Expr(_) => {
+                record_assigned_aliases(statement, context, collected, origins);
             }
             Stmt::If(branch) => {
                 collect_alias_branches(
@@ -7721,25 +7796,40 @@ fn collect_class_method_aliases(
                             .map(|clause| clause.body.as_slice()),
                     ),
                     context,
-                    aliases,
+                    collected,
                     origins,
                 );
             }
-            Stmt::For(loop_) => collect_alias_branches(
-                [loop_.body.as_slice(), loop_.orelse.as_slice()],
-                context,
-                aliases,
-                origins,
-            ),
+            Stmt::For(loop_) => {
+                // A loop over a display written with nothing in it never
+                // reaches its target, so the name is still whatever stood
+                // behind it before. Every other iterable may bind it, and a
+                // name that may have been taken over cannot be relied on
+                // afterwards.
+                if !display_is_empty(&loop_.iter) {
+                    for name in rebound_alias_names(statement) {
+                        origins.remove(&name);
+                    }
+                }
+                collect_alias_branches(
+                    [loop_.body.as_slice(), loop_.orelse.as_slice()],
+                    context,
+                    collected,
+                    origins,
+                );
+            }
             Stmt::While(loop_) => collect_alias_branches(
                 [loop_.body.as_slice(), loop_.orelse.as_slice()],
                 context,
-                aliases,
+                collected,
                 origins,
             ),
             Stmt::With(block) => {
+                for name in rebound_alias_names(statement) {
+                    origins.remove(&name);
+                }
                 let mut branch_origins = origins.clone();
-                collect_class_method_aliases(&block.body, context, aliases, &mut branch_origins);
+                collect_class_method_aliases(&block.body, context, collected, &mut branch_origins);
             }
             Stmt::Try(block) => {
                 let handlers = block.handlers.iter().map(|handler| {
@@ -7755,17 +7845,21 @@ fn collect_class_method_aliases(
                     .into_iter()
                     .chain(handlers),
                     context,
-                    aliases,
+                    collected,
                     origins,
                 );
             }
             Stmt::Match(block) => collect_alias_branches(
                 block.cases.iter().map(|case| case.body.as_slice()),
                 context,
-                aliases,
+                collected,
                 origins,
             ),
-            _ => {}
+            statement => {
+                for name in rebound_alias_names(statement) {
+                    origins.remove(&name);
+                }
+            }
         }
     }
 }
@@ -7773,20 +7867,21 @@ fn collect_class_method_aliases(
 fn collect_alias_branches<'a>(
     branches: impl IntoIterator<Item = &'a [Stmt]>,
     context: AliasContext<'_>,
-    aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
+    collected: &mut ClassAliases,
     origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     for branch in branches {
         let mut branch_origins = origins.clone();
-        collect_class_method_aliases(branch, context, aliases, &mut branch_origins);
+        collect_class_method_aliases(branch, context, collected, &mut branch_origins);
     }
 }
 
 fn record_method_alias(
     target: &Expr,
     value: &Expr,
+    statement: TextSize,
     context: AliasContext<'_>,
-    aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
+    collected: &mut ClassAliases,
     origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     match (target, value) {
@@ -7794,29 +7889,62 @@ fn record_method_alias(
             let Some((original, kind, original_class)) =
                 method_alias_origin(value, context, origins)
             else {
+                // Nothing here says which method the name now holds, so what
+                // it used to be an alias of stops holding as well.
+                origins.remove(alias.id.as_str());
                 return;
             };
-            aliases
-                .entry(original.clone())
-                .or_default()
-                .push(MethodAlias {
-                    name: alias.id.to_string(),
-                    kind,
-                    original_class: original_class.clone(),
-                });
+            // An assignment that puts a method back under its own name, be it
+            // written directly, through a wrapper or by way of a temporary,
+            // replaces nothing: the definition above is still what a call by
+            // that name reaches. A method copied from another class is a
+            // replacement even where it goes by the same name, since what
+            // stands behind the name afterwards is that class's function and
+            // its parameters, so the name it shares settles nothing.
+            if original == alias.id.as_str() && original_class.is_none() {
+                collected
+                    .rewraps
+                    .entry(original.clone())
+                    .or_default()
+                    .push(statement);
+            }
+            let recorded = MethodAlias {
+                name: alias.id.to_string(),
+                kind,
+                original_class: original_class.clone(),
+            };
+            // Two suites of one statement are alternatives, and ones naming
+            // the same origin bind the same method whichever runs. The second
+            // recording is the first over again rather than a second candidate
+            // the name is contested between, so it is not kept.
+            let recorded_aliases = collected.aliases.entry(original.clone()).or_default();
+            if !recorded_aliases.contains(&recorded) {
+                recorded_aliases.push(recorded);
+            }
             origins.insert(alias.id.to_string(), (original, kind, original_class));
         }
-        (Expr::Tuple(targets), Expr::Tuple(values)) if targets.elts.len() == values.elts.len() => {
-            for (target, value) in targets.elts.iter().zip(&values.elts) {
-                record_method_alias(target, value, context, aliases, origins);
+        // A tuple and a list of the same length unpack the same way, so which
+        // brackets each side is written with says nothing about the pairing.
+        // A starred element needs no guard here: with as many elements on one
+        // side as the other, a star that takes anything but the single element
+        // beside it makes the unpacking fail outright.
+        (
+            Expr::Tuple(ast::ExprTuple { elts: targets, .. })
+            | Expr::List(ast::ExprList { elts: targets, .. }),
+            Expr::Tuple(ast::ExprTuple { elts: values, .. })
+            | Expr::List(ast::ExprList { elts: values, .. }),
+        ) if targets.len() == values.len() => {
+            for (target, value) in targets.iter().zip(values) {
+                record_method_alias(target, value, statement, context, collected, origins);
             }
         }
-        (Expr::List(targets), Expr::List(values)) if targets.elts.len() == values.elts.len() => {
-            for (target, value) in targets.elts.iter().zip(&values.elts) {
-                record_method_alias(target, value, context, aliases, origins);
+        _ => {
+            let mut bound = BoundNames::default();
+            bound.bind(target);
+            for name in bound.names {
+                origins.remove(&name);
             }
         }
-        _ => {}
     }
 }
 
@@ -9168,63 +9296,6 @@ fn common_all_state(outcomes: &[Option<BTreeSet<String>>]) -> Option<BTreeSet<St
 /// A nested `def` or `class` is a scope of its own, and the rewriter pushes one
 /// for it on the way in, so what it binds is left to it. Only its own name is
 /// taken, because that is what the body being collected binds.
-/// The class-body assignments that put the same function back under its own
-/// name, such as `target = staticmethod(target)`.
-///
-/// These are not overwrites: a call still reaches the function defined above,
-/// so its default is still the one to give back. Anything else assigned to the
-/// name is a replacement, including a later one that follows a rewrap.
-fn class_rewraps(
-    body: &[Stmt],
-    aliases: &Aliases,
-    module_bindings: &BTreeSet<String>,
-) -> BTreeMap<String, Vec<TextSize>> {
-    struct Collector<'a> {
-        found: BTreeMap<String, Vec<TextSize>>,
-        aliases: &'a Aliases,
-        module_bindings: &'a BTreeSet<String>,
-    }
-
-    impl<'a> Visitor<'a> for Collector<'_> {
-        fn visit_stmt(&mut self, statement: &'a Stmt) {
-            match statement {
-                Stmt::Assign(assign) => {
-                    let [Expr::Name(target)] = assign.targets.as_slice() else {
-                        return;
-                    };
-                    let Expr::Call(call) = assign.value.as_ref() else {
-                        return;
-                    };
-                    // Only the descriptor wrappers are known to leave the
-                    // function's own parameters behind the name. Any other
-                    // call may return something taking anything at all.
-                    let wraps_itself = call.arguments.args.len() == 1
-                        && call.arguments.keywords.is_empty()
-                        && descriptor_wrapper_kind(&call.func, self.aliases, self.module_bindings)
-                            .is_some()
-                        && matches!(&call.arguments.args[0], Expr::Name(wrapped) if wrapped.id == target.id);
-                    if wraps_itself {
-                        self.found
-                            .entry(target.id.to_string())
-                            .or_default()
-                            .push(statement.start());
-                    }
-                }
-                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
-                _ => walk_stmt(self, statement),
-            }
-        }
-    }
-
-    let mut collector = Collector {
-        found: BTreeMap::new(),
-        aliases,
-        module_bindings,
-    };
-    collector.visit_body(body);
-    collector.found
-}
-
 fn class_assignments(body: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
     #[derive(Default)]
     struct Collector(BTreeMap<String, Vec<TextSize>>);
@@ -11014,6 +11085,27 @@ fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral
     }
 }
 
+/// Whether a display is known to hold nothing at all.
+///
+/// `{}` is the empty mapping, and the only empty literal a set cannot be
+/// written as.
+///
+/// This is not the opposite of `display_is_nonempty`: a display written out of
+/// nothing but unpacks answers `false` to both, because how many entries it
+/// ends up with is not written down. Which of the two to ask is settled by
+/// which way the doubt has to fall -- this one where a conclusion holds only
+/// when the display is certainly empty, that one where it holds only when the
+/// display certainly is not.
+fn display_is_empty(iterable: &Expr) -> bool {
+    match iterable {
+        Expr::Tuple(tuple) => tuple.elts.is_empty(),
+        Expr::List(list) => list.elts.is_empty(),
+        Expr::Set(set) => set.elts.is_empty(),
+        Expr::Dict(dict) => dict.items.is_empty(),
+        _ => false,
+    }
+}
+
 /// Whether a display is known to hold at least one item.
 ///
 /// A `*` element in a sequence, or a `**` item in a mapping, contributes an
@@ -11402,14 +11494,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             }
             Stmt::For(loop_statement) if self.in_class_scope() => {
                 self.visit_expr(&loop_statement.iter);
-                let statically_empty = match loop_statement.iter.as_ref() {
-                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
-                    Expr::List(list) => list.elts.is_empty(),
-                    Expr::Set(set) => set.elts.is_empty(),
-                    Expr::Dict(dict) => dict.items.is_empty(),
-                    _ => false,
-                };
-                if statically_empty {
+                if display_is_empty(&loop_statement.iter) {
                     self.visit_body(&loop_statement.orelse);
                     return;
                 }
@@ -11459,14 +11544,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // Once an item is assigned, the body sees the target rather
                 // than an import that previously used the same name.
                 self.visit_expr(&loop_statement.iter);
-                let statically_empty = match loop_statement.iter.as_ref() {
-                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
-                    Expr::List(list) => list.elts.is_empty(),
-                    Expr::Set(set) => set.elts.is_empty(),
-                    Expr::Dict(dict) => dict.items.is_empty(),
-                    _ => false,
-                };
-                if statically_empty {
+                if display_is_empty(&loop_statement.iter) {
                     self.visit_body(&loop_statement.orelse);
                     return;
                 }
@@ -11498,14 +11576,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // The iterable still sees the import; a non-empty loop target
                 // replaces it before the body and later function statements.
                 self.visit_expr(&loop_statement.iter);
-                let statically_empty = match loop_statement.iter.as_ref() {
-                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
-                    Expr::List(list) => list.elts.is_empty(),
-                    Expr::Set(set) => set.elts.is_empty(),
-                    Expr::Dict(dict) => dict.items.is_empty(),
-                    _ => false,
-                };
-                if statically_empty {
+                if display_is_empty(&loop_statement.iter) {
                     self.visit_body(&loop_statement.orelse);
                     return;
                 }
@@ -23107,6 +23178,237 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed_with_retained_defaults(source)?,
             "class Handler:\n    def _do(self, record, extra): return extra\n\n    emit = _do\n\n\nassert Handler._do(Handler(), \"r\", extra=1) == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_later_definition_takes_back_the_name_an_alias_held() -> Result<(), String> {
+        // `later` is the function `def alias` puts behind the name, and that
+        // one takes `w`. The assignment naming `first` stopped holding the
+        // moment the definition below it took the name back, so following it
+        // gave `later` the parameters of a method it is not, and wrote a
+        // keyword the function it does reach rejects outright.
+        let source = "class C:\n    def first(self, x, y=1):\n        return (\"first\", x, y)\n\n    alias = first\n\n    def alias(self, x, w=3):\n        return (\"redef\", x, w)\n\n    later = alias\n\n\nassert C().later(5) == (\"redef\", 5, 3)\n";
+        let updated = fixed(source)?;
+        assert!(
+            updated.contains("assert C().later(5, w=3) == (\"redef\", 5, 3)\n"),
+            "{updated}"
+        );
+        // Anything else that takes the name over ends the alias just as a
+        // definition does, whether it is written straight onto the name, as
+        // one part of an unpacking, or as the target of a loop or a `with`.
+        // What each of these puts there is something this file cannot
+        // describe, so the call that follows is left as written rather than
+        // given another method's keyword.
+        for rebinding in [
+            "    alias = [second][0]\n",
+            "    pair = [second, None]\n    alias, spare = pair\n",
+            "    for alias in [second]:\n        pass\n",
+            "    with contextlib.nullcontext(second) as alias:\n        pass\n",
+        ] {
+            let source = format!("import contextlib\n\n\nclass C:\n    def first(self, x, y=1):\n        return (\"first\", x, y)\n\n    def second(self, x):\n        return (\"second\", x)\n\n    alias = first\n{rebinding}\n    later = alias\n\n\nassert C().later(5) == (\"second\", 5)\n");
+            let updated = fixed(&source)?;
+            assert!(
+                updated.contains("assert C().later(5) == (\"second\", 5)\n"),
+                "{updated}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_assigned_back_onto_its_own_name_keeps_its_default() -> Result<(), String> {
+        // The two assignments together put the function defined above straight
+        // back under its own name, by way of a temporary. Nothing replaced it,
+        // so its default is still the one a call by that name is owed.
+        let source = "class C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    tmp = target\n    target = tmp\n\n\nassert C().target(2) == (2, 1)\n";
+        assert_eq!(
+            fixed(source)?,
+            "class C:\n    def target(self, x, y):\n        return (x, y)\n\n    tmp = target\n    target = tmp\n\n\nassert C().target(2, y=1) == (2, 1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tuple_and_a_list_of_the_same_length_pair_up() -> Result<(), String> {
+        // Which brackets each side of an unpacking is written with says
+        // nothing about how its elements pair off, so a tuple target and a
+        // list value name the alias exactly as two tuples do. Reading only the
+        // matching pairs removed the default and left the call short an
+        // argument, with no warning to say the file had been broken.
+        let mixed = "class C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    (alias,) = [target]\n\n\nassert C().alias(2) == (2, 1)\n";
+        let updated = fixed(mixed)?;
+        assert!(
+            updated.contains("assert C().alias(2, y=1) == (2, 1)\n"),
+            "{updated}"
+        );
+        let reversed = "class C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    [alias] = (target,)\n\n\nassert C().alias(2) == (2, 1)\n";
+        let updated = fixed(reversed)?;
+        assert!(
+            updated.contains("assert C().alias(2, y=1) == (2, 1)\n"),
+            "{updated}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identical_aliases_in_two_suites_are_one_alias() -> Result<(), String> {
+        // Both arms bind the same method, so the name holds the same function
+        // whichever of them runs. Recording it once per arm made the name look
+        // contested between two signatures and left the call behind after the
+        // default it needed had been taken away.
+        let source = "import os\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    if os.environ.get(\"NOD_ALT\"):\n        alias = target\n    else:\n        alias = target\n\n\nassert C().alias(2) == (2, 1)\n";
+        let updated = fixed(source)?;
+        assert!(
+            updated.contains("assert C().alias(2, y=1) == (2, 1)\n"),
+            "{updated}"
+        );
+        // Arms naming different methods are still two candidates, and the call
+        // through them is still left alone.
+        let contested = "import os\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    def other(self, x, w=2):\n        return (x, w)\n\n    if os.environ.get(\"NOD_ALT\"):\n        alias = target\n    else:\n        alias = other\n\n\nC().alias(2)\n";
+        assert_eq!(
+            skipped_reasons(contested)?,
+            ["this call cannot be tied to the definition that was fixed"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_over_nothing_leaves_its_target_alone() -> Result<(), String> {
+        // A loop over a display written with nothing in it never reaches its
+        // target, so `alias` is still the method the assignment above put
+        // there and the call through `later` is owed that method's default.
+        let empty = "class C:\n    def first(self, x, y=1):\n        return (\"first\", x, y)\n\n    alias = first\n    for alias in []:\n        pass\n\n    later = alias\n\n\nassert C().later(5) == (\"first\", 5, 1)\n";
+        let updated = fixed(empty)?;
+        assert!(
+            updated.contains("assert C().later(5, y=1) == (\"first\", 5, 1)\n"),
+            "{updated}"
+        );
+        // A display of nothing but unpacks is not known to be empty, and this
+        // one does iterate, so the name is taken over and the call through it
+        // is left as written. Reading "not known to hold anything" as "known
+        // to hold nothing" here would write `first`'s keyword into `second`,
+        // which never accepts it.
+        let unpacked = "class C:\n    def first(self, x, y=1):\n        return (\"first\", x, y)\n\n    def second(self, x):\n        return (\"second\", x)\n\n    values = [second]\n\n    alias = first\n    for alias in [*values]:\n        pass\n\n    later = alias\n\n\nassert C().later(5) == (\"second\", 5)\n";
+        let updated = fixed(unpacked)?;
+        assert!(
+            updated.contains("assert C().later(5) == (\"second\", 5)\n"),
+            "{updated}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn io_raw_stream_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A buffer wrapped round a raw stream calls each of these on it:
+        // `readable`, `writable` and `seekable` while the buffer is built,
+        // `readinto` and `write` as it fills and drains, `seek` and `tell` as
+        // it moves, and `close` as it closes. None of those calls is written
+        // here, so removing a default leaves a stream the buffer cannot drive.
+        let source = "import io\n\n\nclass R(io.RawIOBase):\n    def readable(self, extra=1): return True\n\n    def writable(self, extra=2): return True\n\n    def seekable(self, extra=3): return True\n\n    def readinto(self, b, extra=4): return 0\n\n    def write(self, b, extra=5): return 0\n\n    def seek(self, offset, whence, extra=6): return 0\n\n    def tell(self, extra=7): return 0\n\n    def close(self, extra=8): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn importlib_source_loader_callbacks_keep_their_defaults() -> Result<(), String> {
+        // The import machinery reaches all four from `SourceLoader.get_code`:
+        // `get_data` for the source, `path_stats` to date the bytecode cache,
+        // `path_mtime` from `path_stats` itself, and `set_data` to write that
+        // cache. The `import` statement that starts it is no call site the
+        // fixer can rewrite.
+        let source = "import importlib.abc\n\n\nclass L(importlib.abc.SourceLoader):\n    def get_data(self, path, extra=1): return b\"\"\n\n    def path_stats(self, path, extra=2): return {}\n\n    def path_mtime(self, path, extra=3): return 0\n\n    def set_data(self, path, data, extra=4): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_imported_raw_stream_base_keeps_its_callback_defaults() -> Result<(), String> {
+        // The base is the same class whether it is spelled through the module
+        // or bound by name.
+        let source = "from io import RawIOBase\n\n\nclass R(RawIOBase):\n    def readinto(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_io_module_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import io as _io\n\n\nclass R(_io.RawIOBase):\n    def write(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_raw_stream_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being driven by a buffer is inherited, so a stream written on one
+        // defined here is read through in the same way.
+        let source = "import io\n\n\nclass Base(io.RawIOBase):\n    pass\n\n\nclass Child(Base):\n    def readinto(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_concrete_file_stream_base_keeps_its_callback_defaults() -> Result<(), String> {
+        // `io.FileIO` is a raw stream in its own right, and a buffer drives a
+        // subclass of it exactly as it drives one written on `io.RawIOBase`.
+        let source =
+            "import io\n\n\nclass F(io.FileIO):\n    def write(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_file_loader_keeps_its_callback_defaults() -> Result<(), String> {
+        // `importlib.machinery.SourceFileLoader` is the concrete source loader
+        // users subclass, and `get_code` reaches its overrides the same way.
+        let source = "import importlib.machinery\n\n\nclass L(importlib.machinery.SourceFileLoader):\n    def get_data(self, path, extra=1): return b\"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_loader_from_a_submodule_import_keeps_its_callback_defaults() -> Result<(), String> {
+        // `from importlib import abc` binds the submodule, so the base is read
+        // through one attribute of a name that stands for `importlib.abc`.
+        let source = "from importlib import abc\n\n\nclass L(abc.SourceLoader):\n    def get_data(self, path, extra=1): return b\"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_io_hierarchy_are_still_fixed() -> Result<(), String> {
+        // `close`, `write`, `seek` and `tell` are as ordinary as method names
+        // get. Nothing calls them here but the calls written below, so the
+        // defaults go and those calls carry the values.
+        let source = "class Stream:\n    def readable(self, extra=1): return extra\n\n    def writable(self, extra=2): return extra\n\n    def seekable(self, extra=3): return extra\n\n    def readinto(self, b, extra=4): return extra\n\n    def write(self, b, extra=5): return extra\n\n    def seek(self, offset, extra=6): return extra\n\n    def tell(self, extra=7): return extra\n\n    def close(self, extra=8): return extra\n\n\ns = Stream()\nassert Stream.readable(s) == 1\nassert Stream.writable(s) == 2\nassert Stream.seekable(s) == 3\nassert Stream.readinto(s, b\"\") == 4\nassert Stream.write(s, b\"\") == 5\nassert Stream.seek(s, 0) == 6\nassert Stream.tell(s) == 7\nassert Stream.close(s) == 8\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Stream:\n    def readable(self, extra): return extra\n\n    def writable(self, extra): return extra\n\n    def seekable(self, extra): return extra\n\n    def readinto(self, b, extra): return extra\n\n    def write(self, b, extra): return extra\n\n    def seek(self, offset, extra): return extra\n\n    def tell(self, extra): return extra\n\n    def close(self, extra): return extra\n\n\ns = Stream()\nassert Stream.readable(s, extra=1) == 1\nassert Stream.writable(s, extra=2) == 2\nassert Stream.seekable(s, extra=3) == 3\nassert Stream.readinto(s, b\"\", extra=4) == 4\nassert Stream.write(s, b\"\", extra=5) == 5\nassert Stream.seek(s, 0, extra=6) == 6\nassert Stream.tell(s, extra=7) == 7\nassert Stream.close(s, extra=8) == 8\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_loader_hierarchy_are_still_fixed() -> Result<(), String> {
+        // Same again for the loader names, which a cache or a store class
+        // spells just as readily as a loader does.
+        let source = "class Store:\n    def get_data(self, path, extra=1): return extra\n\n    def set_data(self, path, data, extra=2): return extra\n\n    def path_stats(self, path, extra=3): return extra\n\n    def path_mtime(self, path, extra=4): return extra\n\n\ns = Store()\nassert Store.get_data(s, \"p\") == 1\nassert Store.set_data(s, \"p\", b\"\") == 2\nassert Store.path_stats(s, \"p\") == 3\nassert Store.path_mtime(s, \"p\") == 4\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Store:\n    def get_data(self, path, extra): return extra\n\n    def set_data(self, path, data, extra): return extra\n\n    def path_stats(self, path, extra): return extra\n\n    def path_mtime(self, path, extra): return extra\n\n\ns = Store()\nassert Store.get_data(s, \"p\", extra=1) == 1\nassert Store.set_data(s, \"p\", b\"\", extra=2) == 2\nassert Store.path_stats(s, \"p\", extra=3) == 3\nassert Store.path_mtime(s, \"p\", extra=4) == 4\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_raw_stream_import_bound_over_stops_reaching_io() -> Result<(), String> {
+        // The assignment takes the name, so the base below is a plain `object`
+        // and no buffer ever drives this method.
+        let source = "from io import RawIOBase\n\nRawIOBase = object\n\n\nclass R(RawIOBase):\n    def close(self, extra=1): return extra\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "from io import RawIOBase\n\nRawIOBase = object\n\n\nclass R(RawIOBase):\n    def close(self, extra): return extra\n"
         );
         Ok(())
     }

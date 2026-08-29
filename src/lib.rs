@@ -1541,6 +1541,26 @@ fn method_base_identity(
             }
         }),
         Expr::Attribute(attribute) => {
+            // The prefix may be a name this scope bound to a class rather than
+            // a spelling written out in full, and an alias of an enclosing
+            // class reaches the same nested class the dotted form does. The
+            // member is only taken when the class it names is one this pass
+            // has recorded methods for, so an ordinary attribute access is
+            // left to the module lookup below.
+            if let Some((file, parent)) = method_base_identity(
+                &attribute.value,
+                importer,
+                bindings,
+                local_classes,
+                defined_at,
+                aliases,
+                methods,
+            ) {
+                let class = format!("{parent}.{}", attribute.attr);
+                if methods.contains_key(&(file.clone(), class.clone())) {
+                    return Some((file, class));
+                }
+            }
             let qualified = dotted_name(expression)?;
             // A nested class holds the dotted name only once it is written,
             // the same rule a simple name follows above. Before that the
@@ -17825,6 +17845,25 @@ def b(x=1): pass  # type: ignore  # noqa
         let source = "import os\n\nclass BaseA:\n    def target(self, value=1): return value\n\nclass BaseB:\n    def target(self, value=2): return value\n\nmatch os.environ.get('PICK'):\n    case 'a':\n        class Child(BaseA):\n            def run(self): return self.target()\n    case _:\n        class Child(BaseB):\n            def run(self): return self.target()\n";
         let updated = fixed(source)?;
         assert!(!updated.contains("self.target(value="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn aliased_namespace_attribute_bases_preserve_inherited_method_calls() -> Result<(), String> {
+        // The dotted spelling of a nested class is not the only way to reach
+        // it: a name bound to the class around it names the same member, and
+        // the spelling `NS.Base` matches no class this file writes.
+        for source in [
+            "class Namespace:\n    class Base:\n        def target(self, value=1): return value\n\nNS = Namespace\n\nclass Child(NS.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+            "class Namespace:\n    class Inner:\n        class Base:\n            def target(self, value=1): return value\n\nNS = Namespace.Inner\n\nclass Child(NS.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+        ] {
+            assert_eq!(
+                fixed(source)?,
+                source
+                    .replace("value=1): return value", "value): return value")
+                    .replace("self.target()", "self.target(value=1)")
+            );
+        }
         Ok(())
     }
 }

@@ -5589,9 +5589,9 @@ fn a_subscripted_copy_of_a_contested_name_keeps_the_inherited_default(
 fn inherited_enum_initializer_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The enum machinery calls this initializer while the class statement
-    // runs, so no call site exists for the fixer to rewrite and a stripped
-    // default leaves a module that raises on import.
+    // Creating `Child.A` calls this initializer from inside the class
+    // statement, so removing the default leaves a module that raises before
+    // anything can import it, and there is no call site to rewrite.
     let source = "from enum import Enum\n\n\nclass Base(Enum):\n    pass\n\n\nclass Child(Base):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())

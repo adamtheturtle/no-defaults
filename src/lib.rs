@@ -3477,7 +3477,7 @@ fn check_source(
         metaclass_classes: BTreeSet::new(),
         entered_class_metaclass_classes: Vec::new(),
         metaclass_definitions: BTreeSet::new(),
-        enum_classes: BTreeSet::new(),
+        local_enum_classes: BTreeSet::new(),
         metaclass_intercepted_classes,
         repeated_functions,
         property_aliased_methods,
@@ -3782,10 +3782,10 @@ struct Checker<'a> {
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
-    /// Same-file classes that are enumerations, directly or through a base
-    /// written here. Enumeration membership is inherited, so a subclass of one
-    /// builds its members through the same implicit calls.
-    enum_classes: BTreeSet<String>,
+    /// The enumerations the file defines, whether they name an imported `Enum`
+    /// or another of these. Being an enumeration is inherited, so a subclass
+    /// of one creates its members the same implicit way.
+    local_enum_classes: BTreeSet<String>,
     /// Same-file classes whose metaclass can replace class attributes.
     metaclass_intercepted_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
@@ -3870,8 +3870,8 @@ struct Scope {
     fields: Option<FieldStyle>,
     /// What kind of class body definitions here sit directly in, if any.
     class: ClassScope,
-    /// Whether this is an `enum.Enum` body, whose members the class statement
-    /// itself builds by calling the initializer it holds.
+    /// Whether this is an `enum.Enum` body whose members are initialized
+    /// implicitly while the class is created.
     enum_class: bool,
     /// Whether a field of this class has kept its default, which forces every
     /// field after it to keep its own: `dataclasses` rejects a field without a
@@ -4430,17 +4430,17 @@ impl Checker<'_> {
         generates_init(class, &self.aliases, &self.metaclass_classes)
     }
 
-    /// Whether the class is an enumeration, so the class statement itself
-    /// builds its members. Each one is created by calling the initializer the
-    /// body holds with the member's value alone, and a lookup miss reaches
-    /// `_missing_` with the value alone as well, neither through a call the
-    /// fixer can see. A base written here that is already an enumeration makes
-    /// this class one too, because enumeration membership is inherited.
+    /// Whether the class statement itself creates the class's members, which
+    /// it does for an enumeration: each member assignment calls the body's
+    /// initializer with the value assigned, through no call site the fixer can
+    /// rewrite. A base written in this file that is already an enumeration
+    /// makes this class one too, because that is inherited like any other
+    /// class behaviour.
     fn is_enum_class(&self, class: &ast::StmtClassDef) -> bool {
         class_bases(class).any(|base| match base {
             Expr::Name(name) => {
                 self.aliases.enum_classes.contains(name.id.as_str())
-                    || self.enum_classes.contains(name.id.as_str())
+                    || self.local_enum_classes.contains(name.id.as_str())
             }
             Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
                 matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
@@ -4554,7 +4554,7 @@ impl Checker<'_> {
         let outer_local_classes = self.local_classes.clone();
         let outer_metaclass_classes = self.metaclass_classes.clone();
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
-        let outer_enum_classes = self.enum_classes.clone();
+        let outer_enum_classes = self.local_enum_classes.clone();
         // Written straight in a class body, this function sees none of the
         // names that body binds: a class written above it there is not in
         // scope here, and reading a base through it would answer with a class
@@ -4597,7 +4597,7 @@ impl Checker<'_> {
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
         self.metaclass_definitions = outer_metaclass_definitions;
-        self.enum_classes = outer_enum_classes;
+        self.local_enum_classes = outer_enum_classes;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
@@ -4928,8 +4928,7 @@ impl Checker<'_> {
                 || self.is_delegation_protocol_method(function.name.as_str())
                 || (self.scope.class == ClassScope::Metaclass
                     && matches!(function.name.as_str(), "__init__" | "mro"))
-                || (self.scope.enum_class
-                    && matches!(function.name.as_str(), "__init__" | "_missing_"))
+                || (self.scope.enum_class && function.name.as_str() == "__init__")
                 || (self.scope.class == ClassScope::None
                     && self.lexical_scope.is_empty()
                     && matches!(function.name.as_str(), "__getattr__" | "__dir__"))
@@ -5502,7 +5501,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer_local_classes = self.local_classes.clone();
                 let outer_metaclass_classes = self.metaclass_classes.clone();
                 let outer_metaclass_definitions = self.metaclass_definitions.clone();
-                let outer_enum_classes = self.enum_classes.clone();
+                let outer_enum_classes = self.local_enum_classes.clone();
                 let enum_class = self.is_enum_class(class);
                 let outer_repeated_functions = self.repeated_functions.clone();
                 let mut method_names = BTreeSet::new();
@@ -5632,14 +5631,14 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.metaclass_classes = outer_metaclass_classes;
                 self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
-                self.enum_classes = outer_enum_classes;
-                // A later class of the same name that is no enumeration clears
-                // the name, so a sibling built on the new class is not treated
-                // as one.
+                self.local_enum_classes = outer_enum_classes;
+                // A later class of the same name that is no enumeration takes
+                // the name back, so a subclass written on it below is built
+                // the ordinary way.
                 if enum_class {
-                    self.enum_classes.insert(class.name.to_string());
+                    self.local_enum_classes.insert(class.name.to_string());
                 } else {
-                    self.enum_classes.remove(class.name.as_str());
+                    self.local_enum_classes.remove(class.name.as_str());
                 }
                 self.repeated_functions = outer_repeated_functions;
                 if defines_metaclass(class, &self.metaclass_definitions) {
@@ -5924,6 +5923,8 @@ struct Aliases {
     pydantic_private_attrs: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
     pydantic_modules: BTreeSet<String>,
+    enum_classes: BTreeSet<String>,
+    enum_modules: BTreeSet<String>,
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
     properties: BTreeSet<String>,
@@ -5932,8 +5933,6 @@ struct Aliases {
     class_vars: BTreeSet<String>,
     typing_modules: BTreeSet<String>,
     abc_modules: BTreeSet<String>,
-    enum_modules: BTreeSet<String>,
-    enum_classes: BTreeSet<String>,
     structural_bases: BTreeSet<String>,
     invalidated_structural_bases: BTreeSet<String>,
     invalidated_import_bindings: BTreeSet<String>,
@@ -5956,6 +5955,8 @@ impl Aliases {
         self.pydantic_private_attrs.remove(name);
         self.dataclasses_modules.remove(name);
         self.pydantic_modules.remove(name);
+        self.enum_classes.remove(name);
+        self.enum_modules.remove(name);
         self.staticmethods.remove(name);
         self.classmethods.remove(name);
         self.supers.remove(name);
@@ -5963,8 +5964,6 @@ impl Aliases {
         self.class_vars.remove(name);
         self.typing_modules.remove(name);
         self.abc_modules.remove(name);
-        self.enum_modules.remove(name);
-        self.enum_classes.remove(name);
         self.structural_bases.remove(name);
         self.type_checking.remove(name);
         self.kw_only_markers.remove(name);
@@ -6106,6 +6105,13 @@ impl Aliases {
                         .as_ref()
                         .map_or_else(|| "pydantic".to_owned(), ToString::to_string),
                 );
+            } else if alias.name.as_str() == "enum" {
+                self.enum_modules.insert(
+                    alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| "enum".to_owned(), ToString::to_string),
+                );
             } else if alias.name.as_str() == "builtins" {
                 self.builtins_modules.insert(
                     alias
@@ -6126,13 +6132,6 @@ impl Aliases {
                         .asname
                         .as_ref()
                         .map_or_else(|| "abc".to_owned(), ToString::to_string),
-                );
-            } else if alias.name.as_str() == "enum" {
-                self.enum_modules.insert(
-                    alias
-                        .asname
-                        .as_ref()
-                        .map_or_else(|| "enum".to_owned(), ToString::to_string),
                 );
             }
         }
@@ -18960,15 +18959,16 @@ def b(x=1): pass  # type: ignore  # noqa
         }
         Ok(())
     }
+
     #[test]
     fn enum_member_initializer_defaults_are_retained() {
-        // Creating a member calls the initializer the body holds with the
-        // member's value alone, from inside the class statement, so a stripped
-        // default leaves a module that cannot even be imported.
+        // Assigning a member in an `Enum` body calls `__init__` with whatever
+        // the assignment holds, so a parameter the members never supply is
+        // reached only through its default. Removing it turns class creation
+        // itself into a `TypeError`, and there is no call site to rewrite,
+        // because the calls are the member assignments the interpreter makes.
         for source in [
             "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
-            "from enum import Enum as Base\n\nclass E(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
-            "import enum\n\nclass E(enum.Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
             "import enum as enums\n\nclass E(enums.Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
         ] {
             let checked = check_source(
@@ -18982,16 +18982,14 @@ def b(x=1): pass  # type: ignore  # noqa
             );
             assert_eq!(checked.diagnostics.len(), 1, "{source}");
             assert!(checked.diagnostics[0].fix.is_none(), "{source}");
-            assert!(checked.signatures.is_empty(), "{source}");
         }
-    }
-
-    #[test]
-    fn enum_missing_hook_defaults_are_retained() {
-        let source = "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n";
+        // The same body with an ordinary base has no implicit call, so the
+        // default is still removed: the retention is the enum base, not the
+        // method name.
+        let control = "class E:\n    def __init__(self, value, label='x'): self.label = label\n";
         let checked = check_source(
             Path::new("fixture.py"),
-            source,
+            control,
             false,
             Path::new(""),
             &Reexports::default(),
@@ -18999,20 +18997,18 @@ def b(x=1): pass  # type: ignore  # noqa
             true,
         );
         assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.signatures.is_empty());
+        assert!(checked.diagnostics[0].fix.is_some());
     }
-
     #[test]
     fn inherited_enum_member_initializer_defaults_are_retained() {
-        // Enumeration membership is inherited, so a subclass of a same-file
-        // enumeration builds its own members the same implicit way, however
-        // many classes and class bodies separate it from the imported base.
+        // Being an enumeration is inherited, so a subclass of one written in
+        // this file creates its own members the same implicit way, however
+        // many classes and class bodies stand between it and the import.
         for source in [
             "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
             "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Mid(Base):\n    pass\n\nclass Child(Mid):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "import enum\n\nclass Base(enum.Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
             "from enum import Enum\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n",
-            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n",
         ] {
             let checked = check_source(
                 Path::new("fixture.py"),
@@ -19031,8 +19027,9 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_redefinition_that_is_no_enum_frees_its_subclasses() {
-        // The name, not the class the enumeration was, is what a later base
-        // resolves to, and nothing implicit calls this initializer.
+        // A base resolves to the class the name holds where the subclass is
+        // written, not to the enumeration that name once stood for, and
+        // nothing creates members of an ordinary class.
         let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Base:\n    pass\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
         let checked = check_source(
             Path::new("fixture.py"),
@@ -19048,11 +19045,11 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn enum_bodies_keep_only_their_implicitly_called_hooks() {
-        // Retention is for the two hooks member creation reaches on its own.
-        // Every other method in the body is called explicitly, so its default
-        // is as removable as any other.
-        let source = "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    def describe(self, prefix='p'): return prefix\n";
+    fn an_inherited_enum_body_keeps_only_its_implicit_initializer() {
+        // Reaching subclasses widens which bodies are enumerations, not which
+        // of their methods are called implicitly. Every other method is called
+        // through a call site the fixer can rewrite.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def describe(self, prefix='p'): return prefix\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

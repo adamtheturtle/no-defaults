@@ -4303,7 +4303,7 @@ impl Checker<'_> {
         self.invalidate_bound_names(bound.names.iter().map(String::as_str));
     }
 
-    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, _statement: &'a Stmt)
+    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor)
     where
         Self: Visitor<'a>,
     {
@@ -5477,7 +5477,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::If(branch) => self.visit_conditional(branch),
             Stmt::Try(_) => self.visit_uncertain(statement),
             Stmt::Match(block) => self.visit_match(block),
-            Stmt::For(loop_) => self.visit_loop(loop_, statement),
+            Stmt::For(loop_) => self.visit_loop(loop_),
             Stmt::While(loop_) => self.visit_while(loop_, statement),
             Stmt::With(block) => self.visit_with(block),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
@@ -18911,12 +18911,28 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn qualified_pydantic_private_attributes_are_not_model_fields() {
+        // `pydantic` may be reached under its own name or an alias, and either
+        // spelling is the same `PrivateAttr` call: per-instance state rather
+        // than a field the constructor takes. A model base answers that on its
+        // own, since an underscore name is no field there whatever it holds,
+        // so the class here is a plain dataclass and the call is all there is
+        // to read.
         for source in [
-            "import pydantic\n\nclass C(pydantic.BaseModel):\n    _value: int = pydantic.PrivateAttr(default=1)\n",
-            "import pydantic as pd\n\nclass C(pd.BaseModel):\n    _value: int = pd.PrivateAttr(default=1)\n",
+            "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pydantic.PrivateAttr(default=1)\n",
+            "import pydantic as pd\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pd.PrivateAttr(default=1)\n",
         ] {
             assert!(messages(source, false).is_empty(), "{source}");
         }
+        // An ordinary default in the same class is still reported, so the
+        // silence above is the call being read rather than the shape being
+        // passed over.
+        assert_eq!(
+            messages(
+                "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = 1\n",
+                false,
+            ),
+            ["dataclass field `_value` has a default"]
+        );
     }
 
     #[test]

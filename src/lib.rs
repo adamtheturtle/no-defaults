@@ -1217,7 +1217,6 @@ fn index_scope_method_bases(
                     &identity,
                     importer,
                     bindings,
-                    defined_at,
                     definitions,
                     scope,
                 );
@@ -1299,7 +1298,6 @@ fn record_class_bases_and_attributes(
     identity: &str,
     importer: &Path,
     bindings: &BTreeMap<String, Binding>,
-    defined_at: TextSize,
     definitions: &mut Definitions,
     scope: &BaseScope<'_>,
 ) {
@@ -1321,7 +1319,7 @@ fn record_class_bases_and_attributes(
                 importer,
                 bindings,
                 scope.classes,
-                defined_at,
+                class.start(),
                 &scope.aliases,
                 &definitions.methods,
             )
@@ -1337,8 +1335,8 @@ fn record_class_bases_and_attributes(
     // shadowing what the bases hold: a subclass that binds `__init__` has a
     // constructor of its own, and rewriting its calls against an ancestor's
     // `__init__` would pass parameters the binding does not take. A name the
-    // body never leaves behind is a shadow that does not exist, and recording it
-    // would stop the lookup that should have walked on to a base.
+    // body never leaves behind is a shadow that does not exist, and recording
+    // it would stop the lookup that should have walked on to a base.
     for name in BoundNames::of_class_attributes(&class.body) {
         methods.entry(name).or_insert(None);
     }
@@ -1349,11 +1347,14 @@ fn record_class_bases_and_attributes(
     );
 }
 
-/// Record the classes a control-flow statement's suites define.
+/// Record the bases of every class a control-flow suite holds.
 ///
-/// A suite is part of the scope around it, so the walk reads it with that
-/// scope's classes and aliases rather than starting afresh: a subclass written
-/// in an `if` body inherits from a base written above the `if`.
+/// A suite opens no namespace of its own, so a class written in one is named
+/// exactly as a class beside it is, and a subclass written after it in the
+/// same suite inherits from it. Leaving these bodies unwalked would record no
+/// bases for either, and an inherited call would keep its arguments while the
+/// default behind it was stripped. The suite is read with the scope around it
+/// rather than afresh, so a base written above the statement is still in reach.
 fn index_control_flow_method_bases(
     statement: &Stmt,
     importer: &Path,
@@ -1367,40 +1368,6 @@ fn index_control_flow_method_bases(
     for suite in suites {
         let mut inner = scope.in_suite(alternative);
         index_scope_method_bases(suite, importer, known, bindings, definitions, &mut inner);
-    }
-}
-
-/// The suites of a statement that hold classes of the scope around it.
-///
-/// A suite does not open a namespace, so a class written inside one is spelled
-/// the same as a class beside it. A function body and a class body do open one,
-/// and each is entered on its own.
-fn control_flow_suites(statement: &Stmt) -> Vec<&[Stmt]> {
-    match statement {
-        Stmt::If(branch) => std::iter::once(branch.body.as_slice())
-            .chain(
-                branch
-                    .elif_else_clauses
-                    .iter()
-                    .map(|clause| clause.body.as_slice()),
-            )
-            .collect(),
-        Stmt::For(loop_) => vec![&loop_.body, &loop_.orelse],
-        Stmt::While(loop_) => vec![&loop_.body, &loop_.orelse],
-        Stmt::With(block) => vec![&block.body],
-        Stmt::Try(block) => std::iter::once(block.body.as_slice())
-            .chain(block.handlers.iter().map(|handler| {
-                let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                handler.body.as_slice()
-            }))
-            .chain([block.orelse.as_slice(), block.finalbody.as_slice()])
-            .collect(),
-        Stmt::Match(block) => block
-            .cases
-            .iter()
-            .map(|case| case.body.as_slice())
-            .collect(),
-        _ => Vec::new(),
     }
 }
 
@@ -1434,6 +1401,37 @@ fn runnable_suites(statement: &Stmt) -> Vec<&[Stmt]> {
         }
     }
     suites
+}
+
+/// The statement bodies a control-flow statement holds, in the order they are
+/// written. Anything else holds none.
+fn control_flow_suites(statement: &Stmt) -> Vec<&[Stmt]> {
+    match statement {
+        Stmt::If(branch) => std::iter::once(branch.body.as_slice())
+            .chain(
+                branch
+                    .elif_else_clauses
+                    .iter()
+                    .map(|clause| clause.body.as_slice()),
+            )
+            .collect(),
+        Stmt::For(loop_) => vec![&loop_.body, &loop_.orelse],
+        Stmt::While(loop_) => vec![&loop_.body, &loop_.orelse],
+        Stmt::With(block) => vec![&block.body],
+        Stmt::Try(block) => std::iter::once(block.body.as_slice())
+            .chain(block.handlers.iter().map(|handler| {
+                let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                handler.body.as_slice()
+            }))
+            .chain([block.orelse.as_slice(), block.finalbody.as_slice()])
+            .collect(),
+        Stmt::Match(block) => block
+            .cases
+            .iter()
+            .map(|case| case.body.as_slice())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The value an assignment binds and the targets it binds it to.
@@ -4182,21 +4180,27 @@ impl Checker<'_> {
 
     fn class_constructs_safely(&self, class: &ast::StmtClassDef) -> bool {
         class_constructs_safely(class, &self.aliases, &self.metaclass_classes)
-            && !class_bases(class).any(|base| {
-                // A base this file only imported may be a dataclass with
-                // fields of its own, or be built by a metaclass that gives the
-                // subclass a constructor of its own shape. Either way the
-                // signature the fields here suggest is a guess, and a keyword
-                // field is no safer to guess at than a positional one.
-                base_root_name(base).is_some_and(|name| self.aliases.import_bindings.contains(name))
-                    && !self.field_bases.matches(base, &self.aliases)
-                    && !carries_no_fields(
-                        base,
-                        &self.aliases,
-                        &self.local_classes,
-                        &self.module_bindings,
-                    )
-            })
+            && !self.inherits_unseen_import(class)
+    }
+
+    /// Whether a base of this class is an import whose fields, and whatever
+    /// metaclass builds it, this file cannot see.
+    ///
+    /// A parameter shadowing the import hides the base further rather than
+    /// revealing it, so the name it took over counts too.
+    fn inherits_unseen_import(&self, class: &ast::StmtClassDef) -> bool {
+        class_bases(class).any(|base| {
+            base_root_name(base).is_some_and(|name| {
+                self.aliases.import_bindings.contains(name)
+                    || self.aliases.invalidated_import_bindings.contains(name)
+            }) && !self.field_bases.matches(base, &self.aliases)
+                && !carries_no_fields(
+                    base,
+                    &self.aliases,
+                    &self.local_classes,
+                    &self.module_bindings,
+                )
+        })
     }
 
     fn generates_init(&self, class: &ast::StmtClassDef) -> bool {
@@ -4204,11 +4208,20 @@ impl Checker<'_> {
     }
 
     /// Note that a metaclass builds this class, so a later subclass of it is
-    /// built by that metaclass too. A later redefinition without a metaclass
-    /// clears the name so a sibling that inherits the new class is not treated
-    /// as metaclass-built.
-    fn record_metaclass_construction(&mut self, class: &ast::StmtClassDef) {
-        if declares_metaclass(class) || inherits_metaclass(class, &self.metaclass_classes) {
+    /// built by that metaclass too. An unseen imported base counts as one: the
+    /// metaclass it may carry reaches every class beneath it alike, and a
+    /// subclass written here sees no more of it than this class does. A later
+    /// redefinition without either clears the name so a sibling that inherits
+    /// the new class is not treated as metaclass-built.
+    fn record_metaclass_construction(
+        &mut self,
+        class: &ast::StmtClassDef,
+        unseen_import_base: bool,
+    ) {
+        if declares_metaclass(class)
+            || inherits_metaclass(class, &self.metaclass_classes)
+            || unseen_import_base
+        {
             self.metaclass_classes.insert(class.name.to_string());
         } else {
             self.metaclass_classes.remove(class.name.as_str());
@@ -5245,6 +5258,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     // written here.
                     kept_default: false,
                 };
+                // Read where the header is: the tables the predicate consults
+                // are the enclosing scope's until the body has been walked,
+                // and a name the body binds says nothing about the base the
+                // header already resolved.
+                let unseen_import_base = self.inherits_unseen_import(class);
                 self.class_constructs
                     .push(self.class_constructs_safely(class));
                 let defines_iterator_method = |expected: &str| {
@@ -5315,7 +5333,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
                 self.metaclass_classes = outer_metaclass_classes;
-                self.record_metaclass_construction(class);
+                self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
                 self.repeated_functions = outer_repeated_functions;
                 if defines_metaclass(class, &self.metaclass_definitions) {
@@ -14908,6 +14926,23 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn a_dataclass_with_an_imported_base_has_no_assumed_metaclass() {
+        let source = "from dataclasses import dataclass\nfrom base import Parent\n\n@dataclass\nclass Child(Parent):\n    value: int = 1\n\nassert Child() == 9\nassert Child.value == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
     fn a_redefined_base_without_a_metaclass_is_not_treated_as_metaclass_built() {
         // An earlier `Base` that named a metaclass must not stick after a
         // later plain `Base` takes its place.
@@ -17417,9 +17452,11 @@ def b(x=1): pass  # type: ignore  # noqa
         // end in a positional default. Removing the child's would leave a
         // field without one behind it, which `dataclasses` rejects outright,
         // and no call could be rewritten to make up for it because the
-        // inherited fields are unknown. A keyword-only field is exempt as it
-        // is without the shadow: `dataclasses` moves it past the `*`, where
-        // nothing the base contributes constrains its order.
+        // inherited fields are unknown. Field order spares a keyword-only
+        // field, which `dataclasses` moves past the `*`, but a metaclass the
+        // base brings does not: one that builds the class without arguments
+        // reaches `__init__` with none to give, and the default is what stood
+        // in for them. That hazard is the same behind the shadow as before it.
         let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\n\ndef build(Parent):\n    @dataclass\n    class Child(Parent):\n        positional: int = 2\n        keyword: int = field(default=3, kw_only=True)\n\n    return Child()\n";
         let checked = check_source(
             Path::new("fixture.py"),
@@ -17431,8 +17468,8 @@ def b(x=1): pass  # type: ignore  # noqa
             true,
         );
         assert_eq!(checked.diagnostics.len(), 2);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.diagnostics[1].fix.is_some());
+        assert!(checked.diagnostics.iter().all(|item| item.fix.is_none()));
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]
@@ -17752,16 +17789,6 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn control_flow_classes_see_enclosing_suite_bases() -> Result<(), String> {
-        let source = "class Base:\n    def target(self, value=1): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
-        assert_eq!(
-            fixed(source)?,
-            "class Base:\n    def target(self, value): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn lexical_attribute_bases_preserve_inherited_method_calls() -> Result<(), String> {
         let source = "def outer():\n    class Namespace:\n        class Base:\n            def target(self, value=1): return value\n    class Child(Namespace.Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert outer() == 1\n";
         assert_eq!(
@@ -17795,20 +17822,87 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn a_dataclass_with_an_imported_base_has_no_assumed_metaclass() {
-        let source = "from dataclasses import dataclass\nfrom base import Parent\n\n@dataclass\nclass Child(Parent):\n    value: int = 1\n\nassert Child() == 9\nassert Child.value == 1\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
+    fn aliased_namespace_attribute_bases_preserve_inherited_method_calls() -> Result<(), String> {
+        // The dotted spelling of a nested class is not the only way to reach
+        // it: a name bound to the class around it names the same member, and
+        // the spelling `NS.Base` matches no class this file writes.
+        for source in [
+            "class Namespace:\n    class Base:\n        def target(self, value=1): return value\n\nNS = Namespace\n\nclass Child(NS.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+            "class Namespace:\n    class Inner:\n        class Base:\n            def target(self, value=1): return value\n\nNS = Namespace.Inner\n\nclass Child(NS.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+        ] {
+            assert_eq!(
+                fixed(source)?,
+                source
+                    .replace("value=1): return value", "value): return value")
+                    .replace("self.target()", "self.target(value=1)")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_unseen_imported_ancestor_protects_a_local_subclass() {
+        // The metaclass an imported base may carry builds every class beneath
+        // it, not only the one that names it, so a local class standing
+        // between the two hides nothing. Removing the subclass's default would
+        // leave that metaclass reaching `__init__` with no argument to stand
+        // in for it, and no call could be rewritten to make up for it because
+        // the inherited fields are unknown.
+        for source in [
+            "from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    pass\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n",
+            "from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    pass\n\nclass Inner(Middle):\n    pass\n\n@dataclass\nclass Child(Inner):\n    keyword: int = field(default=3, kw_only=True)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_class_body_does_not_rewrite_its_own_header_bases() {
+        // Whether a base is an unseen import is settled where the header is
+        // written, not where the body ends. A member binding the base's name
+        // rebinds it for readers of the class, never for the header above it,
+        // and a base spelled with the class's own name still reaches whatever
+        // that name held before the class did. Reading either after the body
+        // would drop the mark that protects a later subclass, or invent one
+        // over a base that carries no fields at all.
+        for (source, removable) in [
+            ("from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    Base = 1\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n", false),
+            ("from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    class Base:\n        pass\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n", false),
+            ("from dataclasses import dataclass, field\nfrom typing import Protocol\n\nclass Protocol(Protocol):\n    pass\n\n@dataclass\nclass Child(Protocol):\n    keyword: int = field(default=3, kw_only=True)\n", true),
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert_eq!(checked.diagnostics[0].fix.is_some(), removable, "{source}");
+            assert_eq!(checked.signatures.is_empty(), !removable, "{source}");
+        }
+    }
+    #[test]
+    fn control_flow_classes_see_enclosing_suite_bases() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
         );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.signatures.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -17845,25 +17939,6 @@ def b(x=1): pass  # type: ignore  # noqa
         let source = "import os\n\nclass BaseA:\n    def target(self, value=1): return value\n\nclass BaseB:\n    def target(self, value=2): return value\n\nmatch os.environ.get('PICK'):\n    case 'a':\n        class Child(BaseA):\n            def run(self): return self.target()\n    case _:\n        class Child(BaseB):\n            def run(self): return self.target()\n";
         let updated = fixed(source)?;
         assert!(!updated.contains("self.target(value="), "{updated}");
-        Ok(())
-    }
-
-    #[test]
-    fn aliased_namespace_attribute_bases_preserve_inherited_method_calls() -> Result<(), String> {
-        // The dotted spelling of a nested class is not the only way to reach
-        // it: a name bound to the class around it names the same member, and
-        // the spelling `NS.Base` matches no class this file writes.
-        for source in [
-            "class Namespace:\n    class Base:\n        def target(self, value=1): return value\n\nNS = Namespace\n\nclass Child(NS.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
-            "class Namespace:\n    class Inner:\n        class Base:\n            def target(self, value=1): return value\n\nNS = Namespace.Inner\n\nclass Child(NS.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
-        ] {
-            assert_eq!(
-                fixed(source)?,
-                source
-                    .replace("value=1): return value", "value): return value")
-                    .replace("self.target()", "self.target(value=1)")
-            );
-        }
         Ok(())
     }
 }

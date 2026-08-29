@@ -9505,6 +9505,12 @@ impl Rewriter<'_> {
             match expression {
                 Expr::Name(name) => {
                     spelled(self.physical, name.id.as_str());
+                    // An import gives the alias a name here of its own, and
+                    // what the spelling stands for was recorded in the file
+                    // that bound it rather than in this one.
+                    if let Some(Binding::Symbol(file, symbol)) = self.binding(name.id.as_str()) {
+                        spelled(file, symbol);
+                    }
                     return found;
                 }
                 Expr::Attribute(attribute) => {
@@ -9924,8 +9930,10 @@ impl Rewriter<'_> {
         let constructs_uncertain = self.constructs_uncertain_ancestry(&call.func);
         // A spelling an assignment bound a class to carries neither name
         // either, and a call made through it reaches a constructor whose
-        // defaults this run may have deleted.
-        let aliased = self.aliased_classes(&call.func);
+        // defaults this run may have deleted. Only a class something was
+        // taken from brings the call in: an alias of a class this run never
+        // touched has nothing behind it to warn about.
+        let aliased = self.fixes_behind(&self.aliased_classes(&call.func));
         if !self.definitions.names.contains(name) && !constructs_uncertain && aliased.is_empty() {
             return;
         }
@@ -9961,8 +9969,7 @@ impl Rewriter<'_> {
         // Nothing was written into this call to stand in for a default, and
         // the alias is the only thing tying it to a class, so every deletion
         // that class carries is held back rather than guessed at.
-        let held = self.fixes_behind(&aliased);
-        self.retained.extend(held);
+        self.retained.extend(aliased);
         self.skip(
             call.start(),
             name,
@@ -22153,6 +22160,19 @@ def b(x=1): pass  # type: ignore  # noqa
         let source = "import os\n\nfrom api import target\n\nvalues = [1] if os.environ.get(\"NOD_FULL\") else []\n\nfor _ in [*values, os.environ.get(\"NOD_FULL\")]:\n    break\nelse:\n    from other import target\n\nassert target() == 1\n";
         let updated = loop_else_import_fixture(source)?;
         assert!(updated.contains("assert target(alpha=1) == 1"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_alias_of_an_untouched_class_is_not_reported() -> Result<(), String> {
+        // Nothing was taken from `Child`, so `Alias()` is a call this run never
+        // threatened and there is no deletion behind it to hold back. Reporting
+        // it because some other default in the file was removed would name a
+        // call that is exactly as it should be.
+        let source = "def unrelated(value=1):\n    return value\n\n\nclass Child:\n    def __init__(self):\n        self.value = 2\n\n\nAlias = Child\n\nassert (Alias().value, unrelated()) == (2, 1)\n";
+        assert!(skipped_reasons(source)?.is_empty());
+        let updated = fixed(source)?;
+        assert!(updated.contains("unrelated(value=1)"), "{updated}");
         Ok(())
     }
 }

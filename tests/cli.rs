@@ -6886,3 +6886,31 @@ fn a_class_making_its_own_instances_keeps_the_inherited_default(
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn an_alias_imported_by_name_keeps_the_inherited_default() -> Result<(), Box<dyn std::error::Error>>
+{
+    // The importing file spells the class with a name of its own, and what
+    // that name stands for was written in the file the import names. Reading
+    // only the calling file's own assignments left `Alias()` tied to nothing
+    // while the default behind the class went.
+    for user_source in [
+        "from api import Alias\n\nassert Alias().value == 1\n",
+        "from api import Alias as Made\n\nassert Made().value == 1\n",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        let api_source = "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n\n\nAlias = Child\n";
+        std::fs::write(&api, api_source)?;
+        std::fs::write(&user, user_source)?;
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(std::fs::read_to_string(&api)?, api_source);
+        assert_eq!(std::fs::read_to_string(&user)?, user_source);
+        assert_eq!(output.status.code(), Some(1), "{user_source}");
+    }
+    Ok(())
+}

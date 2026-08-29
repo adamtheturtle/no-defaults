@@ -1157,7 +1157,16 @@ struct LocalClass {
 impl LocalClass {
     /// Whether this class is what the spelling names at `read_at`.
     fn holds_at(&self, read_at: TextSize) -> bool {
-        self.defined_at < read_at && self.superseded_at.is_none_or(|offset| read_at < offset)
+        self.defined_at < read_at && !self.superseded_before(read_at)
+    }
+
+    /// Whether an import has already taken the spelling back by `read_at`.
+    ///
+    /// This is not the negation of `holds_at`: a class written below the base
+    /// that reads it holds neither, and the two are told apart where a name
+    /// nothing else binds still answers with the class the scope defines.
+    fn superseded_before(&self, read_at: TextSize) -> bool {
+        self.superseded_at.is_some_and(|offset| offset < read_at)
     }
 }
 
@@ -1201,13 +1210,18 @@ fn imported_names(statement: &Stmt) -> Vec<&str> {
 /// Only the scope's own statements are read: an import written in a suite that
 /// may not run leaves the class standing for anything after the statement, and
 /// a class whose ancestry depends on which suite ran is not settled here.
-fn import_rebindings(statements: &[Stmt]) -> BTreeMap<String, TextSize> {
-    let mut rebindings = BTreeMap::new();
+/// Every import of a name is kept, in the order they are written: a scope that
+/// imports a name, defines a class of it and imports it again is reclaimed by
+/// the second import, and only the offsets after the class can say which one
+/// that is.
+fn import_rebindings(statements: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
+    let mut rebindings: BTreeMap<String, Vec<TextSize>> = BTreeMap::new();
     for statement in statements {
         for bound in imported_names(statement) {
             rebindings
                 .entry(bound.to_owned())
-                .or_insert_with(|| statement.start());
+                .or_default()
+                .push(statement.start());
         }
     }
     rebindings
@@ -1256,15 +1270,22 @@ fn local_class_identities(
             // module again, `package.module.Base` is read there rather than in
             // the classes nested under the local `package`.
             let root = spelling.split('.').next().unwrap_or(spelling.as_str());
-            let superseded_at = rebindings
+            // The import that takes the spelling back is the first one written
+            // below every class statement binding the name and below this
+            // class: a scope that writes the class again under an import has
+            // taken the name back from it, and it is the next import after
+            // that, if any, which reclaims it.
+            let claimed_until = last_written
                 .get(root)
                 .copied()
-                .filter(|offset| defined_at < *offset)
-                .filter(|offset| {
-                    last_written
-                        .get(root)
-                        .is_none_or(|written| *written < *offset)
-                });
+                .unwrap_or(defined_at)
+                .max(defined_at);
+            let superseded_at = rebindings.get(root).and_then(|offsets| {
+                offsets
+                    .iter()
+                    .copied()
+                    .find(|offset| claimed_until < *offset)
+            });
             (
                 spelling,
                 LocalClass {
@@ -1809,7 +1830,17 @@ fn method_base_identity(
                 // of the same spelling written further down the scope would
                 // answer with one the subclass was never built on.
                 Some(Binding::Unknown) => None,
-                _ => local.map(|class| (importer.to_path_buf(), class.identity.clone())),
+                // A class the scope defines answers for a name nothing else
+                // here binds, even where it is written below the base reading
+                // it. An import that has already taken the name over is not
+                // such a name: the base was built on whatever that import
+                // bound, and where this pass cannot follow it — an unchecked
+                // module, or a module bound rather than a symbol — the
+                // spelling is left unresolved rather than answered with a
+                // class the file has moved past.
+                _ => local
+                    .filter(|class| !class.superseded_before(defined_at))
+                    .map(|class| (importer.to_path_buf(), class.identity.clone())),
             }
         }),
         Expr::Attribute(attribute) => {
@@ -19570,6 +19601,60 @@ def b(x=1): pass  # type: ignore  # noqa
         fix_all(&[api, case.clone()])?;
         let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
         assert!(!updated.contains("self.target(value=9)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_import_reclaims_a_name_its_own_first_import_bound() -> Result<(), String> {
+        // The scope imports `Base`, defines a class of the name, and imports it
+        // again. It is the second import that takes the name back, so the
+        // subclass under it is built on the imported class and CPython gives
+        // the call 9. Reading only the first import of a name would leave the
+        // local class holding it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Base\n\nclass Base:\n    def target(self, value=1): return value\n\nfrom api import Base\n\nclass Child(Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=9)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_reclaiming_import_this_pass_cannot_follow_leaves_the_name_unresolved() -> Result<(), String>
+    {
+        // `external.py` is not among the checked files, so nothing here can say
+        // what the import bound. The class the import took the name from is
+        // still not the answer: CPython gives the call 9, and rewriting it
+        // against the local class would pass 1. The import's own default is
+        // left alone with its module, so leaving the call as it stands is what
+        // keeps running.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let external = directory.path().join("external.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &external,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Base:\n    def target(self, value=1): return value\n\nfrom external import Base\n\nclass Child(Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(std::slice::from_ref(&case))?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target()"), "{updated}");
         Ok(())
     }
 }

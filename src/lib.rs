@@ -2431,6 +2431,12 @@ fn is_python(path: &Path) -> bool {
         .is_some_and(|extension| extension == "py" || extension == "pyi")
 }
 
+/// Whether `path` is a type stub, whose contents describe an interface rather
+/// than run.
+fn is_stub(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "pyi")
+}
+
 /// The UTF-8 byte-order mark, which Windows editors write and which is not part
 /// of the program.
 const BOM: &str = "\u{feff}";
@@ -2798,7 +2804,7 @@ fn check_source(
         return Checked::default();
     }
     let aliases = Aliases::default();
-    let module_bindings = BoundNames::of_body(parsed.suite()).names;
+    let module_bindings = BoundNames::of_module(parsed.suite());
     let metaclass_intercepted_classes = metaclass_intercepted_classes(parsed.suite());
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
@@ -3782,9 +3788,7 @@ impl Checker<'_> {
     }
 
     fn is_stub(&self) -> bool {
-        self.path
-            .extension()
-            .is_some_and(|extension| extension == "pyi")
+        is_stub(self.path)
     }
 
     fn qualified_class(&self, name: &str) -> String {
@@ -3892,11 +3896,7 @@ impl Checker<'_> {
     /// legitimately omit the argument. Nothing in the source code changes to
     /// match, because a stub has no runtime behaviour to change.
     fn fixable(&self, default: &Expr, fix: TextRange) -> Option<TextRange> {
-        let stub = self
-            .path
-            .extension()
-            .is_some_and(|extension| extension == "pyi");
-        if stub && matches!(default, Expr::EllipsisLiteral(_)) {
+        if self.is_stub() && matches!(default, Expr::EllipsisLiteral(_)) {
             return None;
         }
         Some(fix)
@@ -6308,12 +6308,13 @@ fn rewrite_calls(
         source,
         definitions,
         aliases,
-        future_annotations: parsed.suite().iter().any(|statement| {
-            matches!(statement, Stmt::ImportFrom(import)
-                if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
-                    && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
-        }),
-        module_bindings: BoundNames::of_body(parsed.suite()).names,
+        postponed_annotations: is_stub(path)
+            || parsed.suite().iter().any(|statement| {
+                matches!(statement, Stmt::ImportFrom(import)
+                    if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
+                        && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+            }),
+        module_bindings: BoundNames::of_module(parsed.suite()),
         bindings: vec![BTreeMap::new()],
         binding_scope_depths: vec![0],
         lambda_scope_depths: Vec::new(),
@@ -7226,6 +7227,24 @@ impl BoundNames {
         collector.finish()
     }
 
+    /// The names a module actually puts something behind.
+    ///
+    /// A bare annotation is what separates this from `of_body`. Inside a
+    /// function or a class body `name: int` still makes the name that
+    /// scope's own, so `finish` folds it in; at module level there is no
+    /// enclosing scope to be claimed from, only the builtins, and those an
+    /// annotation leaves entirely alone. `super: object` next to a
+    /// `super()` call reaches the builtin exactly as it would have without
+    /// the annotation.
+    fn of_module(body: &[Stmt]) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        for statement in body {
+            collector.visit_stmt(statement);
+        }
+        collector.annotations.clear();
+        collector.finish().names
+    }
+
     fn of_lambda(lambda: &ast::ExprLambda) -> Self {
         let mut collector = Self::default();
         if let Some(parameters) = &lambda.parameters {
@@ -7386,8 +7405,9 @@ struct Rewriter<'a> {
     definitions: &'a Definitions,
     aliases: Aliases,
     /// Annotation expressions are stored as strings and never evaluated when
-    /// the future annotations feature is active.
-    future_annotations: bool,
+    /// the future annotations feature is active. A stub postpones them the
+    /// same way without the import, because nothing in it runs.
+    postponed_annotations: bool,
     module_bindings: BTreeSet<String>,
     /// What each imported name in this file refers to.
     bindings: Vec<BTreeMap<String, Binding>>,
@@ -7670,6 +7690,9 @@ impl Rewriter<'_> {
             };
             if call.arguments.keywords.is_empty()
                 && matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "super")
+                && self.nested_binding("super").is_none()
+                && self.binding("super").is_none()
+                && !self.module_bindings.contains("super")
                 && (zero_argument_super || explicit_super)
             {
                 return Some((
@@ -8441,7 +8464,7 @@ fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_annotation(&mut self, annotation: &'a Expr) {
-        if !self.future_annotations {
+        if !self.postponed_annotations {
             self.visit_expr(annotation);
         }
     }
@@ -12800,6 +12823,16 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn a_shadowed_super_call_is_not_the_builtin() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nclass Other:\n    def target(self): return 9\n\nclass Child(Base):\n    def run(self):\n        def super(): return Other()\n        return super().target()\n\nassert Child().run() == 9\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("def target(self, value): return value"));
+        assert!(updated.contains("return super().target()"));
+        assert!(!updated.contains("super().target(value="));
+        Ok(())
+    }
+
+    #[test]
     fn explicit_super_calls_resolve_in_the_enclosing_method() -> Result<(), String> {
         let source = "class Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self): return super(Child, self).target()\n\nassert Child().run() == 1\n";
         assert_eq!(
@@ -15472,6 +15505,46 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn stub_annotations_are_not_rewritten_as_calls() -> Result<(), String> {
+        // A stub postpones its annotations without the future import, so a
+        // call in one is a type expression rather than a call site. The two
+        // `.py` cases pin the surrounding behaviour: without the import the
+        // annotation runs and must be rewritten, with it it must not.
+        for (name, caller, expected) in [
+            (
+                "stub.pyi",
+                "from api import helper\n\ndef f(x: helper()) -> None: ...\n",
+                "def f(x: helper()) -> None: ...\n",
+            ),
+            (
+                "plain.py",
+                "from api import helper\n\ndef f(x: helper()) -> None: pass\n",
+                "def f(x: helper(value=1)) -> None: pass\n",
+            ),
+            (
+                "postponed.py",
+                "from __future__ import annotations\n\nfrom api import helper\n\ndef f(x: helper()) -> None: pass\n",
+                "def f(x: helper()) -> None: pass\n",
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let user = directory.path().join(name);
+            std::fs::write(&api, "def helper(value=1): return value\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, caller).map_err(|error| error.to_string())?;
+            fix_all(&[api.clone(), user.clone()])?;
+            assert_eq!(
+                std::fs::read_to_string(&api).map_err(|error| error.to_string())?,
+                "def helper(value): return value\n"
+            );
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(updated.ends_with(expected), "{name}\n{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_class_body_global_rebinding_drops_module_truthiness() -> Result<(), String> {
         // A class body runs when its statement does, so a `global` binding
         // there lands in the module namespace straight away and the flag a
@@ -15811,6 +15884,27 @@ def b(x=1): pass  # type: ignore  # noqa
         }
         let updated = fixed(&format!("{structural_head}{structural_tail}"))?;
         assert!(updated.contains("Child(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_module_annotation_leaves_super_the_builtin() -> Result<(), String> {
+        // Nothing stands behind ``super`` here, so the call in ``run`` still
+        // reaches the builtin and the inherited default has to travel with it.
+        // Removing ``value`` while leaving the call alone would have left a
+        // live call short of an argument.
+        let annotated = "super: object\n\nclass Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(annotated)?,
+            "super: object\n\nclass Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self): return super().target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        // An assignment does put something else behind the name, and then the
+        // call reaches that instead of the inherited method.
+        let assigned = "class Other:\n    def target(self): return 9\n\nclass Base:\n    def target(self, value=1): return value\n\nsuper = Other\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 9\n";
+        assert_eq!(
+            fixed(assigned)?,
+            "class Other:\n    def target(self): return 9\n\nclass Base:\n    def target(self, value): return value\n\nsuper = Other\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 9\n"
+        );
         Ok(())
     }
 }

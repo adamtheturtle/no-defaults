@@ -4002,6 +4002,9 @@ fn check_source(
         metaclass_definitions: BTreeSet::new(),
         local_enum_classes: BTreeSet::new(),
         entered_class_enum_classes: Vec::new(),
+        local_implicit_callback_classes: BTreeMap::new(),
+        entered_class_implicit_callback_classes: Vec::new(),
+        class_implicit_callbacks: BTreeSet::new(),
         metaclass_intercepted_classes,
         repeated_functions,
         property_aliased_methods,
@@ -4316,6 +4319,17 @@ struct Checker<'a> {
     /// its own: a class body binds names only for itself, so a function or a
     /// class written in one reads the names the class statement began with.
     entered_class_enum_classes: Vec<BTreeSet<String>>,
+    /// The classes this file defines that derive from a base
+    /// [`IMPLICIT_CALLBACK_BASES`] names, with the callbacks reached on them.
+    /// Deriving is inherited, so a subclass of one is called the same way.
+    local_implicit_callback_classes: BTreeMap<String, BTreeSet<&'static str>>,
+    /// What `local_implicit_callback_classes` held as each enclosing class body
+    /// was entered, for the reason `entered_class_enum_classes` keeps its own.
+    entered_class_implicit_callback_classes: Vec<BTreeMap<String, BTreeSet<&'static str>>>,
+    /// The callbacks the standard library reaches on the class body being
+    /// visited, empty outside one and for a class that derives from nothing
+    /// which calls back.
+    class_implicit_callbacks: BTreeSet<&'static str>,
     /// Same-file classes whose metaclass can replace class attributes.
     metaclass_intercepted_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
@@ -4726,6 +4740,7 @@ impl Checker<'_> {
             self.shapes
                 .remove(&qualified_class_name(&self.lexical_scope, name));
             self.local_enum_classes.remove(name);
+            self.local_implicit_callback_classes.remove(name);
             if let Some(bindings) = self.lexical_bindings.last_mut() {
                 bindings.insert(name.to_owned());
             }
@@ -4983,6 +4998,50 @@ impl Checker<'_> {
         })
     }
 
+    /// The callbacks the standard library itself calls on instances of `class`,
+    /// through machinery its bases own and no call site in this file. A base
+    /// written here that already derives from such a class contributes its
+    /// callbacks too, because that reach is inherited like any other class
+    /// behaviour, and several bases contribute together.
+    fn implicit_callbacks(&self, class: &ast::StmtClassDef) -> BTreeSet<&'static str> {
+        let mut callbacks = BTreeSet::new();
+        for base in class_bases(class) {
+            match base {
+                Expr::Name(name) => {
+                    if let Some(found) = self.aliases.implicit_callback_bases.get(name.id.as_str())
+                    {
+                        callbacks.extend(found.iter().copied());
+                    }
+                    if let Some(found) = self.local_implicit_callback_classes.get(name.id.as_str())
+                    {
+                        callbacks.extend(found.iter().copied());
+                    }
+                }
+                Expr::Attribute(_) => {
+                    let Some((segments, name)) = dotted_base(base) else {
+                        continue;
+                    };
+                    let Some((root, rest)) = segments.split_first() else {
+                        continue;
+                    };
+                    let Some(module) = self.aliases.implicit_callback_modules.get(*root) else {
+                        continue;
+                    };
+                    let mut dotted = module.clone();
+                    for segment in rest {
+                        dotted.push('.');
+                        dotted.push_str(segment);
+                    }
+                    if let Some(found) = implicit_callbacks_for(&dotted, name) {
+                        callbacks.extend(found.iter().copied());
+                    }
+                }
+                _ => {}
+            }
+        }
+        callbacks
+    }
+
     /// Note that a metaclass builds this class, so a later subclass of it is
     /// built by that metaclass too. An unseen imported base counts as one: the
     /// metaclass it may carry reaches every class beneath it alike, and a
@@ -5091,6 +5150,7 @@ impl Checker<'_> {
         let outer_metaclass_classes = self.metaclass_classes.clone();
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
         let outer_enum_classes = self.local_enum_classes.clone();
+        let outer_implicit_callback_classes = self.local_implicit_callback_classes.clone();
         // Written straight in a class body, this function sees none of the
         // names that body binds: a class written above it there is not in
         // scope here, and reading a base through it would answer with a class
@@ -5103,6 +5163,9 @@ impl Checker<'_> {
             if let Some(entered) = self.entered_class_enum_classes.last() {
                 self.local_enum_classes.clone_from(entered);
             }
+            if let Some(entered) = self.entered_class_implicit_callback_classes.last() {
+                self.local_implicit_callback_classes.clone_from(entered);
+            }
         }
         let mut parameters = BoundNames::default();
         parameters.parameters(&function.parameters);
@@ -5112,6 +5175,7 @@ impl Checker<'_> {
         for name in parameters.names {
             self.aliases.invalidate_parameter(&name);
             self.local_enum_classes.remove(&name);
+            self.local_implicit_callback_classes.remove(&name);
         }
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
@@ -5138,6 +5202,7 @@ impl Checker<'_> {
         self.metaclass_classes = outer_metaclass_classes;
         self.metaclass_definitions = outer_metaclass_definitions;
         self.local_enum_classes = outer_enum_classes;
+        self.local_implicit_callback_classes = outer_implicit_callback_classes;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
@@ -5405,18 +5470,12 @@ impl Checker<'_> {
             })
     }
 
-    fn check_function(&mut self, function: &ast::StmtFunctionDef) {
-        if !self.enabled(function.name.as_str()) {
-            return;
-        }
-        // The function's own range starts at its first decorator, so the name
-        // locates the `def` line that a signature-wide directive sits on.
-        let enclosing = self.header;
-        self.header = Some(line_start(self.source, function.name.start()));
-        let descriptor_invoked = self.descriptor_invokes(function);
-        let implicitly_called = self.scope.class != ClassScope::None
-            && self.generated_code_calls(function.name.as_str());
-        let mut removed = Vec::new();
+    /// Whether something other than a call site the fixer could rewrite decides
+    /// what `function`'s defaults are, which is what makes removing them change
+    /// what runs. The interpreter, a decorator whose effect on the signature is
+    /// unknown, a standard-library subsystem that owns the call, and a second
+    /// definition of the same name all count.
+    fn defaults_are_decided_elsewhere(&self, function: &ast::StmtFunctionDef) -> bool {
         let known_descriptor = |expression: &Expr| match expression {
             Expr::Name(name) => {
                 matches!(name.id.as_str(), "staticmethod" | "classmethod")
@@ -5430,10 +5489,51 @@ impl Checker<'_> {
             }
             _ => false,
         };
-        let unknown_decorator = function
-            .decorator_list
-            .iter()
-            .any(|decorator| !known_descriptor(&decorator.expression));
+        let in_class = self.scope.class != ClassScope::None;
+        (in_class && self.generated_code_calls(function.name.as_str()))
+            || self.method_has_implicit_alias(function.name.as_str())
+            || self.descriptor_invokes(function)
+            || function
+                .decorator_list
+                .iter()
+                .any(|decorator| !known_descriptor(&decorator.expression))
+            || self.is_stub()
+            || (in_class && implicitly_called_method(function.name.as_str()))
+            || (in_class
+                && self
+                    .class_implicit_callbacks
+                    .contains(function.name.as_str()))
+            || self.method_is_intercepted(function.name.as_str())
+            || self.method_is_rebound_later(function)
+            || self.is_delegation_protocol_method(function.name.as_str())
+            || (self.scope.class == ClassScope::Metaclass
+                && matches!(function.name.as_str(), "__init__" | "mro"))
+            || (self.scope.enum_class
+                && matches!(
+                    function.name.as_str(),
+                    "__init__" | "_missing_" | "_generate_next_value_"
+                ))
+            || (!in_class
+                && self.lexical_scope.is_empty()
+                && matches!(
+                    function.name.as_str(),
+                    "__getattr__" | "__dir__" | "__annotate__"
+                ))
+            || self.repeated_functions.contains(function.name.as_str())
+    }
+
+    fn check_function(&mut self, function: &ast::StmtFunctionDef) {
+        if !self.enabled(function.name.as_str()) {
+            return;
+        }
+        // The function's own range starts at its first decorator, so the name
+        // locates the `def` line that a signature-wide directive sits on.
+        let enclosing = self.header;
+        self.header = Some(line_start(self.source, function.name.start()));
+        let mut removed = Vec::new();
+        // Nothing in this answer reads a parameter, so the whole signature is
+        // judged once.
+        let called_implicitly = self.defaults_are_decided_elsewhere(function);
         // A parameter without a default cannot follow one with a default, so
         // once a default has to stay, every positional default after it stays
         // too. Keyword-only parameters sit after the `*`, where order does not
@@ -5457,32 +5557,7 @@ impl Checker<'_> {
                 continue;
             };
             let range = self.default_fix_range(parameter.parameter.end(), default);
-            let fix = if implicitly_called
-                || self.method_has_implicit_alias(function.name.as_str())
-                || descriptor_invoked
-                || unknown_decorator
-                || self.is_stub()
-                || (self.scope.class != ClassScope::None
-                    && implicitly_called_method(function.name.as_str()))
-                || self.method_is_intercepted(function.name.as_str())
-                || self.method_is_rebound_later(function)
-                || self.is_delegation_protocol_method(function.name.as_str())
-                || (self.scope.class == ClassScope::Metaclass
-                    && matches!(function.name.as_str(), "__init__" | "mro"))
-                || (self.scope.enum_class
-                    && matches!(
-                        function.name.as_str(),
-                        "__init__" | "_missing_" | "_generate_next_value_"
-                    ))
-                || (self.scope.class == ClassScope::None
-                    && self.lexical_scope.is_empty()
-                    && matches!(
-                        function.name.as_str(),
-                        "__getattr__" | "__dir__" | "__annotate__"
-                    ))
-                || self.repeated_functions.contains(function.name.as_str())
-                || (positional && kept)
-            {
+            let fix = if called_implicitly || (positional && kept) {
                 None
             } else {
                 self.fixable(default, range)
@@ -5530,6 +5605,7 @@ impl Checker<'_> {
                         implicitly_called_method(&alias.name)
                             || matches!(alias.name.as_str(), "__init__" | "__new__")
                             || self.generated_code_calls(&alias.name)
+                            || self.class_implicit_callbacks.contains(alias.name.as_str())
                     })
                 })
             })
@@ -6042,6 +6118,167 @@ fn implicitly_called_method(name: &str) -> bool {
     )
 }
 
+/// The methods `logging` reaches on a handler it owns, whichever handler base
+/// the subclass was written on.
+const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
+    "acquire",
+    "close",
+    "createLock",
+    "emit",
+    "filter",
+    "flush",
+    "format",
+    "handle",
+    "release",
+];
+
+/// Standard-library base classes whose own machinery calls the methods a
+/// subclass writes, each with the callbacks that machinery reaches.
+///
+/// These names are ordinary ones — `close`, `emit`, `format`, `filter` — so the
+/// bare-name catalogue [`implicitly_called_method`] would retain them for every
+/// class that happens to spell one, and leave most files unfixed. A row names
+/// the base that does the calling instead, and only a class derived from that
+/// base keeps its defaults.
+///
+/// Covering another module means adding rows: the module the base is imported
+/// from, the base's own name, and the callbacks its machinery reaches. A
+/// standard-library subclass that is a base in its own right —
+/// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
+/// list.
+const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
+    (
+        "logging",
+        "BufferingFormatter",
+        &["formatFooter", "formatHeader"],
+    ),
+    ("logging", "FileHandler", LOGGING_HANDLER_CALLBACKS),
+    ("logging", "Filter", &["filter"]),
+    (
+        "logging",
+        "Formatter",
+        &["format", "formatException", "formatStack"],
+    ),
+    ("logging", "Handler", LOGGING_HANDLER_CALLBACKS),
+    ("logging", "LogRecord", &["getMessage"]),
+    (
+        "logging",
+        "Logger",
+        &[
+            "callHandlers",
+            "filter",
+            "findCaller",
+            "getEffectiveLevel",
+            "handle",
+            "isEnabledFor",
+            "makeRecord",
+        ],
+    ),
+    ("logging", "LoggerAdapter", &["process"]),
+    ("logging", "NullHandler", LOGGING_HANDLER_CALLBACKS),
+    ("logging", "StreamHandler", LOGGING_HANDLER_CALLBACKS),
+    (
+        "logging.handlers",
+        "BaseRotatingHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    (
+        "logging.handlers",
+        "BufferingHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    (
+        "logging.handlers",
+        "DatagramHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    ("logging.handlers", "HTTPHandler", LOGGING_HANDLER_CALLBACKS),
+    (
+        "logging.handlers",
+        "MemoryHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    (
+        "logging.handlers",
+        "NTEventLogHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    (
+        "logging.handlers",
+        "QueueHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    (
+        "logging.handlers",
+        "RotatingFileHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    ("logging.handlers", "SMTPHandler", LOGGING_HANDLER_CALLBACKS),
+    (
+        "logging.handlers",
+        "SocketHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    (
+        "logging.handlers",
+        "SysLogHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    (
+        "logging.handlers",
+        "TimedRotatingFileHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+    (
+        "logging.handlers",
+        "WatchedFileHandler",
+        LOGGING_HANDLER_CALLBACKS,
+    ),
+];
+
+/// The callbacks the standard library reaches on a subclass of `base` written in
+/// `module`, if that pair is one [`IMPLICIT_CALLBACK_BASES`] names.
+fn implicit_callbacks_for(module: &str, base: &str) -> Option<&'static [&'static str]> {
+    IMPLICIT_CALLBACK_BASES
+        .iter()
+        .find(|(base_module, base_name, _)| *base_module == module && *base_name == base)
+        .map(|(_, _, callbacks)| *callbacks)
+}
+
+/// Whether `module` is one [`IMPLICIT_CALLBACK_BASES`] names, or a package one
+/// of them sits under, which is what makes the name a plain `import` binds for
+/// it worth recording.
+fn names_implicit_callback_module(module: &str) -> bool {
+    IMPLICIT_CALLBACK_BASES.iter().any(|(base_module, ..)| {
+        *base_module == module
+            || base_module
+                .strip_prefix(module)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
+/// Split a dotted base into the path it is written under and the name of the
+/// base itself, so `logging.handlers.QueueHandler` reads as the segments
+/// `["logging", "handlers"]` and the name `QueueHandler`. The first segment is
+/// whatever local name an `import` bound, not necessarily the module's own.
+fn dotted_base(base: &Expr) -> Option<(Vec<&str>, &str)> {
+    let Expr::Attribute(attribute) = base else {
+        return None;
+    };
+    let mut segments = Vec::new();
+    let mut expression = attribute.value.as_ref();
+    while let Expr::Attribute(inner) = expression {
+        segments.push(inner.attr.as_str());
+        expression = inner.value.as_ref();
+    }
+    let Expr::Name(root) = expression else {
+        return None;
+    };
+    segments.push(root.id.as_str());
+    segments.reverse();
+    Some((segments, attribute.attr.as_str()))
+}
+
 impl<'a> Visitor<'a> for Checker<'a> {
     #[allow(
         clippy::too_many_lines,
@@ -6066,7 +6303,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer_metaclass_classes = self.metaclass_classes.clone();
                 let outer_metaclass_definitions = self.metaclass_definitions.clone();
                 let outer_enum_classes = self.local_enum_classes.clone();
+                let outer_implicit_callback_classes = self.local_implicit_callback_classes.clone();
                 let enum_class = self.is_enum_class(class);
+                // Read the bases with the tables the class statement itself
+                // saw, before its body binds anything over them.
+                let implicit_callbacks = self.implicit_callbacks(class);
                 let outer_repeated_functions = self.repeated_functions.clone();
                 let mut method_names = BTreeSet::new();
                 let mut repeated_methods = BTreeSet::new();
@@ -6175,6 +6416,17 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 } else {
                     outer_enum_classes.clone()
                 };
+                let body_implicit_callback_classes = if self.lexical_is_class.last() == Some(&true)
+                {
+                    self.entered_class_implicit_callback_classes
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| outer_implicit_callback_classes.clone())
+                } else {
+                    outer_implicit_callback_classes.clone()
+                };
+                let outer_class_implicit_callbacks =
+                    std::mem::replace(&mut self.class_implicit_callbacks, implicit_callbacks);
                 self.lexical_scope.push(class.name.to_string());
                 self.lexical_is_class.push(true);
                 self.lexical_bindings.push(BTreeSet::new());
@@ -6183,7 +6435,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     .push(body_metaclass_classes);
                 self.local_enum_classes.clone_from(&body_enum_classes);
                 self.entered_class_enum_classes.push(body_enum_classes);
+                self.local_implicit_callback_classes
+                    .clone_from(&body_implicit_callback_classes);
+                self.entered_class_implicit_callback_classes
+                    .push(body_implicit_callback_classes);
                 walk_stmt(self, statement);
+                self.entered_class_implicit_callback_classes.pop();
                 self.entered_class_enum_classes.pop();
                 self.entered_class_metaclass_classes.pop();
                 self.lexical_bindings.pop();
@@ -6217,6 +6474,25 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     self.local_enum_classes.insert(class.name.to_string());
                 } else if self.conditional_depth == 0 {
                     self.local_enum_classes.remove(class.name.as_str());
+                }
+                let implicit_callbacks = std::mem::replace(
+                    &mut self.class_implicit_callbacks,
+                    outer_class_implicit_callbacks,
+                );
+                self.local_implicit_callback_classes = outer_implicit_callback_classes;
+                // A later class of the same name that derives from nothing the
+                // standard library calls back takes the name over, so a subclass
+                // written on it below is reached through nothing either. A
+                // namesake in a branch that may not run takes nothing back:
+                // where it is skipped the base is still what the name stands
+                // for, and dropping it here would strip a default the standard
+                // library needs.
+                if !implicit_callbacks.is_empty() {
+                    self.local_implicit_callback_classes
+                        .insert(class.name.to_string(), implicit_callbacks);
+                } else if self.conditional_depth == 0 {
+                    self.local_implicit_callback_classes
+                        .remove(class.name.as_str());
                 }
                 self.repeated_functions = outer_repeated_functions;
                 // The header was read against the scope around the class, so
@@ -6536,6 +6812,13 @@ struct Aliases {
     pydantic_modules: BTreeSet<String>,
     enum_classes: BTreeSet<String>,
     enum_modules: BTreeSet<String>,
+    /// Names bound to a base [`IMPLICIT_CALLBACK_BASES`] names, mapped to the
+    /// callbacks that base's machinery calls.
+    implicit_callback_bases: BTreeMap<String, &'static [&'static str]>,
+    /// Names a plain `import` bound for a module holding such a base, mapped to
+    /// the module's own dotted name, so `import logging as lg` still resolves
+    /// `lg.Handler`.
+    implicit_callback_modules: BTreeMap<String, String>,
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
     properties: BTreeSet<String>,
@@ -6571,6 +6854,8 @@ impl Aliases {
         self.pydantic_modules.remove(name);
         self.enum_classes.remove(name);
         self.enum_modules.remove(name);
+        self.implicit_callback_bases.remove(name);
+        self.implicit_callback_modules.remove(name);
         self.staticmethods.remove(name);
         self.classmethods.remove(name);
         self.supers.remove(name);
@@ -6596,11 +6881,29 @@ impl Aliases {
             }
         }
 
-        if let Some(renamed) = before.renamed.get(name) {
-            self.renamed.insert(name.to_owned(), renamed.clone());
-        } else {
-            self.renamed.remove(name);
+        fn copy_mapping<V: Clone>(
+            current: &mut BTreeMap<String, V>,
+            before: &BTreeMap<String, V>,
+            name: &str,
+        ) {
+            if let Some(value) = before.get(name) {
+                current.insert(name.to_owned(), value.clone());
+            } else {
+                current.remove(name);
+            }
         }
+
+        copy_mapping(&mut self.renamed, &before.renamed, name);
+        copy_mapping(
+            &mut self.implicit_callback_bases,
+            &before.implicit_callback_bases,
+            name,
+        );
+        copy_mapping(
+            &mut self.implicit_callback_modules,
+            &before.implicit_callback_modules,
+            name,
+        );
         for (current, before) in [
             (&mut self.import_bindings, &before.import_bindings),
             (&mut self.dataclasses_members, &before.dataclasses_members),
@@ -6751,6 +7054,32 @@ impl Aliases {
         }
     }
 
+    /// The names `from <module> import <Base>` binds for a base whose own
+    /// machinery calls the methods a subclass writes.
+    fn collect_implicit_callback_bases(&mut self, import: &ast::StmtImportFrom) {
+        let Some(module) = import.module.as_ref() else {
+            return;
+        };
+        for alias in &import.names {
+            if let Some(callbacks) = implicit_callbacks_for(module.as_str(), alias.name.as_str()) {
+                self.implicit_callback_bases.insert(
+                    alias.asname.as_ref().unwrap_or(&alias.name).to_string(),
+                    callbacks,
+                );
+            }
+            // The same statement may name a submodule rather than a class, and
+            // a base reached through that name is the one the dotted spelling
+            // reaches.
+            let submodule = format!("{module}.{}", alias.name);
+            if names_implicit_callback_module(&submodule) {
+                self.implicit_callback_modules.insert(
+                    alias.asname.as_ref().unwrap_or(&alias.name).to_string(),
+                    submodule,
+                );
+            }
+        }
+    }
+
     /// Collect the renaming imports visible in one lexical scope, including
     /// those nested in control-flow blocks but not nested definitions.
     /// The names a plain `import` binds for the modules whose members matter.
@@ -6761,6 +7090,21 @@ impl Aliases {
                     || alias.name.split('.').next().unwrap_or_default().to_owned(),
                     ToString::to_string,
                 ));
+            // `import logging.handlers` binds `logging` alone, so the name it
+            // leaves behind stands for the package; a renaming import binds the
+            // submodule itself instead.
+            let bound = alias.asname.as_ref().map_or_else(
+                || alias.name.split('.').next().unwrap_or_default().to_owned(),
+                ToString::to_string,
+            );
+            let module = if alias.asname.is_some() {
+                alias.name.to_string()
+            } else {
+                bound.clone()
+            };
+            if names_implicit_callback_module(&module) {
+                self.implicit_callback_modules.insert(bound, module);
+            }
             if alias.name.as_str() == "dataclasses" {
                 self.dataclasses_modules.insert(
                     alias
@@ -6819,74 +7163,78 @@ impl Aliases {
         }
     }
 
+    /// Record everything one `from <module> import ...` statement binds.
+    fn collect_from_import(&mut self, import: &ast::StmtImportFrom) {
+        self.reclaim_parameter_imports(import);
+        self.import_bindings.extend(
+            import
+                .names
+                .iter()
+                .filter(|alias| alias.name.as_str() != "*")
+                .map(|alias| alias.asname.as_ref().unwrap_or(&alias.name).to_string()),
+        );
+        self.collect_typing_members(import);
+        self.collect_builtin_members(import);
+        self.collect_abc_members(import);
+        self.collect_enum_members(import);
+        self.collect_implicit_callback_bases(import);
+        let carries_fields = import.module.as_ref().is_some_and(|module| {
+            matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
+        });
+        if !carries_fields {
+            return;
+        }
+        let dataclasses = import
+            .module
+            .as_ref()
+            .is_some_and(|module| module.as_str() == "dataclasses");
+        let pydantic = import
+            .module
+            .as_ref()
+            .is_some_and(|module| module.split('.').next() == Some("pydantic"));
+        for alias in &import.names {
+            let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+            if dataclasses && alias.name.as_str() == "field" {
+                self.invalidated_field_helpers.remove(&local);
+                self.dataclass_fields.insert(local.clone());
+            }
+            if pydantic && alias.name.as_str() == "Field" {
+                self.invalidated_field_helpers.remove(&local);
+                self.pydantic_fields.insert(local.clone());
+            }
+            if pydantic && alias.name.as_str() == "PrivateAttr" {
+                self.pydantic_private_attrs.insert(local.clone());
+            }
+            if dataclasses && alias.name.as_str() == "dataclass" {
+                self.dataclass_decorators.insert(local.clone());
+            }
+            if dataclasses && alias.name.as_str() == "MISSING" {
+                self.dataclasses_members.insert(local.clone());
+            }
+            if dataclasses && alias.name.as_str() == "KW_ONLY" {
+                self.kw_only_markers.insert(local.clone());
+            }
+            let Some(local) = &alias.asname else {
+                continue;
+            };
+            match self.renamed.entry(local.to_string()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Some(alias.name.to_string()));
+                }
+                Entry::Occupied(mut entry) => {
+                    if entry.get().as_deref() != Some(alias.name.as_str()) {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+    }
+
     fn collect(&mut self, statements: &[Stmt]) {
         for statement in statements {
             match statement {
                 Stmt::Import(import) => self.collect_module_aliases(import),
-                Stmt::ImportFrom(import) => {
-                    self.reclaim_parameter_imports(import);
-                    self.import_bindings.extend(
-                        import
-                            .names
-                            .iter()
-                            .filter(|alias| alias.name.as_str() != "*")
-                            .map(|alias| alias.asname.as_ref().unwrap_or(&alias.name).to_string()),
-                    );
-                    self.collect_typing_members(import);
-                    self.collect_builtin_members(import);
-                    self.collect_abc_members(import);
-                    self.collect_enum_members(import);
-                    let carries_fields = import.module.as_ref().is_some_and(|module| {
-                        matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
-                    });
-                    if !carries_fields {
-                        continue;
-                    }
-                    let dataclasses = import
-                        .module
-                        .as_ref()
-                        .is_some_and(|module| module.as_str() == "dataclasses");
-                    let pydantic = import
-                        .module
-                        .as_ref()
-                        .is_some_and(|module| module.split('.').next() == Some("pydantic"));
-                    for alias in &import.names {
-                        let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
-                        if dataclasses && alias.name.as_str() == "field" {
-                            self.invalidated_field_helpers.remove(&local);
-                            self.dataclass_fields.insert(local.clone());
-                        }
-                        if pydantic && alias.name.as_str() == "Field" {
-                            self.invalidated_field_helpers.remove(&local);
-                            self.pydantic_fields.insert(local.clone());
-                        }
-                        if pydantic && alias.name.as_str() == "PrivateAttr" {
-                            self.pydantic_private_attrs.insert(local.clone());
-                        }
-                        if dataclasses && alias.name.as_str() == "dataclass" {
-                            self.dataclass_decorators.insert(local.clone());
-                        }
-                        if dataclasses && alias.name.as_str() == "MISSING" {
-                            self.dataclasses_members.insert(local.clone());
-                        }
-                        if dataclasses && alias.name.as_str() == "KW_ONLY" {
-                            self.kw_only_markers.insert(local.clone());
-                        }
-                        let Some(local) = &alias.asname else {
-                            continue;
-                        };
-                        match self.renamed.entry(local.to_string()) {
-                            Entry::Vacant(entry) => {
-                                entry.insert(Some(alias.name.to_string()));
-                            }
-                            Entry::Occupied(mut entry) => {
-                                if entry.get().as_deref() != Some(alias.name.as_str()) {
-                                    entry.insert(None);
-                                }
-                            }
-                        }
-                    }
-                }
+                Stmt::ImportFrom(import) => self.collect_from_import(import),
                 Stmt::If(branch) => {
                     self.collect(&branch.body);
                     for clause in &branch.elif_else_clauses {
@@ -22437,6 +22785,276 @@ def b(x=1): pass  # type: ignore  # noqa
                 "{importing}"
             );
         }
+        Ok(())
+    }
+    #[test]
+    fn logging_handler_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `logging` calls each of these on a handler it owns: `createLock` from
+        // `Handler.__init__`, `emit` and `format` from `Handler.handle`,
+        // `acquire`, `release`, `flush` and `close` from `logging.shutdown`,
+        // `handle` from `Logger.callHandlers`, and `filter` from `handle`.
+        // None of those calls is written here, so removing a default leaves a
+        // handler the subsystem can no longer call.
+        let source = "import logging\n\n\nclass H(logging.Handler):\n    def createLock(self, extra=1): self.lock = None\n\n    def emit(self, record, extra=2): pass\n\n    def format(self, record, extra=3): return \"\"\n\n    def acquire(self, extra=4): pass\n\n    def release(self, extra=5): pass\n\n    def flush(self, extra=6): pass\n\n    def close(self, extra=7): pass\n\n    def handle(self, record, extra=8): return True\n\n    def filter(self, record, extra=9): return True\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn logging_logger_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A logger reaches its own overrides from inside `Logger._log`, so a
+        // plain `logger.info(...)` elsewhere calls every one of these.
+        let source = "import logging\n\n\nclass L(logging.Logger):\n    def handle(self, record, extra=1): pass\n\n    def callHandlers(self, record, extra=2): pass\n\n    def getEffectiveLevel(self, extra=3): return 20\n\n    def isEnabledFor(self, level, extra=4): return True\n\n    def findCaller(self, stack_info=False, stacklevel=1, extra=5): return __file__, 1, \"f\", None\n\n    def makeRecord(self, name, level, fn, lno, msg, args, exc_info, func=None, extra=None, sinfo=None, spare=6): return None\n\n    def filter(self, record, spare=7): return True\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn logging_formatter_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A handler formats through whatever formatter it was given, and
+        // `Formatter.format` reaches the other two itself.
+        let source = "import logging\n\n\nclass F(logging.Formatter):\n    def format(self, record, extra=1): return \"\"\n\n    def formatException(self, ei, extra=2): return \"\"\n\n    def formatStack(self, stack_info, extra=3): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn other_logging_bases_keep_their_callback_defaults() -> Result<(), String> {
+        // `Filterer.filter` calls a filter's `filter`, `BufferingFormatter.format`
+        // calls both of its own hooks, a `LoggerAdapter` calls `process` on every
+        // logging call made through it, and `Formatter.format` calls
+        // `LogRecord.getMessage`.
+        let source = "import logging\n\n\nclass F(logging.Filter):\n    def filter(self, record, extra=1): return True\n\n\nclass B(logging.BufferingFormatter):\n    def formatHeader(self, records, extra=2): return \"\"\n\n    def formatFooter(self, records, extra=3): return \"\"\n\n\nclass A(logging.LoggerAdapter):\n    def process(self, msg, kwargs, extra=4): return msg, kwargs\n\n\nclass R(logging.LogRecord):\n    def getMessage(self, extra=5): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_imported_logging_base_keeps_its_callback_defaults() -> Result<(), String> {
+        // The base is the same class whether it is spelled through the module
+        // or bound by name.
+        let source = "from logging import Handler\n\n\nclass H(Handler):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_logging_module_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import logging as lg\n\n\nclass H(lg.Handler):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_logging_subclass_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being reached by the subsystem is inherited, so a subclass written on
+        // a handler defined here is emitted through in the same way.
+        let source = "import logging\n\n\nclass Base(logging.Handler):\n    pass\n\n\nclass Child(Base):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_logging_submodule_handler_keeps_its_callback_defaults() -> Result<(), String> {
+        // `import logging.handlers` binds `logging` alone, so the base is read
+        // through two attributes rather than one.
+        let source = "import logging.handlers\n\n\nclass H(logging.handlers.BufferingHandler):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_logging_submodule_keeps_its_callback_defaults() -> Result<(), String> {
+        // A renaming import binds the submodule itself, so one attribute is all
+        // that stands between the name and the base.
+        let source = "import logging.handlers as lh\n\n\nclass H(lh.QueueHandler):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_logging_hierarchy_are_still_fixed() -> Result<(), String> {
+        // These are ordinary method names. Nothing calls them here but the call
+        // written below, so the defaults go and that call carries the values.
+        let source = "class Handler:\n    def emit(self, record, extra=1): return extra\n\n    def flush(self, extra=2): return extra\n\n    def close(self, extra=3): return extra\n\n    def format(self, record, extra=4): return extra\n\n    def acquire(self, extra=5): return extra\n\n    def release(self, extra=6): return extra\n\n    def createLock(self, extra=7): return extra\n\n    def filter(self, record, extra=8): return extra\n\n    def handle(self, record, extra=9): return extra\n\n    def getMessage(self, extra=10): return extra\n\n\nh = Handler()\nassert Handler.emit(h, \"r\") == 1\nassert Handler.flush(h) == 2\nassert Handler.close(h) == 3\nassert Handler.format(h, \"r\") == 4\nassert Handler.acquire(h) == 5\nassert Handler.release(h) == 6\nassert Handler.createLock(h) == 7\nassert Handler.filter(h, \"r\") == 8\nassert Handler.handle(h, \"r\") == 9\nassert Handler.getMessage(h) == 10\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Handler:\n    def emit(self, record, extra): return extra\n\n    def flush(self, extra): return extra\n\n    def close(self, extra): return extra\n\n    def format(self, record, extra): return extra\n\n    def acquire(self, extra): return extra\n\n    def release(self, extra): return extra\n\n    def createLock(self, extra): return extra\n\n    def filter(self, record, extra): return extra\n\n    def handle(self, record, extra): return extra\n\n    def getMessage(self, extra): return extra\n\n\nh = Handler()\nassert Handler.emit(h, \"r\", extra=1) == 1\nassert Handler.flush(h, extra=2) == 2\nassert Handler.close(h, extra=3) == 3\nassert Handler.format(h, \"r\", extra=4) == 4\nassert Handler.acquire(h, extra=5) == 5\nassert Handler.release(h, extra=6) == 6\nassert Handler.createLock(h, extra=7) == 7\nassert Handler.filter(h, \"r\", extra=8) == 8\nassert Handler.handle(h, \"r\", extra=9) == 9\nassert Handler.getMessage(h, extra=10) == 10\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_class_in_a_handler_body_is_no_handler() -> Result<(), String> {
+        // Deriving is what the retention is gated on, not being written next to
+        // something that does, so the nested class is fixed while the handler's
+        // own method is left alone.
+        let source = "import logging\n\n\nclass H(logging.Handler):\n    class Inner:\n        def emit(self, record, extra=1): return extra\n\n    def emit(self, record, extra=2): pass\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import logging\n\n\nclass H(logging.Handler):\n    class Inner:\n        def emit(self, record, extra): return extra\n\n    def emit(self, record, extra=2): pass\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_redefined_without_a_logging_base_gives_up_its_callbacks() -> Result<(), String> {
+        // The second `Base` is what `Child` is built on, and nothing in
+        // `logging` reaches it, so the default is removed.
+        let source = "import logging\n\n\nclass Base(logging.Handler):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    def emit(self, record, extra=1): return extra\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import logging\n\n\nclass Base(logging.Handler):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    def emit(self, record, extra): return extra\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameter_shadowing_a_logging_subclass_hides_its_callbacks() -> Result<(), String> {
+        // Whatever the caller passes is the base, so the handler defined above
+        // says nothing about what reaches `Child`.
+        let source = "import logging\n\n\nclass Base(logging.Handler):\n    pass\n\n\ndef make(Base):\n    class Child(Base):\n        def emit(self, record, extra=1): return extra\n\n    return Child\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import logging\n\n\nclass Base(logging.Handler):\n    pass\n\n\ndef make(Base):\n    class Child(Base):\n        def emit(self, record, extra): return extra\n\n    return Child\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_handler_beside_a_method_is_not_in_scope_in_it() -> Result<(), String> {
+        // A class body is no closure scope, so `Base` inside the method is the
+        // module-level class rather than the handler written beside it, and the
+        // default goes.
+        let source = "import logging\n\n\nclass Base:\n    pass\n\n\nclass Outer:\n    class Base(logging.Handler):\n        pass\n\n    def method(self):\n        class Child(Base):\n            def emit(self, record, extra=1): return extra\n\n        return Child\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import logging\n\n\nclass Base:\n    pass\n\n\nclass Outer:\n    class Base(logging.Handler):\n        pass\n\n    def method(self):\n        class Child(Base):\n            def emit(self, record, extra): return extra\n\n        return Child\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_handler_import_bound_over_stops_reaching_logging() -> Result<(), String> {
+        // The assignment takes the name, so the base below is a plain `object`
+        // and nothing in `logging` ever calls this method.
+        let source = "from logging import Handler\n\nHandler = object\n\n\nclass H(Handler):\n    def emit(self, record, extra=1): return extra\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "from logging import Handler\n\nHandler = object\n\n\nclass H(Handler):\n    def emit(self, record, extra): return extra\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_handler_bound_over_stops_reaching_logging() -> Result<(), String> {
+        let source = "import logging\n\n\nclass Base(logging.Handler):\n    pass\n\n\nBase = object\n\n\nclass Child(Base):\n    def emit(self, record, extra=1): return extra\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import logging\n\n\nclass Base(logging.Handler):\n    pass\n\n\nBase = object\n\n\nclass Child(Base):\n    def emit(self, record, extra): return extra\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_except_target_gives_a_handler_import_back() -> Result<(), String> {
+        // Python deletes the handler's name when the handler ends, so the class
+        // below is built on the import again and `logging` reaches its `emit`.
+        let source = "from logging import Handler\n\ntry:\n    pass\nexcept ValueError as Handler:\n    pass\n\n\nclass H(Handler):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_except_target_gives_the_logging_module_back() -> Result<(), String> {
+        let source = "import logging\n\ntry:\n    pass\nexcept ValueError as logging:\n    pass\n\n\nclass H(logging.Handler):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_logging_module_bound_over_stops_reaching_logging() -> Result<(), String> {
+        // The assignment takes the module's name, so `logging.Handler` below
+        // reads the class attribute of whatever was put there and nothing in
+        // `logging` ever calls this method.
+        let source = "import logging\n\n\nclass Fake:\n    Handler = object\n\n\nlogging = Fake\n\n\nclass H(logging.Handler):\n    def emit(self, record, extra=1): return extra\n\n\nassert H.emit(H(), \"r\") == 1\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import logging\n\n\nclass Fake:\n    Handler = object\n\n\nlogging = Fake\n\n\nclass H(logging.Handler):\n    def emit(self, record, extra): return extra\n\n\nassert H.emit(H(), \"r\", extra=1) == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_logging_import_keeps_its_callback_defaults() -> Result<(), String> {
+        // The base is the class the import names, not the spelling it was given
+        // here.
+        let source = "from logging import Handler as Base\n\n\nclass H(Base):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_taking_a_handler_import_name_stops_reaching_logging() -> Result<(), String> {
+        // The class statement binds the name for everything below it, so the
+        // subclass is built on the class written here.
+        let source = "from logging import Handler\n\n\nclass Handler:\n    pass\n\n\nclass H(Handler):\n    def emit(self, record, extra=1): return extra\n\n\nassert H.emit(H(), \"r\") == 1\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "from logging import Handler\n\n\nclass Handler:\n    pass\n\n\nclass H(Handler):\n    def emit(self, record, extra): return extra\n\n\nassert H.emit(H(), \"r\", extra=1) == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn one_logging_base_among_several_is_enough() -> Result<(), String> {
+        // A class is reached by every one of its bases' machinery, so a mixin
+        // beside the handler takes nothing away.
+        let source = "import logging\n\n\nclass Mixin:\n    pass\n\n\nclass H(Mixin, logging.Handler):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_in_an_untaken_branch_leaves_a_handler_standing() -> Result<(), String> {
+        // The same hole as the enumerations' and the metaclasses': the branch
+        // may not run, so `Base` is still the handler, `Child` is still what
+        // `logging` emits through, and removing the default leaves a record
+        // that cannot be handled with no written call for a rewrite to make up
+        // for it.
+        let source = "import logging\nimport os\n\n\nclass Base(logging.Handler):\n    pass\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class Base:\n        pass\n\n\nclass Child(Base):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_submodule_from_import_keeps_its_callback_defaults() -> Result<(), String> {
+        // `from logging import handlers` binds the submodule, so a base reached
+        // through that name is the class the dotted spelling reaches.
+        let source = "from logging import handlers\n\n\nclass H(handlers.BufferingHandler):\n    def emit(self, record, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_aliased_onto_a_logging_callback_keeps_its_default() -> Result<(), String> {
+        // `logging` finds the method by the name it is bound to, so the
+        // definition behind the alias is what the subsystem calls and its
+        // default has nowhere else to come from.
+        let source = "import logging\n\n\nclass H(logging.Handler):\n    def _do(self, record, extra=1): pass\n\n    emit = _do\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_aliased_off_the_logging_hierarchy_is_still_fixed() -> Result<(), String> {
+        // Nothing calls the alias but the call written below, so the default
+        // goes and that call carries the value.
+        let source = "class Handler:\n    def _do(self, record, extra=1): return extra\n\n    emit = _do\n\n\nassert Handler._do(Handler(), \"r\") == 1\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "class Handler:\n    def _do(self, record, extra): return extra\n\n    emit = _do\n\n\nassert Handler._do(Handler(), \"r\", extra=1) == 1\n"
+        );
         Ok(())
     }
 }

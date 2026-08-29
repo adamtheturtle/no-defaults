@@ -1384,12 +1384,14 @@ fn record_class_bases_and_attributes(
         bases,
         scope.namespace.alternative,
     );
-    // A base spelled with a name alternative suites bind to different classes
+    // A base spelled with a name competing suites bind to different classes
     // names a different ancestry depending on which of them ran, so the file
     // settles none of them, exactly as it settles none for a class those
-    // suites give different bases.
+    // suites give different bases. The name is read at the root of the base,
+    // so a parameterized `Alias[int]` and a member of one are caught with it.
     if class_bases(class)
-        .any(|base| matches!(base, Expr::Name(name) if scope.contested.contains(name.id.as_str())))
+        .filter_map(base_root_name)
+        .any(|name| scope.contested.contains(name))
     {
         definitions
             .uncertain_bases
@@ -1415,25 +1417,63 @@ fn index_control_flow_method_bases(
 ) {
     let suites = runnable_suites(statement);
     let alternative = suites.len() > 1;
+    // One suite the statement is certain to enter binds for the code after it
+    // just as a statement written beside that code would. Anything else may
+    // leave a name as it found it.
+    let settles = !alternative && a_suite_certainly_runs(statement);
     for suite in suites {
         let mut inner = scope.in_suite(alternative);
         index_scope_method_bases(suite, importer, known, bindings, definitions, &mut inner);
-        if alternative {
-            note_contested_aliases(scope, &inner);
-        }
+        carry_suite_aliases(scope, &inner, settles);
     }
 }
 
-/// Note the names a suite that may not run binds to something else.
+/// Whether a statement is certain to run one of the suites it holds.
 ///
-/// Only one of a statement's alternative suites runs and the file does not say
-/// which, so a name one of them rebinds stands for no one class afterwards: it
-/// is either what that suite bound or what stood there before. A class built
-/// on such a name has an ancestry for each candidate, and resolving its
-/// inherited calls against any of them strips the defaults behind the others.
-fn note_contested_aliases(scope: &mut BaseScope<'_>, suite: &BaseScope<'_>) {
+/// A `with` body runs. An `if` chain runs one of its suites only when a test
+/// the tool can read is true, or an `else` catches what the tests do not; an
+/// `if` without either may bind nothing at all. A loop body may never be
+/// entered, a `try` may leave part-way through, and a `match` without a
+/// wildcard may match nothing, so none of those settles a name either.
+fn a_suite_certainly_runs(statement: &Stmt) -> bool {
+    let Stmt::If(branch) = statement else {
+        return matches!(statement, Stmt::With(_));
+    };
+    std::iter::once(Some(branch.test.as_ref()))
+        .chain(
+            branch
+                .elif_else_clauses
+                .iter()
+                .map(|clause| clause.test.as_ref()),
+        )
+        .any(|test| {
+            test.is_none_or(|test| {
+                matches!(
+                    Truthiness::from_expr(test, |_| false),
+                    Truthiness::True | Truthiness::Truthy
+                )
+            })
+        })
+}
+
+/// Carry what a suite bound out into the scope around it.
+///
+/// A suite the statement is certain to enter leaves its names standing for the
+/// code after it. Any other may not run, so a name it binds stands for either
+/// what it bound or what was there before: a class built on such a name has an
+/// ancestry for each candidate, and resolving its inherited calls against any
+/// one of them strips the defaults behind the others. A contest the suite
+/// itself found travels out whichever kind of suite it is, since a wrapper
+/// that is certain to run settles nothing the branches inside it left open.
+fn carry_suite_aliases(scope: &mut BaseScope<'_>, suite: &BaseScope<'_>, settles: bool) {
     for (spelling, identity) in &suite.aliases {
-        if scope.aliases.get(spelling) != Some(identity) {
+        if scope.aliases.get(spelling) == Some(identity) {
+            continue;
+        }
+        if settles {
+            scope.contested.remove(spelling);
+            scope.aliases.insert(spelling.clone(), identity.clone());
+        } else {
             scope.contested.insert(spelling.clone());
         }
     }
@@ -8538,13 +8578,18 @@ impl Rewriter<'_> {
         self.class_ancestry_is_uncertain(&attribute.value)
     }
 
-    /// Whether the call builds such a class. `Child()` names the class rather
-    /// than the `__init__` it inherits, so there is no single constructor to
-    /// give it and the class is left without one. That leaves the call bare of
-    /// the argument the removed default stood in for, which is why the
-    /// deletion has to be held back.
+    /// Whether the call builds such a class. `Child()` and `api.Child()` name
+    /// the class rather than the `__init__` it inherits, so there is no single
+    /// constructor to give them and the class is left without one. That leaves
+    /// the call bare of the argument the removed default stood in for, which is
+    /// why the deletion has to be held back.
+    ///
+    /// A construction through a module is spelled exactly as a method call is,
+    /// so what tells them apart is whether the callee itself names a class:
+    /// `api.Child` does, and `receiver.method` does not.
     fn constructs_uncertain_ancestry(&self, expression: &Expr) -> bool {
-        matches!(expression, Expr::Name(_)) && self.class_ancestry_is_uncertain(expression)
+        matches!(expression, Expr::Name(_) | Expr::Attribute(_))
+            && self.class_ancestry_is_uncertain(expression)
     }
 
     fn class_ancestry_is_uncertain(&self, receiver: &Expr) -> bool {
@@ -18085,6 +18130,30 @@ def b(x=1): pass  # type: ignore  # noqa
         Ok(())
     }
 
+    #[test]
+    fn suites_that_disagree_on_a_class_report_a_qualified_construction() -> Result<(), String> {
+        // `api.Child()` is spelled exactly as a method call, but the callee
+        // names a class of the module rather than a method of a receiver. It
+        // resolves and is rewritten when the ancestry is settled, so it has to
+        // be held back when it is not.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        let api_source = "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n";
+        let user_source = "import api\n\nprint(api.Child().value)\n";
+        std::fs::write(&api, api_source).map_err(|error| error.to_string())?;
+        std::fs::write(&user, user_source).map_err(|error| error.to_string())?;
+        let reasons: Vec<String> = fix_all(&[api, user])?
+            .into_iter()
+            .map(|skip| skip.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            ["this call cannot be tied to the definition that was fixed"]
+        );
+        Ok(())
+    }
+
     fn fixed_keeping_unreachable_defaults(source: &str) -> Result<String, String> {
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let path = directory.path().join("example.py");
@@ -18240,6 +18309,30 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn branches_that_disagree_on_a_base_leave_its_inherited_calls_alone() -> Result<(), String> {
+        // The bases are settled at module level and only the subclass is
+        // written twice, so the disagreement is over `Child` alone. Which
+        // `target` it inherits depends on a test the tool cannot read, so the
+        // calls that would have named it are reported rather than rewritten.
+        // That the defaults behind them survive the fix is decided further on,
+        // where `retained` is honoured, so it is covered end to end by
+        // `branches_that_disagree_on_a_base_keep_the_inherited_default` in
+        // `tests/cli.rs` rather than here.
+        let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif os.environ.get('PICK'):\n    class Child(First):\n        def run(self): return self.target()\nelse:\n    class Child(Second):\n        def run(self): return self.target()\n\nChild().run()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("self.target(value="), "{updated}");
+        assert_eq!(
+            skipped_reasons(source)?,
+            [
+                "this call cannot be tied to the definition that was fixed",
+                "this call cannot be tied to the definition that was fixed",
+                "this call cannot be tied to the definition that was fixed"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_later_unguarded_class_definition_settles_a_contested_ancestry() -> Result<(), String> {
         // The definition after the suites is the one standing when the module
         // is done, whichever suite ran, so its bases are the class's and the
@@ -18250,6 +18343,41 @@ def b(x=1): pass  # type: ignore  # noqa
             source
                 .replace("def target(self, value=1)", "def target(self, value)")
                 .replace("def target(self, value=2)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_subscripted_settled_alias_resolves_its_inherited_call() -> Result<(), String> {
+        // The parameter on the base changes nothing about which class it
+        // names, so a settled alias still resolves through it. That the
+        // contested spelling of the same shape keeps its defaults is decided
+        // where `retained` is honoured, so it is covered end to end by
+        // `a_subscripted_contested_base_keeps_the_inherited_default` in
+        // `tests/cli.rs` rather than here.
+        let source = "from typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n\nclass First(Generic[T]):\n    def target(self, value=1): return value\n\nAlias = First\n\nclass Child(Alias[int]):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_suite_that_certainly_runs_settles_the_name_it_binds() -> Result<(), String> {
+        // The body of `if True:` runs, so `Alias` names `First` afterwards
+        // however it was bound above. Reading the earlier binding instead
+        // rewrote the call with `Second`'s parameter, which `First` does not
+        // take.
+        let source = "class First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, other=2): return other\n\nAlias = Second\nif True:\n    Alias = First\n\nclass Child(Alias):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("def target(self, other=2)", "def target(self, other)")
                 .replace("self.target()", "self.target(value=1)")
         );
         Ok(())

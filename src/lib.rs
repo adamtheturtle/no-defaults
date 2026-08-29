@@ -5544,6 +5544,15 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // how this class's bases were resolved.
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
+                // The statement binds the name in the scope around it whether
+                // or not the class it writes has a shape worth recording. A
+                // plain class stands between the name and an enclosing
+                // dataclass of the same spelling exactly as a parameter or a
+                // rebinding does, and reading past it would hand a subclass
+                // fields its base has never had.
+                if let Some(bindings) = self.lexical_bindings.last_mut() {
+                    bindings.insert(class.name.to_string());
+                }
                 self.metaclass_classes = outer_metaclass_classes;
                 self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
@@ -18666,5 +18675,39 @@ def b(x=1): pass  # type: ignore  # noqa
         let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
         assert!(updated.contains("self.target(value=1)"), "{updated}");
         Ok(())
+    }
+
+    #[test]
+    fn a_plain_class_hides_the_enclosing_dataclass_of_the_same_name() -> Result<(), String> {
+        // The `Base` the alias reads is the class `outer` writes, which has no
+        // fields at all. Walking past it to the module dataclass would name a
+        // keyword the class `Child` really inherits from has no field for.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    module: int = 1\n\ndef outer():\n    class Base:\n        pass\n\n    Alias = Base\n\n    @dataclass\n    class Child(Alias):\n        child: int = 3\n\n    return Child()\n\nouter()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("Child(module="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_safe_redefinition_clears_imported_metaclass_uncertainty() {
+        // The second `Base` is the one standing when `Child` is written, and
+        // it inherits from nothing this file cannot see, so the uncertainty
+        // the first one carried must not outlive it.
+        let source = "from dataclasses import dataclass\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base:\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+        assert!(checked
+            .signatures
+            .iter()
+            .any(|signature| signature.positional == ["value"]));
     }
 }

@@ -6198,6 +6198,72 @@ fn a_method_named_near_get_code_is_still_fixed() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
+fn an_inspect_loader_get_source_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `InspectLoader.get_code` reads a module's source by calling
+    // `self.get_source(fullname)`, and `linecache` binds the same one-argument
+    // call when it renders a traceback for such a module, so `extra` only ever
+    // arrives as its default. Both calls are made by the interpreter rather
+    // than by any line in the file, so dropping the default leaves the next
+    // import raising `TypeError: Loader.get_source() missing 1 required
+    // positional argument: 'extra'` with no written call site to carry the
+    // value.
+    let source =
+        "class Loader:\n    def get_source(self, fullname, extra=1):\n        return 'answer = 1'\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_loader_helper_beside_get_source_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // sibling with the same signature shape is rewritten as usual, carrying
+    // its own default to the call.
+    let source = "class Loader:\n    def get_source(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Loader:\n    def get_source(self, fullname, extra=1):\n        return self.helper(fullname, value=2)\n\n    def helper(self, fullname, value):\n        return (fullname, value)\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_method_named_near_get_source_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The loader is consulted for the hook under its exact name, so a near
+    // miss is an ordinary method whose default the fixer removes.
+    let source = "class Loader:\n    def get_sources(self, fullname, extra=1):\n        return 'answer = 1'\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Loader:\n    def get_sources(self, fullname, extra):\n        return 'answer = 1'\n",
+    );
+    // Nothing is left unfixed once the near miss is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn a_closed_stderr_pipe_is_a_normal_termination() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");

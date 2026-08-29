@@ -155,6 +155,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A closed stderr pipe ends the run normally, as a closed stdout pipe already did. The warnings `--fix` writes, and the summary the machine-readable formats put on stderr, outlast a reader such as `head` that stops early, and the failed write left the run exiting 101 from a panic instead of 0. A write that fails for any other reason still exits 2.
 - A base spelled with a name the same suite writes a class of further down reads the class a scope around it bound, rather than that later class. A class body is entered before its own names exist, so `class Child(Helper)` written above a nested `Helper` inherits the module-level one exactly as CPython binds it; reading the nested class instead wrote its defaults into the subclass's inherited calls and silently changed what the program returned. A scope written inside a class body reads none of that body's names either, since neither a method nor a class written in one does, so a base spelled in there reaches past the class holding it. A function that writes a class under a spelling binds it for the whole function, so a scope nested in one reads that binding rather than an outer namesake, and where the class statement stands below the nested scope the spelling is left unresolved rather than answered with the outer class.
 
+### Documentation
+
+- `README.md` is an overview again: what the tool is, how to install and run it, what `--fix` does and cannot do, the configuration keys, and pre-commit. The behaviour it used to spell out in full moved to `docs/reference.md`, which it links to, with nothing dropped.
+- The `.pyi` note said only `= ...` was reported without being fixed. Every default in a stub has been reported and retained since that change, so the note now says so.
+
 ## 2.1.0 - 2026-08-07
 
 Anyone on 2.0.0 who uses `--fix` on a project containing `.pyi` stubs should upgrade: see the first entry under `### Fixed`.

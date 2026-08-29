@@ -22105,6 +22105,18 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(generated)?,
             "from dataclasses import dataclass\n\n\nclass Base:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n\n\n@dataclass\nclass Sub(Base):\n    z: int\n\n\nassert Sub(5).z == 5\n"
         );
+        // A class written in another class or in a function body is indexed
+        // under a qualified identity, which the checker has to name it by for
+        // the guard to reach it there too.
+        for (header, call) in [
+            ("class Holder:\n    @dataclass\n    class Sub(Base):\n        z: int\n\n\nassert Holder.Sub(5).z == 5\n", "Holder.Sub(5)"),
+            ("def make():\n    @dataclass\n    class Sub(Base):\n        z: int\n\n    return Sub(5)\n\n\nassert make().z == 5\n", "Sub(5)"),
+        ] {
+            let nested = format!("from dataclasses import dataclass\n\n\nclass Base:\n    def __init__(self, x, y=1):\n        self.x = x\n        self.y = y\n\n\n{header}");
+            let updated = fixed(&nested)?;
+            assert!(updated.contains("def __init__(self, x, y):"), "{updated}");
+            assert!(updated.contains(call), "{updated}");
+        }
         // A decorator that writes no constructor leaves the inherited one
         // standing, so the call there is still rewritten.
         let inherited = "from dataclasses import dataclass\n\n\nclass Base:\n    def __init__(self, x, y=1):\n        self.x = x\n        self.y = y\n\n\n@dataclass(init=False)\nclass Sub(Base):\n    pass\n\n\nassert Sub(5).y == 1\n";

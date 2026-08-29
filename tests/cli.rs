@@ -6330,3 +6330,91 @@ fn a_method_named_near_sqlite_conform_is_still_fixed() -> Result<(), Box<dyn std
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn an_import_loader_is_package_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Building a specification asks the loader whether the name names a
+    // package, and `importlib._bootstrap.spec_from_loader` makes that call
+    // with the module name alone, so `extra` only ever arrives as its default.
+    // That call sits inside the import machinery rather than in any file the
+    // fixer can see, so dropping the default leaves the next import raising
+    // `TypeError: Loader.is_package() missing 1 required positional argument`
+    // with no written call site to carry the value.
+    let source =
+        "class Loader:\n    def is_package(self, fullname, extra=1):\n        return False\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_loader_helper_beside_is_package_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the shape of the parameter
+    // list, so a sibling declared with the very same signature is stripped and
+    // its call site given the default that used to reach it.
+    let source = "class Loader:\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, extra=1):\n        return False\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Loader:\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname, extra=1)\n\n    def helper(self, fullname, extra):\n        return False\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_method_named_near_is_package_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The import machinery reaches for the hook under its exact name, so a
+    // near miss is an ordinary method whose default the fixer removes.
+    let source =
+        "class Loader:\n    def is_packages(self, fullname, extra=1):\n        return False\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Loader:\n    def is_packages(self, fullname, extra):\n        return False\n",
+    );
+    // Nothing is left unfixed once the near miss is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_module_level_is_package_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The catalogue is consulted for a class attribute, so a plain function of
+    // that name at module level is nothing the import machinery reaches for
+    // and its default is the fixer's.
+    let source = "def is_package(fullname, extra=1):\n    return False\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "def is_package(fullname, extra):\n    return False\n",
+    );
+    // Nothing is left unfixed once the module-level namesake is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

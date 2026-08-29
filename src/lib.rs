@@ -4053,8 +4053,13 @@ impl Checker<'_> {
     fn class_constructs_safely(&self, class: &ast::StmtClassDef) -> bool {
         class_constructs_safely(class, &self.aliases, &self.metaclass_classes)
             && !class_bases(class).any(|base| {
-                base_root_name(base).is_some_and(|name| self.aliases.import_bindings.contains(name))
-                    && !self.field_bases.matches(base, &self.aliases)
+                // A parameter shadowing the import hides the base further
+                // rather than revealing it, so the name it took over counts
+                // too.
+                base_root_name(base).is_some_and(|name| {
+                    self.aliases.import_bindings.contains(name)
+                        || self.aliases.invalidated_import_bindings.contains(name)
+                }) && !self.field_bases.matches(base, &self.aliases)
                     && !carries_no_fields(
                         base,
                         &self.aliases,
@@ -17280,9 +17285,11 @@ def b(x=1): pass  # type: ignore  # noqa
         // end in a positional default. Removing the child's would leave a
         // field without one behind it, which `dataclasses` rejects outright,
         // and no call could be rewritten to make up for it because the
-        // inherited fields are unknown. A keyword-only field is exempt as it
-        // is without the shadow: `dataclasses` moves it past the `*`, where
-        // nothing the base contributes constrains its order.
+        // inherited fields are unknown. Field order spares a keyword-only
+        // field, which `dataclasses` moves past the `*`, but a metaclass the
+        // base brings does not: one that builds the class without arguments
+        // reaches `__init__` with none to give, and the default is what stood
+        // in for them. That hazard is the same behind the shadow as before it.
         let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\n\ndef build(Parent):\n    @dataclass\n    class Child(Parent):\n        positional: int = 2\n        keyword: int = field(default=3, kw_only=True)\n\n    return Child()\n";
         let checked = check_source(
             Path::new("fixture.py"),
@@ -17294,8 +17301,8 @@ def b(x=1): pass  # type: ignore  # noqa
             true,
         );
         assert_eq!(checked.diagnostics.len(), 2);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.diagnostics[1].fix.is_some());
+        assert!(checked.diagnostics.iter().all(|item| item.fix.is_none()));
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]

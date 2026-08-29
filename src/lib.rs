@@ -18821,4 +18821,30 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
     }
+
+    #[test]
+    fn qualified_pydantic_private_attributes_are_not_model_fields() {
+        // `pydantic` may be reached under its own name or an alias, and either
+        // spelling is the same `PrivateAttr` call: per-instance state rather
+        // than a field the constructor takes. A model base answers that on its
+        // own, since an underscore name is no field there whatever it holds,
+        // so the class here is a plain dataclass and the call is all there is
+        // to read.
+        for source in [
+            "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pydantic.PrivateAttr(default=1)\n",
+            "import pydantic as pd\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pd.PrivateAttr(default=1)\n",
+        ] {
+            assert!(messages(source, false).is_empty(), "{source}");
+        }
+        // An ordinary default in the same class is still reported, so the
+        // silence above is the call being read rather than the shape being
+        // passed over.
+        assert_eq!(
+            messages(
+                "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = 1\n",
+                false,
+            ),
+            ["dataclass field `_value` has a default"]
+        );
+    }
 }

@@ -1618,13 +1618,17 @@ fn collect_local_class_offsets(
     }
 }
 
-/// Whether a class written in this file above `defined_at` holds the spelling
-/// a base expression's prefix uses, so the prefix is that class rather than
-/// whatever a module of the same dotted name would be.
+/// Whether a class written in this file above `defined_at`, or a name this
+/// scope has already bound to a class, holds the spelling a base expression's
+/// prefix uses, so the prefix is that class rather than whatever a module of
+/// the same dotted name would be. An assignment carries a class over to a name
+/// just as a class statement does, and the aliases collected so far are only
+/// those bound above, so no offset is needed to keep the order.
 fn prefix_names_a_local_class(
     prefix: &Expr,
     local_classes: &BTreeMap<String, (String, TextSize)>,
     defined_at: TextSize,
+    aliases: &BTreeMap<String, (PathBuf, String)>,
 ) -> bool {
     let mut expression = prefix;
     loop {
@@ -1632,6 +1636,7 @@ fn prefix_names_a_local_class(
             local_classes
                 .get(&spelling)
                 .is_some_and(|(_, offset)| *offset < defined_at)
+                || aliases.contains_key(&spelling)
         }) {
             return true;
         }
@@ -1686,10 +1691,11 @@ fn method_base_identity(
             // prefix would otherwise be given, since the initializer's own
             // namesake answers before the module lookup below is reached.
             //
-            // A class written here still holds the spelling first: the checks
-            // that follow settle that, so the shortcut only fires where no
-            // local class of that name is written above.
-            if !prefix_names_a_local_class(&attribute.value, local_classes, defined_at) {
+            // A class this scope has already put behind the spelling still
+            // holds it first, whether it was written out as a class statement
+            // or assigned to the name: the checks that follow settle that, so
+            // the shortcut only fires where nothing above claimed the name.
+            if !prefix_names_a_local_class(&attribute.value, local_classes, defined_at, aliases) {
                 if let Some(module) = dotted_name(&attribute.value) {
                     if let Some(Binding::Module(file)) = bindings.get(&module) {
                         return Some((file.clone(), attribute.attr.to_string()));
@@ -18986,5 +18992,34 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
+    fn an_aliased_class_holds_a_dotted_base_over_a_submodule() -> Result<(), String> {
+        // An assignment above the subclass puts a class behind the package's
+        // name, so the dotted base reaches that class's nested one rather than
+        // the submodule the import bound. Taking the submodule regardless
+        // writes the wrong module's default into the inherited call.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import package.module\n\nclass Local:\n    class module:\n        class Base:\n            def target(self, value=7): return value\n\npackage = Local\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 7\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=7)"), "{updated}");
+        Ok(())
     }
 }

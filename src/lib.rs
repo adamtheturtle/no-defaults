@@ -5113,6 +5113,7 @@ struct Aliases {
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
     properties: BTreeSet<String>,
+    supers: BTreeSet<String>,
     builtins_modules: BTreeSet<String>,
     class_vars: BTreeSet<String>,
     typing_modules: BTreeSet<String>,
@@ -5141,6 +5142,7 @@ impl Aliases {
         self.pydantic_modules.remove(name);
         self.staticmethods.remove(name);
         self.classmethods.remove(name);
+        self.supers.remove(name);
         self.builtins_modules.remove(name);
         self.class_vars.remove(name);
         self.typing_modules.remove(name);
@@ -5196,6 +5198,9 @@ impl Aliases {
                 }
                 "property" => {
                     self.properties.insert(local);
+                }
+                "super" => {
+                    self.supers.insert(local);
                 }
                 "object" => {
                     self.structural_bases.insert(local);
@@ -7935,10 +7940,7 @@ impl Rewriter<'_> {
                 _ => false,
             };
             if call.arguments.keywords.is_empty()
-                && matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "super")
-                && self.nested_binding("super").is_none()
-                && self.binding("super").is_none()
-                && !self.module_bindings.contains("super")
+                && self.is_builtin_super_call(call)
                 && (zero_argument_super || explicit_super)
             {
                 return Some((
@@ -8033,6 +8035,21 @@ impl Rewriter<'_> {
             false,
             false,
         ))
+    }
+
+    fn is_builtin_super_call(&self, call: &ast::ExprCall) -> bool {
+        match call.func.as_ref() {
+            Expr::Name(name) if name.id.as_str() == "super" => {
+                self.nested_binding("super").is_none()
+                    && self.binding("super").is_none()
+                    && !self.module_bindings.contains("super")
+            }
+            Expr::Name(name) if self.aliases.supers.contains(name.id.as_str()) => {
+                self.nested_binding(name.id.as_str()).is_none()
+                    && !self.binding_is_replaced(name.id.as_str())
+            }
+            _ => false,
+        }
     }
 
     fn self_class_receiver(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
@@ -8995,10 +9012,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                                         || alias.name.to_string(),
                                         ToString::to_string,
                                     );
-                                    let resolved = self
-                                        .bindings
-                                        .first()
-                                        .is_some_and(|bindings| bindings.contains_key(&name));
+                                    let resolved =
+                                        self.bindings
+                                            .first()
+                                            .is_some_and(|bindings| bindings.contains_key(&name))
+                                            || (import.module.as_ref().is_some_and(|module| {
+                                                module.as_str() == "builtins"
+                                            }) && alias.name.as_str() == "super");
                                     (name, resolved)
                                 })
                                 .collect();
@@ -13278,6 +13298,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def target(self, value): pass\n\n    def run(self):\n        return super().target(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn imported_super_aliases_support_zero_argument_lookup() -> Result<(), String> {
+        let source = "from builtins import super as parent\n\nclass Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return parent().target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "from builtins import super as parent\n\nclass Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return parent().target(value=1)\n\nassert Child().run() == 1\n"
         );
         Ok(())
     }

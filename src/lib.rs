@@ -4819,10 +4819,22 @@ impl Checker<'_> {
         }
     }
 
+    /// Forget what a `for` target, a `with` target or a walrus rebinds.
+    ///
+    /// Each of these is reached at the depth of the statement it belongs to
+    /// rather than inside it — a clause's test runs whenever the clause is
+    /// reached, and a loop's target is read before the body is entered — so
+    /// the depth here answers the right question. One written in a suite that
+    /// may not run takes the name's import records off nothing: where the
+    /// suite is skipped the import is still what the name stands for, exactly
+    /// as it is behind a class statement or an assignment written there.
     fn invalidate_target_aliases(&mut self, target: &Expr) {
         let mut bound = BoundNames::default();
         bound.bind(target);
-        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
+        self.rebind_names(
+            bound.names.iter().map(String::as_str),
+            self.conditional_depth == 0,
+        );
     }
 
     /// Forget what a walrus in a `def` or `class` header rebinds.
@@ -23444,6 +23456,62 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(control)?,
             "class IntEnum:\n    pass\n\nclass E(IntEnum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback): return cls.A\n\nE._missing_(1, fallback='x')\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_an_untaken_branch_leaves_an_import_standing() -> Result<(), String> {
+        // A walrus binds the name where it is written, so one written in a
+        // suite that may not run is the same shape as an assignment there.
+        // #1115 covered the assignment and left this reached through
+        // `invalidate_target_aliases`, which still took the import off the
+        // name and stripped a default the enumeration needs.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    holder = (Enum := object)\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_with_target_in_an_untaken_branch_leaves_an_import_standing() -> Result<(), String> {
+        // The `with` target is bound when its statement runs, and its
+        // statement is in the same suite, so it stands or falls with it.
+        let source = "import contextlib\nimport os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    with contextlib.nullcontext(object) as Enum:\n        pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_target_in_an_untaken_branch_leaves_an_import_standing() -> Result<(), String> {
+        // So does the loop target, which is read at the depth of the `for`
+        // statement rather than inside its body.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    for Enum in [object]:\n        pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_a_clause_test_still_takes_an_import_back() -> Result<(), String> {
+        // The counterpart guard. A clause's test runs whenever the clause is
+        // reached, and the traversal reads it before entering the suite, so
+        // the depth there is the depth of the `if` itself and the walrus
+        // really does take the name over.
+        let source = "from enum import Enum\n\nif (Enum := object):\n    pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_target_written_where_it_runs_still_takes_an_import_back() -> Result<(), String> {
+        // And the loop counterpart: nothing guards this loop, so `Enum` is
+        // whatever the iterable last yielded by the time `C` is written.
+        let source = "from enum import Enum\n\nfor Enum in [object]:\n    pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
         );
         Ok(())
     }

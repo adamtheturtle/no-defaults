@@ -15946,4 +15946,52 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         Ok(())
     }
+
+    /// Fix `source` the way `--fix` does, without insisting that nothing is
+    /// left to report afterwards.
+    ///
+    /// A constructor alias keeps the defaults its implementation declares, so
+    /// the diagnostic for them outlives the fix that `fixed` requires to be
+    /// cleared.
+    fn fixed_with_retained_defaults(source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.py");
+        std::fs::write(&path, source).map_err(|error| error.to_string())?;
+        let files = [path.clone()];
+        let checked = check_file(
+            &path,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        let mut edits = call_site_edits(&files, checked.signatures)?.edits;
+        for diagnostic in &checked.diagnostics {
+            if let Some(range) = diagnostic.fix {
+                edits
+                    .entry(diagnostic.path.clone())
+                    .or_default()
+                    .push(Edit::deletion(range));
+            }
+        }
+        let mut updated = 0;
+        let mut unfixed = BTreeSet::new();
+        write_fixes_atomically(fixed_sources(edits, &mut updated, &mut unfixed)?)?;
+        std::fs::read_to_string(&path).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_retained_alias_default_leaves_the_constructor_call_alone() -> Result<(), String> {
+        // The implementation behind `__init__ = setup` keeps its default,
+        // which records no signature for the call site to be rewritten
+        // against. The base's `__init__` must not stand in for the one that
+        // is missing: `setup` never takes `parent`.
+        let source = "class Base:\n    def __init__(self, parent=1):\n        self.value = parent\n\nclass Child(Base):\n    def setup(self, own=2):\n        self.value = own\n    __init__ = setup\n\nassert Child().value == 2\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("def __init__(self, parent=1)", "def __init__(self, parent)")
+        );
+        Ok(())
+    }
 }

@@ -4072,21 +4072,27 @@ impl Checker<'_> {
 
     fn class_constructs_safely(&self, class: &ast::StmtClassDef) -> bool {
         class_constructs_safely(class, &self.aliases, &self.metaclass_classes)
-            && !class_bases(class).any(|base| {
-                // A parameter shadowing the import hides the base further
-                // rather than revealing it, so the name it took over counts
-                // too.
-                base_root_name(base).is_some_and(|name| {
-                    self.aliases.import_bindings.contains(name)
-                        || self.aliases.invalidated_import_bindings.contains(name)
-                }) && !self.field_bases.matches(base, &self.aliases)
-                    && !carries_no_fields(
-                        base,
-                        &self.aliases,
-                        &self.local_classes,
-                        &self.module_bindings,
-                    )
-            })
+            && !self.inherits_unseen_import(class)
+    }
+
+    /// Whether a base of this class is an import whose fields, and whatever
+    /// metaclass builds it, this file cannot see.
+    ///
+    /// A parameter shadowing the import hides the base further rather than
+    /// revealing it, so the name it took over counts too.
+    fn inherits_unseen_import(&self, class: &ast::StmtClassDef) -> bool {
+        class_bases(class).any(|base| {
+            base_root_name(base).is_some_and(|name| {
+                self.aliases.import_bindings.contains(name)
+                    || self.aliases.invalidated_import_bindings.contains(name)
+            }) && !self.field_bases.matches(base, &self.aliases)
+                && !carries_no_fields(
+                    base,
+                    &self.aliases,
+                    &self.local_classes,
+                    &self.module_bindings,
+                )
+        })
     }
 
     fn generates_init(&self, class: &ast::StmtClassDef) -> bool {
@@ -4094,11 +4100,16 @@ impl Checker<'_> {
     }
 
     /// Note that a metaclass builds this class, so a later subclass of it is
-    /// built by that metaclass too. A later redefinition without a metaclass
-    /// clears the name so a sibling that inherits the new class is not treated
-    /// as metaclass-built.
+    /// built by that metaclass too. An unseen imported base counts as one: the
+    /// metaclass it may carry reaches every class beneath it alike, and a
+    /// subclass written here sees no more of it than this class does. A later
+    /// redefinition without either clears the name so a sibling that inherits
+    /// the new class is not treated as metaclass-built.
     fn record_metaclass_construction(&mut self, class: &ast::StmtClassDef) {
-        if declares_metaclass(class) || inherits_metaclass(class, &self.metaclass_classes) {
+        if declares_metaclass(class)
+            || inherits_metaclass(class, &self.metaclass_classes)
+            || self.inherits_unseen_import(class)
+        {
             self.metaclass_classes.insert(class.name.to_string());
         } else {
             self.metaclass_classes.remove(class.name.as_str());
@@ -17691,5 +17702,32 @@ def b(x=1): pass  # type: ignore  # noqa
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn an_unseen_imported_ancestor_protects_a_local_subclass() {
+        // The metaclass an imported base may carry builds every class beneath
+        // it, not only the one that names it, so a local class standing
+        // between the two hides nothing. Removing the subclass's default would
+        // leave that metaclass reaching `__init__` with no argument to stand
+        // in for it, and no call could be rewritten to make up for it because
+        // the inherited fields are unknown.
+        for source in [
+            "from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    pass\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n",
+            "from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    pass\n\nclass Inner(Middle):\n    pass\n\n@dataclass\nclass Child(Inner):\n    keyword: int = field(default=3, kw_only=True)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
     }
 }

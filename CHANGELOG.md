@@ -61,6 +61,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A construction of a class that inherits its constructor is reported, and the inherited default retained, when the pass cannot say which class the name holds. Previously only the base's default went and the call was left bare, with nothing said about it.
 - Class-body aliases created with `staticmethod()` and `classmethod()` carry the wrapper's receiver convention; `property()` aliases retain defaults consumed by descriptor access.
 - Class-body control-flow suites are scanned conservatively for method aliases, while nested definition scopes remain excluded.
 - Annotated assignments, statically paired destructuring, and named expressions in class bodies record method aliases for call rewriting.

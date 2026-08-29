@@ -5613,6 +5613,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "load_module"
             | "get_code"
             | "get_source"
+            | "__conform__"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -20558,6 +20559,69 @@ def b(x=1): pass  # type: ignore  # noqa
         // Only a loader's attribute is consulted for the hook, so a plain
         // function of that name at module level carries no such obligation.
         let source = "def get_source(fullname, extra=1):\n    return 'answer = 1'\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn sqlite_conform_defaults_are_retained() {
+        // Binding a parameter hands the object to `sqlite3`'s adapter, which
+        // calls `__conform__(protocol)` from C with the protocol alone, so a
+        // parameter beside it only ever arrives as its default. The extension
+        // makes that call, so dropping the default leaves the next bind
+        // raising `TypeError: Value.__conform__() missing 1 required
+        // positional argument` inside `_sqlite3` with nothing for the fixer to
+        // update.
+        let source =
+            "class Value:\n    def __conform__(self, protocol, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_method_beside_conform_stays_fixable() {
+        // Retention is keyed to the hook name, so a sibling sharing the class
+        // and the signature shape keeps its ordinary treatment.
+        let source = "class Value:\n    def __conform__(self, protocol, extra=1):\n        return self.helper()\n    def helper(self, value=2):\n        return value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_conform_stays_fixable() {
+        // The adapter looks the hook up under its exact name, so a near miss
+        // is an ordinary method whose default the fixer removes.
+        let source =
+            "class Value:\n    def conform(self, protocol, extra=1):\n        return extra\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

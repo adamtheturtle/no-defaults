@@ -1111,42 +1111,15 @@ fn index_method_bases(
                 // here can still hold a name of its own, so the walk goes on
                 // either way.
                 if lexical_classes.holds(&identity) {
-                    let bases = class
-                        .arguments
-                        .iter()
-                        .flat_map(|arguments| arguments.args.iter())
-                        .filter_map(|base| {
-                            method_base_identity(
-                                base,
-                                importer,
-                                bindings,
-                                &local_classes,
-                                defined_at,
-                                &aliases,
-                                &definitions.methods,
-                            )
-                        })
-                        .collect();
-                    let methods = definitions
-                        .methods
-                        .entry((importer.to_path_buf(), identity.clone()))
-                        .or_default();
-                    // Every name the body still holds at the end of it is an
-                    // attribute of the class, whether a `def` wrote it or an
-                    // assignment such as `__init__ = setup` did. Recording the
-                    // assigned ones too keeps them shadowing what the bases hold:
-                    // a subclass that binds `__init__` has a constructor of its
-                    // own, and rewriting its calls against an ancestor's
-                    // `__init__` would pass parameters the binding does not take.
-                    // A name the body never leaves behind is a shadow that does
-                    // not exist, and recording it would stop the lookup that
-                    // should have walked on to a base.
-                    for name in BoundNames::of_class_attributes(&class.body) {
-                        methods.entry(name).or_insert(None);
-                    }
-                    definitions
-                        .bases
-                        .insert((importer.to_path_buf(), identity.clone()), bases);
+                    record_class_bases_and_attributes(
+                        class,
+                        &identity,
+                        importer,
+                        bindings,
+                        &local_classes,
+                        &aliases,
+                        definitions,
+                    );
                 }
                 let mut inner = namespace.lexical_scope.to_vec();
                 inner.push(class.name.to_string());
@@ -1206,8 +1179,122 @@ fn index_method_bases(
                     }
                 }
             }
-            _ => {}
+            _ => index_control_flow_method_bases(
+                statement,
+                importer,
+                known,
+                bindings,
+                namespace,
+                lexical_classes,
+                definitions,
+            ),
         }
+    }
+}
+
+/// Record one class's bases and the attribute names its body leaves behind.
+fn record_class_bases_and_attributes(
+    class: &ast::StmtClassDef,
+    identity: &str,
+    importer: &Path,
+    bindings: &BTreeMap<String, Binding>,
+    local_classes: &BTreeMap<String, (String, TextSize)>,
+    aliases: &BTreeMap<String, (PathBuf, String)>,
+    definitions: &mut Definitions,
+) {
+    let bases = class
+        .arguments
+        .iter()
+        .flat_map(|arguments| arguments.args.iter())
+        .filter_map(|base| {
+            method_base_identity(
+                base,
+                importer,
+                bindings,
+                local_classes,
+                class.start(),
+                aliases,
+                &definitions.methods,
+            )
+        })
+        .collect();
+    let methods = definitions
+        .methods
+        .entry((importer.to_path_buf(), identity.to_owned()))
+        .or_default();
+    // Every name the body still holds at the end of it is an attribute of the
+    // class, whether a `def` wrote it or an assignment such as
+    // `__init__ = setup` did. Recording the assigned ones too keeps them
+    // shadowing what the bases hold: a subclass that binds `__init__` has a
+    // constructor of its own, and rewriting its calls against an ancestor's
+    // `__init__` would pass parameters the binding does not take. A name the
+    // body never leaves behind is a shadow that does not exist, and recording
+    // it would stop the lookup that should have walked on to a base.
+    for name in BoundNames::of_class_attributes(&class.body) {
+        methods.entry(name).or_insert(None);
+    }
+    definitions
+        .bases
+        .insert((importer.to_path_buf(), identity.to_owned()), bases);
+}
+
+/// Record the bases of every class a control-flow suite holds.
+///
+/// A suite opens no namespace of its own, so a class written in one is named
+/// exactly as a class beside it is, and a subclass written after it in the
+/// same suite inherits from it. Leaving these bodies unwalked would record no
+/// bases for either, and an inherited call would keep its arguments while the
+/// default behind it was stripped.
+fn index_control_flow_method_bases(
+    statement: &Stmt,
+    importer: &Path,
+    known: &BTreeSet<&Path>,
+    bindings: &BTreeMap<String, Binding>,
+    namespace: ClassNamespace<'_>,
+    lexical_classes: LexicalClasses<'_>,
+    definitions: &mut Definitions,
+) {
+    for suite in control_flow_suites(statement) {
+        index_method_bases(
+            suite,
+            importer,
+            known,
+            bindings,
+            namespace,
+            lexical_classes,
+            definitions,
+        );
+    }
+}
+
+/// The statement bodies a control-flow statement holds, in the order they are
+/// written. Anything else holds none.
+fn control_flow_suites(statement: &Stmt) -> Vec<&[Stmt]> {
+    match statement {
+        Stmt::If(branch) => std::iter::once(branch.body.as_slice())
+            .chain(
+                branch
+                    .elif_else_clauses
+                    .iter()
+                    .map(|clause| clause.body.as_slice()),
+            )
+            .collect(),
+        Stmt::For(loop_) => vec![&loop_.body, &loop_.orelse],
+        Stmt::While(loop_) => vec![&loop_.body, &loop_.orelse],
+        Stmt::With(block) => vec![&block.body],
+        Stmt::Try(block) => std::iter::once(block.body.as_slice())
+            .chain(block.handlers.iter().map(|handler| {
+                let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                handler.body.as_slice()
+            }))
+            .chain([block.orelse.as_slice(), block.finalbody.as_slice()])
+            .collect(),
+        Stmt::Match(block) => block
+            .cases
+            .iter()
+            .map(|case| case.body.as_slice())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -17485,6 +17572,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             std::fs::read_to_string(case).map_err(|error| error.to_string())?,
             "from api import Helper\n\n\nclass Child(Helper):\n    def run(self): return self.target(value=9)\n\n\nclass Helper:\n    def target(self, value): return value\n\n\nassert Child().run() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_flow_classes_preserve_inherited_method_calls() -> Result<(), String> {
+        let source = "if True:\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "if True:\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
         );
         Ok(())
     }

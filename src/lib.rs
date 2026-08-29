@@ -4708,7 +4708,11 @@ impl Checker<'_> {
 
     /// Index aliases copied from a same-file class whose signature has already
     /// been collected. Unknown and forward-referenced classes stay unresolved.
-    fn record_inherited_method_aliases(&mut self) {
+    ///
+    /// `direct_class_member` says whether the class being collected is written
+    /// straight in a class body, which is what decides how the class it copies
+    /// from is named.
+    fn record_inherited_method_aliases(&mut self, direct_class_member: bool) {
         let (Some(class), Some(aliases)) = (self.classes.last(), self.method_aliases.last()) else {
             return;
         };
@@ -4723,18 +4727,26 @@ impl Checker<'_> {
                 if alias.kind == MethodAliasKind::Property {
                     continue;
                 }
-                // Signatures record the class chain alone, so qualifying the
-                // source class through `lexical_scope` would name an enclosing
-                // function too and match nothing. Resolve it as a sibling of
-                // the class being collected instead.
-                let original_class = qualified_name(
-                    self.classes
-                        .len()
-                        .checked_sub(2)
-                        .and_then(|parent| self.classes.get(parent))
-                        .map(|parent| parent.qualified.as_str()),
-                    original_class,
-                );
+                // The class an alias copies from is written beside the one
+                // being collected, so it is identified the way that one is:
+                // under the class holding both where both are written straight
+                // in a class body, and under the scopes around them where they
+                // are not. A function body is one of those scopes, and naming a
+                // class in there as though it sat beside a module-level one
+                // matches nothing, or matches a namesake written elsewhere and
+                // takes its parameters.
+                let original_class = if direct_class_member {
+                    qualified_name(
+                        self.classes
+                            .len()
+                            .checked_sub(2)
+                            .and_then(|parent| self.classes.get(parent))
+                            .map(|parent| parent.qualified.as_str()),
+                        original_class,
+                    )
+                } else {
+                    qualified_lexical_name(&self.lexical_scope, original_class)
+                };
                 let Some(signature) = self.signatures.iter().find(|signature| {
                     signature.name == *method
                         && matches!(
@@ -5060,7 +5072,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         fields,
                         removed,
                     });
-                    self.record_inherited_method_aliases();
+                    self.record_inherited_method_aliases(outer.class != ClassScope::None);
                 }
                 self.lexical_scope.push(class.name.to_string());
                 walk_stmt(self, statement);
@@ -17378,6 +17390,35 @@ def b(x=1): pass  # type: ignore  # noqa
                 "{suite}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_aliases_reach_a_class_named_in_the_scope_around_them() -> Result<(), String> {
+        // `alias = Base.target` names the class beside the one being
+        // collected, which a function body identifies by the scopes holding
+        // it. Naming it as though it sat at module level finds nothing, so the
+        // default comes off `target` with the alias call left as written, or
+        // finds a namesake of another scope and passes that one's default.
+        let local = "def outer():\n    class Base:\n        def target(self, value=1): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias()\n\n    return Child().run()\n\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(local)?,
+            "def outer():\n    class Base:\n        def target(self, value): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias(value=1)\n\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        // The module-level namesake is a different class, and taking its
+        // default would return `2` where Python returns `1`.
+        let shadowed = "class Base:\n    def target(self, value=2): return value\n\ndef outer():\n    class Base:\n        def target(self, value=1): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias()\n\n    return Child().run()\n\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(shadowed)?,
+            "class Base:\n    def target(self, value): return value\n\ndef outer():\n    class Base:\n        def target(self, value): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias(value=1)\n\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        // A method body is such a scope too, and the class it holds is told
+        // apart from one written straight in the class around it.
+        let in_method = "class Outer:\n    class Base:\n        def target(self, value=2): return value\n\n    def build(self):\n        class Base:\n            def target(self, value=1): return value\n\n        class Child(Base):\n            alias = Base.target\n\n            def run(self): return self.alias()\n\n        return Child().run()\n\nassert Outer().build() == 1\n";
+        assert_eq!(
+            fixed(in_method)?,
+            "class Outer:\n    class Base:\n        def target(self, value): return value\n\n    def build(self):\n        class Base:\n            def target(self, value): return value\n\n        class Child(Base):\n            alias = Base.target\n\n            def run(self): return self.alias(value=1)\n\n        return Child().run()\n\nassert Outer().build() == 1\n"
+        );
         Ok(())
     }
 }

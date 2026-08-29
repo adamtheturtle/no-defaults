@@ -21025,4 +21025,34 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
     }
+
+    #[test]
+    fn function_parameters_shadow_pydantic_private_attr_imports() {
+        // A parameter named `PrivateAttr` is some unknown callable, not the
+        // import, so the call it makes is an ordinary default rather than
+        // per-instance private state. The field here carries no leading
+        // underscore, which a model base would answer on its own, so the
+        // rebinding is the only reason this is reported.
+        let source = "from pydantic import BaseModel, PrivateAttr\n\ndef helper(*, default): return default\ndef outer(PrivateAttr):\n    class C(BaseModel):\n        value: int = PrivateAttr(default=1)\n    return C\n\nassert outer(helper)(value=2).value == 2\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].message.contains("field `value`"));
+        // Under the import the same call is still read as private state, in a
+        // plain dataclass so that no underscore rule can answer first. The
+        // report above is therefore the parameter binding rather than the
+        // call shape going unrecognised.
+        assert!(messages(
+            "from dataclasses import dataclass\nfrom pydantic import PrivateAttr\n\n@dataclass\nclass C:\n    _value: int = PrivateAttr(default=1)\n",
+            false,
+        )
+        .is_empty());
+    }
 }

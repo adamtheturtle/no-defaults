@@ -2804,7 +2804,7 @@ fn check_source(
         return Checked::default();
     }
     let aliases = Aliases::default();
-    let module_bindings = BoundNames::of_body(parsed.suite()).names;
+    let module_bindings = BoundNames::of_module(parsed.suite());
     let metaclass_intercepted_classes = metaclass_intercepted_classes(parsed.suite());
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
@@ -6314,7 +6314,7 @@ fn rewrite_calls(
                     if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
                         && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
             }),
-        module_bindings: BoundNames::of_body(parsed.suite()).names,
+        module_bindings: BoundNames::of_module(parsed.suite()),
         bindings: vec![BTreeMap::new()],
         binding_scope_depths: vec![0],
         lambda_scope_depths: Vec::new(),
@@ -7225,6 +7225,24 @@ impl BoundNames {
             collector.visit_stmt(statement);
         }
         collector.finish()
+    }
+
+    /// The names a module actually puts something behind.
+    ///
+    /// A bare annotation is what separates this from `of_body`. Inside a
+    /// function or a class body `name: int` still makes the name that
+    /// scope's own, so `finish` folds it in; at module level there is no
+    /// enclosing scope to be claimed from, only the builtins, and those an
+    /// annotation leaves entirely alone. `super: object` next to a
+    /// `super()` call reaches the builtin exactly as it would have without
+    /// the annotation.
+    fn of_module(body: &[Stmt]) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        for statement in body {
+            collector.visit_stmt(statement);
+        }
+        collector.annotations.clear();
+        collector.finish().names
     }
 
     fn of_lambda(lambda: &ast::ExprLambda) -> Self {
@@ -15866,6 +15884,27 @@ def b(x=1): pass  # type: ignore  # noqa
         }
         let updated = fixed(&format!("{structural_head}{structural_tail}"))?;
         assert!(updated.contains("Child(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_module_annotation_leaves_super_the_builtin() -> Result<(), String> {
+        // Nothing stands behind ``super`` here, so the call in ``run`` still
+        // reaches the builtin and the inherited default has to travel with it.
+        // Removing ``value`` while leaving the call alone would have left a
+        // live call short of an argument.
+        let annotated = "super: object\n\nclass Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(annotated)?,
+            "super: object\n\nclass Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self): return super().target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        // An assignment does put something else behind the name, and then the
+        // call reaches that instead of the inherited method.
+        let assigned = "class Other:\n    def target(self): return 9\n\nclass Base:\n    def target(self, value=1): return value\n\nsuper = Other\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 9\n";
+        assert_eq!(
+            fixed(assigned)?,
+            "class Other:\n    def target(self): return 9\n\nclass Base:\n    def target(self, value): return value\n\nsuper = Other\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 9\n"
+        );
         Ok(())
     }
 }

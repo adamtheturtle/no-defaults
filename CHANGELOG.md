@@ -121,6 +121,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A module-level loop or `with` target replaces an imported name, as an assignment to it already did. Calls through the name were still being rewritten as the import's. An `except … as` target does not: the name is deleted when the handler ends, and if the handler never runs the import still binds.
 - Two definitions of one name in different branches of an `if`, loop, `with`, `try`, or `match` keep their defaults, as two written side by side already did. Which one survives is not knowable, and `--fix` was stripping both while leaving the call as written.
 - A call inside an annotation in a `.pyi` stub is left alone, as one under `from __future__ import annotations` already was. A stub postpones its annotations without the import, so the call is a type expression and rewriting it edited a file that needed no change.
+- A bare module-level annotation such as `super: object` no longer counts as shadowing the builtin it names. Nothing is put behind the name, so `super()`, `staticmethod`, `property`, and the dataclass field helpers still reach what they always did; an inherited `super().method()` was being left as written while the method's default was removed.
 
 ## 2.1.0 - 2026-08-07
 

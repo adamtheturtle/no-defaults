@@ -1618,6 +1618,30 @@ fn collect_local_class_offsets(
     }
 }
 
+/// Whether a class written in this file above `defined_at` holds the spelling
+/// a base expression's prefix uses, so the prefix is that class rather than
+/// whatever a module of the same dotted name would be.
+fn prefix_names_a_local_class(
+    prefix: &Expr,
+    local_classes: &BTreeMap<String, (String, TextSize)>,
+    defined_at: TextSize,
+) -> bool {
+    let mut expression = prefix;
+    loop {
+        if dotted_name(expression).is_some_and(|spelling| {
+            local_classes
+                .get(&spelling)
+                .is_some_and(|(_, offset)| *offset < defined_at)
+        }) {
+            return true;
+        }
+        match expression {
+            Expr::Attribute(attribute) => expression = attribute.value.as_ref(),
+            _ => return false,
+        }
+    }
+}
+
 /// Resolve the class identity denoted by a base expression for method lookup.
 fn method_base_identity(
     expression: &Expr,
@@ -1656,6 +1680,22 @@ fn method_base_identity(
             }
         }),
         Expr::Attribute(attribute) => {
+            // A dotted submodule binding names the module its components spell
+            // out, which is more specific than reading those same components
+            // as classes nested in the package initializer — the reading the
+            // prefix would otherwise be given, since the initializer's own
+            // namesake answers before the module lookup below is reached.
+            //
+            // A class written here still holds the spelling first: the checks
+            // that follow settle that, so the shortcut only fires where no
+            // local class of that name is written above.
+            if !prefix_names_a_local_class(&attribute.value, local_classes, defined_at) {
+                if let Some(module) = dotted_name(&attribute.value) {
+                    if let Some(Binding::Module(file)) = bindings.get(&module) {
+                        return Some((file.clone(), attribute.attr.to_string()));
+                    }
+                }
+            }
             // The prefix may be a name this scope bound to a class rather than
             // a spelling written out in full, and an alias of an enclosing
             // class reaches the same nested class the dotted form does. The
@@ -18539,5 +18579,65 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn dotted_submodules_win_over_package_nested_classes() -> Result<(), String> {
+        // `import package.module` sets the submodule on the package, so the
+        // initializer's namesake class is not what the dotted base reaches.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &initializer,
+            "class module:\n    class Base:\n        def target(self, value=1): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 2\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_package_namesake_holds_a_dotted_base() -> Result<(), String> {
+        // A class written above the subclass takes the package's name over, so
+        // the dotted base is that class's nested one and not the submodule the
+        // import bound. Preferring the submodule regardless would write the
+        // wrong module's field into the inherited call.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import package.module\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=7): return value\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 7\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=7)"), "{updated}");
+        Ok(())
     }
 }

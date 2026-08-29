@@ -10323,6 +10323,22 @@ mod tests {
     }
 
     #[test]
+    fn function_parameters_shadow_class_var_imports() {
+        let source = "from dataclasses import dataclass\nfrom typing import ClassVar\n\nclass Marker:\n    def __getitem__(self, item): return item\n\ndef outer(ClassVar):\n    @dataclass\n    class C:\n        x: ClassVar[int] = 1\n    return C\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].message.contains("field `x`"));
+    }
+
+    #[test]
     fn a_function_local_dataclass_alias_does_not_escape() {
         assert!(messages(
             "def dc(cls): return cls\n\ndef load():\n    from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    value: int = 1\n",

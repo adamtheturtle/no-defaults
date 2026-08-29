@@ -1495,6 +1495,11 @@ fn index_scope_method_bases(
                         } else if !scope.namespace.alternative {
                             scope.contested.remove(alias.id.as_str());
                         }
+                        // Binding the name again spends whatever an import
+                        // above took it back from: what stands here now is
+                        // this class, and the scope around a suite should be
+                        // handed that rather than the reclaim.
+                        scope.reclaimed.remove(alias.id.as_str());
                         scope.aliases.insert(alias.id.to_string(), identity.clone());
                     }
                 }
@@ -19778,6 +19783,64 @@ def b(x=1): pass  # type: ignore  # noqa
         fix_all(&[initializer, module, case.clone()])?;
         let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
         assert!(updated.contains("self.target(value=3)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_assignment_below_a_suite_import_keeps_the_name_it_binds() -> Result<(), String> {
+        // The suite takes the name back with its import and then binds it
+        // again, so what stands there when the statement ends is the class the
+        // assignment named. Carrying the reclaim out regardless would hand the
+        // code below the module instead, and resolve the subclass against a
+        // base it is not built on.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Local:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nif True:\n    import package.module\n    package = Local\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=3)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_suite_import_below_an_assignment_still_reclaims_the_name() -> Result<(), String> {
+        // The other order, which pins the fix above from the other side: the
+        // import is what the suite ends with, so the name is the module's and
+        // the class the assignment named is out of reach below.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Local:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nif True:\n    package = Local\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
         Ok(())
     }
 }

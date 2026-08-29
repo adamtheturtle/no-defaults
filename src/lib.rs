@@ -912,7 +912,14 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
-        index_method_bases(parsed.suite(), &importer, &bindings, None, &mut definitions);
+        index_method_bases(
+            parsed.suite(),
+            &importer,
+            &known,
+            &bindings,
+            None,
+            &mut definitions,
+        );
         definitions.bindings.extend(
             bindings
                 .into_iter()
@@ -960,6 +967,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
 fn index_method_bases(
     statements: &[Stmt],
     importer: &Path,
+    known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
     parent_class: Option<&str>,
     definitions: &mut Definitions,
@@ -1023,7 +1031,8 @@ fn index_method_bases(
                 index_method_bases(
                     &class.body,
                     importer,
-                    bindings,
+                    known,
+                    &scoped_bindings(&class.body, importer, known, bindings),
                     Some(&identity),
                     definitions,
                 );
@@ -1031,7 +1040,8 @@ fn index_method_bases(
             Stmt::FunctionDef(function) => index_method_bases(
                 &function.body,
                 importer,
-                bindings,
+                known,
+                &scoped_bindings(&function.body, importer, known, bindings),
                 parent_class,
                 definitions,
             ),
@@ -1072,6 +1082,23 @@ fn index_method_bases(
             _ => {}
         }
     }
+}
+
+/// The bindings a nested scope sees: the ones the scopes around it left
+/// standing, plus the imports the scope makes for itself. `collect_bindings`
+/// stops at every scope boundary, so a body is read for its own imports as it
+/// is entered; without that, a `from module import Base` written beside the
+/// class that inherits from it would name nothing, though the same pair at
+/// module level resolves.
+fn scoped_bindings(
+    body: &[Stmt],
+    importer: &Path,
+    known: &BTreeSet<&Path>,
+    bindings: &BTreeMap<String, Binding>,
+) -> BTreeMap<String, Binding> {
+    let mut scoped = bindings.clone();
+    collect_bindings(body, importer, known, &mut scoped);
+    scoped
 }
 
 /// Where each class this file defines is written, under the name a base
@@ -8063,14 +8090,18 @@ impl Rewriter<'_> {
 
     fn is_builtin_super_call(&self, call: &ast::ExprCall) -> bool {
         match call.func.as_ref() {
+            // An import of the builtin is checked before the bare name, since
+            // `from builtins import super` binds `super` to the very builtin
+            // the name would have reached anyway. Reading that binding as a
+            // shadow would leave the call pointing at nothing.
+            Expr::Name(name) if self.aliases.supers.contains(name.id.as_str()) => {
+                self.nested_binding(name.id.as_str()).is_none()
+                    && !self.binding_is_replaced(name.id.as_str())
+            }
             Expr::Name(name) if name.id.as_str() == "super" => {
                 self.nested_binding("super").is_none()
                     && self.binding("super").is_none()
                     && !self.module_bindings.contains("super")
-            }
-            Expr::Name(name) if self.aliases.supers.contains(name.id.as_str()) => {
-                self.nested_binding(name.id.as_str()).is_none()
-                    && !self.binding_is_replaced(name.id.as_str())
             }
             _ => false,
         }
@@ -16691,6 +16722,53 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(bound)?,
             "class Base:\n    def method(self, value): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n\nassert Child().method() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unaliased_imported_super_is_still_the_builtin() -> Result<(), String> {
+        // `from builtins import super` binds `super` to the very builtin the
+        // bare name reaches, so the call it stands in front of resolves as it
+        // would without the import.
+        let source = "from builtins import super\n\nclass Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "from builtins import super\n\nclass Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method(value=1)\n\nassert Child().run() == 1\n"
+        );
+        // A name the file binds to something of its own is a real shadow, and
+        // the call through it names nothing this pass can follow.
+        let shadowed = "def super(): raise SystemExit\n\nclass Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n";
+        assert_eq!(
+            fixed(shadowed)?,
+            "def super(): raise SystemExit\n\nclass Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_same_scope_import_names_a_nested_class_base() -> Result<(), String> {
+        // The import and the subclass sit in one function body, where a scope
+        // of its own holds the name. The same pair at module level resolves,
+        // and so must this one.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Base:\n    def method(self, value=1): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def outer():\n    from other import Base\n\n    class Child(Base):\n        def run(self): return self.method()\n\n    return Child().run()\n\n\nassert outer() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert_eq!(
+            updated,
+            "def outer():\n    from other import Base\n\n    class Child(Base):\n        def run(self): return self.method(value=1)\n\n    return Child().run()\n\n\nassert outer() == 1\n"
         );
         Ok(())
     }

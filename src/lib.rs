@@ -5727,10 +5727,10 @@ impl<'a> Visitor<'a> for Checker<'a> {
     }
 }
 
-/// Whether a base named here is one of the `enum` module's own enumeration
-/// classes, each of which creates its members the same way `Enum` does.
+/// Whether a name stands for the `enum` module's enumeration class, whose
+/// subclasses create their members while the class statement runs.
 fn is_enum_base_name(name: &str) -> bool {
-    matches!(name, "Enum")
+    name == "Enum"
 }
 
 fn is_private(name: &str) -> bool {

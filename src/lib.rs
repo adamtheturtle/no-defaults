@@ -5148,7 +5148,10 @@ impl Checker<'_> {
                 || (self.scope.class == ClassScope::Metaclass
                     && matches!(function.name.as_str(), "__init__" | "mro"))
                 || (self.scope.enum_class
-                    && matches!(function.name.as_str(), "__init__" | "_missing_"))
+                    && matches!(
+                        function.name.as_str(),
+                        "__init__" | "_missing_" | "_generate_next_value_"
+                    ))
                 || (self.scope.class == ClassScope::None
                     && self.lexical_scope.is_empty()
                     && matches!(function.name.as_str(), "__getattr__" | "__dir__"))
@@ -19842,5 +19845,48 @@ def b(x=1): pass  # type: ignore  # noqa
         let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
         assert!(updated.contains("self.target(value=2)"), "{updated}");
         Ok(())
+    }
+
+    #[test]
+    fn enum_generate_next_value_defaults_are_retained() {
+        // `auto()` resolves to whatever `_generate_next_value_` returns, and
+        // the enum machinery calls it with the member name, the start, the
+        // count and the values so far -- four arguments, whether the hook is
+        // written as a static method or left bare for the metaclass to wrap.
+        // A fifth parameter is reached only through its default, and the call
+        // sits inside `enum.py`, so removing the default turns the class
+        // statement itself into a `TypeError` with no call site to rewrite.
+        for source in [
+            "from enum import Enum, auto\n\nclass E(Enum):\n    @staticmethod\n    def _generate_next_value_(name, start, count, last_values, suffix='x'):\n        return name + suffix\n    A = auto()\n",
+            "from enum import Enum, auto\n\nclass E(Enum):\n    def _generate_next_value_(name, start, count, last_values, suffix='x'):\n        return name + suffix\n    A = auto()\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+        // A plain class has no enum machinery to call the hook, so the same
+        // method name there is an ordinary function: the retention is the enum
+        // base, not the name.
+        let control = "class E:\n    @staticmethod\n    def _generate_next_value_(name, start, count, last_values, suffix='x'):\n        return name + suffix\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            control,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
     }
 }

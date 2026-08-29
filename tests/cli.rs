@@ -5637,3 +5637,24 @@ fn an_enum_hidden_by_a_nested_namesake_survives_a_fix() -> Result<(), Box<dyn st
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn enum_generate_next_value_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    // `auto()` reaches this hook from inside `enum.py`, which passes the member
+    // name, the start, the count and the values so far and nothing else. The
+    // fifth parameter arrives only through its default, and the call happens
+    // while the class statement runs, so removing the default leaves a module
+    // that raises `TypeError` on import with no call site the fixer could
+    // update.
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "from enum import Enum, auto\n\n\nclass E(Enum):\n    @staticmethod\n    def _generate_next_value_(name, start, count, last_values, suffix=\"x\"):\n        return name + suffix\n\n    A = auto()\n\n\nprint(E.A.value)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

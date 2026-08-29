@@ -1032,7 +1032,7 @@ fn index_method_bases(
                     &class.body,
                     importer,
                     known,
-                    &scoped_bindings(&class.body, importer, known, bindings),
+                    &scoped_bindings(&class.body, None, importer, known, bindings),
                     Some(&identity),
                     definitions,
                 );
@@ -1041,7 +1041,13 @@ fn index_method_bases(
                 &function.body,
                 importer,
                 known,
-                &scoped_bindings(&function.body, importer, known, bindings),
+                &scoped_bindings(
+                    &function.body,
+                    Some(&function.parameters),
+                    importer,
+                    known,
+                    bindings,
+                ),
                 parent_class,
                 definitions,
             ),
@@ -1085,18 +1091,26 @@ fn index_method_bases(
 }
 
 /// The bindings a nested scope sees: the ones the scopes around it left
-/// standing, plus the imports the scope makes for itself. `collect_bindings`
-/// stops at every scope boundary, so a body is read for its own imports as it
-/// is entered; without that, a `from module import Base` written beside the
-/// class that inherits from it would name nothing, though the same pair at
-/// module level resolves.
+/// standing, less the names the scope's own parameters claim, plus the imports
+/// the scope makes for itself. `collect_bindings` stops at every scope
+/// boundary, so a body is read for its own imports as it is entered; without
+/// that, a `from module import Base` written beside the class that inherits
+/// from it would name nothing, though the same pair at module level resolves.
+/// A parameter pushes the other way: it takes its name over for the whole
+/// call, so a base spelled with it is whatever the caller handed in, and
+/// linking the subclass to the import of that spelling would rewrite inherited
+/// calls against a class the subclass never had.
 fn scoped_bindings(
     body: &[Stmt],
+    parameters: Option<&ast::Parameters>,
     importer: &Path,
     known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
 ) -> BTreeMap<String, Binding> {
     let mut scoped = bindings.clone();
+    for name in parameters.into_iter().flat_map(BoundNames::of_parameters) {
+        scoped.remove(&name);
+    }
     collect_bindings(body, importer, known, &mut scoped);
     scoped
 }
@@ -7472,6 +7486,13 @@ impl BoundNames {
             collector.visit_stmt(statement);
         }
         collector.finish()
+    }
+
+    /// The names a signature claims, without reading the body behind it.
+    fn of_parameters(parameters: &ast::Parameters) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        collector.parameters(parameters);
+        collector.names
     }
 
     fn of_body(body: &[Stmt]) -> Self {
@@ -16808,5 +16829,37 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 2);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_parameter_shadowing_an_import_leaves_a_nested_class_base_unknown() -> Result<(), String> {
+        // The parameter holds the name for the whole call, so the class the
+        // subclass is built on is whatever the caller passed rather than the
+        // import above. Reading the import as the base would rewrite the
+        // inherited call with a default the runtime base never had, silently
+        // changing what the program returns.
+        // `a_same_scope_import_names_a_nested_class_base` covers the same
+        // shape without the parameter, where the import is the base and the
+        // call is rewritten.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let runtime = directory.path().join("runtime.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Base:\n    def method(self, value=1): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &runtime,
+            "class Runtime:\n    def method(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let source = "from other import Base\nfrom runtime import Runtime\n\n\ndef outer(Base):\n    class Child(Base):\n        def run(self): return self.method()\n\n    return Child().run()\n\n\nassert outer(Runtime) == 2\n";
+        std::fs::write(&user, source).map_err(|error| error.to_string())?;
+        fix_all(&[other, runtime, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert_eq!(updated, source);
+        Ok(())
     }
 }

@@ -6673,6 +6673,37 @@ fn a_parameter_shadowing_pydantic_field_keeps_the_default() -> Result<(), Box<dy
 }
 
 #[test]
+fn a_contested_dotted_owner_keeps_both_candidates_defaults(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The import runs only when the environment says so, so `package` names
+    // either the module or the class written above it and `Child` inherits
+    // whichever `Base` that leaves. Both are candidates, so both keep their
+    // defaults and the call is left as written: rewriting it with either value
+    // changes what the other run computes, and stripping a default while
+    // leaving the call bare stops both runs dead.
+    let directory = tempfile::tempdir()?;
+    let package = directory.path().join("package");
+    std::fs::create_dir(&package)?;
+    let initializer = package.join("__init__.py");
+    let module = package.join("module.py");
+    let case = directory.path().join("case.py");
+    let module_source = "class Base:\n    def target(self, value=2): return value\n";
+    let case_source = "import os\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nif os.environ.get(\"USE_REAL\"):\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nprint(Child().run())\n";
+    std::fs::write(&initializer, "")?;
+    std::fs::write(&module, module_source)?;
+    std::fs::write(&case, case_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&module)?, module_source);
+    assert_eq!(std::fs::read_to_string(&case)?, case_source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
 fn an_inherited_constructor_keeps_its_default_when_a_construction_is_unresolved(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
@@ -6692,6 +6723,46 @@ fn an_inherited_constructor_keeps_its_default_when_a_construction_is_unresolved(
         .output()?;
     assert_eq!(std::fs::read_to_string(&api)?, base);
     assert_eq!(std::fs::read_to_string(&user)?, caller);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_untaken_branch_namesake_keeps_an_inherited_enum_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The plain `Base` is written in a branch the interpreter may skip, so the
+    // enumeration above it is still what `Child` is built on. Creating
+    // `Child.A` calls the initializer from inside the class statement, and
+    // there is no written call for a rewrite to make up for the missing
+    // argument.
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "import os\nfrom enum import Enum\n\n\nclass Base(Enum):\n    pass\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class Base:\n        pass\n\n\nclass Child(Base):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_untaken_branch_namesake_keeps_a_metaclass_init_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The same shape for the table beside the enumerations': `M` is still the
+    // metaclass, so `N` is still one, and the interpreter calls `N.__init__`
+    // with a class statement's four arguments and nothing more.
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "import os\n\n\nclass M(type):\n    pass\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class M:\n        pass\n\n\nclass N(M):\n    def __init__(cls, name, bases, namespace, extra=1):\n        super().__init__(name, bases, namespace)\n\n\nclass C(metaclass=N):\n    pass\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }

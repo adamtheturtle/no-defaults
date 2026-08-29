@@ -5677,3 +5677,23 @@ fn a_module_annotate_hook_survives_a_fix() -> Result<(), Box<dyn std::error::Err
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn an_import_finder_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `sys.meta_path` finders are called by the import system with the name,
+    // the path and the target alone, so `extra` is only ever filled by its
+    // default. Nothing in the file calls `find_spec`, so removing the default
+    // leaves the next import raising `TypeError` from inside `importlib` with
+    // no written call site for the fixer to keep in step.
+    let source = "class Finder:\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

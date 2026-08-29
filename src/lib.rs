@@ -5602,6 +5602,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__prepare__"
             | "__init_subclass__"
             | "__annotate__"
+            | "find_spec"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -19954,5 +19955,47 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn import_finder_defaults_are_retained() {
+        // The import system calls a meta-path finder's `find_spec` itself,
+        // handing it the name, the path and the target and nothing else, so a
+        // parameter beside those is only ever filled by its default. Removing
+        // it leaves the next import raising `TypeError` from inside
+        // `importlib`, where there is no written call the fixer could update.
+        let source = "class Finder:\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_finder_method_beside_find_spec_stays_fixable() {
+        // Retention covers the callback the import system reaches for, not
+        // every method a finder happens to carry, so an ordinary helper on the
+        // same class is still the fixer's to rewrite.
+        let source = "class Finder:\n    def find_spec(self, fullname, path, target, extra=1):\n        return self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
     }
 }

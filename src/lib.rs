@@ -919,6 +919,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
             &importer,
             &known,
             &bindings,
+            EnclosingClasses::of_function_body(&BTreeMap::new()),
             None,
             &mut definitions,
         );
@@ -971,23 +972,21 @@ fn index_method_bases(
     importer: &Path,
     known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
+    enclosing: EnclosingClasses<'_>,
     parent_class: Option<&str>,
     definitions: &mut Definitions,
 ) {
-    // A class this scope defines itself takes the name over from an import of
-    // the same name, so a subclass written after it is built on the local
-    // class. One written before it still reaches the import. The offsets are
-    // gathered under the spelling a base expression uses here, while the
-    // identity a spelling resolves to carries the enclosing class's name.
-    let mut spellings = BTreeMap::new();
-    collect_local_class_offsets(statements, None, &mut spellings);
-    let local_classes: BTreeMap<String, (String, TextSize)> = spellings
-        .into_iter()
-        .map(|(spelling, offset)| {
-            let identity = qualified_name(parent_class, &spelling);
-            (spelling, (identity, offset))
-        })
-        .collect();
+    let local_classes = spelled_classes(statements, enclosing, parent_class);
+    // What a scope written here sees around it. A class body hands its own
+    // nested scopes nothing of its own, since neither a method nor a class
+    // written in there reads the names beside it.
+    let nested = |defined_at| {
+        if enclosing.class_body {
+            enclosing.classes.clone()
+        } else {
+            visible_classes(&local_classes, defined_at)
+        }
+    };
     let mut aliases = BTreeMap::new();
     for statement in statements {
         let defined_at = statement.start();
@@ -1035,6 +1034,7 @@ fn index_method_bases(
                     importer,
                     known,
                     &scoped_bindings(&class.body, None, importer, known, bindings),
+                    EnclosingClasses::of_class_body(&nested(defined_at)),
                     Some(&identity),
                     definitions,
                 );
@@ -1050,7 +1050,8 @@ fn index_method_bases(
                     known,
                     bindings,
                 ),
-                parent_class,
+                EnclosingClasses::of_function_body(&nested(defined_at)),
+                Some(&qualified_name(parent_class, function.name.as_str())),
                 definitions,
             ),
             // An annotated binding names a class just as a plain one does, so
@@ -1090,6 +1091,102 @@ fn index_method_bases(
             _ => {}
         }
     }
+}
+
+/// What each name a base expression can spell in a suite stands for.
+///
+/// A class this scope defines itself takes the name over from an import of the
+/// same name, so a subclass written after it is built on the local class. One
+/// written before it still reaches the import, or the class a scope around
+/// this one wrote. The offsets are gathered under the spelling a base
+/// expression uses here, while the identity a spelling resolves to carries the
+/// name of every scope holding it.
+fn spelled_classes(
+    statements: &[Stmt],
+    enclosing: EnclosingClasses<'_>,
+    parent_class: Option<&str>,
+) -> BTreeMap<String, SpelledClass> {
+    let mut spellings = BTreeMap::new();
+    collect_local_class_offsets(statements, None, &mut spellings);
+    let mut classes: BTreeMap<String, SpelledClass> = enclosing
+        .classes
+        .iter()
+        .map(|(spelling, identity)| {
+            let spelled = SpelledClass {
+                local: None,
+                enclosing: Some(identity.clone()),
+            };
+            (spelling.clone(), spelled)
+        })
+        .collect();
+    for (spelling, offset) in spellings {
+        let identity = qualified_name(parent_class, &spelling);
+        classes.entry(spelling).or_default().local = Some((identity, offset));
+    }
+    classes
+}
+
+/// What the scopes written inside a suite can see of the classes around it.
+///
+/// A class body is a scope its own nested scopes do not read: a method reads
+/// neither the class's locals nor the names beside it, and nor does a class
+/// written in there, so what they see is what the class body itself saw.
+#[derive(Clone, Copy)]
+struct EnclosingClasses<'a> {
+    /// The identity of each class in view, under the spelling reaching it.
+    classes: &'a BTreeMap<String, String>,
+    /// Whether the suite these classes are handed to is a class body.
+    class_body: bool,
+}
+
+impl<'a> EnclosingClasses<'a> {
+    fn of_class_body(classes: &'a BTreeMap<String, String>) -> Self {
+        Self {
+            classes,
+            class_body: true,
+        }
+    }
+
+    /// A module counts as a function body here: what it holds is in view of
+    /// every scope written in it.
+    fn of_function_body(classes: &'a BTreeMap<String, String>) -> Self {
+        Self {
+            classes,
+            class_body: false,
+        }
+    }
+}
+
+/// A name a base expression can spell in one scope: the class the scope writes
+/// under it, and the class a scope around it already bound it to.
+#[derive(Default)]
+struct SpelledClass {
+    /// The identity of the class this scope writes, and where it is written.
+    local: Option<(String, TextSize)>,
+    /// The identity the spelling reaches before this scope writes anything
+    /// under it.
+    enclosing: Option<String>,
+}
+
+/// The classes a scope written at `defined_at` sees around it, under the
+/// spelling that reaches each one there.
+fn visible_classes(
+    local_classes: &BTreeMap<String, SpelledClass>,
+    defined_at: TextSize,
+) -> BTreeMap<String, String> {
+    local_classes
+        .iter()
+        .filter_map(|(spelling, spelled)| {
+            let identity = match &spelled.local {
+                Some((identity, offset)) if *offset < defined_at => identity,
+                // A class written after the nested scope begins has not bound
+                // the spelling yet, so what it reaches in there is whatever a
+                // scope further out wrote.
+                _ => spelled.enclosing.as_ref()?,
+            };
+            Some((spelling.clone(), identity.clone()))
+        })
+        .collect()
 }
 
 /// The bindings a nested scope sees: the ones the scopes around it left
@@ -1177,7 +1274,7 @@ fn method_base_identity(
     expression: &Expr,
     importer: &Path,
     bindings: &BTreeMap<String, Binding>,
-    local_classes: &BTreeMap<String, (String, TextSize)>,
+    local_classes: &BTreeMap<String, SpelledClass>,
     defined_at: TextSize,
     aliases: &BTreeMap<String, (PathBuf, String)>,
     methods: &BTreeMap<(PathBuf, String), BTreeMap<String, Option<Signature>>>,
@@ -1193,7 +1290,8 @@ fn method_base_identity(
             methods,
         ),
         Expr::Name(name) => aliases.get(name.id.as_str()).cloned().or_else(|| {
-            let local = local_classes.get(name.id.as_str());
+            let spelled = local_classes.get(name.id.as_str());
+            let local = spelled.and_then(|spelled| spelled.local.as_ref());
             // A class already defined here holds the name, whatever an import
             // of the same name bound earlier.
             if let Some((identity, _)) = local.filter(|(_, offset)| *offset < defined_at) {
@@ -1206,7 +1304,13 @@ fn method_base_identity(
                 // of the same spelling written further down the scope would
                 // answer with one the subclass was never built on.
                 Some(Binding::Unknown) => None,
-                _ => local.map(|(identity, _)| (importer.to_path_buf(), identity.clone())),
+                // A class of this scope written after the base held nothing
+                // when the base was read, so the spelling still reaches the
+                // class a scope around this one wrote.
+                _ => spelled
+                    .and_then(|spelled| spelled.enclosing.as_ref())
+                    .or_else(|| local.map(|(identity, _)| identity))
+                    .map(|identity| (importer.to_path_buf(), identity.clone())),
             }
         }),
         Expr::Attribute(attribute) => {
@@ -1216,6 +1320,7 @@ fn method_base_identity(
             // prefix still names whatever an import bound.
             if let Some((identity, _)) = local_classes
                 .get(&qualified)
+                .and_then(|spelled| spelled.local.as_ref())
                 .filter(|(_, offset)| *offset < defined_at)
                 .filter(|(identity, _)| {
                     methods
@@ -3966,10 +4071,7 @@ impl Checker<'_> {
     }
 
     fn qualified_class(&self, name: &str) -> String {
-        qualified_name(
-            self.classes.last().map(|parent| parent.qualified.as_str()),
-            name,
-        )
+        qualified_class_name(&self.lexical_scope, name)
     }
 
     fn leave_class(&mut self) {
@@ -4585,18 +4687,9 @@ impl Checker<'_> {
                 if alias.kind == MethodAliasKind::Property {
                     continue;
                 }
-                // Signatures record the class chain alone, so qualifying the
-                // source class through `lexical_scope` would name an enclosing
-                // function too and match nothing. Resolve it as a sibling of
-                // the class being collected instead.
-                let original_class = qualified_name(
-                    self.classes
-                        .len()
-                        .checked_sub(2)
-                        .and_then(|parent| self.classes.get(parent))
-                        .map(|parent| parent.qualified.as_str()),
-                    original_class,
-                );
+                // The class being collected is not in `lexical_scope` yet, so
+                // the source class is qualified as a sibling of it.
+                let original_class = qualified_class_name(&self.lexical_scope, original_class);
                 let Some(signature) = self.signatures.iter().find(|signature| {
                     signature.name == *method
                         && matches!(
@@ -9616,8 +9709,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 if let Some(arguments) = &class.arguments {
                     self.visit_arguments(arguments);
                 }
-                let qualified =
-                    qualified_name(self.classes.last().map(String::as_str), class.name.as_str());
+                let qualified = qualified_class_name(&self.lexical_scope, class.name.as_str());
                 self.classes.push(qualified);
                 self.lexical_scope.push(class.name.to_string());
                 self.lexical_is_class.push(true);
@@ -17063,6 +17155,92 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed_against_runtime_class(source)?,
             "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Helper:\n        def method(self, value): return value\n\n    class Child(Helper):\n        def run(self): return self.method(value=3)\n\n    return Child().run()\n\n\nassert outer(Runtime) == 3\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_of_a_function_body_is_not_a_namesake_outside_it() -> Result<(), String> {
+        // The identity a class is recorded under names every scope around it,
+        // the function body included, so the two `Helper` classes are told
+        // apart. Sharing one identity let the function-local class's bases
+        // replace the module-level class's, and `Child`, which inherits
+        // `Alpha`, was rewritten with what `Beta` declares — a `TypeError`
+        // where a working call stood.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Alpha:\n    def method(self, alpha=1): return alpha\n\nclass Beta:\n    def method(self, beta=2): return beta\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from other import Alpha, Beta\n\n\nclass Helper(Alpha):\n    pass\n\n\nclass Child(Helper):\n    def run(self): return self.method()\n\n\ndef outer():\n    class Helper(Beta):\n        pass\n\n    return Helper\n\n\nassert Child().run() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.method(alpha=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_of_a_function_local_class_is_not_a_namesake_method() -> Result<(), String> {
+        // The same identity from the other side: the method the function-local
+        // `Helper` declares is not one the module-level `Helper` holds, so the
+        // inherited call reaches `Alpha` as the runtime does.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Alpha:\n    def method(self, alpha=1): return alpha\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from other import Alpha\n\n\nclass Helper(Alpha):\n    pass\n\n\nclass Child(Helper):\n    def run(self): return self.method()\n\n\ndef outer():\n    class Helper:\n        def method(self, other=2): return other\n\n    return Helper\n\n\nassert Child().run() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.method(alpha=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_written_after_a_subclass_leaves_an_outer_base_alone() -> Result<(), String> {
+        // A class body reads a name it has not written yet from the module
+        // around it, so `Child` is built on the module-level `Helper` and
+        // returns 1. Reading the nested `Helper` written below it instead
+        // rewrote the call with a default the base never had, and the file
+        // went on returning 3 where it had returned 1.
+        let later = "class Helper:\n    def method(self, value=1): return value\n\n\nclass Outer:\n    class Child(Helper):\n        def run(self): return self.method()\n\n    class Helper:\n        def method(self, value=3): return value\n\n\nassert Outer.Child().run() == 1\n";
+        assert_eq!(
+            fixed(later)?,
+            "class Helper:\n    def method(self, value): return value\n\n\nclass Outer:\n    class Child(Helper):\n        def run(self): return self.method(value=1)\n\n    class Helper:\n        def method(self, value): return value\n\n\nassert Outer.Child().run() == 1\n"
+        );
+        // The other order, where the nested class has the name by the time the
+        // subclass is written and really is what it inherits.
+        let earlier = "class Helper:\n    def method(self, value=1): return value\n\n\nclass Outer:\n    class Helper:\n        def method(self, value=3): return value\n\n    class Child(Helper):\n        def run(self): return self.method()\n\n\nassert Outer.Child().run() == 3\n";
+        assert_eq!(
+            fixed(earlier)?,
+            "class Helper:\n    def method(self, value): return value\n\n\nclass Outer:\n    class Helper:\n        def method(self, value): return value\n\n    class Child(Helper):\n        def run(self): return self.method(value=3)\n\n\nassert Outer.Child().run() == 3\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_scope_inside_a_class_body_does_not_read_its_names() -> Result<(), String> {
+        // A method reads neither the class's own namespace nor the names
+        // beside it, so the base `Helper` spelled in there is the module-level
+        // class rather than `A.Helper`, and the call returns 1.
+        let source = "class Helper:\n    def method(self, value=1): return value\n\n\nclass A:\n    class Helper:\n        def method(self, value=2): return value\n\n    def run(self):\n        class Child(Helper):\n            def go(self): return super().method()\n\n        return Child().go()\n\n\nassert A().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Helper:\n    def method(self, value): return value\n\n\nclass A:\n    class Helper:\n        def method(self, value): return value\n\n    def run(self):\n        class Child(Helper):\n            def go(self): return super().method(value=1)\n\n        return Child().go()\n\n\nassert A().run() == 1\n"
         );
         Ok(())
     }

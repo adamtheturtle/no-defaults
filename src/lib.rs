@@ -4105,10 +4105,14 @@ impl Checker<'_> {
     /// subclass written here sees no more of it than this class does. A later
     /// redefinition without either clears the name so a sibling that inherits
     /// the new class is not treated as metaclass-built.
-    fn record_metaclass_construction(&mut self, class: &ast::StmtClassDef) {
+    fn record_metaclass_construction(
+        &mut self,
+        class: &ast::StmtClassDef,
+        unseen_import_base: bool,
+    ) {
         if declares_metaclass(class)
             || inherits_metaclass(class, &self.metaclass_classes)
-            || self.inherits_unseen_import(class)
+            || unseen_import_base
         {
             self.metaclass_classes.insert(class.name.to_string());
         } else {
@@ -5146,6 +5150,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     // written here.
                     kept_default: false,
                 };
+                // Read where the header is: the tables the predicate consults
+                // are the enclosing scope's until the body has been walked,
+                // and a name the body binds says nothing about the base the
+                // header already resolved.
+                let unseen_import_base = self.inherits_unseen_import(class);
                 self.class_constructs
                     .push(self.class_constructs_safely(class));
                 let defines_iterator_method = |expected: &str| {
@@ -5216,7 +5225,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
                 self.metaclass_classes = outer_metaclass_classes;
-                self.record_metaclass_construction(class);
+                self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
                 self.repeated_functions = outer_repeated_functions;
                 if defines_metaclass(class, &self.metaclass_definitions) {
@@ -17728,6 +17737,35 @@ def b(x=1): pass  # type: ignore  # noqa
             assert_eq!(checked.diagnostics.len(), 1);
             assert!(checked.diagnostics[0].fix.is_none(), "{source}");
             assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_class_body_does_not_rewrite_its_own_header_bases() {
+        // Whether a base is an unseen import is settled where the header is
+        // written, not where the body ends. A member binding the base's name
+        // rebinds it for readers of the class, never for the header above it,
+        // and a base spelled with the class's own name still reaches whatever
+        // that name held before the class did. Reading either after the body
+        // would drop the mark that protects a later subclass, or invent one
+        // over a base that carries no fields at all.
+        for (source, removable) in [
+            ("from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    Base = 1\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n", false),
+            ("from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    class Base:\n        pass\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n", false),
+            ("from dataclasses import dataclass, field\nfrom typing import Protocol\n\nclass Protocol(Protocol):\n    pass\n\n@dataclass\nclass Child(Protocol):\n    keyword: int = field(default=3, kw_only=True)\n", true),
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert_eq!(checked.diagnostics[0].fix.is_some(), removable, "{source}");
+            assert_eq!(checked.signatures.is_empty(), !removable, "{source}");
         }
     }
 }

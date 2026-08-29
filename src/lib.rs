@@ -4665,7 +4665,16 @@ impl Checker<'_> {
             Stmt::AugAssign(assign) => bound.bind(&assign.target),
             _ => return,
         }
-        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
+        // An assignment in a suite that may not run is the same shape as a
+        // class statement written there, and leaves the name's import records
+        // standing for the same reason. Only a plain assignment is held back:
+        // a `for` target and a `match` capture are bound where the traversal
+        // has already entered the suite, and a capture pattern is irrefutable,
+        // so holding those back would keep a record a binding really did take.
+        self.rebind_names(
+            bound.names.iter().map(String::as_str),
+            self.conditional_depth == 0,
+        );
         // An annotated assignment binds its target every bit as much as a plain
         // one does, so an annotation is no reason to forget what the name was
         // just given. Reading only plain assignments left `Alias: object = Base`
@@ -4725,6 +4734,21 @@ impl Checker<'_> {
     /// fields into a subclass's constructor, and stale truthiness would take
     /// a branch the rebinding decided against.
     fn invalidate_bound_names<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+        self.rebind_names(names, true);
+    }
+
+    /// Forget what `names` stood for, where `supersedes` says whether the
+    /// binding really takes the name over.
+    ///
+    /// A binding written in a suite that may not run does not: where the suite
+    /// is skipped the import is still what the name stands for, and forgetting
+    /// it hands a class written below a base the file no longer recognises as
+    /// an enumeration or as something the standard library calls back. The
+    /// shape goes either way, because an unknown base only stops a rewrite,
+    /// while a forgotten import record is what strips a default the program
+    /// needs. So does the binding stop, which records that a name was written
+    /// here at all rather than what it was written as.
+    fn rebind_names<'n>(&mut self, names: impl IntoIterator<Item = &'n str>, supersedes: bool) {
         // Truthiness is recorded for module-level names and consulted only
         // where a module-level test can see them. A binding in a function or
         // class body names something else that leaves the module name alone,
@@ -4733,14 +4757,16 @@ impl Checker<'_> {
         let rebinds_module_name =
             self.scope.class == ClassScope::None && self.lexical_scope.is_empty();
         for name in names {
-            self.aliases.invalidate(name);
+            if supersedes {
+                self.aliases.invalidate(name);
+                self.local_enum_classes.remove(name);
+                self.local_implicit_callback_classes.remove(name);
+            }
             if rebinds_module_name {
                 self.known_truthiness.remove(name);
             }
             self.shapes
                 .remove(&qualified_class_name(&self.lexical_scope, name));
-            self.local_enum_classes.remove(name);
-            self.local_implicit_callback_classes.remove(name);
             if let Some(bindings) = self.lexical_bindings.last_mut() {
                 bindings.insert(name.to_owned());
             }
@@ -6109,6 +6135,32 @@ fn implicitly_called_method(name: &str) -> bool {
     )
 }
 
+/// The methods a buffering layer reaches on the raw stream underneath it,
+/// whichever raw base the subclass was written on.
+const IO_RAW_CALLBACKS: &[&str] = &[
+    "close", "readable", "readinto", "seek", "seekable", "tell", "writable", "write",
+];
+
+/// The methods the import machinery reaches on a source loader while it turns a
+/// module name into code, whichever source-loader base the subclass was written
+/// on.
+const IMPORTLIB_SOURCE_LOADER_CALLBACKS: &[&str] =
+    &["get_data", "path_mtime", "path_stats", "set_data"];
+
+/// The methods `logging` reaches on a handler it owns, whichever handler base
+/// the subclass was written on.
+const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
+    "acquire",
+    "close",
+    "createLock",
+    "emit",
+    "filter",
+    "flush",
+    "format",
+    "handle",
+    "release",
+];
+
 /// The methods `argparse` reaches on the formatter a parser builds, whichever
 /// formatter base the subclass was written on.
 ///
@@ -6143,20 +6195,6 @@ const EMAIL_POLICY_CALLBACKS: &[&str] = &[
     "header_source_parse",
     "header_store_parse",
     "register_defect",
-];
-
-/// The methods `logging` reaches on a handler it owns, whichever handler base
-/// the subclass was written on.
-const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
-    "acquire",
-    "close",
-    "createLock",
-    "emit",
-    "filter",
-    "flush",
-    "format",
-    "handle",
-    "release",
 ];
 
 /// Standard-library base classes whose own machinery calls the methods a
@@ -6205,6 +6243,18 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
     ("email.policy", "Compat32", EMAIL_POLICY_CALLBACKS),
     ("email.policy", "EmailPolicy", EMAIL_POLICY_CALLBACKS),
     ("email.policy", "Policy", EMAIL_POLICY_CALLBACKS),
+    (
+        "importlib.abc",
+        "SourceLoader",
+        IMPORTLIB_SOURCE_LOADER_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "SourceFileLoader",
+        IMPORTLIB_SOURCE_LOADER_CALLBACKS,
+    ),
+    ("io", "FileIO", IO_RAW_CALLBACKS),
+    ("io", "RawIOBase", IO_RAW_CALLBACKS),
     (
         "logging",
         "BufferingFormatter",
@@ -6603,7 +6653,17 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 }
                 self.header = old_header;
                 self.restore_aliases(outer_aliases);
-                self.aliases.invalidate(class.name.as_str());
+                // The class takes the name over for everything below it, so
+                // whatever an import made the name stands there no longer.
+                // A namesake in a suite that may not run takes nothing over:
+                // where it is skipped the import is still what the name means,
+                // and forgetting it hands a subclass written below a base the
+                // file no longer recognises. That is the rule the class tables
+                // beside this already follow, applied to every record `Aliases`
+                // keeps rather than to one table at a time.
+                if self.conditional_depth == 0 {
+                    self.aliases.invalidate(class.name.as_str());
+                }
                 self.scope = outer;
             }
             _ => {
@@ -23286,6 +23346,210 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(
             updated.contains("assert C().later(5) == (\"second\", 5)\n"),
             "{updated}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn io_raw_stream_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A buffer wrapped round a raw stream calls each of these on it:
+        // `readable`, `writable` and `seekable` while the buffer is built,
+        // `readinto` and `write` as it fills and drains, `seek` and `tell` as
+        // it moves, and `close` as it closes. None of those calls is written
+        // here, so removing a default leaves a stream the buffer cannot drive.
+        let source = "import io\n\n\nclass R(io.RawIOBase):\n    def readable(self, extra=1): return True\n\n    def writable(self, extra=2): return True\n\n    def seekable(self, extra=3): return True\n\n    def readinto(self, b, extra=4): return 0\n\n    def write(self, b, extra=5): return 0\n\n    def seek(self, offset, whence, extra=6): return 0\n\n    def tell(self, extra=7): return 0\n\n    def close(self, extra=8): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn importlib_source_loader_callbacks_keep_their_defaults() -> Result<(), String> {
+        // The import machinery reaches all four from `SourceLoader.get_code`:
+        // `get_data` for the source, `path_stats` to date the bytecode cache,
+        // `path_mtime` from `path_stats` itself, and `set_data` to write that
+        // cache. The `import` statement that starts it is no call site the
+        // fixer can rewrite.
+        let source = "import importlib.abc\n\n\nclass L(importlib.abc.SourceLoader):\n    def get_data(self, path, extra=1): return b\"\"\n\n    def path_stats(self, path, extra=2): return {}\n\n    def path_mtime(self, path, extra=3): return 0\n\n    def set_data(self, path, data, extra=4): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_imported_raw_stream_base_keeps_its_callback_defaults() -> Result<(), String> {
+        // The base is the same class whether it is spelled through the module
+        // or bound by name.
+        let source = "from io import RawIOBase\n\n\nclass R(RawIOBase):\n    def readinto(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_io_module_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import io as _io\n\n\nclass R(_io.RawIOBase):\n    def write(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_raw_stream_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being driven by a buffer is inherited, so a stream written on one
+        // defined here is read through in the same way.
+        let source = "import io\n\n\nclass Base(io.RawIOBase):\n    pass\n\n\nclass Child(Base):\n    def readinto(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_concrete_file_stream_base_keeps_its_callback_defaults() -> Result<(), String> {
+        // `io.FileIO` is a raw stream in its own right, and a buffer drives a
+        // subclass of it exactly as it drives one written on `io.RawIOBase`.
+        let source =
+            "import io\n\n\nclass F(io.FileIO):\n    def write(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_file_loader_keeps_its_callback_defaults() -> Result<(), String> {
+        // `importlib.machinery.SourceFileLoader` is the concrete source loader
+        // users subclass, and `get_code` reaches its overrides the same way.
+        let source = "import importlib.machinery\n\n\nclass L(importlib.machinery.SourceFileLoader):\n    def get_data(self, path, extra=1): return b\"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_loader_from_a_submodule_import_keeps_its_callback_defaults() -> Result<(), String> {
+        // `from importlib import abc` binds the submodule, so the base is read
+        // through one attribute of a name that stands for `importlib.abc`.
+        let source = "from importlib import abc\n\n\nclass L(abc.SourceLoader):\n    def get_data(self, path, extra=1): return b\"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_io_hierarchy_are_still_fixed() -> Result<(), String> {
+        // `close`, `write`, `seek` and `tell` are as ordinary as method names
+        // get. Nothing calls them here but the calls written below, so the
+        // defaults go and those calls carry the values.
+        let source = "class Stream:\n    def readable(self, extra=1): return extra\n\n    def writable(self, extra=2): return extra\n\n    def seekable(self, extra=3): return extra\n\n    def readinto(self, b, extra=4): return extra\n\n    def write(self, b, extra=5): return extra\n\n    def seek(self, offset, extra=6): return extra\n\n    def tell(self, extra=7): return extra\n\n    def close(self, extra=8): return extra\n\n\ns = Stream()\nassert Stream.readable(s) == 1\nassert Stream.writable(s) == 2\nassert Stream.seekable(s) == 3\nassert Stream.readinto(s, b\"\") == 4\nassert Stream.write(s, b\"\") == 5\nassert Stream.seek(s, 0) == 6\nassert Stream.tell(s) == 7\nassert Stream.close(s) == 8\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Stream:\n    def readable(self, extra): return extra\n\n    def writable(self, extra): return extra\n\n    def seekable(self, extra): return extra\n\n    def readinto(self, b, extra): return extra\n\n    def write(self, b, extra): return extra\n\n    def seek(self, offset, extra): return extra\n\n    def tell(self, extra): return extra\n\n    def close(self, extra): return extra\n\n\ns = Stream()\nassert Stream.readable(s, extra=1) == 1\nassert Stream.writable(s, extra=2) == 2\nassert Stream.seekable(s, extra=3) == 3\nassert Stream.readinto(s, b\"\", extra=4) == 4\nassert Stream.write(s, b\"\", extra=5) == 5\nassert Stream.seek(s, 0, extra=6) == 6\nassert Stream.tell(s, extra=7) == 7\nassert Stream.close(s, extra=8) == 8\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_loader_hierarchy_are_still_fixed() -> Result<(), String> {
+        // Same again for the loader names, which a cache or a store class
+        // spells just as readily as a loader does.
+        let source = "class Store:\n    def get_data(self, path, extra=1): return extra\n\n    def set_data(self, path, data, extra=2): return extra\n\n    def path_stats(self, path, extra=3): return extra\n\n    def path_mtime(self, path, extra=4): return extra\n\n\ns = Store()\nassert Store.get_data(s, \"p\") == 1\nassert Store.set_data(s, \"p\", b\"\") == 2\nassert Store.path_stats(s, \"p\") == 3\nassert Store.path_mtime(s, \"p\") == 4\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Store:\n    def get_data(self, path, extra): return extra\n\n    def set_data(self, path, data, extra): return extra\n\n    def path_stats(self, path, extra): return extra\n\n    def path_mtime(self, path, extra): return extra\n\n\ns = Store()\nassert Store.get_data(s, \"p\", extra=1) == 1\nassert Store.set_data(s, \"p\", b\"\", extra=2) == 2\nassert Store.path_stats(s, \"p\", extra=3) == 3\nassert Store.path_mtime(s, \"p\", extra=4) == 4\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_raw_stream_import_bound_over_stops_reaching_io() -> Result<(), String> {
+        // The assignment takes the name, so the base below is a plain `object`
+        // and no buffer ever drives this method.
+        let source = "from io import RawIOBase\n\nRawIOBase = object\n\n\nclass R(RawIOBase):\n    def close(self, extra=1): return extra\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "from io import RawIOBase\n\nRawIOBase = object\n\n\nclass R(RawIOBase):\n    def close(self, extra): return extra\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_in_an_untaken_branch_leaves_an_imported_enumeration_standing(
+    ) -> Result<(), String> {
+        // The branch may not run, so `Enum` is still the import and `C` is
+        // still built by the enum machinery, which calls the initializer from
+        // inside the class statement. Removing the default leaves a module
+        // that raises before anything can import it, and there is no written
+        // call for a rewrite to make up for it.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class Enum:\n        pass\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_in_an_untaken_branch_leaves_an_imported_callback_base_standing(
+    ) -> Result<(), String> {
+        // The same hole reaches every record `Aliases` keeps, not the
+        // enumerations alone: where the branch is skipped `Handler` is still
+        // the imported base, `logging` still emits through `H`, and the
+        // default has nowhere else to come from.
+        let source = "import os\nfrom logging import Handler\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class Handler:\n        pass\n\n\nclass H(Handler):\n    def emit(self, record, prefix='p'): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_in_an_untaken_branch_leaves_an_imported_class_var_standing() -> Result<(), String>
+    {
+        // A category with no class table of its own: forgetting the import
+        // left `kind` looking like an ordinary field, so its default went and
+        // the constructor was called with a keyword it never accepted.
+        let source = "import os\nfrom dataclasses import dataclass\nfrom typing import ClassVar\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class ClassVar:\n        pass\n\n\n@dataclass\nclass C:\n    kind: ClassVar[int] = 5\n    x: int = 1\n\n\nassert C().x == 1\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import os\nfrom dataclasses import dataclass\nfrom typing import ClassVar\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class ClassVar:\n        pass\n\n\n@dataclass\nclass C:\n    kind: ClassVar[int] = 5\n    x: int\n\n\nassert C(x=1).x == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_class_written_where_it_runs_still_takes_an_import_back() -> Result<(), String> {
+        // The counterpart guard: the second `Enum` is written where the file
+        // is certain to reach it, so it really does take the name off the
+        // import and `C` is an ordinary class whose initializer nothing calls
+        // on its own. Holding every namesake back would retain this default.
+        let source = "from enum import Enum\n\n\nclass Enum:\n    pass\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_assignment_in_an_untaken_branch_leaves_an_imported_enumeration_standing(
+    ) -> Result<(), String> {
+        // An assignment written in a suite that may not run shadows the import
+        // exactly as a class statement there does, and #1110 covered neither.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    Enum = object\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_assignment_written_where_it_runs_still_takes_an_import_back() -> Result<(), String> {
+        // The counterpart guard for the assignment: nothing guards this
+        // rebinding, so `Enum` really is `object` by the time `C` is written
+        // and the initializer is an ordinary one.
+        let source = "from enum import Enum\n\nEnum = object\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_match_capture_still_takes_an_import_back() -> Result<(), String> {
+        // A capture pattern is irrefutable, so it binds whenever the match
+        // statement runs at all. It sits inside the traversal's conditional
+        // depth all the same, which is why only a plain assignment is held
+        // back there.
+        let source = "from enum import Enum\n\nmatch object:\n    case Enum:\n        pass\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
         );
         Ok(())
     }

@@ -5660,10 +5660,20 @@ impl Checker<'_> {
     /// default stays.
     fn method_is_opaquely_rebound(&self, name: &str) -> bool {
         self.scope.class != ClassScope::None
-            && self
-                .class_opaque_rebindings
-                .last()
-                .is_some_and(|names| names.contains(name))
+            && self.class_opaque_rebindings.last().is_some_and(|names| {
+                // An alias the file does understand is the method under
+                // another spelling, so a value that cannot be described naming
+                // the alias names the method just as surely as one naming the
+                // method itself. `wrapped = _identity(alias)` beside
+                // `alias = target` reaches `target`, and reading only the
+                // written spelling let its default go.
+                names.contains(name)
+                    || self.method_aliases.last().is_some_and(|aliases| {
+                        aliases.get(name).is_some_and(|aliases| {
+                            aliases.iter().any(|alias| names.contains(&alias.name))
+                        })
+                    })
+            })
     }
 
     fn method_is_rebound_later(&self, function: &ast::StmtFunctionDef) -> bool {
@@ -23699,6 +23709,31 @@ def b(x=1): pass  # type: ignore  # noqa
             source
                 .replace("y=1):", "y):")
                 .replace("assert target(2)", "assert target(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_opaque_value_naming_a_class_body_alias_holds_the_default_back() -> Result<(), String> {
+        // `alias` is `target` under another spelling, so a value this file
+        // cannot describe naming `alias` puts `target` out of reach just as
+        // surely. Reading only the written spelling let the default go and
+        // left `C().wrapped(2)` unrewritten and unreported.
+        let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = target\n    wrapped = _identity(alias)\n\n\nassert C().wrapped(2) == (2, 1)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_opaque_value_naming_an_unrelated_alias_is_still_fixed() -> Result<(), String> {
+        // The counterpart guard: `other` is an alias of a different method, so
+        // naming it says nothing about `target` and `target` is still fixed.
+        let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    def spare(self):\n        return 0\n\n    other = spare\n    wrapped = _identity(other)\n\n\nassert C().target(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("y=1):", "y):")
+                .replace("C().target(2)", "C().target(2, y=1)")
         );
         Ok(())
     }

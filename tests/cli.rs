@@ -5586,6 +5586,22 @@ fn a_subscripted_copy_of_a_contested_name_keeps_the_inherited_default(
 }
 
 #[test]
+fn enum_missing_hook_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    // The enum machinery calls `_missing_` with the looked-up value alone, so
+    // the parameter's default is the only thing supplying it, and the call is
+    // one the interpreter makes rather than one the fixer could update.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\nfrom enum import Enum\n\n\nclass E(Enum):\n    A = 1\n\n    @classmethod\n    def _missing_(cls, value, fallback=\"x\"):\n        return cls.A\n\n\nprint(E(int(os.environ[\"WANTED\"])))\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
 fn inherited_enum_initializer_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

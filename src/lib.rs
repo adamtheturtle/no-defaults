@@ -4928,7 +4928,8 @@ impl Checker<'_> {
                 || self.is_delegation_protocol_method(function.name.as_str())
                 || (self.scope.class == ClassScope::Metaclass
                     && matches!(function.name.as_str(), "__init__" | "mro"))
-                || (self.scope.enum_class && function.name.as_str() == "__init__")
+                || (self.scope.enum_class
+                    && matches!(function.name.as_str(), "__init__" | "_missing_"))
                 || (self.scope.class == ClassScope::None
                     && self.lexical_scope.is_empty()
                     && matches!(function.name.as_str(), "__getattr__" | "__dir__"))
@@ -18999,16 +19000,35 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
     }
+
+    #[test]
+    fn enum_missing_hook_defaults_are_retained() {
+        let source = "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+
     #[test]
     fn inherited_enum_member_initializer_defaults_are_retained() {
         // Being an enumeration is inherited, so a subclass of one written in
-        // this file creates its own members the same implicit way, however
-        // many classes and class bodies stand between it and the import.
+        // this file creates its own members the same implicit way, and reaches
+        // `_missing_` the same way too, however many classes and class bodies
+        // stand between it and the import.
         for source in [
             "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
             "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Mid(Base):\n    pass\n\nclass Child(Mid):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
             "import enum\n\nclass Base(enum.Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
             "from enum import Enum\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n",
         ] {
             let checked = check_source(
                 Path::new("fixture.py"),

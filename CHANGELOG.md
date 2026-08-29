@@ -131,6 +131,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - An alias such as `Alias = Base` written in a class body resolves the name the way Python does: against the enclosing functions and then the module, never against an outer class body, which is not a closure scope, and stopping at the nearest scope that binds the name at all. A dataclass inheriting through such an alias was being given another class's fields.
 - `import package.module` makes `package.module.Base` the submodule's class, over a same-named class the package initializer defines. The initializer's class was winning, and inherited calls were rewritten with defaults the real base never had. A class written here above the subclass still takes the name back off the import, and everything spelled under it goes with the name.
 - A default on the `__init__` of an `enum.Enum` subclass is reported but retained. Assigning a member calls it implicitly while the class is created, so removing the default made the class itself raise `TypeError`, and there is no written call site to keep in step: the calls are the member assignments the interpreter makes.
+- A default on the `_missing_` of an `enum.Enum` subclass is reported but retained. Looking a value up that no member holds calls it implicitly, with the value alone, so removing the default made that lookup raise `TypeError`, and the call the interpreter makes is not one the fixer can update.
+- Being an enumeration is inherited, so a class written on another of this file's enumerations keeps its `__init__` and `_missing_` defaults too, however many classes and class bodies stand between it and the `enum.Enum` the file imported.
 
 ## 2.1.0 - 2026-08-07
 

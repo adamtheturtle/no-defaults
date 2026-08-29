@@ -62,6 +62,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 ### Fixed
 
 - A construction of a class that inherits its constructor is reported, and the inherited default retained, when the pass cannot say which class the name holds. Previously only the base's default went and the call was left bare, with nothing said about it.
+- A dataclass whose constructor is not known from the file that defines it keeps its field defaults. Removing them while leaving the constructions unrewritten made the file raise `TypeError`.
+- A class bound to a second name by an assignment keeps the defaults behind it, and a construction spelled with that name is reported. `Alias = Child` followed by `Alias()`, `api.Alias()`, `from api import Alias`, or `H.Child()` after `H = Holder` was passed over in silence while the default it relied on was deleted. A class nothing was taken from is not reported, since no call to it was threatened.
+- A class whose decorator writes its constructor is no longer given the `__init__` it would otherwise inherit, which wrote an ancestor's parameters into calls that never accepted them.
+- A class defining `__new__` has its inherited constructor's defaults retained: `__new__` takes the arguments the construction is spelled with, so the inherited `__init__` cannot say what belongs in the call.
 - Class-body aliases created with `staticmethod()` and `classmethod()` carry the wrapper's receiver convention; `property()` aliases retain defaults consumed by descriptor access.
 - Class-body control-flow suites are scanned conservatively for method aliases, while nested definition scopes remain excluded.
 - Annotated assignments, statically paired destructuring, and named expressions in class bodies record method aliases for call rewriting.

@@ -277,16 +277,15 @@ fn unpacked_kw_only_field_options_do_not_produce_constructor_arguments(
 fn a_shadowed_object_base_is_not_treated_as_builtin() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");
-    std::fs::write(
-        &path,
-        "from dataclasses import dataclass\n\nclass Base:\n    inherited: int = 1\n\nobject = Base\n\n@dataclass\nclass C(object):\n    own: int = 2\n\nC()\n",
-    )?;
+    let source = "from dataclasses import dataclass\n\nclass Base:\n    inherited: int = 1\n\nobject = Base\n\n@dataclass\nclass C(object):\n    own: int = 2\n\nC()\n";
+    std::fs::write(&path, source)?;
     let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
-    assert_eq!(output.status.code(), Some(0));
-    let fixed = std::fs::read_to_string(path)?;
-    assert!(fixed.contains("own: int\n"), "{fixed}");
-    assert!(fixed.ends_with("C()\n"), "{fixed}");
+    // `object` names `Base` here, so `C` inherits a field the file cannot
+    // account for and `C()` is left as it is. The default it needs stays with
+    // it: deleting one and not the other is what raises `TypeError`.
+    assert_eq!(std::fs::read_to_string(path)?, source);
     assert!(String::from_utf8(output.stderr)?.contains("inherits fields"));
+    assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
 
@@ -4229,17 +4228,16 @@ fn custom_qualified_protocol_bases_are_not_treated_as_structural(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");
-    std::fs::write(
-        &path,
-        "from dataclasses import dataclass\n\nclass helpers:\n    class Protocol:\n        inherited: int = 1\n\n@dataclass\nclass C(helpers.Protocol):\n    own: int = 2\n\nC()\n",
-    )?;
+    let source = "from dataclasses import dataclass\n\nclass helpers:\n    class Protocol:\n        inherited: int = 1\n\n@dataclass\nclass C(helpers.Protocol):\n    own: int = 2\n\nC()\n";
+    std::fs::write(&path, source)?;
     let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
-    assert_eq!(output.status.code(), Some(0));
-    let fixed = std::fs::read_to_string(path)?;
-    assert!(fixed.contains("own: int\n"), "{fixed}");
-    assert!(fixed.ends_with("C()\n"), "{fixed}");
+    // `helpers.Protocol` is a class of this file rather than the typing
+    // construct, so `C` inherits a field the file cannot account for and both
+    // the call and the default behind it are left alone.
+    assert_eq!(std::fs::read_to_string(path)?, source);
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("inherits fields"), "{stderr}");
+    assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
 
@@ -6764,5 +6762,155 @@ fn an_untaken_branch_namesake_keeps_a_metaclass_init_default(
         .output()?;
     assert_eq!(std::fs::read_to_string(&case)?, source);
     assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_plain_local_base_keeps_the_dataclass_default_behind_its_construction(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `Base` carries no shape this file recorded, so `Child`'s constructor is
+    // not known here and `Child()` is left as it is. The default has to stay
+    // with it: deleting the one and not the other is what turns a running file
+    // into `TypeError: Child.__init__() missing 1 required positional
+    // argument: 'value'`.
+    let source = "from dataclasses import dataclass\n\n\nclass Base:\n    pass\n\n\n@dataclass\nclass Child(Base):\n    value: int = 1\n\n\nassert Child().value == 1\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_aliased_class_construction_keeps_the_inherited_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `Alias` is spelled with neither the class's name nor the inherited
+    // `__init__`'s, so nothing ties `Alias()` to the definition a fix would
+    // reach. The deletion is held back rather than left in front of a call
+    // that no longer supplies the argument it stood for.
+    let source = "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n\n\nAlias = Child\n\nassert Alias().value == 1\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_aliased_class_constructed_through_its_module_keeps_the_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let user = directory.path().join("user.py");
+    let api_source = "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n\n\nAlias = Child\n";
+    let user_source = "import api\n\nassert api.Alias().value == 1\n";
+    std::fs::write(&api, api_source)?;
+    std::fs::write(&user, user_source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&api)?, api_source);
+    assert_eq!(std::fs::read_to_string(&user)?, user_source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_class_reached_through_an_aliased_holder_keeps_the_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // A class written inside an aliased one is reached through the alias too,
+    // so `H.Child()` is as far out of reach as `H()` would be.
+    let source = "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Holder:\n    class Child(Base):\n        pass\n\n\nH = Holder\n\nassert H.Child().value == 1\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_shadowed_subclass_construction_keeps_the_inherited_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The parameter takes the name over, so `Child()` in the body builds
+    // whatever the caller handed in. A dataclass of the same shape is already
+    // held back here; a class whose constructor is inherited was not, because
+    // the construction is spelled with the class's name rather than with the
+    // `__init__` the fix was made in.
+    let source = "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n\n\ndef run(Child):\n    return Child()\n\n\nassert run(Child).value == 1\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_class_making_its_own_instances_keeps_the_inherited_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `Sub.__new__` takes the arguments the construction is spelled with, so
+    // the inherited `__init__` cannot say what belongs in the call. It still
+    // runs afterwards, so its default has to stay: writing `y=1` into the call
+    // raises `TypeError: Sub.__new__() got an unexpected keyword argument
+    // 'y'`, and deleting the default without writing anything raises
+    // `TypeError: Base.__init__() missing 1 required positional argument`.
+    let source = "class Base:\n    def __init__(self, x, y=1):\n        self.x = x\n        self.y = y\n\n\nclass Sub(Base):\n    def __new__(cls, z):\n        instance = object.__new__(cls)\n        instance.z = z\n        return instance\n\n\nassert Sub(5).z == 5\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_alias_imported_by_name_keeps_the_inherited_default() -> Result<(), Box<dyn std::error::Error>>
+{
+    // The importing file spells the class with a name of its own, and what
+    // that name stands for was written in the file the import names. Reading
+    // only the calling file's own assignments left `Alias()` tied to nothing
+    // while the default behind the class went.
+    for user_source in [
+        "from api import Alias\n\nassert Alias().value == 1\n",
+        "from api import Alias as Made\n\nassert Made().value == 1\n",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        let api_source = "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n\n\nAlias = Child\n";
+        std::fs::write(&api, api_source)?;
+        std::fs::write(&user, user_source)?;
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(std::fs::read_to_string(&api)?, api_source);
+        assert_eq!(std::fs::read_to_string(&user)?, user_source);
+        assert_eq!(output.status.code(), Some(1), "{user_source}");
+    }
     Ok(())
 }

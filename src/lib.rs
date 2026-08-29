@@ -410,6 +410,15 @@ struct Definitions {
     /// Default deletions grouped by every callable spelling, used to retain
     /// them when an unresolved checked call may refer to that callable.
     fixes_by_name: BTreeMap<String, BTreeSet<FixKey>>,
+    /// The classes an assignment bound to a second name, under the file and
+    /// spelling that name is reached by. Every class a spelling ever stood for
+    /// is kept: the entry decides only which defaults are held back, so naming
+    /// one class too many costs a retained default rather than a wrong
+    /// rewrite.
+    class_aliases: BTreeMap<(PathBuf, String), BTreeSet<(PathBuf, String)>>,
+    /// Classes whose decorator writes their constructor, so the `__init__`
+    /// they inherit is not what a construction of them reaches.
+    own_constructors: BTreeSet<(PathBuf, String)>,
 }
 
 impl Definitions {
@@ -610,11 +619,37 @@ impl Definitions {
             {
                 continue;
             }
+            // A decorator that writes the constructor replaces what the
+            // class would otherwise inherit outright, so the ancestor's
+            // parameters describe nothing this construction takes. The class
+            // is left without a synthesized signature: its own fields are
+            // recorded by the checker where any were removed, and where none
+            // were there is nothing to write into its calls.
+            if self
+                .own_constructors
+                .contains(&(file.clone(), class.clone()))
+            {
+                continue;
+            }
             let Some(mut signature) = self.method(&file, &class, "__init__").cloned() else {
                 continue;
             };
             signature.name.clone_from(&class);
             signature.kind = Callable::Constructor;
+            // A class that makes its own instances is not described by the
+            // `__init__` it inherits: `__new__` is handed the arguments the
+            // construction is spelled with, and writing an ancestor's
+            // parameters into the call passes it what it never took. The
+            // signature is still recorded, so the call is reported and the
+            // deletion behind it held back rather than left in front of a
+            // construction that can no longer run.
+            if self
+                .methods
+                .get(&(file.clone(), class.clone()))
+                .is_some_and(|methods| methods.contains_key("__new__"))
+            {
+                signature.complete = false;
+            }
             // A class written in a function or another class body is indexed
             // under a qualified identity, and a call spells only the last
             // part of it, exactly as the names a checked definition registers.
@@ -639,6 +674,11 @@ impl Definitions {
 struct Checked {
     diagnostics: Vec<Diagnostic>,
     signatures: Vec<Signature>,
+    /// The classes whose decorator writes their constructor, under the file
+    /// and identity the definition index knows them by. A class among these
+    /// builds its instances with a constructor of its own, whatever it
+    /// inherits.
+    own_constructors: Vec<(PathBuf, String)>,
     /// Calls the checker already knows `--fix` will not reach, such as those
     /// to a lambda whose default it removed.
     skipped: Vec<Skipped>,
@@ -730,17 +770,26 @@ fn run() -> Result<bool, String> {
         .collect();
     let mut diagnostics = Vec::new();
     let mut signatures = Vec::new();
+    let mut own_constructors = Vec::new();
     let mut skipped = Vec::new();
     for checked in results {
         diagnostics.extend(checked.diagnostics);
         signatures.extend(checked.signatures);
+        own_constructors.extend(checked.own_constructors);
         skipped.extend(checked.skipped);
     }
     diagnostics.sort_by(|left, right| {
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
     if fixing && !diagnostics.is_empty() {
-        return apply_fixes(&cli, &files, &diagnostics, signatures, skipped);
+        return apply_fixes(
+            &cli,
+            &files,
+            &diagnostics,
+            signatures,
+            own_constructors,
+            skipped,
+        );
     }
     report_diagnostics(&diagnostics, cli.output_format, true)?;
     Ok(!diagnostics.is_empty())
@@ -753,9 +802,10 @@ fn apply_fixes(
     files: &[PathBuf],
     diagnostics: &[Diagnostic],
     signatures: Vec<Signature>,
+    own_constructors: Vec<(PathBuf, String)>,
     skipped: Vec<Skipped>,
 ) -> Result<bool, String> {
-    let mut call_sites = call_site_edits(files, signatures)?;
+    let mut call_sites = call_site_edits(files, signatures, own_constructors)?;
     // Calls the checker already knew were out of reach, such as those to a
     // lambda whose default was removed, are warned about alongside the rest.
     call_sites.skipped.extend(skipped);
@@ -946,7 +996,11 @@ fn physical_paths(files: &[PathBuf]) -> BTreeMap<&Path, PathBuf> {
     clippy::too_many_lines,
     reason = "building the cross-file definition index and scanning its callers is one pipeline"
 )]
-fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<CallSites, String> {
+fn call_site_edits(
+    files: &[PathBuf],
+    signatures: Vec<Signature>,
+    own_constructors: Vec<(PathBuf, String)>,
+) -> Result<CallSites, String> {
     let physical = physical_paths(files);
     let physical_path = |path: &Path| -> PathBuf {
         physical
@@ -954,7 +1008,13 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
             .cloned()
             .unwrap_or_else(|| path.to_path_buf())
     };
-    let mut definitions = Definitions::default();
+    let mut definitions = Definitions {
+        own_constructors: own_constructors
+            .into_iter()
+            .map(|(path, class)| (physical_path(&path), class))
+            .collect(),
+        ..Definitions::default()
+    };
     for signature in signatures {
         let display_name = signature
             .name
@@ -1639,6 +1699,21 @@ fn index_scope_method_bases(
                         // this class, and the scope around a suite should be
                         // handed that rather than the reclaim.
                         scope.reclaimed.remove(alias.id.as_str());
+                        // A call spelled with the alias is tied to no
+                        // definition, so what the spelling stands for is
+                        // recorded for the defaults behind it to be held back.
+                        // Both spellings are kept because a call reaches the
+                        // name either way: bare inside the scope that bound
+                        // it, and through the class where a class body did.
+                        for spelling in
+                            [alias.id.to_string(), namespace.identity(alias.id.as_str())]
+                        {
+                            definitions
+                                .class_aliases
+                                .entry((importer.to_path_buf(), spelling))
+                                .or_default()
+                                .insert(identity.clone());
+                        }
                         scope.aliases.insert(alias.id.to_string(), identity.clone());
                     }
                 }
@@ -3573,6 +3648,7 @@ fn source_error(path: &Path, error: String) -> Checked {
             fix: None,
         }],
         signatures: Vec::new(),
+        own_constructors: Vec::new(),
         skipped: Vec::new(),
     }
 }
@@ -3828,6 +3904,7 @@ fn syntax_error(path: &Path, source: &str, error: &ruff_python_parser::ParseErro
             fix: None,
         }],
         signatures: Vec::new(),
+        own_constructors: Vec::new(),
         skipped: Vec::new(),
     }
 }
@@ -3920,6 +3997,7 @@ fn check_source(
         class_rewraps: Vec::new(),
         method_aliases: Vec::new(),
         signatures: Vec::new(),
+        own_constructors: Vec::new(),
         skipped: Vec::new(),
         directives,
         diagnostics: Vec::new(),
@@ -4273,6 +4351,9 @@ struct Checker<'a> {
     /// original method name.
     method_aliases: Vec<BTreeMap<String, Vec<MethodAlias>>>,
     signatures: Vec<Signature>,
+    /// The classes whose decorator writes their constructor, so that a
+    /// subclass is never handed an ancestor's `__init__` in its place.
+    own_constructors: Vec<(PathBuf, String)>,
     skipped: Vec<Skipped>,
     directives: Vec<Directive>,
     diagnostics: Vec<Diagnostic>,
@@ -5198,6 +5279,7 @@ impl Checker<'_> {
         Checked {
             diagnostics: self.diagnostics,
             signatures: self.signatures,
+            own_constructors: self.own_constructors,
             skipped: self.skipped,
         }
     }
@@ -6126,6 +6208,15 @@ impl<'a> Visitor<'a> for Checker<'a> {
                             kept_default: self.scope.kept_default,
                         };
                         self.record_shape(shape_name, shape);
+                    }
+                    // A class whose decorator writes its constructor is not
+                    // built by the `__init__` it would otherwise inherit, so
+                    // it is named here whether or not anything was removed
+                    // from it. Without that an ancestor's parameters are
+                    // written into calls that never accepted them.
+                    if collector.style.is_some() && collector.constructs {
+                        self.own_constructors
+                            .push((self.path.to_path_buf(), collector.qualified.clone()));
                     }
                     if collector.style.is_some()
                         && collector.constructs
@@ -9390,6 +9481,88 @@ impl Rewriter<'_> {
         );
     }
 
+    /// The classes a callee spelling could name because an assignment bound
+    /// one of them to it.
+    ///
+    /// `Alias = Child` leaves the class reachable as `Alias`, and neither the
+    /// tables a construction is looked up in nor the names the fixed callables
+    /// go by answer to that spelling. A class written inside an aliased one
+    /// travels with it, so `H = Holder` is read off the receiver of
+    /// `H.Child()` as readily as off `H()` itself.
+    fn aliased_classes(&self, callee: &Expr) -> BTreeSet<(PathBuf, String)> {
+        let mut found = BTreeSet::new();
+        let mut spelled = |file: &Path, spelling: &str| {
+            if let Some(classes) = self
+                .definitions
+                .class_aliases
+                .get(&(file.to_path_buf(), spelling.to_owned()))
+            {
+                found.extend(classes.iter().cloned());
+            }
+        };
+        let mut expression = callee;
+        loop {
+            match expression {
+                Expr::Name(name) => {
+                    spelled(self.physical, name.id.as_str());
+                    // An import gives the alias a name here of its own, and
+                    // what the spelling stands for was recorded in the file
+                    // that bound it rather than in this one.
+                    if let Some(Binding::Symbol(file, symbol)) = self.binding(name.id.as_str()) {
+                        spelled(file, symbol);
+                    }
+                    return found;
+                }
+                Expr::Attribute(attribute) => {
+                    // A class body binds its aliases under the class, so the
+                    // dotted spelling is what reaches one from outside it.
+                    if let Some(dotted) = dotted_name(expression) {
+                        spelled(self.physical, &dotted);
+                    }
+                    // A module the file imported holds aliases of its own,
+                    // which is what `api.Alias()` is spelled with.
+                    if let Some(Binding::Module(file)) =
+                        dotted_name(&attribute.value).and_then(|dotted| self.binding(&dotted))
+                    {
+                        let file = file.clone();
+                        spelled(&file, attribute.attr.as_str());
+                    }
+                    expression = attribute.value.as_ref();
+                }
+                Expr::Subscript(subscript) => expression = subscript.value.as_ref(),
+                _ => return found,
+            }
+        }
+    }
+
+    /// Every deletion made in a class an alias could name, its nested classes
+    /// included, since those are reached through the alias too.
+    fn fixes_behind(&self, classes: &BTreeSet<(PathBuf, String)>) -> Vec<FixKey> {
+        classes
+            .iter()
+            .filter_map(|(file, class)| {
+                Some((
+                    self.definitions.symbols.get(file)?,
+                    format!("{class}."),
+                    class,
+                ))
+            })
+            .flat_map(|(symbols, nested, class)| {
+                symbols
+                    .iter()
+                    .filter(move |(name, _)| *name == class || name.starts_with(&nested))
+                    .filter_map(|(_, signature)| signature.as_ref())
+                    .filter(|signature| !signature.kind.is_function())
+                    .flat_map(|signature| {
+                        signature
+                            .removed
+                            .iter()
+                            .map(|removed| fix_key(&signature.path, removed.fix))
+                    })
+            })
+            .collect()
+    }
+
     /// The class a receiver expression stands for, the file defining it, and
     /// whether the receiver is an instance rather than the class itself.
     ///
@@ -9755,7 +9928,13 @@ impl Rewriter<'_> {
         // construction does not carry: it is spelled with the class's name,
         // not the inherited `__init__`'s.
         let constructs_uncertain = self.constructs_uncertain_ancestry(&call.func);
-        if !self.definitions.names.contains(name) && !constructs_uncertain {
+        // A spelling an assignment bound a class to carries neither name
+        // either, and a call made through it reaches a constructor whose
+        // defaults this run may have deleted. Only a class something was
+        // taken from brings the call in: an alias of a class this run never
+        // touched has nothing behind it to warn about.
+        let aliased = self.fixes_behind(&self.aliased_classes(&call.func));
+        if !self.definitions.names.contains(name) && !constructs_uncertain && aliased.is_empty() {
             return;
         }
         let replaced_import =
@@ -9787,6 +9966,10 @@ impl Rewriter<'_> {
                 }
             }
         }
+        // Nothing was written into this call to stand in for a default, and
+        // the alias is the only thing tying it to a class, so every deletion
+        // that class carries is held back rather than guessed at.
+        self.retained.extend(aliased);
         self.skip(
             call.start(),
             name,
@@ -9810,13 +9993,30 @@ impl Rewriter<'_> {
             return;
         };
         if !signature.complete {
-            self.skip(
-                call.start(),
-                name,
+            // The constructor this call reaches is not known here, so there is
+            // no argument list to write the deleted default back into. Holding
+            // the deletion back is what keeps the call running: removing it and
+            // leaving the call as it stands is the one pairing that turns a
+            // working file into a `TypeError`. A signature nothing was taken
+            // from leaves the call untouched either way, and saying so would
+            // warn about a call this run never threatened.
+            let held: Vec<FixKey> = signature
+                .removed
+                .iter()
+                .map(|removed| fix_key(&signature.path, removed.fix))
+                .collect();
+            if held.is_empty() {
+                return;
+            }
+            let reason = if matches!(signature.kind, Callable::Dataclass) {
                 "the dataclass inherits fields, so its constructor is not known from the file \
                  that defines it"
-                    .to_owned(),
-            );
+            } else {
+                "the class makes its own instances, so the constructor it inherits is not what \
+                 this call reaches"
+            };
+            self.retained.extend(held);
+            self.skip(call.start(), name, reason.to_owned());
             return;
         }
         let arguments = match missing_arguments(&call.arguments, signature, bound) {
@@ -11467,6 +11667,7 @@ mod tests {
     fn fix_all(files: &[PathBuf]) -> Result<Vec<Skipped>, String> {
         let mut diagnostics = Vec::new();
         let mut signatures = Vec::new();
+        let mut own_constructors = Vec::new();
         let mut skipped = Vec::new();
         for path in files {
             let checked = check_file(
@@ -11479,9 +11680,10 @@ mod tests {
             );
             diagnostics.extend(checked.diagnostics);
             signatures.extend(checked.signatures);
+            own_constructors.extend(checked.own_constructors);
             skipped.extend(checked.skipped);
         }
-        let mut call_sites = call_site_edits(files, signatures)?;
+        let mut call_sites = call_site_edits(files, signatures, own_constructors)?;
         call_sites.skipped.extend(skipped);
         for diagnostic in &diagnostics {
             let Some(range) = diagnostic.fix else {
@@ -18172,7 +18374,8 @@ def b(x=1): pass  # type: ignore  # noqa
             &default_bases(),
             true,
         );
-        let mut edits = call_site_edits(&files, checked.signatures)?.edits;
+        let mut edits =
+            call_site_edits(&files, checked.signatures, checked.own_constructors)?.edits;
         for diagnostic in &checked.diagnostics {
             if let Some(range) = diagnostic.fix {
                 edits
@@ -19086,7 +19289,7 @@ def b(x=1): pass  # type: ignore  # noqa
             true,
         );
         let files = [path.clone()];
-        let mut call_sites = call_site_edits(&files, checked.signatures)?;
+        let mut call_sites = call_site_edits(&files, checked.signatures, checked.own_constructors)?;
         for diagnostic in &checked.diagnostics {
             let Some(range) = diagnostic.fix else {
                 continue;
@@ -21534,6 +21737,27 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn an_inherited_constructor_is_reported_under_the_class_name() -> Result<(), String> {
+        // The parameter takes `Child` over, so the construction in the body
+        // reaches whatever the caller passed. It is spelled with the class's
+        // name rather than the inherited `__init__`'s, and only the latter was
+        // among the names a fixed callable goes by, so the call went
+        // unreported while the default behind it was deleted. The dataclass
+        // beside it, whose own name is indexed, was already held back.
+        for source in [
+            "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n\n\ndef run(Child):\n    return Child()\n\n\nassert run(Child).value == 1\n",
+            "from dataclasses import dataclass\n\n\n@dataclass\nclass Child:\n    value: int = 1\n\n\ndef run(Child):\n    return Child()\n\n\nassert run(Child).value == 1\n",
+        ] {
+            assert_eq!(
+                skipped_reasons(source)?,
+                ["this call cannot be tied to the definition that was fixed"],
+                "{source}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_class_in_one_clause_is_no_base_for_a_sibling_clause() -> Result<(), String> {
         // Only one clause of the chain runs, so the `Base` written in the `if`
         // body is not there for the `Child` written in the `else`. The base is
@@ -21842,6 +22066,93 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn a_construction_through_an_assigned_name_is_reported() -> Result<(), String> {
+        // An assignment leaves the class reachable under a second spelling.
+        // Neither the tables a construction is looked up in nor the names the
+        // fixed callables go by answer to it, so without the alias index the
+        // call is passed over in silence and the default behind it goes.
+        for source in [
+            "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n\n\nAlias = Child\n\nassert Alias().value == 1\n",
+            "class Child:\n    def __init__(self, value=1):\n        self.value = value\n\n\nAlias = Child\n\nassert Alias().value == 1\n",
+            "from dataclasses import dataclass\n\n\n@dataclass\nclass Child:\n    value: int = 1\n\n\nAlias = Child\n\nassert Alias().value == 1\n",
+            "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Holder:\n    class Child(Base):\n        pass\n\n\nH = Holder\n\nassert H.Child().value == 1\n",
+        ] {
+            assert_eq!(
+                skipped_reasons(source)?,
+                ["this call cannot be tied to the definition that was fixed"],
+                "{source}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_assignment_no_call_reaches_leaves_the_class_alone() -> Result<(), String> {
+        // The alias index is read at the call rather than at the assignment,
+        // so a class bound to a second name nothing constructs is fixed and
+        // its calls rewritten exactly as before. Holding the default back
+        // there would retain a default no broken call is behind.
+        let source = "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n\n\nAlias = Child\n\nassert Child().value == 1\n";
+        assert!(skipped_reasons(source)?.is_empty());
+        let updated = fixed(source)?;
+        assert!(
+            updated.contains("assert Child(value=1).value == 1"),
+            "{updated}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_generated_initializer_is_not_replaced_by_an_inherited_one() -> Result<(), String> {
+        // `Sub` is built by the `__init__` its decorator writes, so the one it
+        // inherits describes nothing the call takes. Handing it that signature
+        // wrote `y=1` into a construction that never accepted the name at all.
+        let generated = "from dataclasses import dataclass\n\n\nclass Base:\n    def __init__(self, x, y=1):\n        self.x = x\n        self.y = y\n\n\n@dataclass\nclass Sub(Base):\n    z: int\n\n\nassert Sub(5).z == 5\n";
+        assert_eq!(
+            fixed(generated)?,
+            "from dataclasses import dataclass\n\n\nclass Base:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n\n\n@dataclass\nclass Sub(Base):\n    z: int\n\n\nassert Sub(5).z == 5\n"
+        );
+        // A class written in another class or in a function body is indexed
+        // under a qualified identity, which the checker has to name it by for
+        // the guard to reach it there too.
+        for (header, call) in [
+            ("class Holder:\n    @dataclass\n    class Sub(Base):\n        z: int\n\n\nassert Holder.Sub(5).z == 5\n", "Holder.Sub(5)"),
+            ("def make():\n    @dataclass\n    class Sub(Base):\n        z: int\n\n    return Sub(5)\n\n\nassert make().z == 5\n", "Sub(5)"),
+        ] {
+            let nested = format!("from dataclasses import dataclass\n\n\nclass Base:\n    def __init__(self, x, y=1):\n        self.x = x\n        self.y = y\n\n\n{header}");
+            let updated = fixed(&nested)?;
+            assert!(updated.contains("def __init__(self, x, y):"), "{updated}");
+            assert!(updated.contains(call), "{updated}");
+        }
+        // A decorator that writes no constructor leaves the inherited one
+        // standing, so the call there is still rewritten.
+        let inherited = "from dataclasses import dataclass\n\n\nclass Base:\n    def __init__(self, x, y=1):\n        self.x = x\n        self.y = y\n\n\n@dataclass(init=False)\nclass Sub(Base):\n    pass\n\n\nassert Sub(5).y == 1\n";
+        assert_eq!(
+            fixed(inherited)?,
+            "from dataclasses import dataclass\n\n\nclass Base:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n\n\n@dataclass(init=False)\nclass Sub(Base):\n    pass\n\n\nassert Sub(5, y=1).y == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_making_its_own_instances_reports_its_construction() -> Result<(), String> {
+        // `Sub.__new__` is handed the arguments the construction is spelled
+        // with, so an ancestor's `__init__` parameters cannot be written into
+        // it. `Base.__init__` still runs afterwards, though, so its default is
+        // what the call relies on and the deletion is held back rather than
+        // left in front of a call that can no longer supply it.
+        let source = "class Base:\n    def __init__(self, x, y=1):\n        self.x = x\n        self.y = y\n\n\nclass Sub(Base):\n    def __new__(cls, z):\n        instance = object.__new__(cls)\n        instance.z = z\n        return instance\n\n\nassert Sub(5).z == 5\n";
+        assert_eq!(
+            skipped_reasons(source)?,
+            [
+                "the class makes its own instances, so the constructor it inherits is not what \
+                 this call reaches"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_plain_element_beside_an_unpack_still_fills_a_display() -> Result<(), String> {
         // Whatever `*values` adds, the element written beside it is one item
         // on its own, so the loop does iterate and break out, leaving the
@@ -21849,6 +22160,19 @@ def b(x=1): pass  # type: ignore  # noqa
         let source = "import os\n\nfrom api import target\n\nvalues = [1] if os.environ.get(\"NOD_FULL\") else []\n\nfor _ in [*values, os.environ.get(\"NOD_FULL\")]:\n    break\nelse:\n    from other import target\n\nassert target() == 1\n";
         let updated = loop_else_import_fixture(source)?;
         assert!(updated.contains("assert target(alpha=1) == 1"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_alias_of_an_untouched_class_is_not_reported() -> Result<(), String> {
+        // Nothing was taken from `Child`, so `Alias()` is a call this run never
+        // threatened and there is no deletion behind it to hold back. Reporting
+        // it because some other default in the file was removed would name a
+        // call that is exactly as it should be.
+        let source = "def unrelated(value=1):\n    return value\n\n\nclass Child:\n    def __init__(self):\n        self.value = 2\n\n\nAlias = Child\n\nassert (Alias().value, unrelated()) == (2, 1)\n";
+        assert!(skipped_reasons(source)?.is_empty());
+        let updated = fixed(source)?;
+        assert!(updated.contains("unrelated(value=1)"), "{updated}");
         Ok(())
     }
 }

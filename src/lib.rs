@@ -1431,6 +1431,13 @@ impl<'a> BaseScope<'a> {
     /// class written in the body, so what those scopes see is what the class
     /// body itself saw. Anywhere else the classes this scope has written above
     /// the nested scope stand alongside them.
+    ///
+    /// A spelling this scope writes a class under is bound for the whole scope,
+    /// so a scope nested in it reads this scope's binding and never the class a
+    /// scope further out put behind the same spelling. Where the class
+    /// statement stands below the nested scope, what the name reaches by the
+    /// time that scope runs is not something the written order settles, so the
+    /// spelling is taken away rather than answered with the outer class.
     fn visible_classes(&self, defined_at: TextSize) -> BTreeMap<String, String> {
         let mut visible = self.namespace.enclosing.clone();
         if self.namespace.parent.is_some() {
@@ -1439,6 +1446,8 @@ impl<'a> BaseScope<'a> {
         for (spelling, class) in self.classes {
             if class.holds_at(defined_at) {
                 visible.insert(spelling.clone(), class.identity.clone());
+            } else {
+                visible.remove(spelling);
             }
         }
         visible
@@ -21354,6 +21363,30 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "class Helper:\n    def method(self, value): return value\n\n\nclass A:\n    class Helper:\n        def method(self, value): return value\n\n    def run(self):\n        class Child(Helper):\n            def go(self): return super().method(value=1)\n\n        return Child().go()\n\n\nassert A().run() == 1\n"
         );
+        Ok(())
+    }
+    #[test]
+    fn a_class_written_below_a_nested_scope_takes_its_spelling_away() -> Result<(), String> {
+        // Writing `class Helper` anywhere in `outer` binds that spelling for
+        // the whole of `outer`, so `inner` reads what `outer` holds rather than
+        // the module-level class. Which class that is when `inner` runs is not
+        // something the written order settles — the call could come before the
+        // class statement as easily as after — so the base is left unresolved
+        // and the call it heads is left alone, rather than answered with the
+        // module-level class the subclass may never be built on.
+        let source = "class Helper:\n    def method(self, value=111):\n        return value\n\n\ndef outer():\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    class Helper:\n        def method(self, value=333):\n            return value\n\n    return inner()\n\n\nassert outer() == 333, outer()\n";
+        assert_eq!(fixed(source)?, "class Helper:\n    def method(self, value):\n        return value\n\n\ndef outer():\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    class Helper:\n        def method(self, value):\n            return value\n\n    return inner()\n\n\nassert outer() == 333, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_assignment_in_an_enclosing_scope_is_read_before_an_outer_class() -> Result<(), String> {
+        // The assignment binds `Helper` in `outer` before the subclass is
+        // written, so the base is what the assignment put there and the call
+        // takes that class's default. The module-level namesake a scope
+        // further out holds is not reached.
+        let source = "class Other:\n    def method(self, value=333):\n        return value\n\n\nclass Helper:\n    def method(self, value=111):\n        return value\n\n\ndef outer():\n    Helper = Other\n\n    class Child(Helper):\n        def run(self):\n            return self.method()\n\n    return Child().run()\n\n\nassert outer() == 333, outer()\n";
+        assert_eq!(fixed(source)?, "class Other:\n    def method(self, value):\n        return value\n\n\nclass Helper:\n    def method(self, value):\n        return value\n\n\ndef outer():\n    Helper = Other\n\n    class Child(Helper):\n        def run(self):\n            return self.method(value=333)\n\n    return Child().run()\n\n\nassert outer() == 333, outer()\n");
         Ok(())
     }
 }

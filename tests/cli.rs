@@ -5782,6 +5782,90 @@ fn a_loader_helper_beside_exec_module_is_still_fixed() -> Result<(), Box<dyn std
 }
 
 #[test]
+fn a_pickler_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `Pickler.dump` reaches for `persistent_id` itself, handing it the object
+    // and nothing else, so `extra` is only ever filled by its default. That
+    // call lives in `pickle` rather than in any file the fixer can see, so
+    // removing the default leaves the next dump raising `TypeError` with no
+    // written call site to carry the argument.
+    let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return None\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_pickler_helper_beside_persistent_id_is_still_fixed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // plain helper on the same pickler is rewritten as usual.
+    let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value=2):\n        return value\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class P:\n    def persistent_id(self, obj, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value):\n        return value\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_pickler_reducer_override_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `dump` caches a pickler's `reducer_override` and calls it with the object
+    // being pickled and nothing else, so `extra` is only ever filled by its
+    // default. That call is made inside `pickle`, so removing the default
+    // leaves `dump` raising `TypeError` with no written call site to carry the
+    // argument.
+    let source =
+        "class P:\n    def reducer_override(self, obj, extra=1):\n        return NotImplemented\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_pickler_helper_beside_reducer_override_is_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the shape of the parameter
+    // list, so a sibling declared with the very same signature is stripped and
+    // its call site given the default that used to reach it.
+    let source = "class P:\n    def reducer_override(self, obj, extra=1):\n        return self.fallback(obj)\n\n    def fallback(self, obj, extra=1):\n        return NotImplemented\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class P:\n    def reducer_override(self, obj, extra=1):\n        return self.fallback(obj, extra=1)\n\n    def fallback(self, obj, extra):\n        return NotImplemented\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
 fn an_unpickler_class_lookup_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

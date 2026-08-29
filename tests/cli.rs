@@ -7062,6 +7062,48 @@ fn a_same_named_method_from_another_class_is_a_replacement(
 }
 
 #[test]
+fn io_and_importlib_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // A buffer calls `readinto`, `write`, `seek`, `tell` and `close` on the raw
+    // stream it wraps, and the import machinery calls `get_data` and
+    // `path_stats` on a source loader from `get_code`. Neither call is written
+    // here, so there is nothing to carry the value once the default is gone.
+    // The subclass of a stream written in this file inherits that reach.
+    let source = "import io\nimport importlib.abc\nfrom io import RawIOBase\n\n\nclass R(io.RawIOBase):\n    def readinto(self, b, extra=1): return 0\n\n    def close(self, extra=2): pass\n\n\nclass Child(R):\n    def seek(self, offset, whence, extra=3): return 0\n\n\nclass W(RawIOBase):\n    def write(self, b, extra=4): return 0\n\n\nclass L(importlib.abc.SourceLoader):\n    def get_data(self, path, extra=5): return b''\n\n    def path_stats(self, path, extra=6): return {}\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The defaults are still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn callback_names_off_the_io_hierarchy_are_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `close`, `write`, `seek` and `tell` are ordinary method names, and a
+    // class of any other ancestry that spells one is fixed as before: the
+    // defaults go and the calls written below carry the values they held.
+    let source = "class Stream:\n    def write(self, b, extra=1): return extra\n\n    def seek(self, offset, extra=2): return extra\n\n    def tell(self, extra=3): return extra\n\n    def close(self, extra=4): return extra\n\n\ns = Stream()\nassert Stream.write(s, b'') == 1\nassert Stream.seek(s, 0) == 2\nassert Stream.tell(s) == 3\nassert Stream.close(s) == 4\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Stream:\n    def write(self, b, extra): return extra\n\n    def seek(self, offset, extra): return extra\n\n    def tell(self, extra): return extra\n\n    def close(self, extra): return extra\n\n\ns = Stream()\nassert Stream.write(s, b'', extra=1) == 1\nassert Stream.seek(s, 0, extra=2) == 2\nassert Stream.tell(s, extra=3) == 3\nassert Stream.close(s, extra=4) == 4\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn a_copy_of_a_first_bound_contested_name_keeps_the_inherited_default(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The suites bind `Alias` for the first time, so nothing stands behind it

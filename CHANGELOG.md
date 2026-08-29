@@ -61,6 +61,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A construction of a class that inherits its constructor is reported, and the inherited default retained, when the pass cannot say which class the name holds. Previously only the base's default went and the call was left bare, with nothing said about it.
 - Class-body aliases created with `staticmethod()` and `classmethod()` carry the wrapper's receiver convention; `property()` aliases retain defaults consumed by descriptor access.
 - Class-body control-flow suites are scanned conservatively for method aliases, while nested definition scopes remain excluded.
 - Annotated assignments, statically paired destructuring, and named expressions in class bodies record method aliases for call rewriting.
@@ -158,6 +159,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A class written in one clause of an `if` chain, or in one case of a `match`, is no longer read as the base of a class written in another. Only one of them runs, so the class in the clause that did not is not there for the one that did, and taking it as the base rewrote the inherited call with a default the run never reaches — turning a working file into one that computes the wrong answer. A class written beside its own subclass in the same clause is still its base, and a class in a `try` body is still in reach from the `except` handler that picks up after it.
 - An import in a suite that may not run leaves a class the scope already writes under that spelling contested rather than settled. The name stands for the module or for the class, so a subclass built on it has an ancestry for each, and resolving against either stripped the default behind the other while rewriting the inherited call with the wrong value. Both candidates now keep their defaults and the call is reported instead of rewritten. An import of a spelling nothing else in the file binds names the same module whichever way the test went, so it settles the ancestry as before.
 - A class statement in a suite that may not run no longer takes a name off the tables that say which of this file's classes are metaclasses and which are enumerations. A plain namesake written under `if TYPE_CHECKING:` left the live metaclass or enumeration untracked, so a subclass below it lost the retention that keeps an implicitly called `__init__` intact, and `--fix` removed a default that class creation supplies no argument for — with no written call site to make up for it, and nothing reported. A namesake the file is certain to reach still takes the name back.
+### Documentation
+
+- `README.md` is an overview again: what the tool is, how to install and run it, what `--fix` does and cannot do, the configuration keys, and pre-commit. The behaviour it used to spell out in full moved to `docs/reference.md`, which it links to, with nothing dropped.
+- The `.pyi` note said only `= ...` was reported without being fixed. Every default in a stub has been reported and retained since that change, so the note now says so.
 
 ## 2.1.0 - 2026-08-07
 

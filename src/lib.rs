@@ -3865,6 +3865,9 @@ struct Scope {
     fields: Option<FieldStyle>,
     /// What kind of class body definitions here sit directly in, if any.
     class: ClassScope,
+    /// Whether this is an `enum.Enum` body whose members are initialized
+    /// implicitly while the class is created.
+    enum_class: bool,
     /// Whether a field of this class has kept its default, which forces every
     /// field after it to keep its own: `dataclasses` rejects a field without a
     /// default following one with it.
@@ -4549,6 +4552,7 @@ impl Checker<'_> {
             private: self.encloses_private(function.name.as_str(), outer),
             fields: None,
             class: ClassScope::None,
+            enum_class: false,
             kept_default: false,
         };
         let outer_repeated_functions = self.repeated_functions.clone();
@@ -4898,6 +4902,7 @@ impl Checker<'_> {
                 || self.is_delegation_protocol_method(function.name.as_str())
                 || (self.scope.class == ClassScope::Metaclass
                     && matches!(function.name.as_str(), "__init__" | "mro"))
+                || (self.scope.enum_class && function.name.as_str() == "__init__")
                 || (self.scope.class == ClassScope::None
                     && self.lexical_scope.is_empty()
                     && matches!(function.name.as_str(), "__getattr__" | "__dir__"))
@@ -5486,6 +5491,15 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     } else {
                         ClassScope::Ordinary
                     },
+                    enum_class: class_bases(class).any(|base| match base {
+                        Expr::Name(name) => {
+                            self.aliases.enum_classes.contains(name.id.as_str())
+                        }
+                        Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
+                            matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
+                        }
+                        _ => false,
+                    }),
                     // Each class body starts fresh; a base's fields are not
                     // written here.
                     kept_default: false,
@@ -5880,6 +5894,8 @@ struct Aliases {
     pydantic_private_attrs: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
     pydantic_modules: BTreeSet<String>,
+    enum_classes: BTreeSet<String>,
+    enum_modules: BTreeSet<String>,
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
     properties: BTreeSet<String>,
@@ -5910,6 +5926,8 @@ impl Aliases {
         self.pydantic_private_attrs.remove(name);
         self.dataclasses_modules.remove(name);
         self.pydantic_modules.remove(name);
+        self.enum_classes.remove(name);
+        self.enum_modules.remove(name);
         self.staticmethods.remove(name);
         self.classmethods.remove(name);
         self.supers.remove(name);
@@ -6018,6 +6036,22 @@ impl Aliases {
         }
     }
 
+    fn collect_enum_members(&mut self, import: &ast::StmtImportFrom) {
+        if import
+            .module
+            .as_ref()
+            .is_none_or(|module| module.as_str() != "enum")
+        {
+            return;
+        }
+        for alias in &import.names {
+            if alias.name.as_str() == "Enum" {
+                self.enum_classes
+                    .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
+            }
+        }
+    }
+
     /// Collect the renaming imports visible in one lexical scope, including
     /// those nested in control-flow blocks but not nested definitions.
     /// The names a plain `import` binds for the modules whose members matter.
@@ -6041,6 +6075,13 @@ impl Aliases {
                         .asname
                         .as_ref()
                         .map_or_else(|| "pydantic".to_owned(), ToString::to_string),
+                );
+            } else if alias.name.as_str() == "enum" {
+                self.enum_modules.insert(
+                    alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| "enum".to_owned(), ToString::to_string),
                 );
             } else if alias.name.as_str() == "builtins" {
                 self.builtins_modules.insert(
@@ -6082,6 +6123,7 @@ impl Aliases {
                     self.collect_typing_members(import);
                     self.collect_builtin_members(import);
                     self.collect_abc_members(import);
+                    self.collect_enum_members(import);
                     let carries_fields = import.module.as_ref().is_some_and(|module| {
                         matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
                     });
@@ -18887,5 +18929,45 @@ def b(x=1): pass  # type: ignore  # noqa
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn enum_member_initializer_defaults_are_retained() {
+        // Assigning a member in an `Enum` body calls `__init__` with whatever
+        // the assignment holds, so a parameter the members never supply is
+        // reached only through its default. Removing it turns class creation
+        // itself into a `TypeError`, and there is no call site to rewrite,
+        // because the calls are the member assignments the interpreter makes.
+        for source in [
+            "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "import enum as enums\n\nclass E(enums.Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+        // The same body with an ordinary base has no implicit call, so the
+        // default is still removed: the retention is the enum base, not the
+        // method name.
+        let control = "class E:\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            control,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
     }
 }

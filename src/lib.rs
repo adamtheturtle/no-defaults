@@ -593,6 +593,13 @@ impl Definitions {
 
     /// Give a subclass with no constructor of its own the signature of the
     /// checked `__init__` it inherits.
+    ///
+    /// A construction is spelled with the class's name, so the subclass takes
+    /// its place among the names a call can go by and carries the inherited
+    /// defaults behind it. Without that, a `Child()` the pass cannot resolve —
+    /// through an import another suite replaces, say — passes the gate in
+    /// `report_unresolved_call` unnoticed: the base's default is deleted, the
+    /// call is left bare, and nothing is said about it.
     fn index_inherited_constructors(&mut self) {
         let classes: Vec<(PathBuf, String)> = self.bases.keys().cloned().collect();
         for (file, class) in classes {
@@ -608,6 +615,17 @@ impl Definitions {
             };
             signature.name.clone_from(&class);
             signature.kind = Callable::Constructor;
+            // A class written in a function or another class body is indexed
+            // under a qualified identity, and a call spells only the last
+            // part of it, exactly as the names a checked definition registers.
+            let spelling = class.rsplit('.').next().unwrap_or(&class).to_owned();
+            self.names.insert(spelling.clone());
+            self.fixes_by_name.entry(spelling).or_default().extend(
+                signature
+                    .removed
+                    .iter()
+                    .map(|removed| fix_key(&signature.path, removed.fix)),
+            );
             self.symbols
                 .entry(file)
                 .or_default()
@@ -21387,6 +21405,37 @@ def b(x=1): pass  # type: ignore  # noqa
         // further out holds is not reached.
         let source = "class Other:\n    def method(self, value=333):\n        return value\n\n\nclass Helper:\n    def method(self, value=111):\n        return value\n\n\ndef outer():\n    Helper = Other\n\n    class Child(Helper):\n        def run(self):\n            return self.method()\n\n    return Child().run()\n\n\nassert outer() == 333, outer()\n";
         assert_eq!(fixed(source)?, "class Other:\n    def method(self, value):\n        return value\n\n\nclass Helper:\n    def method(self, value):\n        return value\n\n\ndef outer():\n    Helper = Other\n\n    class Child(Helper):\n        def run(self):\n            return self.method(value=333)\n\n    return Child().run()\n\n\nassert outer() == 333, outer()\n");
+        Ok(())
+    }
+    #[test]
+    fn an_unresolved_construction_of_an_inheriting_class_is_reported() -> Result<(), String> {
+        // `Child` has no constructor of its own, so what a construction reaches
+        // is the one it inherits. The guarded import leaves which class the
+        // name holds unsettled, and the call has to be reported: the class's
+        // own spelling is the only one a construction carries, so leaving it
+        // out of the names a fixed callable goes by passed the call over in
+        // silence while the base's default went.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from api import Child\n\nif flag:\n    from other import Child\n\nChild()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let skipped = fix_all(&[api, user])?;
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|skip| skip.callable.clone())
+                .collect::<Vec<_>>(),
+            ["Child"]
+        );
         Ok(())
     }
 }

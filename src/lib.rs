@@ -6135,6 +6135,18 @@ fn implicitly_called_method(name: &str) -> bool {
     )
 }
 
+/// The methods a buffering layer reaches on the raw stream underneath it,
+/// whichever raw base the subclass was written on.
+const IO_RAW_CALLBACKS: &[&str] = &[
+    "close", "readable", "readinto", "seek", "seekable", "tell", "writable", "write",
+];
+
+/// The methods the import machinery reaches on a source loader while it turns a
+/// module name into code, whichever source-loader base the subclass was written
+/// on.
+const IMPORTLIB_SOURCE_LOADER_CALLBACKS: &[&str] =
+    &["get_data", "path_mtime", "path_stats", "set_data"];
+
 /// The methods `logging` reaches on a handler it owns, whichever handler base
 /// the subclass was written on.
 const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
@@ -6164,6 +6176,18 @@ const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
 const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
+    (
+        "importlib.abc",
+        "SourceLoader",
+        IMPORTLIB_SOURCE_LOADER_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "SourceFileLoader",
+        IMPORTLIB_SOURCE_LOADER_CALLBACKS,
+    ),
+    ("io", "FileIO", IO_RAW_CALLBACKS),
+    ("io", "RawIOBase", IO_RAW_CALLBACKS),
     (
         "logging",
         "BufferingFormatter",
@@ -23255,6 +23279,120 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(
             updated.contains("assert C().later(5) == (\"second\", 5)\n"),
             "{updated}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn io_raw_stream_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A buffer wrapped round a raw stream calls each of these on it:
+        // `readable`, `writable` and `seekable` while the buffer is built,
+        // `readinto` and `write` as it fills and drains, `seek` and `tell` as
+        // it moves, and `close` as it closes. None of those calls is written
+        // here, so removing a default leaves a stream the buffer cannot drive.
+        let source = "import io\n\n\nclass R(io.RawIOBase):\n    def readable(self, extra=1): return True\n\n    def writable(self, extra=2): return True\n\n    def seekable(self, extra=3): return True\n\n    def readinto(self, b, extra=4): return 0\n\n    def write(self, b, extra=5): return 0\n\n    def seek(self, offset, whence, extra=6): return 0\n\n    def tell(self, extra=7): return 0\n\n    def close(self, extra=8): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn importlib_source_loader_callbacks_keep_their_defaults() -> Result<(), String> {
+        // The import machinery reaches all four from `SourceLoader.get_code`:
+        // `get_data` for the source, `path_stats` to date the bytecode cache,
+        // `path_mtime` from `path_stats` itself, and `set_data` to write that
+        // cache. The `import` statement that starts it is no call site the
+        // fixer can rewrite.
+        let source = "import importlib.abc\n\n\nclass L(importlib.abc.SourceLoader):\n    def get_data(self, path, extra=1): return b\"\"\n\n    def path_stats(self, path, extra=2): return {}\n\n    def path_mtime(self, path, extra=3): return 0\n\n    def set_data(self, path, data, extra=4): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_imported_raw_stream_base_keeps_its_callback_defaults() -> Result<(), String> {
+        // The base is the same class whether it is spelled through the module
+        // or bound by name.
+        let source = "from io import RawIOBase\n\n\nclass R(RawIOBase):\n    def readinto(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_io_module_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import io as _io\n\n\nclass R(_io.RawIOBase):\n    def write(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_raw_stream_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being driven by a buffer is inherited, so a stream written on one
+        // defined here is read through in the same way.
+        let source = "import io\n\n\nclass Base(io.RawIOBase):\n    pass\n\n\nclass Child(Base):\n    def readinto(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_concrete_file_stream_base_keeps_its_callback_defaults() -> Result<(), String> {
+        // `io.FileIO` is a raw stream in its own right, and a buffer drives a
+        // subclass of it exactly as it drives one written on `io.RawIOBase`.
+        let source =
+            "import io\n\n\nclass F(io.FileIO):\n    def write(self, b, extra=1): return 0\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_file_loader_keeps_its_callback_defaults() -> Result<(), String> {
+        // `importlib.machinery.SourceFileLoader` is the concrete source loader
+        // users subclass, and `get_code` reaches its overrides the same way.
+        let source = "import importlib.machinery\n\n\nclass L(importlib.machinery.SourceFileLoader):\n    def get_data(self, path, extra=1): return b\"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_loader_from_a_submodule_import_keeps_its_callback_defaults() -> Result<(), String> {
+        // `from importlib import abc` binds the submodule, so the base is read
+        // through one attribute of a name that stands for `importlib.abc`.
+        let source = "from importlib import abc\n\n\nclass L(abc.SourceLoader):\n    def get_data(self, path, extra=1): return b\"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_io_hierarchy_are_still_fixed() -> Result<(), String> {
+        // `close`, `write`, `seek` and `tell` are as ordinary as method names
+        // get. Nothing calls them here but the calls written below, so the
+        // defaults go and those calls carry the values.
+        let source = "class Stream:\n    def readable(self, extra=1): return extra\n\n    def writable(self, extra=2): return extra\n\n    def seekable(self, extra=3): return extra\n\n    def readinto(self, b, extra=4): return extra\n\n    def write(self, b, extra=5): return extra\n\n    def seek(self, offset, extra=6): return extra\n\n    def tell(self, extra=7): return extra\n\n    def close(self, extra=8): return extra\n\n\ns = Stream()\nassert Stream.readable(s) == 1\nassert Stream.writable(s) == 2\nassert Stream.seekable(s) == 3\nassert Stream.readinto(s, b\"\") == 4\nassert Stream.write(s, b\"\") == 5\nassert Stream.seek(s, 0) == 6\nassert Stream.tell(s) == 7\nassert Stream.close(s) == 8\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Stream:\n    def readable(self, extra): return extra\n\n    def writable(self, extra): return extra\n\n    def seekable(self, extra): return extra\n\n    def readinto(self, b, extra): return extra\n\n    def write(self, b, extra): return extra\n\n    def seek(self, offset, extra): return extra\n\n    def tell(self, extra): return extra\n\n    def close(self, extra): return extra\n\n\ns = Stream()\nassert Stream.readable(s, extra=1) == 1\nassert Stream.writable(s, extra=2) == 2\nassert Stream.seekable(s, extra=3) == 3\nassert Stream.readinto(s, b\"\", extra=4) == 4\nassert Stream.write(s, b\"\", extra=5) == 5\nassert Stream.seek(s, 0, extra=6) == 6\nassert Stream.tell(s, extra=7) == 7\nassert Stream.close(s, extra=8) == 8\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_loader_hierarchy_are_still_fixed() -> Result<(), String> {
+        // Same again for the loader names, which a cache or a store class
+        // spells just as readily as a loader does.
+        let source = "class Store:\n    def get_data(self, path, extra=1): return extra\n\n    def set_data(self, path, data, extra=2): return extra\n\n    def path_stats(self, path, extra=3): return extra\n\n    def path_mtime(self, path, extra=4): return extra\n\n\ns = Store()\nassert Store.get_data(s, \"p\") == 1\nassert Store.set_data(s, \"p\", b\"\") == 2\nassert Store.path_stats(s, \"p\") == 3\nassert Store.path_mtime(s, \"p\") == 4\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Store:\n    def get_data(self, path, extra): return extra\n\n    def set_data(self, path, data, extra): return extra\n\n    def path_stats(self, path, extra): return extra\n\n    def path_mtime(self, path, extra): return extra\n\n\ns = Store()\nassert Store.get_data(s, \"p\", extra=1) == 1\nassert Store.set_data(s, \"p\", b\"\", extra=2) == 2\nassert Store.path_stats(s, \"p\", extra=3) == 3\nassert Store.path_mtime(s, \"p\", extra=4) == 4\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_raw_stream_import_bound_over_stops_reaching_io() -> Result<(), String> {
+        // The assignment takes the name, so the base below is a plain `object`
+        // and no buffer ever drives this method.
+        let source = "from io import RawIOBase\n\nRawIOBase = object\n\n\nclass R(RawIOBase):\n    def close(self, extra=1): return extra\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "from io import RawIOBase\n\nRawIOBase = object\n\n\nclass R(RawIOBase):\n    def close(self, extra): return extra\n"
         );
         Ok(())
     }

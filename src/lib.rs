@@ -4859,16 +4859,7 @@ impl Checker<'_> {
     where
         Self: Visitor<'a>,
     {
-        let statically_empty = match loop_.iter.as_ref() {
-            Expr::Tuple(tuple) => tuple.elts.is_empty(),
-            Expr::List(list) => list.elts.is_empty(),
-            Expr::Set(set) => set.elts.is_empty(),
-            // `{}` is the empty mapping, and the only empty literal a set
-            // cannot be written as.
-            Expr::Dict(dict) => dict.items.is_empty(),
-            _ => false,
-        };
-        if statically_empty {
+        if display_is_empty(&loop_.iter) {
             self.visit_body(&loop_.orelse);
         } else {
             // The iterable is evaluated before the target is assigned. The
@@ -7751,8 +7742,15 @@ fn collect_class_method_aliases(
                 );
             }
             Stmt::For(loop_) => {
-                for name in rebound_alias_names(statement) {
-                    origins.remove(&name);
+                // A loop over a display written with nothing in it never
+                // reaches its target, so the name is still whatever stood
+                // behind it before. Every other iterable may bind it, and a
+                // name that may have been taken over cannot be relied on
+                // afterwards.
+                if !display_is_empty(&loop_.iter) {
+                    for name in rebound_alias_names(statement) {
+                        origins.remove(&name);
+                    }
                 }
                 collect_alias_branches(
                     [loop_.body.as_slice(), loop_.orelse.as_slice()],
@@ -11028,6 +11026,27 @@ fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral
     }
 }
 
+/// Whether a display is known to hold nothing at all.
+///
+/// `{}` is the empty mapping, and the only empty literal a set cannot be
+/// written as.
+///
+/// This is not the opposite of `display_is_nonempty`: a display written out of
+/// nothing but unpacks answers `false` to both, because how many entries it
+/// ends up with is not written down. Which of the two to ask is settled by
+/// which way the doubt has to fall -- this one where a conclusion holds only
+/// when the display is certainly empty, that one where it holds only when the
+/// display certainly is not.
+fn display_is_empty(iterable: &Expr) -> bool {
+    match iterable {
+        Expr::Tuple(tuple) => tuple.elts.is_empty(),
+        Expr::List(list) => list.elts.is_empty(),
+        Expr::Set(set) => set.elts.is_empty(),
+        Expr::Dict(dict) => dict.items.is_empty(),
+        _ => false,
+    }
+}
+
 /// Whether a display is known to hold at least one item.
 ///
 /// A `*` element in a sequence, or a `**` item in a mapping, contributes an
@@ -11416,14 +11435,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             }
             Stmt::For(loop_statement) if self.in_class_scope() => {
                 self.visit_expr(&loop_statement.iter);
-                let statically_empty = match loop_statement.iter.as_ref() {
-                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
-                    Expr::List(list) => list.elts.is_empty(),
-                    Expr::Set(set) => set.elts.is_empty(),
-                    Expr::Dict(dict) => dict.items.is_empty(),
-                    _ => false,
-                };
-                if statically_empty {
+                if display_is_empty(&loop_statement.iter) {
                     self.visit_body(&loop_statement.orelse);
                     return;
                 }
@@ -11473,14 +11485,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // Once an item is assigned, the body sees the target rather
                 // than an import that previously used the same name.
                 self.visit_expr(&loop_statement.iter);
-                let statically_empty = match loop_statement.iter.as_ref() {
-                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
-                    Expr::List(list) => list.elts.is_empty(),
-                    Expr::Set(set) => set.elts.is_empty(),
-                    Expr::Dict(dict) => dict.items.is_empty(),
-                    _ => false,
-                };
-                if statically_empty {
+                if display_is_empty(&loop_statement.iter) {
                     self.visit_body(&loop_statement.orelse);
                     return;
                 }
@@ -11512,14 +11517,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 // The iterable still sees the import; a non-empty loop target
                 // replaces it before the body and later function statements.
                 self.visit_expr(&loop_statement.iter);
-                let statically_empty = match loop_statement.iter.as_ref() {
-                    Expr::Tuple(tuple) => tuple.elts.is_empty(),
-                    Expr::List(list) => list.elts.is_empty(),
-                    Expr::Set(set) => set.elts.is_empty(),
-                    Expr::Dict(dict) => dict.items.is_empty(),
-                    _ => false,
-                };
-                if statically_empty {
+                if display_is_empty(&loop_statement.iter) {
                     self.visit_body(&loop_statement.orelse);
                     return;
                 }
@@ -23196,6 +23194,31 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             skipped_reasons(contested)?,
             ["this call cannot be tied to the definition that was fixed"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_over_nothing_leaves_its_target_alone() -> Result<(), String> {
+        // A loop over a display written with nothing in it never reaches its
+        // target, so `alias` is still the method the assignment above put
+        // there and the call through `later` is owed that method's default.
+        let empty = "class C:\n    def first(self, x, y=1):\n        return (\"first\", x, y)\n\n    alias = first\n    for alias in []:\n        pass\n\n    later = alias\n\n\nassert C().later(5) == (\"first\", 5, 1)\n";
+        let updated = fixed(empty)?;
+        assert!(
+            updated.contains("assert C().later(5, y=1) == (\"first\", 5, 1)\n"),
+            "{updated}"
+        );
+        // A display of nothing but unpacks is not known to be empty, and this
+        // one does iterate, so the name is taken over and the call through it
+        // is left as written. Reading "not known to hold anything" as "known
+        // to hold nothing" here would write `first`'s keyword into `second`,
+        // which never accepts it.
+        let unpacked = "class C:\n    def first(self, x, y=1):\n        return (\"first\", x, y)\n\n    def second(self, x):\n        return (\"second\", x)\n\n    values = [second]\n\n    alias = first\n    for alias in [*values]:\n        pass\n\n    later = alias\n\n\nassert C().later(5) == (\"second\", 5)\n";
+        let updated = fixed(unpacked)?;
+        assert!(
+            updated.contains("assert C().later(5) == (\"second\", 5)\n"),
+            "{updated}"
         );
         Ok(())
     }

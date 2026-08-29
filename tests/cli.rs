@@ -5740,47 +5740,6 @@ fn a_loader_helper_beside_create_module_is_still_fixed() -> Result<(), Box<dyn s
 }
 
 #[test]
-fn an_import_loader_execution_hook_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::tempdir()?;
-    let case = directory.path().join("case.py");
-    // `_bootstrap._load_unlocked` runs a module by calling the loader with the
-    // module alone, so `extra` is only ever filled by its default. That call
-    // sits in `importlib` rather than in any file the fixer can see, so
-    // removing the default leaves the import raising `TypeError` with no
-    // written call site to carry the argument.
-    let source =
-        "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
-    std::fs::write(&case, source)?;
-    let output = Command::new(binary())
-        .arg("--fix")
-        .arg(directory.path())
-        .output()?;
-    assert_eq!(std::fs::read_to_string(&case)?, source);
-    assert_eq!(output.status.code(), Some(1));
-    Ok(())
-}
-
-#[test]
-fn a_pickler_persistent_id_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::tempdir()?;
-    let case = directory.path().join("case.py");
-    // `pickle` asks a pickler whether each object is persistent by calling the
-    // hook with that object alone, so `extra` is only ever filled by its
-    // default. The call is made inside `pickle`, so removing the default
-    // leaves `dump` raising `TypeError` with no written call site for the
-    // fixer to keep in step.
-    let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return None\n";
-    std::fs::write(&case, source)?;
-    let output = Command::new(binary())
-        .arg("--fix")
-        .arg(directory.path())
-        .output()?;
-    assert_eq!(std::fs::read_to_string(&case)?, source);
-    assert_eq!(output.status.code(), Some(1));
-    Ok(())
-}
-
-#[test]
 fn a_pickler_reducer_override_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

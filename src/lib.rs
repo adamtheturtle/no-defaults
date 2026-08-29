@@ -20042,11 +20042,9 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn import_loader_exec_module_defaults_are_retained() {
-        // `importlib` runs a module by calling the loader itself, handing it
-        // the module and nothing else, so a parameter beside it is only ever
-        // filled by its default. Removing it leaves the import raising
-        // `TypeError` from inside `importlib._bootstrap`, where there is no
-        // written call the fixer could update.
+        // `importlib` runs a loader's `exec_module` from inside
+        // `_bootstrap._load`, handing it the module and nothing more, so a
+        // parameter beside it survives only through its default.
         let source =
             "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
         let checked = check_source(
@@ -20065,9 +20063,9 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_loader_method_beside_exec_module_stays_fixable() {
-        // Retention follows the hook name, so a helper sharing the loader is
-        // still the fixer's to rewrite.
-        let source = "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
+        // Retention is keyed to the hook name, so a sibling sharing the
+        // loader and the signature shape keeps its ordinary treatment.
+        let source = "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(module)\n    def helper(self, module, value=2):\n        return value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -20084,11 +20082,6 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn pickler_persistent_id_defaults_are_retained() {
-        // `pickle` asks a pickler whether each object is persistent by
-        // calling the hook with that object alone, so a parameter beside it
-        // is only ever filled by its default. Removing it leaves `dump`
-        // raising `TypeError` from inside `pickle`, with no written call site
-        // for the fixer to keep in step.
         let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return None\n";
         let checked = check_source(
             Path::new("fixture.py"),
@@ -20107,7 +20100,7 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn a_pickler_method_beside_persistent_id_stays_fixable() {
         // Retention is keyed to the hook `pickle` reaches for, so an ordinary
-        // helper on the same pickler keeps its ordinary treatment.
+        // helper sharing the pickler keeps its ordinary treatment.
         let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
         let checked = check_source(
             Path::new("fixture.py"),

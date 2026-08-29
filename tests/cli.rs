@@ -6766,3 +6766,27 @@ fn an_untaken_branch_namesake_keeps_a_metaclass_init_default(
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn a_redefined_temporary_does_not_put_a_method_back() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `tmp` was another name for `target` only until the definition below it
+    // took the name over, so the last assignment puts the second function
+    // behind `target` rather than restoring the first. `target`'s own default
+    // therefore has no call site to be carried to and has to stay where it is,
+    // while the call goes to `tmp`'s parameters instead.
+    let source = "class C:\n    def target(self, x, y=1):\n        return (\"target\", x, y)\n\n    tmp = target\n\n    def tmp(self, x, w=2):\n        return (\"tmp\", x, w)\n\n    target = tmp\n\n\nassert C().target(5) == (\"tmp\", 5, 2)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class C:\n    def target(self, x, y=1):\n        return (\"target\", x, y)\n\n    tmp = target\n\n    def tmp(self, x, w):\n        return (\"tmp\", x, w)\n\n    target = tmp\n\n\nassert C().target(5, w=2) == (\"tmp\", 5, 2)\n"
+    );
+    // `target`'s default is still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

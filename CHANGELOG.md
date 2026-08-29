@@ -62,6 +62,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 ### Fixed
 
 - A construction of a class that inherits its constructor is reported, and the inherited default retained, when the pass cannot say which class the name holds. Previously only the base's default went and the call was left bare, with nothing said about it.
+- A class-body name taken over by a later definition, import, `del`, loop target or assignment the file cannot describe stops standing for the method it used to alias, so a further alias of that name is no longer given the wrong method's removed default.
+- A method assigned back onto its own name, whether directly or by way of a temporary, is recognised as replacing nothing, so its default is removed and its calls are rewritten.
+- A tuple target unpacking a list of methods, or the reverse, records the aliases it names, so the call through such an alias is rewritten rather than silently left short an argument.
+- The same class method alias recorded in more than one control-flow suite is one alias rather than a contested name, so calls through it are rewritten.
 - Class-body aliases created with `staticmethod()` and `classmethod()` carry the wrapper's receiver convention; `property()` aliases retain defaults consumed by descriptor access.
 - Class-body control-flow suites are scanned conservatively for method aliases, while nested definition scopes remain excluded.
 - Annotated assignments, statically paired destructuring, and named expressions in class bodies record method aliases for call rewriting.

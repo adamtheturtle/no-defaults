@@ -5616,6 +5616,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__conform__"
             | "is_package"
             | "get_filename"
+            | "source_to_code"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -20849,5 +20850,88 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn inspect_loader_source_to_code_defaults_are_retained() {
+        // The import machinery compiles a module's source by asking its loader
+        // to do it, calling `source_to_code(data, path)` with those two alone,
+        // so a parameter beside them only ever arrives as its default. That
+        // call is made from `<frozen importlib._bootstrap_external>` rather
+        // than by any written line, so dropping the default leaves the next
+        // import raising `TypeError: L.source_to_code() missing 1 required
+        // positional argument` with nothing for the fixer to update.
+        let source =
+            "class L:\n    def source_to_code(self, data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_loader_method_beside_source_to_code_stays_fixable() {
+        // Retention is keyed to the hook name, so a sibling sharing the loader
+        // and the signature shape keeps its ordinary treatment.
+        let source = "class L:\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path)\n    def helper(self, data, path, value=2):\n        return (data, path, value)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_source_to_code_stays_fixable() {
+        // The import machinery looks the hook up under its exact name, so a
+        // near miss is an ordinary method and its default is the fixer's.
+        let source =
+            "class L:\n    def source_to_codes(self, data, path, extra=1):\n        return (data, path, extra)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_decorated_source_to_code_keeps_its_defaults_too() {
+        // Real loaders spell the hook as a `staticmethod`, and the import
+        // machinery reaches it through the instance either way, so the
+        // decorated form is retained on the same grounds.
+        let source =
+            "class L:\n    @staticmethod\n    def source_to_code(data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
     }
 }

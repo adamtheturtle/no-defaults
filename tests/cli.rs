@@ -6508,3 +6508,88 @@ fn a_function_named_get_filename_is_still_fixed() -> Result<(), Box<dyn std::err
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_source_loader_source_to_code_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The import machinery compiles a module's source by asking its loader to
+    // do it, calling `source_to_code(data, path)` with those two alone, so
+    // `extra` only ever arrives as its default. That call is made from
+    // `<frozen importlib._bootstrap_external>` rather than by any line in the
+    // file, so dropping the default leaves the next import raising
+    // `TypeError: L.source_to_code() missing 1 required positional argument:
+    // 'extra'` with no written call site to carry the value.
+    let source =
+        "class L:\n    def source_to_code(self, data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_static_source_to_code_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `importlib.abc.InspectLoader` spells the hook as a `staticmethod`, so a
+    // loader written against the documented shape is retained the same way.
+    let source =
+        "class L:\n    @staticmethod\n    def source_to_code(data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_loader_helper_beside_source_to_code_is_still_fixed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // sibling with the same signature shape is rewritten as usual, carrying
+    // its own default to the call.
+    let source = "class L:\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path)\n\n    def helper(self, data, path, value=2):\n        return (data, path, value)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class L:\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path, value=2)\n\n    def helper(self, data, path, value):\n        return (data, path, value)\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_method_named_near_source_to_code_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The import machinery looks the hook up under its exact name, so a near
+    // miss is an ordinary method whose default the fixer removes.
+    let source =
+        "class L:\n    def source_to_codes(self, data, path, extra=1):\n        return (data, path, extra)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class L:\n    def source_to_codes(self, data, path, extra):\n        return (data, path, extra)\n",
+    );
+    // Nothing is left unfixed once the near miss is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

@@ -10307,6 +10307,22 @@ mod tests {
     }
 
     #[test]
+    fn function_parameters_shadow_dataclass_field_imports() {
+        let source = "from dataclasses import dataclass, field\n\ndef helper(*, default, repr): return default\ndef outer(field):\n    @dataclass\n    class C:\n        x: int = field(default=1, repr=False)\n    return C()\n\nassert outer(helper).x == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
     fn a_function_local_dataclass_alias_does_not_escape() {
         assert!(messages(
             "def dc(cls): return cls\n\ndef load():\n    from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    value: int = 1\n",

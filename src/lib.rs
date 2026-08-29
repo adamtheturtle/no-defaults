@@ -1491,6 +1491,18 @@ fn index_control_flow_method_bases(
     for suite in suites {
         let mut inner = scope.in_suite(alternative);
         index_scope_method_bases(suite, importer, known, bindings, definitions, &mut inner);
+        // An import written in a suite the statement is certain to enter takes
+        // its names over for the code after the statement, exactly as one
+        // written beside that code would. Nothing puts a class back into the
+        // map, so the spellings the suite no longer holds are the ones it gave
+        // to an import, and dropping them here is what carries that out. A
+        // suite that may not run leaves the name as it found it: which class a
+        // base names would depend on whether the import ran.
+        if settles {
+            scope
+                .classes
+                .retain(|spelling, _| inner.classes.contains_key(spelling));
+        }
         carry_suite_aliases(scope, &inner, settles);
     }
 }
@@ -19518,6 +19530,66 @@ def b(x=1): pass  # type: ignore  # noqa
         std::fs::write(
             &case,
             "class package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=3)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_import_in_a_certain_suite_reclaims_a_dotted_owner() -> Result<(), String> {
+        // A suite the statement is certain to enter runs for the code after
+        // it, so the import inside one takes `package` back from the class
+        // written above just as an import beside that code would. Reading the
+        // base as the nested class instead rewrites the inherited call with a
+        // default the class it really inherits from never had.
+        for case_source in [
+            "class package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nif True:\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+            "import contextlib\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nwith contextlib.nullcontext():\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let package = directory.path().join("package");
+            std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+            let initializer = package.join("__init__.py");
+            let module = package.join("module.py");
+            let case = directory.path().join("case.py");
+            std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+            std::fs::write(
+                &module,
+                "class Base:\n    def target(self, value=2): return value\n",
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(&case, case_source).map_err(|error| error.to_string())?;
+            fix_all(&[initializer, module, case.clone()])?;
+            let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+            assert!(updated.contains("self.target(value=2)"), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_suite_that_cannot_run_reclaims_no_dotted_owner() -> Result<(), String> {
+        // The control on the case above: the same file with the import behind
+        // a test that is never true. Nothing takes the name off the class
+        // written here, so the base is that class and its own default is the
+        // one the call is given.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nif False:\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
         )
         .map_err(|error| error.to_string())?;
         fix_all(&[initializer, module, case.clone()])?;

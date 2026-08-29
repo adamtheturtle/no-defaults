@@ -5435,6 +5435,28 @@ fn branches_that_disagree_on_a_base_keep_the_inherited_default(
 }
 
 #[test]
+fn an_alias_reaches_the_enclosing_functions_class() -> Result<(), Box<dyn std::error::Error>> {
+    // `inner` binds no `Base` of its own, so the alias reads the one `outer`
+    // holds and not the module class of the same name. Naming the module
+    // class's field here would hand the constructor a keyword the class it
+    // really inherits from has no field for, and the fixed file would stop
+    // running.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "from dataclasses import dataclass\n\n\n@dataclass\nclass Base:\n    module: int = 1\n\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    def inner():\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n        return Child()\n\n    return inner()\n\n\nprint(outer())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    let updated = std::fs::read_to_string(path)?;
+    assert!(
+        updated.contains("        return Child(local=2, child=3)\n"),
+        "{updated}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn a_subscripted_contested_base_keeps_the_inherited_default(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `Alias[int]` names the same class `Alias` does, so a subclass spelled

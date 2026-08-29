@@ -7102,3 +7102,42 @@ fn callback_names_off_the_io_hierarchy_are_still_fixed() -> Result<(), Box<dyn s
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_namesake_in_an_untaken_branch_leaves_an_import_standing_end_to_end(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `ND_TYPING` is unset, so the branch never runs, `Enum` is the import and
+    // `C` is an enumeration whose members the class statement builds by
+    // calling the initializer. Nothing written here could carry the value once
+    // the default were gone, so the file has to come back untouched.
+    let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class Enum:\n        pass\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n\n\nassert C.A.label == 'x'\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The default is still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_assignment_in_an_untaken_branch_leaves_an_import_standing_end_to_end(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The assignment counterpart of the same shape, which is reached through a
+    // different path in the traversal and was broken in the same way.
+    let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    Enum = object\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n\n\nassert C.A.label == 'x'\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

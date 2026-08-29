@@ -285,6 +285,23 @@ enum Receiver {
     None,
 }
 
+/// The receiver a function body sees without naming it, and what it stands for.
+///
+/// The class travels with the receiver rather than being read back off the
+/// class stack, because a class nested inside a method pushes its own name
+/// while the method's receiver stays in view. Reading the top of that stack
+/// from in there would name the nested class for a receiver belonging to the
+/// enclosing one.
+#[derive(Clone, Debug)]
+struct ImplicitReceiver {
+    /// The parameter name, conventionally `self` or `cls`.
+    name: String,
+    /// The qualified name of the class the receiver stands for.
+    class: String,
+    /// Whether it is a `classmethod`'s class rather than an instance.
+    is_class: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MethodAliasKind {
     Direct,
@@ -4089,8 +4106,7 @@ impl Checker<'_> {
         self.header = Some(line_start(self.source, function.name.start()));
         let descriptor_invoked = self.descriptor_invokes(function);
         let implicitly_called = self.scope.class != ClassScope::None
-            && self.scope.fields == Some(FieldStyle::Dataclass)
-            && function.name.as_str() == "__post_init__";
+            && self.generated_code_calls(function.name.as_str());
         let mut removed = Vec::new();
         let known_descriptor = |expression: &Expr| match expression {
             Expr::Name(name) => {
@@ -4196,9 +4212,22 @@ impl Checker<'_> {
                     aliases.iter().any(|alias| {
                         implicitly_called_method(&alias.name)
                             || matches!(alias.name.as_str(), "__init__" | "__new__")
+                            || self.generated_code_calls(&alias.name)
                     })
                 })
             })
+    }
+
+    /// Whether a method of this name is reached from code the decorator
+    /// generates rather than from a call written in the source.
+    ///
+    /// `@dataclass` writes an `__init__` that calls `__post_init__` with the
+    /// `InitVar` fields and nothing else, so a default there has no call site
+    /// to be carried to and has to stay where it is. The same holds when the
+    /// hook is a method defined under another name and then aliased, because
+    /// the generated call finds it by the name it is bound to.
+    fn generated_code_calls(&self, name: &str) -> bool {
+        self.scope.fields == Some(FieldStyle::Dataclass) && name == "__post_init__"
     }
 
     fn method_is_rebound_later(&self, function: &ast::StmtFunctionDef) -> bool {
@@ -6375,7 +6404,6 @@ fn rewrite_calls(
         class_direct_statements: Vec::new(),
         lexical_is_class: Vec::new(),
         implicit_receivers: Vec::new(),
-        implicit_receiver_is_class: Vec::new(),
         lexical_scope: Vec::new(),
         called: BTreeSet::new(),
         scopes: Vec::new(),
@@ -7485,12 +7513,9 @@ struct Rewriter<'a> {
     /// Whether each `lexical_scope` entry is a class body rather than a
     /// function, so a lookup can pass over the ones that are not closures.
     lexical_is_class: Vec<bool>,
-    /// The implicit receiver name of each enclosing function. Static methods
-    /// and module functions contribute `None`.
-    implicit_receivers: Vec<Option<String>>,
-    /// Whether each implicit receiver is a classmethod's class rather than an
-    /// instance method's instance.
-    implicit_receiver_is_class: Vec<bool>,
+    /// The implicit receiver of each enclosing function. Static methods and
+    /// module functions contribute `None`.
+    implicit_receivers: Vec<Option<ImplicitReceiver>>,
     /// Enclosing class and function names, matching the checker's lexical
     /// identity for nested functions.
     lexical_scope: Vec<String>,
@@ -7731,14 +7756,14 @@ impl Rewriter<'_> {
             if let Some(class) = self.type_of_implicit_instance(call) {
                 return Some(class);
             }
-            let current_class = self.classes.last();
-            let implicit_receiver = self.implicit_receivers.last().and_then(Option::as_deref);
+            let implicit_receiver = self.implicit_receiver();
             let zero_argument_super = call.arguments.args.is_empty() && implicit_receiver.is_some();
             let explicit_super = match &*call.arguments.args {
-                [Expr::Name(class), Expr::Name(receiver)] => {
-                    current_class.and_then(|class| class.rsplit('.').next())
-                        == Some(class.id.as_str())
-                        && implicit_receiver == Some(receiver.id.as_str())
+                [Expr::Name(class), Expr::Name(instance)] => {
+                    implicit_receiver.is_some_and(|receiver| {
+                        receiver.class.rsplit('.').next() == Some(class.id.as_str())
+                            && receiver.name == instance.id.as_str()
+                    })
                 }
                 _ => false,
             };
@@ -7751,7 +7776,7 @@ impl Rewriter<'_> {
             {
                 return Some((
                     self.physical.to_path_buf(),
-                    current_class?.clone(),
+                    implicit_receiver?.class.clone(),
                     true,
                     true,
                 ));
@@ -7771,15 +7796,14 @@ impl Rewriter<'_> {
             return None;
         }
         if let Expr::Name(name) = receiver {
-            if self.implicit_receivers.last().and_then(Option::as_deref) == Some(name.id.as_str()) {
+            if let Some(implicit) = self
+                .implicit_receiver()
+                .filter(|implicit| implicit.name == name.id.as_str())
+            {
                 return Some((
                     self.physical.to_path_buf(),
-                    self.classes.last()?.clone(),
-                    !self
-                        .implicit_receiver_is_class
-                        .last()
-                        .copied()
-                        .unwrap_or(false),
+                    implicit.class.clone(),
+                    !implicit.is_class,
                     false,
                 ));
             }
@@ -7836,18 +7860,14 @@ impl Rewriter<'_> {
         let Expr::Name(instance) = attribute.value.as_ref() else {
             return None;
         };
+        let implicit = self.implicit_receiver()?;
         if attribute.attr.as_str() == "__class__"
-            && self.implicit_receivers.last().and_then(Option::as_deref)
-                == Some(instance.id.as_str())
-            && !self
-                .implicit_receiver_is_class
-                .last()
-                .copied()
-                .unwrap_or(false)
+            && implicit.name == instance.id.as_str()
+            && !implicit.is_class
         {
             Some((
                 self.physical.to_path_buf(),
-                self.classes.last()?.clone(),
+                implicit.class.clone(),
                 false,
                 false,
             ))
@@ -7863,15 +7883,11 @@ impl Rewriter<'_> {
         let [Expr::Name(instance)] = &*call.arguments.args else {
             return None;
         };
+        let implicit = self.implicit_receiver()?;
         if !call.arguments.keywords.is_empty()
             || !matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "type")
-            || self.implicit_receivers.last().and_then(Option::as_deref)
-                != Some(instance.id.as_str())
-            || self
-                .implicit_receiver_is_class
-                .last()
-                .copied()
-                .unwrap_or(false)
+            || implicit.name != instance.id.as_str()
+            || implicit.is_class
             || self.nested_binding("type").is_some()
             || self.binding("type").is_some()
             || self.module_bindings.contains("type")
@@ -7880,10 +7896,15 @@ impl Rewriter<'_> {
         }
         Some((
             self.physical.to_path_buf(),
-            self.classes.last()?.clone(),
+            implicit.class.clone(),
             false,
             false,
         ))
+    }
+
+    /// The receiver the body being walked sees without naming it.
+    fn implicit_receiver(&self) -> Option<&ImplicitReceiver> {
+        self.implicit_receivers.last()?.as_ref()
     }
 
     /// The callable an expression names, when the file's own imports say so,
@@ -9326,30 +9347,26 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 } else {
                     Receiver::None
                 };
-                let (receiver, receiver_is_class) = if receiver_kind == Receiver::None {
-                    let receiver = self
-                        .implicit_receivers
+                let receiver = if receiver_kind == Receiver::None {
+                    self.implicit_receivers
                         .last()
                         .and_then(Clone::clone)
-                        .filter(|name| !function_scope.names.contains(name));
-                    let is_class = receiver.is_some()
-                        && self
-                            .implicit_receiver_is_class
-                            .last()
-                            .copied()
-                            .unwrap_or(false);
-                    (receiver, is_class)
+                        .filter(|receiver| !function_scope.names.contains(&receiver.name))
                 } else {
-                    let receiver = function
+                    function
                         .parameters
                         .posonlyargs
                         .first()
                         .or_else(|| function.parameters.args.first())
-                        .map(|parameter| parameter.parameter.name.to_string());
-                    (receiver, receiver_kind == Receiver::Class)
+                        .map(|parameter| parameter.parameter.name.to_string())
+                        .zip(self.classes.last().cloned())
+                        .map(|(name, class)| ImplicitReceiver {
+                            name,
+                            class,
+                            is_class: receiver_kind == Receiver::Class,
+                        })
                 };
                 self.implicit_receivers.push(receiver);
-                self.implicit_receiver_is_class.push(receiver_is_class);
                 self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
                 self.binding_scope_depths.push(self.scopes.len() - 1);
@@ -9361,7 +9378,6 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.scopes.pop();
                 self.bindings.pop();
                 self.binding_scope_depths.pop();
-                self.implicit_receiver_is_class.pop();
                 self.implicit_receivers.pop();
                 if !module_scope && !self.in_class_scope() {
                     if let Some(bindings) = self.bindings.last_mut() {
@@ -9466,8 +9482,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_parameters(parameters);
                 }
                 let scope = BoundNames::of_lambda(lambda);
-                let receiver = self.implicit_receivers.last().cloned().flatten();
-                let receiver = receiver.filter(|name| !scope.names.contains(name));
+                let receiver = self
+                    .implicit_receivers
+                    .last()
+                    .and_then(Clone::clone)
+                    .filter(|receiver| !scope.names.contains(&receiver.name));
                 self.implicit_receivers.push(receiver);
                 self.scopes.push(scope);
                 self.lambda_scope_depths.push(self.scopes.len() - 1);
@@ -16120,6 +16139,73 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(assigned)?,
             "class Other:\n    def target(self): return 9\n\nclass Base:\n    def target(self, value): return value\n\nsuper = Other\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_aliased_post_init_keeps_its_defaults() {
+        // `@dataclass` finds the hook under the name it is bound to, so
+        // aliasing an ordinary method to `__post_init__` makes the generated
+        // `__init__` call that method with no arguments. There is no call site
+        // to carry the default to, so it has to stay.
+        let aliased = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int\n\n    def setup(self, extra=1):\n        self.extra = extra\n\n    __post_init__ = setup\n\nC(5)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            aliased,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+        // Without the alias nothing calls the method implicitly, so the same
+        // default is removed as usual.
+        let unaliased = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int\n\n    def setup(self, extra=1):\n        self.extra = extra\n\nC(5)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            unaliased,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_class_nested_in_a_method_does_not_claim_its_receiver() -> Result<(), String> {
+        // A class defined in a method body is pushed onto the class stack
+        // while the method's `self` or `cls` is still in view, so a receiver
+        // used from inside that class stands for the outer class rather than
+        // the one being defined.
+        for receiver in ["type(self)()", "self.__class__()"] {
+            let source = format!(
+                "class Outer:\n    def target(self, value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, other=2):\n                return other\n\n            result = {receiver}.target()\n        return Inner.result\n\nassert Outer().run() == 1\n"
+            );
+            assert_eq!(
+                fixed(&source)?,
+                format!(
+                    "class Outer:\n    def target(self, value):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, other):\n                return other\n\n            result = {receiver}.target(value=1)\n        return Inner.result\n\nassert Outer().run() == 1\n"
+                )
+            );
+        }
+        let classmethod = "class Outer:\n    def target(self, value=1):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            def target(self, other=2):\n                return other\n\n            result = cls().target()\n        return Inner.result\n\nassert Outer.run() == 1\n";
+        assert_eq!(
+            fixed(classmethod)?,
+            "class Outer:\n    def target(self, value):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            def target(self, other):\n                return other\n\n            result = cls().target(value=1)\n        return Inner.result\n\nassert Outer.run() == 1\n"
+        );
+        // A method of the nested class brings its own receiver, which does
+        // stand for the nested class.
+        let own_receiver = "class Outer:\n    def target(self, value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, other=2):\n                return other\n\n            @classmethod\n            def build(cls):\n                return cls().target()\n        return Inner.build()\n\nassert Outer().run() == 2\n";
+        assert_eq!(
+            fixed(own_receiver)?,
+            "class Outer:\n    def target(self, value):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, other):\n                return other\n\n            @classmethod\n            def build(cls):\n                return cls().target(other=2)\n        return Inner.build()\n\nassert Outer().run() == 2\n"
         );
         Ok(())
     }

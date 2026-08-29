@@ -3488,7 +3488,7 @@ fn check_source(
         lexical_scope: Vec::new(),
         lexical_is_class: Vec::new(),
         lexical_bindings: Vec::new(),
-        deferred_bodies: 0,
+        lambda_bodies: 0,
         conditional_depth: 0,
         scope: Scope {
             private: is_private_module(path, project_root, reexports),
@@ -3816,12 +3816,10 @@ struct Checker<'a> {
     /// name hides whatever the scopes outside it call by the same name, even
     /// where nothing about the class it now stands for is known.
     lexical_bindings: Vec<BTreeSet<String>>,
-    /// How many bodies that run later than the expression holding them
-    /// enclose the expression being visited. A walrus in a lambda body binds
-    /// in the lambda's own scope, which nothing outside it sees and
-    /// `lexical_scope` has no entry to say so, and one in the deferred part of
-    /// a generator has not run by the time the names around it are read.
-    deferred_bodies: usize,
+    /// How many lambda bodies enclose the expression being visited. A walrus
+    /// in one binds in the lambda's own scope, which nothing outside it sees,
+    /// and `lexical_scope` has no entry to say so.
+    lambda_bodies: usize,
     /// Unknown control-flow branches do not describe one reliable constructor.
     conditional_depth: usize,
     scope: Scope,
@@ -4420,18 +4418,6 @@ impl Checker<'_> {
                     &self.local_classes,
                     &self.module_bindings,
                 )
-        })
-    }
-
-    /// Whether a class derives from `enum.Enum`, whose members the class body
-    /// itself creates.
-    fn inherits_enum(&self, class: &ast::StmtClassDef) -> bool {
-        class_bases(class).any(|base| match base {
-            Expr::Name(name) => self.aliases.enum_classes.contains(name.id.as_str()),
-            Expr::Attribute(attribute) if is_enum_base_name(attribute.attr.as_str()) => {
-                matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
-            }
-            _ => false,
         })
     }
 
@@ -5506,7 +5492,15 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     } else {
                         ClassScope::Ordinary
                     },
-                    enum_class: self.inherits_enum(class),
+                    enum_class: class_bases(class).any(|base| match base {
+                        Expr::Name(name) => {
+                            self.aliases.enum_classes.contains(name.id.as_str())
+                        }
+                        Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
+                            matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
+                        }
+                        _ => false,
+                    }),
                     // Each class body starts fresh; a base's fields are not
                     // written here.
                     kept_default: false,
@@ -5678,10 +5672,10 @@ impl<'a> Visitor<'a> for Checker<'a> {
         if let Expr::Named(named) = expression {
             self.visit_expr(&named.value);
             self.visit_expr(&named.target);
-            // A walrus that has not run by the time the surrounding names are
-            // read leaves them alone, so the name it shares a spelling with
-            // still stands for what the enclosing scope gave it.
-            if self.deferred_bodies == 0 {
+            // A walrus in a lambda binds in the lambda's own scope, which
+            // nothing outside the lambda ever reads, so the name it shares a
+            // spelling with still stands for what the enclosing scope gave it.
+            if self.lambda_bodies == 0 {
                 self.invalidate_target_aliases(&named.target);
             }
             return;
@@ -5694,43 +5688,13 @@ impl<'a> Visitor<'a> for Checker<'a> {
             if let Some(parameters) = &lambda.parameters {
                 self.visit_parameters(parameters);
             }
-            self.deferred_bodies += 1;
+            self.lambda_bodies += 1;
             self.visit_expr(&lambda.body);
-            self.deferred_bodies -= 1;
-            return;
-        }
-        if let Expr::Generator(generator) = expression {
-            let Some((first, rest)) = generator.generators.split_first() else {
-                return;
-            };
-            // Creating a generator evaluates only its leftmost iterable. The
-            // targets, filters, remaining iterables, and element run when the
-            // generator is consumed, which may be never.
-            self.visit_expr(&first.iter);
-            self.deferred_bodies += 1;
-            self.visit_expr(&first.target);
-            for condition in &first.ifs {
-                self.visit_expr(condition);
-            }
-            for clause in rest {
-                self.visit_expr(&clause.iter);
-                self.visit_expr(&clause.target);
-                for condition in &clause.ifs {
-                    self.visit_expr(condition);
-                }
-            }
-            self.visit_expr(&generator.elt);
-            self.deferred_bodies -= 1;
+            self.lambda_bodies -= 1;
             return;
         }
         walk_expr(self, expression);
     }
-}
-
-/// Whether a name stands for the `enum` module's enumeration class, whose
-/// subclasses create their members while the class statement runs.
-fn is_enum_base_name(name: &str) -> bool {
-    name == "Enum"
 }
 
 fn is_private(name: &str) -> bool {
@@ -6082,7 +6046,7 @@ impl Aliases {
             return;
         }
         for alias in &import.names {
-            if is_enum_base_name(alias.name.as_str()) {
+            if alias.name.as_str() == "Enum" {
                 self.enum_classes
                     .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
             }
@@ -18936,21 +18900,45 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn deferred_walruses_do_not_invalidate_live_imports() {
-        for source in [
-            "from dataclasses import dataclass as dc\n\ncallback = lambda: (dc := replacement)\n\n@dc\nclass C:\n    value: int = 1\n",
-            "from dataclasses import dataclass as dc\n\nvalues = ((dc := replacement) for _ in items)\n\n@dc\nclass C:\n    value: int = 1\n",
+    fn a_comprehension_walrus_rebinds_the_enclosing_name() -> Result<(), String> {
+        // A walrus in a comprehension binds in the scope the comprehension is
+        // written in, unlike one in a lambda body, which binds in the lambda's
+        // own. A list comprehension runs where it is written, and a generator
+        // expression runs as soon as anything draws from it, so the rebinding
+        // reaches the module name before the class below is built. Skipping
+        // the invalidation because the element is only visited and not yet run
+        // kept a shape the name no longer holds, and the subclass was called
+        // with fields the rebound base never had.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n";
+        let tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in [
+            "list((Alias := object) for _ in seed)\n",
+            "total = sum(1 for _ in seed if (Alias := object))\n",
+            "values = ((Alias := object) for _ in seed)\nlist(values)\n",
+            "values = [(Alias := object) for _ in seed]\n",
         ] {
-            assert_eq!(
-                messages(source, false),
-                ["dataclass field `value` has a default"],
-                "{source}"
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{rebind}\n{updated}");
+        }
+        // A comprehension with no walrus rebinds nothing, so the alias still
+        // stands and the inherited field comes through.
+        for kept in ["values = (item for item in seed)\n", ""] {
+            let updated = fixed(&format!("{head}{kept}{tail}"))?;
+            assert!(
+                updated.contains("Child(inherited=1, value=2)"),
+                "{kept}\n{updated}"
             );
         }
+        Ok(())
     }
 
     #[test]
     fn enum_member_initializer_defaults_are_retained() {
+        // Assigning a member in an `Enum` body calls `__init__` with whatever
+        // the assignment holds, so a parameter the members never supply is
+        // reached only through its default. Removing it turns class creation
+        // itself into a `TypeError`, and there is no call site to rewrite,
+        // because the calls are the member assignments the interpreter makes.
         for source in [
             "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
             "import enum as enums\n\nclass E(enums.Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
@@ -18967,6 +18955,21 @@ def b(x=1): pass  # type: ignore  # noqa
             assert_eq!(checked.diagnostics.len(), 1, "{source}");
             assert!(checked.diagnostics[0].fix.is_none(), "{source}");
         }
+        // The same body with an ordinary base has no implicit call, so the
+        // default is still removed: the retention is the enum base, not the
+        // method name.
+        let control = "class E:\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            control,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
     }
 
     #[test]

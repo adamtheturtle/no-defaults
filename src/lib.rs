@@ -4921,9 +4921,6 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         // An unseen base may end in a positional default. A
                         // child field without one would then make dataclass
                         // construction fail before any call can be rewritten.
-                        // A parameter shadowing the import hides the base
-                        // further rather than revealing it, so the name it
-                        // took over counts too.
                         Inherited::Unknown => self.unknown_base_may_end_in_default(class),
                         Inherited::Nothing => false,
                     };

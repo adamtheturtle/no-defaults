@@ -5414,3 +5414,22 @@ fn suites_that_disagree_on_a_class_keep_the_default_behind_a_qualified_construct
     assert_eq!(std::fs::read_to_string(user)?, user_source);
     Ok(())
 }
+
+#[test]
+fn branches_that_disagree_on_a_base_keep_the_inherited_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The bases are settled at module level and only the subclass is written
+    // twice, so the disagreement is over `Child` alone. Which `target` it
+    // inherits depends on a test the tool cannot read, so both defaults have
+    // to survive the fix: stripping either would leave the `self.target()`
+    // that was left alone short of the argument it stood in for.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass First:\n    def target(self, value=1):\n        return value\n\n\nclass Second:\n    def target(self, value=2):\n        return value\n\n\nif os.environ.get(\"PICK\"):\n\n    class Child(First):\n        def run(self):\n            return self.target()\n\nelse:\n\n    class Child(Second):\n        def run(self):\n            return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

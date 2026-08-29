@@ -18023,11 +18023,15 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn branches_that_disagree_on_a_base_keep_the_inherited_default() -> Result<(), String> {
+    fn branches_that_disagree_on_a_base_leave_its_inherited_calls_alone() -> Result<(), String> {
         // The bases are settled at module level and only the subclass is
         // written twice, so the disagreement is over `Child` alone. Which
-        // `target` it inherits depends on a test the tool cannot read, and the
-        // default behind it has to stay where it is written.
+        // `target` it inherits depends on a test the tool cannot read, so the
+        // calls that would have named it are reported rather than rewritten.
+        // That the defaults behind them survive the fix is decided further on,
+        // where `retained` is honoured, so it is covered end to end by
+        // `branches_that_disagree_on_a_base_keep_the_inherited_default` in
+        // `tests/cli.rs` rather than here.
         let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif os.environ.get('PICK'):\n    class Child(First):\n        def run(self): return self.target()\nelse:\n    class Child(Second):\n        def run(self): return self.target()\n\nChild().run()\n";
         let updated = fixed(source)?;
         assert!(!updated.contains("self.target(value="), "{updated}");

@@ -18640,4 +18640,31 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(updated.contains("self.target(value=7)"), "{updated}");
         Ok(())
     }
+
+    #[test]
+    fn a_local_namesake_holds_a_single_component_dotted_base() -> Result<(), String> {
+        // The prefix is one name rather than a dotted path, so the walk over
+        // its components has only that name to test. A class written above the
+        // subclass takes it over just the same, and the base is the nested
+        // class here rather than the package the import bound.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &initializer,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import pkg\n\nclass pkg:\n    class Base:\n        def target(self, value=1): return value\n\nclass Child(pkg.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=1)"), "{updated}");
+        Ok(())
+    }
 }

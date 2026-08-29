@@ -5507,3 +5507,37 @@ fn a_contest_inside_a_wrapper_reaches_the_scope_around_it() -> Result<(), Box<dy
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn a_copy_of_a_contested_name_keeps_the_inherited_default() -> Result<(), Box<dyn std::error::Error>>
+{
+    // `Other` is read from a name that stands for either class, so it stands
+    // for either one too. Resolving `Child` against the candidate the copy
+    // happened to read rewrote the call with `First`'s parameter, which the
+    // `Second` the module may have built does not take.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass First:\n    def target(self, value=1):\n        return value\n\n\nclass Second:\n    def target(self, other=2):\n        return other\n\n\nAlias = First\nif os.environ.get(\"PICK\"):\n    Alias = Second\n\nOther = Alias\n\n\nclass Child(Other):\n    def run(self):\n        return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_subscripted_copy_of_a_contested_name_keeps_the_inherited_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The parameter changes nothing about which class the copy reads, so the
+    // doubt travels through `Alias[int]` exactly as it does through `Alias`.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\nfrom typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n\n\nclass First(Generic[T]):\n    def target(self, value=1):\n        return value\n\n\nclass Second(Generic[T]):\n    def target(self, other=2):\n        return other\n\n\nAlias = First\nif os.environ.get(\"PICK\"):\n    Alias = Second\n\nOther = Alias[int]\n\n\nclass Child(Other):\n    def run(self):\n        return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

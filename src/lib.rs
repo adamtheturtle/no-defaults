@@ -1307,12 +1307,20 @@ fn index_scope_method_bases(
                 ) else {
                     continue;
                 };
+                // A name that stands for either of two classes hands that
+                // doubt on: what is read here is whichever class the name it
+                // was read from turned out to be, so the target is no more
+                // settled than the source was.
+                let contested_source =
+                    base_root_name(value).is_some_and(|name| scope.contested.contains(name));
                 for target in targets {
                     if let Expr::Name(alias) = target {
                         // An assignment no alternative suite guards takes the
                         // name over for good, which settles it again after
                         // competing suites left it standing for either class.
-                        if !scope.namespace.alternative {
+                        if contested_source {
+                            scope.contested.insert(alias.id.to_string());
+                        } else if !scope.namespace.alternative {
                             scope.contested.remove(alias.id.as_str());
                         }
                         scope.aliases.insert(alias.id.to_string(), identity.clone());
@@ -1467,13 +1475,13 @@ fn a_suite_certainly_runs(statement: &Stmt) -> bool {
 /// that is certain to run settles nothing the branches inside it left open.
 fn carry_suite_aliases(scope: &mut BaseScope<'_>, suite: &BaseScope<'_>, settles: bool) {
     for (spelling, identity) in &suite.aliases {
-        if scope.aliases.get(spelling) == Some(identity) {
-            continue;
-        }
         if settles {
+            // Binding what the scope already held still settles the name: an
+            // earlier branch may have left another candidate standing, and
+            // this assignment runs whatever that branch did.
             scope.contested.remove(spelling);
             scope.aliases.insert(spelling.clone(), identity.clone());
-        } else {
+        } else if scope.aliases.get(spelling) != Some(identity) {
             scope.contested.insert(spelling.clone());
         }
     }
@@ -18473,6 +18481,41 @@ def b(x=1): pass  # type: ignore  # noqa
             .find(|signature| signature.positional.iter().any(|field| field == "child"))
             .ok_or("expected the nested child signature")?;
         assert_eq!(child.positional, ["module", "child"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_copy_of_a_settled_name_resolves_its_inherited_call() -> Result<(), String> {
+        // Nothing is in doubt here, so reading one name from another resolves
+        // straight through. That the same shape keeps its defaults once the
+        // source is contested is decided where `retained` is honoured, so it
+        // is covered end to end by
+        // `a_copy_of_a_contested_name_keeps_the_inherited_default` in
+        // `tests/cli.rs` rather than here.
+        let source = "class First:\n    def target(self, value=1): return value\n\nAlias = First\n\nOther = Alias\n\nclass Child(Other):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_certain_suite_settles_a_name_by_rebinding_what_the_scope_held() -> Result<(), String> {
+        // The `if True:` body runs, so `Alias` names `First` afterwards
+        // whichever way the branch above it went. Binding what the scope
+        // already held is still a binding: passing over it left the earlier
+        // branch's candidate standing and the call declined for nothing.
+        let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, other=2): return other\n\nAlias = First\nif os.environ.get(\"PICK\"):\n    Alias = Second\n\nif True:\n    Alias = First\n\nclass Child(Alias):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("def target(self, other=2)", "def target(self, other)")
+                .replace("self.target()", "self.target(value=1)")
+        );
         Ok(())
     }
 }

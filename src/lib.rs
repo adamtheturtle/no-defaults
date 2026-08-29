@@ -10251,6 +10251,65 @@ fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral
     }
 }
 
+/// Whether a display is known to hold at least one item.
+///
+/// A `*` element in a sequence, or a `**` item in a mapping, contributes an
+/// unknown number of entries, none included, so a display written entirely out
+/// of unpacks can still be empty. One plain element settles it on its own.
+fn display_is_nonempty(iterable: &Expr) -> bool {
+    match iterable {
+        Expr::Tuple(tuple) => tuple.elts.iter().any(|element| !element.is_starred_expr()),
+        Expr::List(list) => list.elts.iter().any(|element| !element.is_starred_expr()),
+        Expr::Set(set) => set.elts.iter().any(|element| !element.is_starred_expr()),
+        Expr::Dict(dict) => dict.items.iter().any(|item| item.key.is_some()),
+        _ => false,
+    }
+}
+
+/// Whether a loop suite always leaves through `break`.
+///
+/// A trailing `break` settles that only where nothing ahead of it can start
+/// the next iteration instead. A `continue` on any path through the suite
+/// reaches the end of the loop, so the `else` the `break` was read as skipping
+/// can run after all.
+fn suite_always_breaks(body: &[Stmt]) -> bool {
+    let Some((last, earlier)) = body.split_last() else {
+        return false;
+    };
+    if !matches!(last, Stmt::Break(_)) {
+        return false;
+    }
+    let mut search = ContinueSearch::default();
+    search.visit_body(earlier);
+    !search.found
+}
+
+/// Looks for a `continue` belonging to the loop whose suite is searched.
+#[derive(Default)]
+struct ContinueSearch {
+    found: bool,
+}
+
+impl<'a> Visitor<'a> for ContinueSearch {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        match statement {
+            Stmt::Continue(_) => self.found = true,
+            // A nested loop takes the `continue` written in its own suite;
+            // only what its `else` holds belongs to the loop outside it.
+            Stmt::For(loop_statement) => self.visit_body(&loop_statement.orelse),
+            Stmt::While(loop_statement) => self.visit_body(&loop_statement.orelse),
+            // A `continue` cannot reach out of a scope of its own.
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => walk_stmt(self, statement),
+        }
+    }
+
+    fn visit_expr(&mut self, _: &'a Expr) {
+        // `continue` is a statement, so nothing an expression holds is a
+        // reason to descend into it.
+    }
+}
+
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_annotation(&mut self, annotation: &'a Expr) {
         if !self.postponed_annotations {
@@ -10651,17 +10710,8 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&loop_statement.target);
                 self.rebind_module_name(rebound_names(statement));
                 self.visit_body(&loop_statement.body);
-                let statically_nonempty = match loop_statement.iter.as_ref() {
-                    Expr::Tuple(tuple) => !tuple.elts.is_empty(),
-                    Expr::List(list) => !list.elts.is_empty(),
-                    Expr::Set(set) => !set.elts.is_empty(),
-                    Expr::Dict(dict) => !dict.items.is_empty(),
-                    _ => false,
-                };
-                let definitely_breaks = loop_statement
-                    .body
-                    .last()
-                    .is_some_and(|statement| matches!(statement, Stmt::Break(_)));
+                let statically_nonempty = display_is_nonempty(&loop_statement.iter);
+                let definitely_breaks = suite_always_breaks(&loop_statement.body);
                 if !(statically_nonempty && definitely_breaks) {
                     self.visit_body(&loop_statement.orelse);
                 }
@@ -21436,6 +21486,92 @@ def b(x=1): pass  # type: ignore  # noqa
                 .collect::<Vec<_>>(),
             ["Child"]
         );
+        Ok(())
+    }
+
+    fn loop_else_import_fixture(user_source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): return alpha\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &other,
+            "def target(**overrides): return overrides.get(\"alpha\", 2)\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(&user, user_source).map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        std::fs::read_to_string(user).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_continue_can_carry_a_loop_past_its_trailing_break() -> Result<(), String> {
+        // The `continue` starts the next iteration without reaching the
+        // `break`, so the loop runs out and the `else` suite rebinds `target`
+        // to the module the import there names. With `NOD_SKIP` set CPython
+        // returns 2, which the call is left alone to keep saying.
+        let source = "import os\n\nfrom api import target\n\nfor _ in [1]:\n    if os.environ.get(\"NOD_SKIP\"):\n        continue\n    break\nelse:\n    from other import target\n\nassert target() == 2\n";
+        assert_eq!(loop_else_import_fixture(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_suite_that_only_breaks_still_discards_its_loop_else_import() -> Result<(), String> {
+        // Nothing ahead of the `break` can start another iteration, so the
+        // loop cannot run out and the `else` import never happens. `target`
+        // stays the one the module imported, and CPython returns 1 both
+        // before and after the call takes that definition's default.
+        let source = "import os\n\nfrom api import target\n\nfor _ in [1, os.environ.get(\"NOD_SKIP\")]:\n    if os.environ.get(\"NOD_SKIP\"):\n        pass\n    break\nelse:\n    from other import target\n\nassert target() == 1\n";
+        let updated = loop_else_import_fixture(source)?;
+        assert!(updated.contains("assert target(alpha=1) == 1"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_continue_in_a_nested_loop_does_not_reach_the_outer_break() -> Result<(), String> {
+        // The inner loop takes that `continue` for itself, so every path
+        // through the outer suite still arrives at the `break` and the `else`
+        // import stays dead. CPython returns 1.
+        let source = "import os\n\nfrom api import target\n\nfor _ in [1, os.environ.get(\"NOD_SKIP\")]:\n    for inner in [2]:\n        if os.environ.get(\"NOD_SKIP\"):\n            continue\n    break\nelse:\n    from other import target\n\nassert target() == 1\n";
+        let updated = loop_else_import_fixture(source)?;
+        assert!(updated.contains("assert target(alpha=1) == 1"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_list_of_only_unpacks_is_not_taken_as_iterating() -> Result<(), String> {
+        // `[*values]` looks like a display with an element in it, but what it
+        // unpacks is empty, so the body never runs and the `else` suite does.
+        // With `NOD_FULL` unset CPython returns 2.
+        let source = "import os\n\nfrom api import target\n\nvalues = [1] if os.environ.get(\"NOD_FULL\") else []\n\nfor _ in [*values]:\n    break\nelse:\n    from other import target\n\nassert target() == 2\n";
+        assert_eq!(loop_else_import_fixture(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn every_display_kind_of_only_unpacks_is_not_taken_as_iterating() -> Result<(), String> {
+        // A tuple, a set and a mapping written out of nothing but unpacks are
+        // as empty as their operands are, so none of them settles that the
+        // body runs. CPython returns 2 for each with `NOD_FULL` unset.
+        for display in ["(*values,)", "{*values}", "{**mapping}"] {
+            let source = format!(
+                "import os\n\nfrom api import target\n\nvalues = [1] if os.environ.get(\"NOD_FULL\") else []\nmapping = {{\"key\": 1}} if os.environ.get(\"NOD_FULL\") else {{}}\n\nfor _ in {display}:\n    break\nelse:\n    from other import target\n\nassert target() == 2\n"
+            );
+            assert_eq!(loop_else_import_fixture(&source)?, source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_element_beside_an_unpack_still_fills_a_display() -> Result<(), String> {
+        // Whatever `*values` adds, the element written beside it is one item
+        // on its own, so the loop does iterate and break out, leaving the
+        // `else` import dead. CPython returns 1.
+        let source = "import os\n\nfrom api import target\n\nvalues = [1] if os.environ.get(\"NOD_FULL\") else []\n\nfor _ in [*values, os.environ.get(\"NOD_FULL\")]:\n    break\nelse:\n    from other import target\n\nassert target() == 1\n";
+        let updated = loop_else_import_fixture(source)?;
+        assert!(updated.contains("assert target(alpha=1) == 1"), "{updated}");
         Ok(())
     }
 }

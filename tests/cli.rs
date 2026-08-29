@@ -6131,3 +6131,68 @@ fn a_method_named_near_load_module_is_still_fixed() -> Result<(), Box<dyn std::e
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn an_inspect_loader_get_code_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `importlib` executes a module by asking its loader for the code object,
+    // calling `get_code(fullname)` with the module name alone, so `extra` only
+    // ever arrives as its default. That call is made from
+    // `<frozen importlib._bootstrap_external>` rather than by any line in the
+    // file, so dropping the default leaves the next import raising
+    // `TypeError: L.get_code() missing 1 required positional argument:
+    // 'extra'` with no written call site to carry the value.
+    let source = "class L:\n    def get_code(self, fullname, extra=1):\n        return None\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_loader_helper_beside_get_code_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // sibling with the same signature shape is rewritten as usual, carrying
+    // its own default to the call.
+    let source = "class L:\n    def get_code(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class L:\n    def get_code(self, fullname, extra=1):\n        return self.helper(fullname, value=2)\n\n    def helper(self, fullname, value):\n        return (fullname, value)\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_method_named_near_get_code_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The import machinery looks the hook up under its exact name, so a near
+    // miss is an ordinary method whose default the fixer removes.
+    let source =
+        "class L:\n    def get_codes(self, fullname, extra=1):\n        return (fullname, extra)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class L:\n    def get_codes(self, fullname, extra):\n        return (fullname, extra)\n",
+    );
+    // Nothing is left unfixed once the near miss is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

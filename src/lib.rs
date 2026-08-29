@@ -5611,6 +5611,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "find_class"
             | "invalidate_caches"
             | "load_module"
+            | "get_code"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -20412,6 +20413,68 @@ def b(x=1): pass  # type: ignore  # noqa
         // The fallback looks the hook up under its exact name, so a near miss
         // is an ordinary method and its default is the fixer's.
         let source = "class Loader:\n    def load_modules(self, fullname, extra=1):\n        return fullname\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn inspect_loader_get_code_defaults_are_retained() {
+        // `importlib` executes a module by asking its loader for the code
+        // object, calling `get_code(fullname)` with the module name alone, so
+        // a parameter beside it only ever arrives as its default. That call is
+        // made from `<frozen importlib._bootstrap_external>` rather than by
+        // any written line, so dropping the default leaves the next import
+        // raising `TypeError: L.get_code() missing 1 required positional
+        // argument` with nothing for the fixer to update.
+        let source = "class L:\n    def get_code(self, fullname, extra=1):\n        return None\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_loader_method_beside_get_code_stays_fixable() {
+        // Retention is keyed to the hook name, so a sibling sharing the loader
+        // and the signature shape keeps its ordinary treatment.
+        let source = "class L:\n    def get_code(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_get_code_stays_fixable() {
+        // The import machinery looks the hook up under its exact name, so a
+        // near miss is an ordinary method and its default is the fixer's.
+        let source =
+            "class L:\n    def get_codes(self, fullname, extra=1):\n        return (fullname, extra)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

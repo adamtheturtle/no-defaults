@@ -120,6 +120,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - Rebinding a package name drops the dotted import under it. After `import pkg.api`, a later `pkg = …` left the `pkg.api` entry in place and calls through it were still rewritten as the original module's.
 - A module-level loop or `with` target replaces an imported name, as an assignment to it already did. Calls through the name were still being rewritten as the import's. An `except … as` target does not: the name is deleted when the handler ends, and if the handler never runs the import still binds.
 - Two definitions of one name in different branches of an `if`, loop, `with`, `try`, or `match` keep their defaults, as two written side by side already did. Which one survives is not knowable, and `--fix` was stripping both while leaving the call as written.
+- A name a class body binds by assignment shadows what its bases hold, as a `def` of that name already did. A subclass writing `__init__ = setup` has a constructor of its own, and `--fix` was rewriting its calls against an ancestor's `__init__` with parameters the alias does not take.
 
 ## 2.1.0 - 2026-08-07
 

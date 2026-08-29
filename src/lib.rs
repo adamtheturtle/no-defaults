@@ -909,10 +909,19 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                         .methods
                         .entry((importer.clone(), class.name.to_string()))
                         .or_default();
+                    // Every name the body binds is an attribute of the class,
+                    // whether a `def` wrote it or an assignment such as
+                    // `__init__ = setup` did. Recording the assigned ones too
+                    // keeps them shadowing what the bases hold: a subclass
+                    // that binds `__init__` has a constructor of its own, and
+                    // rewriting its calls against an ancestor's `__init__`
+                    // would pass parameters the binding does not take.
+                    let mut bound = BoundNames::default();
                     for statement in &class.body {
-                        if let Stmt::FunctionDef(function) = statement {
-                            methods.entry(function.name.to_string()).or_insert(None);
-                        }
+                        bound.visit_stmt(statement);
+                    }
+                    for name in bound.names {
+                        methods.entry(name).or_insert(None);
                     }
                     let bases = class
                         .arguments
@@ -15914,6 +15923,27 @@ def b(x=1): pass  # type: ignore  # noqa
         }
         let updated = fixed(&format!("{structural_head}{structural_tail}"))?;
         assert!(updated.contains("Child(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn constructor_aliases_shadow_the_inherited_constructor() -> Result<(), String> {
+        // ``__init__ = setup`` makes ``setup`` the constructor, so ``Child()``
+        // takes that method's parameters rather than the ones the base's
+        // ``__init__`` was left with. Rewriting it against the base would call
+        // ``setup`` with a keyword it does not accept.
+        let aliased = "class Base:\n    def __init__(self, parent=1):\n        self.value = parent\n\nclass Child(Base):\n    def setup(self):\n        self.value = 2\n    __init__ = setup\n\nassert Child().value == 2\n";
+        assert_eq!(
+            fixed(aliased)?,
+            "class Base:\n    def __init__(self, parent):\n        self.value = parent\n\nclass Child(Base):\n    def setup(self):\n        self.value = 2\n    __init__ = setup\n\nassert Child().value == 2\n"
+        );
+        // A subclass that binds no constructor of its own still inherits the
+        // base's, so its calls are rewritten against it.
+        let inherited = "class Base:\n    def __init__(self, parent=1):\n        self.value = parent\n\nclass Child(Base):\n    pass\n\nassert Child().value == 1\n";
+        assert_eq!(
+            fixed(inherited)?,
+            "class Base:\n    def __init__(self, parent):\n        self.value = parent\n\nclass Child(Base):\n    pass\n\nassert Child(parent=1).value == 1\n"
+        );
         Ok(())
     }
 }

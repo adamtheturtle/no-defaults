@@ -5612,6 +5612,9 @@ fn implicitly_called_method(name: &str) -> bool {
             | "invalidate_caches"
             | "load_module"
             | "get_code"
+            | "get_source"
+            | "__conform__"
+            | "is_package"
             | "get_filename"
             | "__call__"
             | "__enter__"
@@ -9101,6 +9104,15 @@ impl Rewriter<'_> {
     /// and whether it was reached through a zero-argument `super()`, whose
     /// lookup starts after the class the call appears in.
     fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
+        if let Expr::Subscript(subscript) = receiver {
+            // `Box[int]` parameterizes a generic and still names the class, so
+            // a call through it reaches the same definition. Subscripting an
+            // instance instead runs `__getitem__`, whose result is an
+            // unrelated object, so only a receiver that resolves to a class
+            // may be unwrapped.
+            let class = self.receiving_class(&subscript.value)?;
+            return (!class.2).then_some(class);
+        }
         if let Expr::Call(call) = receiver {
             if let Some(class) = self.type_of_implicit_instance(call) {
                 return Some(class);
@@ -9341,6 +9353,7 @@ impl Rewriter<'_> {
 
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
+            Expr::Subscript(subscript) => self.resolve(&subscript.value),
             Expr::Name(name)
                 if self.in_class_scope()
                     && self
@@ -9490,6 +9503,11 @@ impl Rewriter<'_> {
         let name = match &*call.func {
             Expr::Name(name) => name.id.as_str(),
             Expr::Attribute(attribute) => attribute.attr.as_str(),
+            Expr::Subscript(subscript) => match subscript.value.as_ref() {
+                Expr::Name(name) => name.id.as_str(),
+                Expr::Attribute(attribute) => attribute.attr.as_str(),
+                _ => return,
+            },
             _ => return,
         };
         let Some((signature, bound)) = self.resolve(&call.func) else {
@@ -20476,6 +20494,268 @@ def b(x=1): pass  # type: ignore  # noqa
         // near miss is an ordinary method and its default is the fixer's.
         let source =
             "class L:\n    def get_codes(self, fullname, extra=1):\n        return (fullname, extra)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+    #[test]
+    fn inspect_loader_get_source_defaults_are_retained() {
+        // `InspectLoader.get_code` asks the loader for its own source by
+        // calling `self.get_source(fullname)`, and `linecache` binds the same
+        // one-argument call to render a traceback, so a parameter beside
+        // `fullname` only ever arrives as its default. Both calls are made by
+        // the interpreter rather than by any written line, so dropping the
+        // default leaves the next import raising `TypeError:
+        // Loader.get_source() missing 1 required positional argument` from
+        // inside `importlib.abc` with nothing for the fixer to update.
+        let source =
+            "class Loader:\n    def get_source(self, fullname, extra=1):\n        return 'answer = 1'\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_loader_method_beside_get_source_stays_fixable() {
+        // Retention is keyed to the hook name, so a sibling sharing the loader
+        // and the signature shape keeps its ordinary treatment.
+        let source = "class Loader:\n    def get_source(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_get_source_stays_fixable() {
+        // The import system and `linecache` both look the hook up under its
+        // exact name, so a near miss is an ordinary method and its default is
+        // the fixer's.
+        let source =
+            "class Loader:\n    def get_sources(self, fullname, extra=1):\n        return 'answer = 1'\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_module_level_get_source_stays_fixable() {
+        // Only a loader's attribute is consulted for the hook, so a plain
+        // function of that name at module level carries no such obligation.
+        let source = "def get_source(fullname, extra=1):\n    return 'answer = 1'\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn sqlite_conform_defaults_are_retained() {
+        // Binding a parameter hands the object to `sqlite3`'s adapter, which
+        // calls `__conform__(protocol)` from C with the protocol alone, so a
+        // parameter beside it only ever arrives as its default. The extension
+        // makes that call, so dropping the default leaves the next bind
+        // raising `TypeError: Value.__conform__() missing 1 required
+        // positional argument` inside `_sqlite3` with nothing for the fixer to
+        // update.
+        let source =
+            "class Value:\n    def __conform__(self, protocol, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_method_beside_conform_stays_fixable() {
+        // Retention is keyed to the hook name, so a sibling sharing the class
+        // and the signature shape keeps its ordinary treatment.
+        let source = "class Value:\n    def __conform__(self, protocol, extra=1):\n        return self.helper()\n    def helper(self, value=2):\n        return value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_conform_stays_fixable() {
+        // The adapter looks the hook up under its exact name, so a near miss
+        // is an ordinary method whose default the fixer removes.
+        let source =
+            "class Value:\n    def conform(self, protocol, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn parameterized_generic_constructor_calls_are_updated() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar('T')\n@dataclass\nclass Box(Generic[T]):\n    value: int = 1\n\nBox[int]()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar('T')\n@dataclass\nclass Box(Generic[T]):\n    value: int\n\nBox[int](value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parameterized_generic_method_calls_are_updated() -> Result<(), String> {
+        let source = "from typing import Generic, TypeVar\n\nT = TypeVar('T')\nclass Box(Generic[T]):\n    @classmethod\n    def make(cls, value=1):\n        return cls()\n\nBox[int].make()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from typing import Generic, TypeVar\n\nT = TypeVar('T')\nclass Box(Generic[T]):\n    @classmethod\n    def make(cls, value):\n        return cls()\n\nBox[int].make(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_indexed_instance_receiver_keeps_its_own_default() -> Result<(), String> {
+        // `self[0]` and `C()[0]` run `__getitem__`, so the call lands on
+        // whatever that returns rather than on `C`, and borrowing `C`'s
+        // default would pass the wrong value.
+        let source = "class Other:\n    def target(self, value=2):\n        pass\n\nclass C:\n    def target(self, value=1):\n        pass\n\n    def __getitem__(self, index):\n        return Other()\n\n    def run(self):\n        self[0].target()\n        C()[0].target()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("def target(self, value):"), "{updated}");
+        assert!(!updated.contains("value=1"), "{updated}");
+        assert!(!updated.contains("value=2"), "{updated}");
+        assert!(updated.contains("self[0].target()\n"), "{updated}");
+        assert!(updated.contains("C()[0].target()\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn import_loader_is_package_defaults_are_retained() {
+        // Building a specification asks the loader whether the name is a
+        // package, and `importlib._bootstrap.spec_from_loader` makes that call
+        // with the module name alone, so a parameter beside it only ever
+        // arrives as its default. Dropping the default leaves the next import
+        // raising `TypeError: Loader.is_package() missing 1 required
+        // positional argument` from inside the import machinery, where there
+        // is no written line for the fixer to keep in step.
+        let source =
+            "class Loader:\n    def is_package(self, fullname, extra=1):\n        return False\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_loader_method_beside_is_package_stays_fixable() {
+        // Retention is keyed to the hook name rather than to the shape of the
+        // parameter list, so a sibling declared the very same way keeps its
+        // ordinary treatment.
+        let source = "class Loader:\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, extra=1):\n        return False\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_is_package_stays_fixable() {
+        // The import machinery reaches for the hook under its exact name, so a
+        // near miss is an ordinary method and its default is the fixer's.
+        let source =
+            "class Loader:\n    def is_packages(self, fullname, extra=1):\n        return False\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_module_level_is_package_stays_fixable() {
+        // Only a loader's attribute is consulted for the hook, so a plain
+        // function of that name at module level carries no such obligation.
+        let source = "def is_package(fullname, extra=1):\n    return False\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

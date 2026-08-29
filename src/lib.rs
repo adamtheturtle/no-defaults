@@ -3512,6 +3512,8 @@ impl Checker<'_> {
 
     fn unknown_base_may_end_in_default(&self, class: &ast::StmtClassDef) -> bool {
         class_bases(class).any(|base| {
+            // A parameter shadowing the import hides the base further rather
+            // than revealing it, so the name it took over counts too.
             if base_root_name(base).is_some_and(|name| {
                 self.aliases.import_bindings.contains(name)
                     || self.aliases.invalidated_import_bindings.contains(name)
@@ -4931,9 +4933,6 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         // An unseen base may end in a positional default. A
                         // child field without one would then make dataclass
                         // construction fail before any call can be rewritten.
-                        // A parameter shadowing the import hides the base
-                        // further rather than revealing it, so the name it
-                        // took over counts too.
                         Inherited::Unknown => self.unknown_base_may_end_in_default(class),
                         Inherited::Nothing => false,
                     };

@@ -6914,3 +6914,50 @@ fn an_alias_imported_by_name_keeps_the_inherited_default() -> Result<(), Box<dyn
     }
     Ok(())
 }
+
+#[test]
+fn a_qualified_builtin_type_base_keeps_the_metaclass_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `builtins.type` is the same class the bare name is, so `Meta` is a
+    // metaclass and creating `C` calls its `__init__` with the name, bases and
+    // namespace alone. Taking `tag` away left an import-time `TypeError` with
+    // no call anywhere for `--fix` to rewrite.
+    let source = "import builtins\n\n\nclass Meta(builtins.type):\n    def __init__(cls, name, bases, namespace, tag=\"alpha\"):\n        super().__init__(name, bases, namespace)\n        cls.tag = tag\n\n\nclass C(metaclass=Meta):\n    pass\n\n\nassert C.tag == \"alpha\"\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The default is still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_definition_body_does_not_resolve_the_import_it_replaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let user = directory.path().join("user.py");
+    // The recursive call reaches the `def`, which takes no `flag`: Python
+    // binds the name once the body is compiled and the body reads it only when
+    // it runs. Resolving it against the import instead both kept the default
+    // and wrote `helper(x - 1, flag="ALPHA")`, which raised `TypeError` where
+    // the file had returned `done`.
+    let api_source = "def helper(x, flag=\"ALPHA\"):\n    return (x, flag)\n";
+    let user_source = "from api import helper\n\n\ndef helper(x):\n    if x > 0:\n        return helper(x - 1)\n    return \"done\"\n\n\nassert helper(2) == \"done\"\n";
+    std::fs::write(&api, api_source)?;
+    std::fs::write(&user, user_source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&api)?, api_source);
+    assert_eq!(std::fs::read_to_string(&user)?, user_source);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
+    Ok(())
+}

@@ -243,6 +243,9 @@ struct Removed {
 
 type FixKey = (PathBuf, TextSize, TextSize);
 
+/// A class named by the file that defines it and the name it is defined under.
+type ClassIdentity = (PathBuf, String);
+
 fn fix_key(path: &Path, range: TextRange) -> FixKey {
     (path.to_path_buf(), range.start(), range.end())
 }
@@ -598,6 +601,37 @@ impl Definitions {
             }
         }
         Some(result)
+    }
+
+    /// Follow every recorded base to the file that defines it.
+    ///
+    /// A base named through a package that re-exports it — `from pkg import
+    /// Base`, where `pkg/__init__.py` binds that name to `pkg.core` — is
+    /// recorded against the initializer, which defines no class of that name.
+    /// A lookup that stops there walks past the methods a subclass inherits,
+    /// so their defaults come out while the calls that need them are left
+    /// alone. Following the binding needs every file's imports indexed, which
+    /// is why this runs once the whole set has been read, and it follows only
+    /// what [`Definitions::class_identity`] settles: an import the initializer
+    /// makes under a condition binds nothing this pass will follow.
+    fn resolve_reexported_bases(&mut self) {
+        let followed: Vec<(ClassIdentity, Vec<ClassIdentity>)> = self
+            .bases
+            .iter()
+            .filter_map(|(class, bases)| {
+                let resolved: Vec<ClassIdentity> = bases
+                    .iter()
+                    .map(|(file, name)| {
+                        self.class_identity(file, name)
+                            .unwrap_or_else(|| (file.clone(), name.clone()))
+                    })
+                    .collect();
+                (resolved != *bases).then(|| (class.clone(), resolved))
+            })
+            .collect();
+        for (class, bases) in followed {
+            self.bases.insert(class, bases);
+        }
     }
 
     /// Give a subclass with no constructor of its own the signature of the
@@ -1084,6 +1118,7 @@ fn call_site_edits(
                 .map(|(name, binding)| ((importer.clone(), name), binding)),
         );
     }
+    definitions.resolve_reexported_bases();
     definitions.index_inherited_constructors();
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()
@@ -6043,7 +6078,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
                     fields: style,
-                    class: if defines_metaclass(class, &self.metaclass_definitions) {
+                    class: if defines_metaclass(class, &self.metaclass_definitions, &self.aliases) {
                         ClassScope::Metaclass
                     } else {
                         ClassScope::Ordinary
@@ -6184,7 +6219,10 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     self.local_enum_classes.remove(class.name.as_str());
                 }
                 self.repeated_functions = outer_repeated_functions;
-                if defines_metaclass(class, &self.metaclass_definitions) {
+                // The header was read against the scope around the class, so
+                // the spellings it could have used are the ones bound there
+                // rather than anything the body has since imported.
+                if defines_metaclass(class, &self.metaclass_definitions, &outer_aliases) {
                     self.metaclass_definitions.insert(class.name.to_string());
                 } else if self.conditional_depth == 0 {
                     self.metaclass_definitions.remove(class.name.as_str());
@@ -6503,6 +6541,8 @@ struct Aliases {
     properties: BTreeSet<String>,
     supers: BTreeSet<String>,
     builtins_modules: BTreeSet<String>,
+    /// Names `from builtins import type as ...` bound the builtin `type` to.
+    builtin_types: BTreeSet<String>,
     class_vars: BTreeSet<String>,
     typing_modules: BTreeSet<String>,
     abc_modules: BTreeSet<String>,
@@ -6535,6 +6575,7 @@ impl Aliases {
         self.classmethods.remove(name);
         self.supers.remove(name);
         self.builtins_modules.remove(name);
+        self.builtin_types.remove(name);
         self.class_vars.remove(name);
         self.typing_modules.remove(name);
         self.abc_modules.remove(name);
@@ -6582,6 +6623,7 @@ impl Aliases {
             (&mut self.classmethods, &before.classmethods),
             (&mut self.supers, &before.supers),
             (&mut self.builtins_modules, &before.builtins_modules),
+            (&mut self.builtin_types, &before.builtin_types),
             (&mut self.class_vars, &before.class_vars),
             (&mut self.typing_modules, &before.typing_modules),
             (&mut self.abc_modules, &before.abc_modules),
@@ -6646,6 +6688,9 @@ impl Aliases {
                 }
                 "object" => {
                     self.structural_bases.insert(local);
+                }
+                "type" => {
+                    self.builtin_types.insert(local);
                 }
                 _ => {}
             }
@@ -6988,11 +7033,33 @@ fn declares_metaclass(class: &ast::StmtClassDef) -> bool {
     })
 }
 
+/// Whether a base expression names the builtin `type`.
+///
+/// A qualified `builtins.type` is the same class the bare name is, and the
+/// module can be bound under any spelling an `import builtins as ...` gives
+/// it — the spellings the descriptor wrappers already accept.
+fn names_builtin_type(base: &Expr, aliases: &Aliases) -> bool {
+    match base {
+        Expr::Name(name) => {
+            name.id.as_str() == "type" || aliases.builtin_types.contains(name.id.as_str())
+        }
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "type" => {
+            matches!(attribute.value.as_ref(), Expr::Name(module) if aliases.builtins_modules.contains(module.id.as_str()))
+        }
+        _ => false,
+    }
+}
+
 /// Whether a class is itself a metaclass, directly or through a local base.
-fn defines_metaclass(class: &ast::StmtClassDef, known: &BTreeSet<String>) -> bool {
+fn defines_metaclass(
+    class: &ast::StmtClassDef,
+    known: &BTreeSet<String>,
+    aliases: &Aliases,
+) -> bool {
     class.arguments.as_ref().is_some_and(|arguments| {
         arguments.args.iter().any(|base| {
-            matches!(base, Expr::Name(name) if name.id.as_str() == "type" || known.contains(name.id.as_str()))
+            names_builtin_type(base, aliases)
+                || matches!(base, Expr::Name(name) if known.contains(name.id.as_str()))
         })
     })
 }
@@ -8007,6 +8074,7 @@ fn rewrite_calls(
             }),
         module_bindings: BoundNames::of_module(parsed.suite()),
         module_rebindings: module_rebindings(parsed.suite()),
+        enclosing_definitions: Vec::new(),
         bindings: vec![BTreeMap::new()],
         binding_scope_depths: vec![0],
         lambda_scope_depths: Vec::new(),
@@ -9205,6 +9273,14 @@ struct Rewriter<'a> {
     /// Module-level names that something other than an import binds, so an
     /// import of the name no longer says what a call to it reaches.
     module_rebindings: BTreeSet<String>,
+    /// Module-level names whose own `def` or `class` statement is being
+    /// walked, and which an import above bound first. The statement has
+    /// finished by the time a function body inside it can run, so a call
+    /// written there reaches the definition rather than the import it
+    /// replaces. A class body runs before the name is bound and so still
+    /// reaches the import, which is why the set is only applied on entering a
+    /// function body.
+    enclosing_definitions: Vec<String>,
     known: &'a BTreeSet<&'a Path>,
     /// The class bodies being walked, so `self.method(...)` can be resolved.
     classes: Vec<String>,
@@ -9244,6 +9320,37 @@ struct Rewriter<'a> {
 impl Rewriter<'_> {
     fn in_class_scope(&self) -> bool {
         self.class_scope_depths.last() == Some(&self.scopes.len())
+    }
+
+    /// Whether a `def` or a `class` written here takes a module-level name an
+    /// import above already bound.
+    fn definition_replaces_import(&self, name: &str) -> bool {
+        self.scopes.is_empty()
+            && self
+                .bindings
+                .first()
+                .is_some_and(|bindings| bindings.contains_key(name))
+    }
+
+    /// Hold every enclosing definition's name as bound for the function body
+    /// about to be walked, answering with the names this call was the one to
+    /// take so that they can be handed back after it.
+    fn bind_enclosing_definitions(&mut self) -> Vec<String> {
+        let mut taken = Vec::new();
+        for name in self.enclosing_definitions.clone() {
+            if self.invalidated_bindings.insert(name.clone()) {
+                taken.push(name);
+            }
+        }
+        taken
+    }
+
+    /// Give the imports back to the names [`Rewriter::bind_enclosing_definitions`]
+    /// took them from, so that whatever follows the body reads them again.
+    fn release_enclosing_definitions(&mut self, taken: Vec<String>) {
+        for name in taken {
+            self.invalidated_bindings.remove(&name);
+        }
     }
 
     /// Bind in the class body what a statement in it binds, once that
@@ -11254,6 +11361,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             }
             Stmt::ClassDef(class) => {
                 let module_scope = self.scopes.is_empty();
+                let replaces_import = self.definition_replaces_import(class.name.as_str());
                 // The class header is evaluated before its local namespace is
                 // populated, so body bindings cannot shadow header calls.
                 for decorator in &class.decorator_list {
@@ -11279,7 +11387,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.class_scope_depths.push(self.scopes.len());
                 self.class_direct_statements
                     .push(class.body.iter().map(Ranged::start).collect());
+                if replaces_import {
+                    self.enclosing_definitions.push(class.name.to_string());
+                }
                 self.visit_body(&class.body);
+                if replaces_import {
+                    self.enclosing_definitions.pop();
+                }
                 self.class_direct_statements.pop();
                 self.class_scope_depths.pop();
                 self.conditional_class_definitions.pop();
@@ -11294,17 +11408,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         bindings.remove(class.name.as_str());
                     }
                 }
-                if module_scope
-                    && self
-                        .bindings
-                        .first()
-                        .is_some_and(|bindings| bindings.contains_key(class.name.as_str()))
-                {
+                if replaces_import {
                     self.invalidated_bindings.insert(class.name.to_string());
                 }
             }
             Stmt::FunctionDef(function) => {
                 let module_scope = self.scopes.is_empty();
+                let replaces_import = self.definition_replaces_import(function.name.as_str());
                 // Decorators run while the function object is being created,
                 // before names local to its body exist.
                 for decorator in &function.decorator_list {
@@ -11357,7 +11467,15 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.binding_scope_depths.push(self.scopes.len() - 1);
                 self.lexical_scope.push(function.name.to_string());
                 self.lexical_is_class.push(false);
+                if replaces_import {
+                    self.enclosing_definitions.push(function.name.to_string());
+                }
+                let taken = self.bind_enclosing_definitions();
                 self.visit_body(&function.body);
+                self.release_enclosing_definitions(taken);
+                if replaces_import {
+                    self.enclosing_definitions.pop();
+                }
                 self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.scopes.pop();
@@ -11374,12 +11492,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 if module_scope {
                     self.rebound_classes.insert(function.name.to_string());
                 }
-                if module_scope
-                    && self
-                        .bindings
-                        .first()
-                        .is_some_and(|bindings| bindings.contains_key(function.name.as_str()))
-                {
+                if replaces_import {
                     self.invalidated_bindings.insert(function.name.to_string());
                 }
             }
@@ -22173,6 +22286,157 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(skipped_reasons(source)?.is_empty());
         let updated = fixed(source)?;
         assert!(updated.contains("unrelated(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_qualified_builtin_type_base_makes_a_metaclass() {
+        // `builtins.type` is the class the bare name is. Creating `C` calls
+        // `Meta.__init__` with the name, bases and namespace and nothing else,
+        // so taking `tag` away leaves an import-time `TypeError` with no call
+        // written anywhere to rewrite. The spellings are the ones the
+        // descriptor wrappers already accept.
+        for header in [
+            "import builtins\n\nclass Meta(builtins.type):",
+            "import builtins as b\n\nclass Meta(b.type):",
+            "from builtins import type as t\n\nclass Meta(t):",
+        ] {
+            let source = format!(
+                "{header}\n    def __init__(cls, name, bases, namespace, tag=\"alpha\"):\n        super().__init__(name, bases, namespace)\n        cls.tag = tag\n\n\nclass C(metaclass=Meta):\n    pass\n\n\nassert C.tag == \"alpha\"\n"
+            );
+            let checked = check_source(
+                Path::new("fixture.py"),
+                &source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+        // The same body under a base that is no metaclass is fixed as ever, so
+        // what is retained above is the `type` base rather than the shape of
+        // the method or the `builtins` import written over it.
+        let ordinary = "import builtins\n\nclass Meta:\n    def __init__(cls, name, bases, namespace, tag=\"alpha\"):\n        cls.tag = tag\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            ordinary,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_definition_holds_its_name_for_the_bodies_inside_it() -> Result<(), String> {
+        // Python binds a `def` once its body is compiled, and the body reads
+        // the name when it runs, which is necessarily later: the recursive
+        // call reaches the definition, never the import it replaces. Writing
+        // the import's `flag` in there raised `TypeError` where the file had
+        // returned `done`.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &api,
+            "def helper(x, flag=\"ALPHA\"):\n    return (x, flag)\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let source = "from api import helper\n\n\ndef helper(x):\n    if x > 0:\n        return helper(x - 1)\n    return \"done\"\n\n\nassert helper(2) == \"done\"\n";
+        std::fs::write(&user, source).map_err(|error| error.to_string())?;
+        fix_all(&[api, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            source
+        );
+
+        // A method is deferred the same way, so the class statement has bound
+        // its name long before one of them runs.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &api,
+            "class Thing:\n    def __init__(self, value=\"ALPHA\"):\n        self.value = value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let source = "from api import Thing\n\n\nclass Thing:\n    def make(self):\n        return Thing()\n\n\nassert isinstance(Thing().make(), Thing)\n";
+        std::fs::write(&user, source).map_err(|error| error.to_string())?;
+        fix_all(&[api, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            source
+        );
+
+        // A class body runs before the name is bound, so a construction there
+        // does reach the import and is rewritten. Without that the two cases
+        // above would pass on a rewriter that had stopped resolving anything.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &api,
+            "class Thing:\n    def __init__(self, value=\"ALPHA\"):\n        self.value = value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from api import Thing\n\n\nclass Thing:\n    made = Thing()\n\n\nassert Thing.made.value == \"ALPHA\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from api import Thing\n\n\nclass Thing:\n    made = Thing(value=\"ALPHA\")\n\n\nassert Thing.made.value == \"ALPHA\"\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_a_package_reexports_is_followed_to_its_module() -> Result<(), String> {
+        // `pkg/__init__.py` binds `Base` to the class `pkg/core.py` writes, so
+        // `C` inherits `target` from there. Stopping at the initializer, which
+        // defines no class at all, left the inherited call alone while the
+        // default behind it came out, and `C().target(5)` raised `TypeError`.
+        // Importing from the defining module is the same tree read one hop
+        // shorter, and has always resolved.
+        for importing in ["from pkg import Base", "from pkg.core import Base"] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let package = directory.path().join("pkg");
+            std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+            let core = package.join("core.py");
+            let init = package.join("__init__.py");
+            let user = directory.path().join("main.py");
+            std::fs::write(
+                &core,
+                "class Base:\n    def target(self, x, y=\"CORE\"):\n        return (\"base\", x, y)\n",
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(&init, "from pkg.core import Base\n\n__all__ = [\"Base\"]\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(
+                &user,
+                format!(
+                    "{importing}\n\n\nclass C(Base):\n    pass\n\n\nassert C().target(5) == (\"base\", 5, \"CORE\")\n"
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            fix_all(&[core, init, user.clone()])?;
+            assert_eq!(
+                std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+                format!(
+                    "{importing}\n\n\nclass C(Base):\n    pass\n\n\nassert C().target(5, y=\"CORE\") == (\"base\", 5, \"CORE\")\n"
+                ),
+                "{importing}"
+            );
+        }
         Ok(())
     }
 }

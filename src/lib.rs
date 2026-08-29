@@ -19022,4 +19022,27 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(updated.contains("self.target(value=7)"), "{updated}");
         Ok(())
     }
+
+    #[test]
+    fn a_self_named_base_uses_the_previous_metaclass_binding() {
+        // The name a class statement writes is bound only once its body has
+        // run, so a base spelled the same as the class being defined reaches
+        // the earlier binding. That earlier `Base` inherits an import this run
+        // cannot see, and the redefinition carries the doubt forward: a
+        // metaclass there could build `Child` itself, leaving the field's
+        // default in place.
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base(Base):\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = field(default=1, kw_only=True)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
 }

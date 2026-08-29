@@ -19474,4 +19474,48 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(updated.contains("self.target(value=3)"), "{updated}");
         Ok(())
     }
+
+    #[test]
+    fn metaclass_base_lookup_skips_outer_class_scopes() {
+        // A class body is not a scope a nested body closes over, so the `Base`
+        // an outer class body binds is invisible from the body inside it. The
+        // base the nested class really gets is the module-level one, and the
+        // import behind that one could bring a metaclass along, so the field's
+        // default has to stay.
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Container:\n    @dataclass\n    class Base:\n        pass\n\n    class Inner:\n        @dataclass\n        class Child(Base):\n            value: int = field(default=1, kw_only=True)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn metaclass_base_lookup_uses_the_immediate_class_scope() {
+        // The header of a class written directly in another class body is
+        // evaluated with that body's names in hand, so the sibling `Base`
+        // beside it wins over the one the enclosing function bound. That
+        // sibling inherits nothing, which leaves no metaclass to intercept
+        // construction and no reason to keep the default.
+        let source = "from dataclasses import dataclass, field\n\ndef build():\n    from base import Parent\n\n    class Base(Parent):\n        pass\n\n    class Container:\n        @dataclass\n        class Base:\n            pass\n\n        @dataclass\n        class Child(Base):\n            value: int = field(default=1, kw_only=True)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+        assert_eq!(checked.signatures.len(), 1);
+    }
 }

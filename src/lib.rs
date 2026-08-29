@@ -17069,4 +17069,32 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         Ok(())
     }
+
+    #[test]
+    fn an_import_stays_the_base_of_a_subclass_written_above_a_local_class() -> Result<(), String> {
+        // `Child` is written while `Helper` still names the import, so that is
+        // the class it inherits from however thoroughly a class further down
+        // takes the name over. Reading the whole suite for local classes
+        // without regard for where each is written would rewrite the
+        // inherited call with a default the base never had.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Helper:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Helper\n\n\nclass Child(Helper):\n    def run(self): return self.target()\n\n\nclass Helper:\n    def target(self, value=2): return value\n\n\nassert Child().run() == 9\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
+            "from api import Helper\n\n\nclass Child(Helper):\n    def run(self): return self.target(value=9)\n\n\nclass Helper:\n    def target(self, value): return value\n\n\nassert Child().run() == 9\n"
+        );
+        Ok(())
+    }
 }

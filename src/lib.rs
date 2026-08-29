@@ -1209,6 +1209,7 @@ fn index_method_bases(
 ) {
     let local_classes = local_class_identities(statements, namespace);
     let mut aliases = BTreeMap::new();
+    let mut contested: BTreeMap<String, BTreeSet<(PathBuf, String)>> = BTreeMap::new();
     for (statement, conditional) in scope_statements(statements, false) {
         let defined_at = statement.start();
         match statement {
@@ -1235,6 +1236,7 @@ fn index_method_bases(
                     if conditional {
                         note_competing_bases(definitions, &key, previous.as_deref());
                     }
+                    note_contested_alias_bases(definitions, &key, class, &contested);
                 }
                 let mut inner = namespace.lexical_scope.to_vec();
                 inner.push(class.name.to_string());
@@ -1290,6 +1292,13 @@ fn index_method_bases(
                 };
                 for target in targets {
                     if let Expr::Name(alias) = target {
+                        note_contested_alias(
+                            &mut contested,
+                            &aliases,
+                            alias.id.as_str(),
+                            &identity,
+                            conditional,
+                        );
                         aliases.insert(alias.id.to_string(), identity.clone());
                     }
                 }
@@ -1325,6 +1334,66 @@ fn scope_statements(statements: &[Stmt], conditional: bool) -> Vec<(&Stmt, bool)
         }
     }
     walked
+}
+
+/// Note a name that competing suites bind to different classes.
+///
+/// A suite may not run, so an assignment in one does not take the name over
+/// from what another bound: every candidate still stands, and a class built on
+/// the name has an ancestry for each. An assignment no suite guards does take
+/// it over, which settles the name again.
+fn note_contested_alias(
+    contested: &mut BTreeMap<String, BTreeSet<(PathBuf, String)>>,
+    aliases: &BTreeMap<String, (PathBuf, String)>,
+    spelling: &str,
+    identity: &(PathBuf, String),
+    conditional: bool,
+) {
+    if !conditional {
+        contested.remove(spelling);
+        return;
+    }
+    let Some(previous) = aliases
+        .get(spelling)
+        .filter(|previous| *previous != identity)
+    else {
+        return;
+    };
+    let candidates = contested.entry(spelling.to_owned()).or_default();
+    candidates.insert(previous.clone());
+    candidates.insert(identity.clone());
+}
+
+/// Note a class built on a name competing suites bind to different classes.
+///
+/// Which suite ran decides which class the name stands for, so the subclass
+/// has one ancestry per candidate and the file settles none of them. Recording
+/// every candidate beside the bases already read leaves the ancestry unsettled
+/// on purpose, which is what keeps the defaults each candidate holds.
+fn note_contested_alias_bases(
+    definitions: &mut Definitions,
+    class: &(PathBuf, String),
+    definition: &ast::StmtClassDef,
+    contested: &BTreeMap<String, BTreeSet<(PathBuf, String)>>,
+) {
+    let candidates: BTreeSet<(PathBuf, String)> = class_bases(definition)
+        .filter_map(|base| match base {
+            Expr::Name(name) => contested.get(name.id.as_str()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let bases = definitions.bases.get(class).cloned().unwrap_or_default();
+    definitions.ambiguous_bases.insert(class.clone());
+    definitions
+        .ambiguous_base_options
+        .entry(class.clone())
+        .or_default()
+        .extend(bases.into_iter().chain(candidates));
 }
 
 /// Note a class whose competing definitions disagree about its bases.
@@ -18047,5 +18116,37 @@ def b(x=1): pass  # type: ignore  # noqa
             assert_eq!(checked.diagnostics[0].fix.is_some(), removable, "{source}");
             assert_eq!(checked.signatures.is_empty(), !removable, "{source}");
         }
+    }
+
+    #[test]
+    fn competing_aliases_leave_a_subclass_ancestry_unsettled() -> Result<(), String> {
+        // Which suite ran decides which class `Alias` stands for, so `Child`
+        // has an ancestry for each and the file settles neither. Resolving the
+        // inherited call against whichever assignment was read last strips the
+        // other candidate's default too: with `Second` live, the rewritten
+        // `self.target(value=1)` raises `TypeError: Second.target() got an
+        // unexpected keyword argument 'value'`.
+        for source in [
+            "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, other=2): return other\n\nif os.environ.get(\"PICK\"):\n    Alias = Second\nelse:\n    Alias = First\n\nclass Child(Alias):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+            "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, other=2): return other\n\nif os.environ.get(\"PICK\"):\n    Alias = Second\nelse:\n    Alias = First\n\nif os.environ.get(\"OTHER\"):\n    class Child(Alias):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n",
+        ] {
+            assert_eq!(fixed_keeping_unreachable_defaults(source)?, source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_alias_a_later_assignment_settles_resolves_a_subclass_ancestry() -> Result<(), String> {
+        // The assignment after the branches runs whichever way they went, so
+        // the name is no longer contested and the ancestry is known again.
+        let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif os.environ.get(\"PICK\"):\n    Alias = Second\nelse:\n    Alias = First\n\nAlias = First\n\nclass Child(Alias):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("def target(self, value=2)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
     }
 }

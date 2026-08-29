@@ -602,6 +602,13 @@ impl Definitions {
 
     /// Give a subclass with no constructor of its own the signature of the
     /// checked `__init__` it inherits.
+    ///
+    /// A construction is spelled with the class's name, so the subclass takes
+    /// its place among the names a call can go by and carries the inherited
+    /// defaults behind it. Without that, a `Child()` the pass cannot resolve —
+    /// through an import another suite replaces, say — passes the gate in
+    /// `report_unresolved_call` unnoticed: the base's default is deleted, the
+    /// call is left bare, and nothing is said about it.
     fn index_inherited_constructors(&mut self) {
         let classes: Vec<(PathBuf, String)> = self.bases.keys().cloned().collect();
         for (file, class) in classes {
@@ -643,11 +650,9 @@ impl Definitions {
             {
                 signature.complete = false;
             }
-            // A construction is spelled with the class's name, never with the
-            // `__init__` it inherits, so the indexes that report a call which
-            // resolves to nothing have to know the class by that name too.
-            // Without this an unresolvable `Child()` matches nothing there and
-            // the inherited default goes with no word said about the call.
+            // A class written in a function or another class body is indexed
+            // under a qualified identity, and a call spells only the last
+            // part of it, exactly as the names a checked definition registers.
             let spelling = class.rsplit('.').next().unwrap_or(&class).to_owned();
             self.names.insert(spelling.clone());
             self.fixes_by_name.entry(spelling).or_default().extend(
@@ -1241,12 +1246,22 @@ struct LocalClass {
     /// Where an import of the same name binds the spelling again, when one in
     /// this scope does.
     superseded_at: Option<TextSize>,
+    /// The suites this class is written beside and never runs with: the other
+    /// clauses of an `if` chain it sits in, and the other cases of a `match`.
+    /// Code written in one of them runs only where this class statement did
+    /// not, so the spelling names whatever stood behind it there instead.
+    hidden_from: Vec<TextRange>,
 }
 
 impl LocalClass {
     /// Whether this class is what the spelling names at `read_at`.
     fn holds_at(&self, read_at: TextSize) -> bool {
-        self.defined_at < read_at && !self.superseded_before(read_at)
+        self.defined_at < read_at
+            && !self.superseded_before(read_at)
+            && !self
+                .hidden_from
+                .iter()
+                .any(|clause| clause.contains(read_at))
     }
 
     /// Whether an import has already taken the spelling back by `read_at`.
@@ -1369,13 +1384,13 @@ fn local_class_identities(
     namespace: ClassNamespace<'_>,
 ) -> BTreeMap<String, LocalClass> {
     let mut spellings = BTreeMap::new();
-    collect_local_class_offsets(statements, None, &mut spellings);
+    collect_local_class_offsets(statements, None, &[], &mut spellings);
     let rebindings = import_rebindings(statements);
     let mut last_written = BTreeMap::new();
     last_class_offsets(statements, &mut last_written);
     spellings
         .into_iter()
-        .map(|(spelling, defined_at)| {
+        .map(|(spelling, (defined_at, hidden_from))| {
             let identity = namespace.identity(&spelling);
             // A dotted spelling is reclaimed by an import of its root, which
             // is the name the import actually binds: once `package` is the
@@ -1404,6 +1419,7 @@ fn local_class_identities(
                     identity,
                     defined_at,
                     superseded_at,
+                    hidden_from,
                 },
             )
         })
@@ -1807,7 +1823,7 @@ fn index_control_flow_method_bases(
     for suite in suites {
         let mut inner = scope.in_suite(alternative);
         index_scope_method_bases(suite, importer, known, bindings, definitions, &mut inner);
-        carry_suite_aliases(scope, &inner, settles);
+        carry_suite_aliases(scope, &inner, settles, statement.start());
     }
 }
 
@@ -1848,7 +1864,12 @@ fn a_suite_certainly_runs(statement: &Stmt) -> bool {
 /// one of them strips the defaults behind the others. A contest the suite
 /// itself found travels out whichever kind of suite it is, since a wrapper
 /// that is certain to run settles nothing the branches inside it left open.
-fn carry_suite_aliases(scope: &mut BaseScope<'_>, suite: &BaseScope<'_>, settles: bool) {
+fn carry_suite_aliases(
+    scope: &mut BaseScope<'_>,
+    suite: &BaseScope<'_>,
+    settles: bool,
+    read_at: TextSize,
+) {
     for (spelling, identity) in &suite.aliases {
         if settles {
             // Binding what the scope already held still settles the name: an
@@ -1866,12 +1887,23 @@ fn carry_suite_aliases(scope: &mut BaseScope<'_>, suite: &BaseScope<'_>, settles
     // be left standing, and a base spelled with it read as the class the
     // assignment put there rather than the module the import names.
     //
-    // A suite that may not run is left alone. Marking the name unsettled there
-    // would decline the base while the defaults behind it were still stripped,
-    // which turns a wrong argument into a call that cannot run at all.
-    if settles {
-        for spelling in &suite.reclaimed {
+    // Where the suite may not run, an import in it leaves the name standing
+    // for either the module it names or whatever the scope had put behind it,
+    // so a class the scope holds under that spelling is contested rather than
+    // taken away: a base written with it names one ancestry per candidate, and
+    // resolving against either strips the defaults behind the other. Only a
+    // spelling the scope really holds is marked, since an import of a name
+    // nothing else binds names the same module whichever way the test went.
+    for spelling in &suite.reclaimed {
+        if settles {
             scope.aliases.remove(spelling);
+        } else if scope.aliases.contains_key(spelling)
+            || scope
+                .classes
+                .get(spelling)
+                .is_some_and(|class| class.holds_at(read_at))
+        {
+            scope.contested.insert(spelling.clone());
         }
     }
     scope.contested.extend(suite.contested.iter().cloned());
@@ -1985,26 +2017,66 @@ fn scoped_bindings(
 
 /// Where each class this file defines is written, under the name a base
 /// expression would spell it with — nested classes included, so `Outer.Inner`
-/// is found as readily as a class at the top level.
+/// is found as readily as a class at the top level. Each is recorded beside
+/// the clauses it is missing from, which `hidden` carries down as the walk
+/// enters a suite whose siblings never run with it.
 fn collect_local_class_offsets(
     statements: &[Stmt],
     prefix: Option<&str>,
-    found: &mut BTreeMap<String, TextSize>,
+    hidden: &[TextRange],
+    found: &mut BTreeMap<String, (TextSize, Vec<TextRange>)>,
 ) {
     for statement in statements {
-        match statement {
-            Stmt::ClassDef(class) => {
-                let qualified = qualified_name(prefix, class.name.as_str());
-                found.entry(qualified.clone()).or_insert(statement.start());
-                collect_local_class_offsets(&class.body, Some(&qualified), found);
-            }
-            _ => {
-                for suite in control_flow_suites(statement) {
-                    collect_local_class_offsets(suite, prefix, found);
+        if let Stmt::ClassDef(class) = statement {
+            let qualified = qualified_name(prefix, class.name.as_str());
+            match found.entry(qualified.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert((statement.start(), hidden.to_vec()));
                 }
+                // A spelling written in a clause is no longer missing from it,
+                // whichever clause the first definition sat in, so the clause
+                // stops hiding the name from the code inside it.
+                Entry::Occupied(mut held) => held
+                    .get_mut()
+                    .1
+                    .retain(|clause| !clause.contains(statement.start())),
             }
+            collect_local_class_offsets(&class.body, Some(&qualified), hidden, found);
+            continue;
+        }
+        let suites = control_flow_suites(statement);
+        // An `if` chain enters a single clause and a `match` matches a single
+        // case, so a class written in one of them is not there for a base
+        // written in another. Everything else runs its suites together — an
+        // `except` handler picks up after part of the `try` body has run, and a
+        // loop's `else` after its body — so a class written in one of those is
+        // still in reach from the next.
+        let clauses: Vec<TextRange> = if matches!(statement, Stmt::If(_) | Stmt::Match(_)) {
+            suites
+                .iter()
+                .filter_map(|suite| suite_range(suite))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for suite in suites {
+            let own = suite_range(suite);
+            let mut inner = hidden.to_vec();
+            inner.extend(
+                clauses
+                    .iter()
+                    .copied()
+                    .filter(|clause| Some(*clause) != own),
+            );
+            collect_local_class_offsets(suite, prefix, &inner, found);
         }
     }
+}
+
+/// The stretch of source a suite covers, which is nothing at all for a suite
+/// the parser left empty.
+fn suite_range(suite: &[Stmt]) -> Option<TextRange> {
+    Some(TextRange::new(suite.first()?.start(), suite.last()?.end()))
 }
 
 /// Whether a class written in this file above `defined_at`, or a name this
@@ -4881,7 +4953,9 @@ impl Checker<'_> {
     /// metaclass it may carry reaches every class beneath it alike, and a
     /// subclass written here sees no more of it than this class does. A later
     /// redefinition without either clears the name so a sibling that inherits
-    /// the new class is not treated as metaclass-built.
+    /// the new class is not treated as metaclass-built — but only where the
+    /// redefinition is certain to run, since a namesake in a branch the
+    /// interpreter skips leaves the metaclass-built class standing.
     fn record_metaclass_construction(
         &mut self,
         class: &ast::StmtClassDef,
@@ -4892,7 +4966,7 @@ impl Checker<'_> {
             || unseen_import_base
         {
             self.metaclass_classes.insert(class.name.to_string());
-        } else {
+        } else if self.conditional_depth == 0 {
             self.metaclass_classes.remove(class.name.as_str());
         }
     }
@@ -6100,16 +6174,19 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.local_enum_classes = outer_enum_classes;
                 // A later class of the same name that is no enumeration takes
                 // the name back, so a subclass written on it below is built
-                // the ordinary way.
+                // the ordinary way. A namesake in a branch that may not run
+                // takes nothing back: where it is skipped the enumeration is
+                // still what the name stands for, and dropping it here would
+                // strip a default the class statement of a subclass needs.
                 if enum_class {
                     self.local_enum_classes.insert(class.name.to_string());
-                } else {
+                } else if self.conditional_depth == 0 {
                     self.local_enum_classes.remove(class.name.as_str());
                 }
                 self.repeated_functions = outer_repeated_functions;
                 if defines_metaclass(class, &self.metaclass_definitions) {
                     self.metaclass_definitions.insert(class.name.to_string());
-                } else {
+                } else if self.conditional_depth == 0 {
                     self.metaclass_definitions.remove(class.name.as_str());
                 }
                 self.record_base_field_class(class.name.as_str(), style);
@@ -10439,6 +10516,65 @@ fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral
     }
 }
 
+/// Whether a display is known to hold at least one item.
+///
+/// A `*` element in a sequence, or a `**` item in a mapping, contributes an
+/// unknown number of entries, none included, so a display written entirely out
+/// of unpacks can still be empty. One plain element settles it on its own.
+fn display_is_nonempty(iterable: &Expr) -> bool {
+    match iterable {
+        Expr::Tuple(tuple) => tuple.elts.iter().any(|element| !element.is_starred_expr()),
+        Expr::List(list) => list.elts.iter().any(|element| !element.is_starred_expr()),
+        Expr::Set(set) => set.elts.iter().any(|element| !element.is_starred_expr()),
+        Expr::Dict(dict) => dict.items.iter().any(|item| item.key.is_some()),
+        _ => false,
+    }
+}
+
+/// Whether a loop suite always leaves through `break`.
+///
+/// A trailing `break` settles that only where nothing ahead of it can start
+/// the next iteration instead. A `continue` on any path through the suite
+/// reaches the end of the loop, so the `else` the `break` was read as skipping
+/// can run after all.
+fn suite_always_breaks(body: &[Stmt]) -> bool {
+    let Some((last, earlier)) = body.split_last() else {
+        return false;
+    };
+    if !matches!(last, Stmt::Break(_)) {
+        return false;
+    }
+    let mut search = ContinueSearch::default();
+    search.visit_body(earlier);
+    !search.found
+}
+
+/// Looks for a `continue` belonging to the loop whose suite is searched.
+#[derive(Default)]
+struct ContinueSearch {
+    found: bool,
+}
+
+impl<'a> Visitor<'a> for ContinueSearch {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        match statement {
+            Stmt::Continue(_) => self.found = true,
+            // A nested loop takes the `continue` written in its own suite;
+            // only what its `else` holds belongs to the loop outside it.
+            Stmt::For(loop_statement) => self.visit_body(&loop_statement.orelse),
+            Stmt::While(loop_statement) => self.visit_body(&loop_statement.orelse),
+            // A `continue` cannot reach out of a scope of its own.
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => walk_stmt(self, statement),
+        }
+    }
+
+    fn visit_expr(&mut self, _: &'a Expr) {
+        // `continue` is a statement, so nothing an expression holds is a
+        // reason to descend into it.
+    }
+}
+
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_annotation(&mut self, annotation: &'a Expr) {
         if !self.postponed_annotations {
@@ -10839,17 +10975,8 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&loop_statement.target);
                 self.rebind_module_name(rebound_names(statement));
                 self.visit_body(&loop_statement.body);
-                let statically_nonempty = match loop_statement.iter.as_ref() {
-                    Expr::Tuple(tuple) => !tuple.elts.is_empty(),
-                    Expr::List(list) => !list.elts.is_empty(),
-                    Expr::Set(set) => !set.elts.is_empty(),
-                    Expr::Dict(dict) => !dict.items.is_empty(),
-                    _ => false,
-                };
-                let definitely_breaks = loop_statement
-                    .body
-                    .last()
-                    .is_some_and(|statement| matches!(statement, Stmt::Break(_)));
+                let statically_nonempty = display_is_nonempty(&loop_statement.iter);
+                let definitely_breaks = suite_always_breaks(&loop_statement.body);
                 if !(statically_nonempty && definitely_breaks) {
                     self.visit_body(&loop_statement.orelse);
                 }
@@ -20208,11 +20335,14 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn a_conditional_import_does_not_reclaim_a_dotted_owner() -> Result<(), String> {
-        // The suite may not run, so the class written above it is still the
-        // one the file may end up with. Neither answer is safe here — see
-        // #1100 — and handing the name to the module would strip the local
-        // default while leaving the call unable to run without it.
+    fn a_conditional_import_contests_a_dotted_owner() -> Result<(), String> {
+        // The suite may not run, so `package` names either the module the
+        // import brings in or the class written above it, and `Child` has an
+        // ancestry for each. Answering with either strips the default behind
+        // the other, so the ancestry is held unknown and the call is left as
+        // written; the defaults behind both candidates are retained, which
+        // `a_contested_dotted_owner_keeps_both_candidates_defaults` in
+        // `tests/cli.rs` covers where the `retained` set is honoured.
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let package = directory.path().join("package");
         std::fs::create_dir(&package).map_err(|error| error.to_string())?;
@@ -20232,7 +20362,7 @@ def b(x=1): pass  # type: ignore  # noqa
         .map_err(|error| error.to_string())?;
         fix_all(&[initializer, module, case.clone()])?;
         let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("self.target(value=3)"), "{updated}");
+        assert!(updated.contains("self.target()\n"), "{updated}");
         Ok(())
     }
 
@@ -21621,6 +21751,314 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn a_class_in_one_clause_is_no_base_for_a_sibling_clause() -> Result<(), String> {
+        // Only one clause of the chain runs, so the `Base` written in the `if`
+        // body is not there for the `Child` written in the `else`. The base is
+        // the import, whose default is what the call has to carry.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import os\nfrom api import Base\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    class Base:\n        def target(self, value=1): return value\nelse:\n    class Child(Base):\n        def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=9)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_in_one_case_is_no_base_for_a_sibling_case() -> Result<(), String> {
+        // A `match` reaches a single case for the same reason an `if` chain
+        // reaches a single clause.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import os\nfrom api import Base\n\nmatch os.environ.get(\"ND_TYPING\"):\n    case \"1\":\n        class Base:\n            def target(self, value=1): return value\n    case _:\n        class Child(Base):\n            def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=9)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_beside_its_subclass_in_one_clause_is_still_its_base() -> Result<(), String> {
+        // The clause that writes the subclass writes the base too, so where
+        // the subclass exists at all this class is what its base names. Hiding
+        // a clause's classes from the clause itself would answer this with the
+        // import instead.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import os\nfrom api import Base\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    pass\nelse:\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_in_a_try_body_is_still_a_base_in_the_handler() -> Result<(), String> {
+        // An `except` handler picks up after part of the `try` body has run,
+        // so the two are not alternatives the way clauses of an `if` are, and
+        // the class written above is in reach. Widening the clause rule to
+        // every control-flow statement would answer this with the import.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Base\n\ntry:\n    class Base:\n        def target(self, value=1): return value\n    raise ValueError\nexcept ValueError:\n    class Child(Base):\n        def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_each_clause_writes_is_the_base_in_every_clause() -> Result<(), String> {
+        // Every clause writes a `Base` of its own, so none of them is a clause
+        // the name is missing from and the subclass still reads the one beside
+        // it. The two definitions share an identity, which is what leaves the
+        // method unresolvable and the call alone rather than resolved against
+        // the import.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import os\nfrom api import Base\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    class Base:\n        def target(self, value=1): return value\nelse:\n    class Base:\n        def target(self, value=2): return value\n    class Child(Base):\n        def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("self.target(value=9)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_conditional_import_leaves_an_unheld_spelling_settled() -> Result<(), String> {
+        // Nothing in the file stands behind `package`, so the import names the
+        // same module whichever way the test went and the ancestry is settled.
+        // Contesting every name a suite's import binds would decline this too.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import os\n\nif os.environ.get(\"USE_REAL\"):\n    import package.module\nelse:\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_in_an_untaken_branch_leaves_an_enumeration_standing() -> Result<(), String> {
+        // The branch may not run, so `Base` is still the enumeration and
+        // `Child` is still built by the enum machinery, which calls the
+        // initializer from inside the class statement. Removing the default
+        // leaves a module that raises before anything can import it, and there
+        // is no written call for a rewrite to make up for it.
+        let source = "import os\nfrom enum import Enum\n\n\nclass Base(Enum):\n    pass\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class Base:\n        pass\n\n\nclass Child(Base):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_in_an_untaken_branch_leaves_a_metaclass_standing() -> Result<(), String> {
+        // The same hole in the table beside the enumerations': the branch may
+        // not run, so `M` is still the metaclass, `N` is still built on it, and
+        // the interpreter still calls `N.__init__` with the four arguments a
+        // class statement gives it.
+        let source = "import os\n\n\nclass M(type):\n    pass\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class M:\n        pass\n\n\nclass N(M):\n    def __init__(cls, name, bases, namespace, extra=1):\n        super().__init__(name, bases, namespace)\n\n\nclass C(metaclass=N):\n    pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_beside_an_enumeration_still_takes_the_name_back() -> Result<(), String> {
+        // The second `Base` is written where the file is certain to reach it,
+        // so it really does take the name off the enumeration and `Child` is
+        // built the ordinary way. Holding every namesake back would retain
+        // this default too.
+        let source = "from enum import Enum\n\n\nclass Base(Enum):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_beside_a_metaclass_still_takes_the_name_back() -> Result<(), String> {
+        // The counterpart guard for the metaclass tables: an unguarded
+        // redefinition leaves `N` an ordinary class, whose `__init__` the
+        // interpreter never calls on its own.
+        let source = "class M(type):\n    pass\n\n\nclass M:\n    pass\n\n\nclass N(M):\n    def __init__(cls, name, bases, namespace, extra=1):\n        pass\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("extra=1", "extra")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unresolved_construction_of_an_inheriting_class_is_reported() -> Result<(), String> {
+        // `Child` has no constructor of its own, so what a construction reaches
+        // is the one it inherits. The guarded import leaves which class the
+        // name holds unsettled, and the call has to be reported: the class's
+        // own spelling is the only one a construction carries, so leaving it
+        // out of the names a fixed callable goes by passed the call over in
+        // silence while the base's default went.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from api import Child\n\nif flag:\n    from other import Child\n\nChild()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let skipped = fix_all(&[api, user])?;
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|skip| skip.callable.clone())
+                .collect::<Vec<_>>(),
+            ["Child"]
+        );
+        Ok(())
+    }
+
+    fn loop_else_import_fixture(user_source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): return alpha\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &other,
+            "def target(**overrides): return overrides.get(\"alpha\", 2)\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(&user, user_source).map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        std::fs::read_to_string(user).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_continue_can_carry_a_loop_past_its_trailing_break() -> Result<(), String> {
+        // The `continue` starts the next iteration without reaching the
+        // `break`, so the loop runs out and the `else` suite rebinds `target`
+        // to the module the import there names. With `NOD_SKIP` set CPython
+        // returns 2, which the call is left alone to keep saying.
+        let source = "import os\n\nfrom api import target\n\nfor _ in [1]:\n    if os.environ.get(\"NOD_SKIP\"):\n        continue\n    break\nelse:\n    from other import target\n\nassert target() == 2\n";
+        assert_eq!(loop_else_import_fixture(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_suite_that_only_breaks_still_discards_its_loop_else_import() -> Result<(), String> {
+        // Nothing ahead of the `break` can start another iteration, so the
+        // loop cannot run out and the `else` import never happens. `target`
+        // stays the one the module imported, and CPython returns 1 both
+        // before and after the call takes that definition's default.
+        let source = "import os\n\nfrom api import target\n\nfor _ in [1, os.environ.get(\"NOD_SKIP\")]:\n    if os.environ.get(\"NOD_SKIP\"):\n        pass\n    break\nelse:\n    from other import target\n\nassert target() == 1\n";
+        let updated = loop_else_import_fixture(source)?;
+        assert!(updated.contains("assert target(alpha=1) == 1"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_continue_in_a_nested_loop_does_not_reach_the_outer_break() -> Result<(), String> {
+        // The inner loop takes that `continue` for itself, so every path
+        // through the outer suite still arrives at the `break` and the `else`
+        // import stays dead. CPython returns 1.
+        let source = "import os\n\nfrom api import target\n\nfor _ in [1, os.environ.get(\"NOD_SKIP\")]:\n    for inner in [2]:\n        if os.environ.get(\"NOD_SKIP\"):\n            continue\n    break\nelse:\n    from other import target\n\nassert target() == 1\n";
+        let updated = loop_else_import_fixture(source)?;
+        assert!(updated.contains("assert target(alpha=1) == 1"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_list_of_only_unpacks_is_not_taken_as_iterating() -> Result<(), String> {
+        // `[*values]` looks like a display with an element in it, but what it
+        // unpacks is empty, so the body never runs and the `else` suite does.
+        // With `NOD_FULL` unset CPython returns 2.
+        let source = "import os\n\nfrom api import target\n\nvalues = [1] if os.environ.get(\"NOD_FULL\") else []\n\nfor _ in [*values]:\n    break\nelse:\n    from other import target\n\nassert target() == 2\n";
+        assert_eq!(loop_else_import_fixture(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn every_display_kind_of_only_unpacks_is_not_taken_as_iterating() -> Result<(), String> {
+        // A tuple, a set and a mapping written out of nothing but unpacks are
+        // as empty as their operands are, so none of them settles that the
+        // body runs. CPython returns 2 for each with `NOD_FULL` unset.
+        for display in ["(*values,)", "{*values}", "{**mapping}"] {
+            let source = format!(
+                "import os\n\nfrom api import target\n\nvalues = [1] if os.environ.get(\"NOD_FULL\") else []\nmapping = {{\"key\": 1}} if os.environ.get(\"NOD_FULL\") else {{}}\n\nfor _ in {display}:\n    break\nelse:\n    from other import target\n\nassert target() == 2\n"
+            );
+            assert_eq!(loop_else_import_fixture(&source)?, source);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_construction_through_an_assigned_name_is_reported() -> Result<(), String> {
         // An assignment leaves the class reachable under a second spelling.
         // Neither the tables a construction is looked up in nor the names the
@@ -21692,6 +22130,17 @@ def b(x=1): pass  # type: ignore  # noqa
                  this call reaches"
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_element_beside_an_unpack_still_fills_a_display() -> Result<(), String> {
+        // Whatever `*values` adds, the element written beside it is one item
+        // on its own, so the loop does iterate and break out, leaving the
+        // `else` import dead. CPython returns 1.
+        let source = "import os\n\nfrom api import target\n\nvalues = [1] if os.environ.get(\"NOD_FULL\") else []\n\nfor _ in [*values, os.environ.get(\"NOD_FULL\")]:\n    break\nelse:\n    from other import target\n\nassert target() == 1\n";
+        let updated = loop_else_import_fixture(source)?;
+        assert!(updated.contains("assert target(alpha=1) == 1"), "{updated}");
         Ok(())
     }
 }

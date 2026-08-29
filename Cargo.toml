@@ -34,7 +34,7 @@ toml = "1"
 unicode-width = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-exacl = "0.12"
+exacl = "0.13"
 xattr = "1.6"
 
 [dev-dependencies]

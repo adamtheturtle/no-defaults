@@ -5608,6 +5608,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "persistent_id"
             | "reducer_override"
             | "persistent_load"
+            | "load_module"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -20224,6 +20225,69 @@ def b(x=1): pass  # type: ignore  # noqa
         // Only an unpickler's attribute is consulted for the hook, so a plain
         // function of that name at module level carries no such obligation.
         let source = "def persistent_load(pid, extra=1):\n    return (pid, extra)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn legacy_import_loader_defaults_are_retained() {
+        // A loader that offers no `exec_module` is still driven through the
+        // legacy fallback, where the import machinery calls `load_module` with
+        // the module name alone, so a parameter beside it only ever arrives as
+        // its default. That call is made inside `importlib._bootstrap` rather
+        // than by any written line, so dropping the default leaves the next
+        // import raising `TypeError: Loader.load_module() missing 1 required
+        // positional argument` with nothing for the fixer to update.
+        let source =
+            "class Loader:\n    def load_module(self, fullname, extra=1):\n        return fullname\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_loader_method_beside_load_module_stays_fixable() {
+        // Retention is keyed to the hook name rather than to the shape of the
+        // parameter list, so a sibling declared the very same way keeps its
+        // ordinary treatment.
+        let source = "class Loader:\n    def load_module(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, extra=1):\n        return fullname\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_load_module_stays_fixable() {
+        // The fallback looks the hook up under its exact name, so a near miss
+        // is an ordinary method and its default is the fixer's.
+        let source = "class Loader:\n    def load_modules(self, fullname, extra=1):\n        return fullname\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

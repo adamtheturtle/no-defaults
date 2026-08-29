@@ -4128,6 +4128,7 @@ impl Checker<'_> {
             };
             let range = self.default_fix_range(parameter.parameter.end(), default);
             let fix = if implicitly_called
+                || self.method_has_implicit_alias(function.name.as_str())
                 || descriptor_invoked
                 || unknown_decorator
                 || self.is_stub()
@@ -4181,6 +4182,17 @@ impl Checker<'_> {
                     .instance_attributes
                     .last()
                     .is_some_and(|attributes| attributes.contains(name)))
+    }
+
+    fn method_has_implicit_alias(&self, name: &str) -> bool {
+        self.scope.class != ClassScope::None
+            && self.method_aliases.last().is_some_and(|aliases| {
+                aliases.get(name).is_some_and(|aliases| {
+                    aliases
+                        .iter()
+                        .any(|alias| implicitly_called_method(&alias.name))
+                })
+            })
     }
 
     fn method_is_rebound_later(&self, function: &ast::StmtFunctionDef) -> bool {
@@ -12169,6 +12181,23 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn iterator_send_defaults_are_retained_for_yield_from_delegation() {
         let source = "class I:\n    def __iter__(self):\n        return self\n    def __next__(self):\n        return 0\n    def send(self, value, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn dunder_aliases_retain_implicitly_called_defaults() {
+        let source = "class Values:\n    def iterate(self, items=(1, 2)): return iter(items)\n    __iter__ = iterate\n\nassert list(Values()) == [1, 2]\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

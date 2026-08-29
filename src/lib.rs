@@ -921,7 +921,7 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
             &importer,
             &known,
             &bindings,
-            None,
+            ClassNamespace::module(),
             LexicalClasses::of_module(&outside_functions),
             &mut definitions,
         );
@@ -1026,6 +1026,62 @@ impl<'a> LexicalClasses<'a> {
     }
 }
 
+/// Where the walk stands, for naming the classes it finds.
+///
+/// A class body is a namespace a name reaches from outside it, so a class
+/// written in one is named under the class holding it. A function body is not:
+/// each call makes its classes afresh, and two functions defining a class of
+/// the same name define two classes. Naming those under the scopes around them
+/// keeps them apart, and matches the identity the checker gives the same class.
+#[derive(Clone, Copy)]
+struct ClassNamespace<'a> {
+    /// The class whose body is being walked, when the statements are directly
+    /// in one.
+    parent: Option<&'a str>,
+    /// The enclosing class and function names, outermost first.
+    lexical_scope: &'a [String],
+}
+
+impl ClassNamespace<'_> {
+    fn module() -> Self {
+        Self {
+            parent: None,
+            lexical_scope: &[],
+        }
+    }
+
+    /// The identity a class of this spelling is indexed under.
+    fn identity(self, spelling: &str) -> String {
+        self.parent.map_or_else(
+            || qualified_lexical_name(self.lexical_scope, spelling),
+            |parent| qualified_name(Some(parent), spelling),
+        )
+    }
+}
+
+/// The classes a scope defines, under the spelling a base expression uses for
+/// each one there.
+///
+/// A class this scope defines itself takes the name over from an import of the
+/// same name, so a subclass written after it is built on the local class. One
+/// written before it still reaches the import, which is what the offset each
+/// spelling carries decides. The identity beside it is the one the class is
+/// indexed under, which the scopes around it name.
+fn local_class_identities(
+    statements: &[Stmt],
+    namespace: ClassNamespace<'_>,
+) -> BTreeMap<String, (String, TextSize)> {
+    let mut spellings = BTreeMap::new();
+    collect_local_class_offsets(statements, None, &mut spellings);
+    spellings
+        .into_iter()
+        .map(|(spelling, offset)| {
+            let identity = namespace.identity(&spelling);
+            (spelling, (identity, offset))
+        })
+        .collect()
+}
+
 /// Record the bases and attribute names of every class a file defines.
 ///
 /// A class body and a function body each open a namespace of their own, so the
@@ -1037,30 +1093,17 @@ fn index_method_bases(
     importer: &Path,
     known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
-    parent_class: Option<&str>,
+    namespace: ClassNamespace<'_>,
     lexical_classes: LexicalClasses<'_>,
     definitions: &mut Definitions,
 ) {
-    // A class this scope defines itself takes the name over from an import of
-    // the same name, so a subclass written after it is built on the local
-    // class. One written before it still reaches the import. The offsets are
-    // gathered under the spelling a base expression uses here, while the
-    // identity a spelling resolves to carries the enclosing class's name.
-    let mut spellings = BTreeMap::new();
-    collect_local_class_offsets(statements, None, &mut spellings);
-    let local_classes: BTreeMap<String, (String, TextSize)> = spellings
-        .into_iter()
-        .map(|(spelling, offset)| {
-            let identity = qualified_name(parent_class, &spelling);
-            (spelling, (identity, offset))
-        })
-        .collect();
+    let local_classes = local_class_identities(statements, namespace);
     let mut aliases = BTreeMap::new();
     for statement in statements {
         let defined_at = statement.start();
         match statement {
             Stmt::ClassDef(class) => {
-                let identity = qualified_name(parent_class, class.name.as_str());
+                let identity = namespace.identity(class.name.as_str());
                 // A class written in a function body leaves the name to a
                 // namesake written outside one: recording this one under it
                 // would replace that class's bases with these and leave its
@@ -1105,31 +1148,43 @@ fn index_method_bases(
                         .bases
                         .insert((importer.to_path_buf(), identity.clone()), bases);
                 }
+                let mut inner = namespace.lexical_scope.to_vec();
+                inner.push(class.name.to_string());
                 index_method_bases(
                     &class.body,
                     importer,
                     known,
                     &scoped_bindings(&class.body, None, importer, known, bindings),
-                    Some(&identity),
+                    ClassNamespace {
+                        parent: Some(&identity),
+                        lexical_scope: &inner,
+                    },
                     lexical_classes,
                     definitions,
                 );
             }
-            Stmt::FunctionDef(function) => index_method_bases(
-                &function.body,
-                importer,
-                known,
-                &scoped_bindings(
+            Stmt::FunctionDef(function) => {
+                let mut inner = namespace.lexical_scope.to_vec();
+                inner.push(function.name.to_string());
+                index_method_bases(
                     &function.body,
-                    Some(&function.parameters),
                     importer,
                     known,
-                    bindings,
-                ),
-                parent_class,
-                lexical_classes.entering_function(),
-                definitions,
-            ),
+                    &scoped_bindings(
+                        &function.body,
+                        Some(&function.parameters),
+                        importer,
+                        known,
+                        bindings,
+                    ),
+                    ClassNamespace {
+                        parent: None,
+                        lexical_scope: &inner,
+                    },
+                    lexical_classes.entering_function(),
+                    definitions,
+                );
+            }
             Stmt::Assign(_) | Stmt::AnnAssign(_) => {
                 let Some((value, targets)) = assigned_value_and_targets(statement) else {
                     continue;
@@ -4044,11 +4099,15 @@ impl Checker<'_> {
         is_stub(self.path)
     }
 
-    fn qualified_class(&self, name: &str) -> String {
-        qualified_name(
-            self.classes.last().map(|parent| parent.qualified.as_str()),
-            name,
-        )
+    fn qualified_class(&self, name: &str, direct_class_member: bool) -> String {
+        if direct_class_member {
+            qualified_name(
+                self.classes.last().map(|parent| parent.qualified.as_str()),
+                name,
+            )
+        } else {
+            qualified_lexical_name(&self.lexical_scope, name)
+        }
     }
 
     fn leave_class(&mut self) {
@@ -4649,7 +4708,11 @@ impl Checker<'_> {
 
     /// Index aliases copied from a same-file class whose signature has already
     /// been collected. Unknown and forward-referenced classes stay unresolved.
-    fn record_inherited_method_aliases(&mut self) {
+    ///
+    /// `direct_class_member` says whether the class being collected is written
+    /// straight in a class body, which is what decides how the class it copies
+    /// from is named.
+    fn record_inherited_method_aliases(&mut self, direct_class_member: bool) {
         let (Some(class), Some(aliases)) = (self.classes.last(), self.method_aliases.last()) else {
             return;
         };
@@ -4664,18 +4727,26 @@ impl Checker<'_> {
                 if alias.kind == MethodAliasKind::Property {
                     continue;
                 }
-                // Signatures record the class chain alone, so qualifying the
-                // source class through `lexical_scope` would name an enclosing
-                // function too and match nothing. Resolve it as a sibling of
-                // the class being collected instead.
-                let original_class = qualified_name(
-                    self.classes
-                        .len()
-                        .checked_sub(2)
-                        .and_then(|parent| self.classes.get(parent))
-                        .map(|parent| parent.qualified.as_str()),
-                    original_class,
-                );
+                // The class an alias copies from is written beside the one
+                // being collected, so it is identified the way that one is:
+                // under the class holding both where both are written straight
+                // in a class body, and under the scopes around them where they
+                // are not. A function body is one of those scopes, and naming a
+                // class in there as though it sat beside a module-level one
+                // matches nothing, or matches a namesake written elsewhere and
+                // takes its parameters.
+                let original_class = if direct_class_member {
+                    qualified_name(
+                        self.classes
+                            .len()
+                            .checked_sub(2)
+                            .and_then(|parent| self.classes.get(parent))
+                            .map(|parent| parent.qualified.as_str()),
+                        original_class,
+                    )
+                } else {
+                    qualified_lexical_name(&self.lexical_scope, original_class)
+                };
                 let Some(signature) = self.signatures.iter().find(|signature| {
                     signature.name == *method
                         && matches!(
@@ -4989,7 +5060,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         Inherited::Unknown => self.unknown_base_may_end_in_default(class),
                         Inherited::Nothing => false,
                     };
-                    let qualified = self.qualified_class(class.name.as_str());
+                    let qualified =
+                        self.qualified_class(class.name.as_str(), outer.class != ClassScope::None);
                     self.classes.push(ClassCollector {
                         name: class.name.to_string(),
                         qualified,
@@ -5000,7 +5072,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         fields,
                         removed,
                     });
-                    self.record_inherited_method_aliases();
+                    self.record_inherited_method_aliases(outer.class != ClassScope::None);
                 }
                 self.lexical_scope.push(class.name.to_string());
                 walk_stmt(self, statement);
@@ -9741,8 +9813,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 if let Some(arguments) = &class.arguments {
                     self.visit_arguments(arguments);
                 }
-                let qualified =
-                    qualified_name(self.classes.last().map(String::as_str), class.name.as_str());
+                let qualified = if self.in_class_scope() {
+                    qualified_name(self.classes.last().map(String::as_str), class.name.as_str())
+                } else {
+                    qualified_lexical_name(&self.lexical_scope, class.name.as_str())
+                };
                 self.classes.push(qualified);
                 self.lexical_scope.push(class.name.to_string());
                 self.lexical_is_class.push(true);
@@ -13537,6 +13612,16 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn nested_class_inheritance_is_lexically_scoped() -> Result<(), String> {
+        let source = "def first():\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\ndef second():\n    class Base:\n        def target(self, value=2): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert first() == 1\nassert second() == 2\n";
+        assert_eq!(
+            fixed(source)?,
+            "def first():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\ndef second():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=2)\n    return Child().run()\n\nassert first() == 1\nassert second() == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn statically_resolvable_base_expressions_preserve_inherited_calls() -> Result<(), String> {
         for source in [
             "class Base:\n    def target(self, value=1): return value\nAlias = Base\nclass Child(Alias):\n    def run(self): return self.target()\n",
@@ -17099,6 +17184,42 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn a_nested_class_body_calls_through_the_enclosing_receiver() -> Result<(), String> {
+        // A class suite is not a closure scope for the names it binds, but a
+        // name it only reads still comes from the function around it, so
+        // `self` and `cls` written straight in a nested class body are the
+        // enclosing method's receiver rather than anything the nested class
+        // holds. Indexing nested classes puts a same-named method of the
+        // nested class within reach, and taking that one would supply the
+        // wrong default.
+        let instance = "class Outer:\n    def target(self, value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, value=2):\n                return value\n\n            probe = self.target()\n\n        return Inner.probe\n\nassert Outer().run() == 1\n";
+        assert_eq!(
+            fixed(instance)?,
+            "class Outer:\n    def target(self, value):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, value):\n                return value\n\n            probe = self.target(value=1)\n\n        return Inner.probe\n\nassert Outer().run() == 1\n"
+        );
+        // The class a receiver stands for reaches the nested body the same way
+        // however the call spells it out.
+        for receiver in ["type(self)", "self.__class__"] {
+            let source = format!(
+                "class Outer:\n    @staticmethod\n    def target(value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value=2):\n                return value\n\n            probe = {receiver}.target()\n\n        return Inner.probe\n\nassert Outer().run() == 1\n"
+            );
+            assert_eq!(
+                fixed(&source)?,
+                format!(
+                    "class Outer:\n    @staticmethod\n    def target(value):\n        return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value):\n                return value\n\n            probe = {receiver}.target(value=1)\n\n        return Inner.probe\n\nassert Outer().run() == 1\n"
+                ),
+                "{receiver}"
+            );
+        }
+        let class_method = "class Outer:\n    @staticmethod\n    def target(value=1):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            @staticmethod\n            def target(value=2):\n                return value\n\n            probe = cls.target()\n\n        return Inner.probe\n\nassert Outer.run() == 1\n";
+        assert_eq!(
+            fixed(class_method)?,
+            "class Outer:\n    @staticmethod\n    def target(value):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            @staticmethod\n            def target(value):\n                return value\n\n            probe = cls.target(value=1)\n\n        return Inner.probe\n\nassert Outer.run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_function_local_class_holds_a_base_name_against_an_import() -> Result<(), String> {
         // The class written in the function body takes `Helper` over from the
         // import for the rest of that body, so `Child` is built on the local
@@ -17269,6 +17390,35 @@ def b(x=1): pass  # type: ignore  # noqa
                 "{suite}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_aliases_reach_a_class_named_in_the_scope_around_them() -> Result<(), String> {
+        // `alias = Base.target` names the class beside the one being
+        // collected, which a function body identifies by the scopes holding
+        // it. Naming it as though it sat at module level finds nothing, so the
+        // default comes off `target` with the alias call left as written, or
+        // finds a namesake of another scope and passes that one's default.
+        let local = "def outer():\n    class Base:\n        def target(self, value=1): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias()\n\n    return Child().run()\n\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(local)?,
+            "def outer():\n    class Base:\n        def target(self, value): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias(value=1)\n\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        // The module-level namesake is a different class, and taking its
+        // default would return `2` where Python returns `1`.
+        let shadowed = "class Base:\n    def target(self, value=2): return value\n\ndef outer():\n    class Base:\n        def target(self, value=1): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias()\n\n    return Child().run()\n\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(shadowed)?,
+            "class Base:\n    def target(self, value): return value\n\ndef outer():\n    class Base:\n        def target(self, value): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias(value=1)\n\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        // A method body is such a scope too, and the class it holds is told
+        // apart from one written straight in the class around it.
+        let in_method = "class Outer:\n    class Base:\n        def target(self, value=2): return value\n\n    def build(self):\n        class Base:\n            def target(self, value=1): return value\n\n        class Child(Base):\n            alias = Base.target\n\n            def run(self): return self.alias()\n\n        return Child().run()\n\nassert Outer().build() == 1\n";
+        assert_eq!(
+            fixed(in_method)?,
+            "class Outer:\n    class Base:\n        def target(self, value): return value\n\n    def build(self):\n        class Base:\n            def target(self, value): return value\n\n        class Child(Base):\n            alias = Base.target\n\n            def run(self): return self.alias(value=1)\n\n        return Child().run()\n\nassert Outer().build() == 1\n"
+        );
         Ok(())
     }
 }

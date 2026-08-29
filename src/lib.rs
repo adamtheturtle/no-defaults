@@ -3821,7 +3821,7 @@ impl Checker<'_> {
         let mut parameters = BoundNames::default();
         parameters.parameters(&function.parameters);
         for name in parameters.names {
-            self.aliases.invalidate(&name);
+            self.aliases.invalidate_parameter(&name);
         }
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
@@ -5090,6 +5090,7 @@ struct Aliases {
     typing_modules: BTreeSet<String>,
     abc_modules: BTreeSet<String>,
     structural_bases: BTreeSet<String>,
+    invalidated_structural_bases: BTreeSet<String>,
     type_checking: BTreeSet<String>,
     kw_only_markers: BTreeSet<String>,
 }
@@ -5117,6 +5118,17 @@ impl Aliases {
         self.structural_bases.remove(name);
         self.type_checking.remove(name);
         self.kw_only_markers.remove(name);
+    }
+
+    fn invalidate_parameter(&mut self, name: &str) {
+        if self.builtins_modules.contains(name)
+            || self.typing_modules.contains(name)
+            || self.abc_modules.contains(name)
+            || self.structural_bases.contains(name)
+        {
+            self.invalidated_structural_bases.insert(name.to_owned());
+        }
+        self.invalidate(name);
     }
 
     /// The `dataclasses` or `pydantic` member `name` was imported as, or `name`
@@ -5407,7 +5419,29 @@ fn class_constructs_safely(
     aliases: &Aliases,
     metaclass_classes: &BTreeSet<String>,
 ) -> bool {
-    generates_init(class, aliases, metaclass_classes) && class_defaults_are_fixable(class, aliases)
+    generates_init(class, aliases, metaclass_classes)
+        && class_defaults_are_fixable(class, aliases)
+        && class_bases_are_fixable(class, aliases)
+}
+
+/// A base whose imported structural identity was shadowed in this lexical
+/// scope may contribute runtime fields, so its constructor cannot be rewritten.
+fn class_bases_are_fixable(class: &ast::StmtClassDef, aliases: &Aliases) -> bool {
+    class_bases(class).all(|base| {
+        let base = match base {
+            Expr::Subscript(subscript) => subscript.value.as_ref(),
+            expression => expression,
+        };
+        let root = match base {
+            Expr::Name(name) => Some(name.id.as_str()),
+            Expr::Attribute(attribute) => match attribute.value.as_ref() {
+                Expr::Name(name) => Some(name.id.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        root.is_none_or(|name| !aliases.invalidated_structural_bases.contains(name))
+    })
 }
 
 /// Whether a class names a metaclass of its own.
@@ -10357,6 +10391,22 @@ mod tests {
     #[test]
     fn function_parameters_shadow_classmethod_imports() {
         let source = "from builtins import classmethod as cm\n\ndef identity(function): return function\ndef outer(cm):\n    class C:\n        @cm\n        def f(cls, value=1): return value\n    return C.f(C())\n\nassert outer(identity) == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
+    fn function_parameters_shadow_structural_base_imports() {
+        let source = "from dataclasses import dataclass\nfrom typing import Generic\n\n@dataclass\nclass Parent:\n    inherited: int = 1  # noqa: NOD001\n\ndef outer(Generic):\n    @dataclass\n    class Child(Generic):\n        own: int = 2\n    return Child\n\nassert outer(Parent)().own == 2\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

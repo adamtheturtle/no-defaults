@@ -1656,12 +1656,6 @@ fn method_base_identity(
             }
         }),
         Expr::Attribute(attribute) => {
-            // `import package.module` leaves the submodule behind the dotted
-            // name, over anything a package initializer wrote there, so a
-            // prefix bound as a module names that module and not a class of
-            // the same spelling nested in the initializer. Reading the dots as
-            // nested classes instead reached a namesake class and rewrote the
-            // call against its defaults rather than the submodule's.
             // The prefix may be a name this scope bound to a class rather than
             // a spelling written out in full, and an alias of an enclosing
             // class reaches the same nested class the dotted form does. The
@@ -18586,6 +18580,11 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn imported_metaclass_uncertainty_propagates_through_local_bases() {
+        // A metaclass an imported base carries builds every class under it, so
+        // the local class between the import and the dataclass hides nothing.
+        // A keyword-only default is no safer to remove than a positional one
+        // here: the metaclass reaches `__init__` either way, and the inherited
+        // fields are unknown, so no call could be rewritten to make up for it.
         let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Middle(Parent):\n    pass\n\n@dataclass\nclass Child(Middle):\n    value: int = field(default=1, kw_only=True)\n";
         let checked = check_source(
             Path::new("fixture.py"),

@@ -339,8 +339,10 @@ enum Binding {
     Module(PathBuf),
     /// A symbol imported from a module, so `name(...)` resolves to it.
     Symbol(PathBuf, String),
-    /// A name definitely bound by an import whose checked definition is
-    /// ambiguous. It shadows earlier candidates but cannot be resolved.
+    /// A name definitely bound, by an import whose checked definition is
+    /// ambiguous or by a parameter of the scope being read, to something this
+    /// file cannot follow. It shadows earlier candidates but cannot be
+    /// resolved, and it is not free for a later definition to answer to.
     Unknown,
 }
 
@@ -1109,7 +1111,10 @@ fn scoped_bindings(
 ) -> BTreeMap<String, Binding> {
     let mut scoped = bindings.clone();
     for name in parameters.into_iter().flat_map(BoundNames::of_parameters) {
-        scoped.remove(&name);
+        // Claimed, not vacated. Merely dropping the name would leave it free
+        // for a class written later in the same body to answer to, and that
+        // class does not exist yet where the subclass is written.
+        scoped.insert(name, Binding::Unknown);
     }
     collect_bindings(body, importer, known, &mut scoped);
     scoped
@@ -1196,6 +1201,11 @@ fn method_base_identity(
             }
             match bindings.get(name.id.as_str()) {
                 Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
+                // Something holds the name here that cannot be followed, so
+                // the class it stands for is unknown. Reading on to a class
+                // of the same spelling written further down the scope would
+                // answer with one the subclass was never built on.
+                Some(Binding::Unknown) => None,
                 _ => local.map(|(identity, _)| (importer.to_path_buf(), identity.clone())),
             }
         }),
@@ -16860,6 +16870,52 @@ def b(x=1): pass  # type: ignore  # noqa
         fix_all(&[other, runtime, user.clone()])?;
         let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
         assert_eq!(updated, source);
+        Ok(())
+    }
+
+    /// Fix a function body written against a `Runtime` class in another file,
+    /// and report what the body became.
+    fn fixed_against_runtime_class(user_source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let runtime = directory.path().join("runtime.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &runtime,
+            "class Runtime:\n    def method(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(&user, user_source).map_err(|error| error.to_string())?;
+        fix_all(&[runtime, user.clone()])?;
+        std::fs::read_to_string(&user).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_parameter_holds_its_name_against_a_later_class_of_the_same_spelling() -> Result<(), String>
+    {
+        // The class comes after the subclass, so the name the subclass was
+        // built on was still the parameter's. Dropping the parameter's name
+        // rather than holding it would leave the later class free to answer
+        // to it, and the inherited call would be rewritten with a default
+        // that belongs to a class the subclass never had.
+        let source = "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Child(Helper):\n        def run(self): return self.method()\n\n    class Helper:\n        def method(self, value=3): return value\n\n    return Child().run()\n\n\nassert outer(Runtime) == 2\n";
+        assert_eq!(
+            fixed_against_runtime_class(source)?,
+            "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Child(Helper):\n        def run(self): return self.method()\n\n    class Helper:\n        def method(self, value): return value\n\n    return Child().run()\n\n\nassert outer(Runtime) == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_written_before_a_subclass_takes_the_name_from_a_parameter() -> Result<(), String> {
+        // The other order, where the class has replaced the parameter by the
+        // time the subclass is written and is what it inherits from. Holding
+        // the parameter's name must not reach this far, or the base would go
+        // unresolved and the call would be left alone.
+        let source = "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Helper:\n        def method(self, value=3): return value\n\n    class Child(Helper):\n        def run(self): return self.method()\n\n    return Child().run()\n\n\nassert outer(Runtime) == 3\n";
+        assert_eq!(
+            fixed_against_runtime_class(source)?,
+            "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Helper:\n        def method(self, value): return value\n\n    class Child(Helper):\n        def run(self): return self.method(value=3)\n\n    return Child().run()\n\n\nassert outer(Runtime) == 3\n"
+        );
         Ok(())
     }
 }

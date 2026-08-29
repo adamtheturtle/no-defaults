@@ -10,6 +10,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - `PYTHONPATH` is used when resolving imports, so a project whose layout depends on it has its call sites updated. Where an explicit root and the importer's own directory name different files the import is ambiguous, and the call is reported rather than rewritten against a guess.
 - `--diff` lists the diagnostics it cannot fix, and `--fix` prints the ones that remain after writing, so neither mode implies everything was handled.
 - A `# noqa` may carry an explanation after a blanket directive and after a file-level one, and Flake8's whitespace forms are accepted.
+- `--fix` resolves a call whose receiver is a parameterized generic, so `Box[int]()` and `Box[int].make()` are rewritten like their unsubscripted spellings.
 
 ### Changed
 

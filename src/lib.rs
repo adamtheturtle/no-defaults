@@ -21005,4 +21005,24 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         Ok(())
     }
+
+    #[test]
+    fn function_parameters_shadow_pydantic_field_imports() {
+        // `Field` names the parameter inside `outer`, so what the annotation
+        // calls is whatever the caller passed and not `pydantic.Field`. Its
+        // keywords therefore carry none of the meaning the fixer relies on to
+        // move a default onto the constructor, and the default has to stay.
+        let source = "from pydantic import BaseModel, Field\n\ndef helper(*, default, description): return default\ndef outer(Field):\n    class C(BaseModel):\n        x: int = Field(default=1, description='x')\n    return C\n\nassert outer(helper)().x == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
 }

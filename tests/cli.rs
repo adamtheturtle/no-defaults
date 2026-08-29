@@ -6628,3 +6628,24 @@ fn a_failure_announced_on_stderr_still_sets_the_exit_status(
     assert!(stderr.contains("path does not exist"), "{stderr}");
     Ok(())
 }
+
+#[test]
+fn a_parameter_shadowing_a_configured_base_keeps_its_class_defaults(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `BaseModel` inside `outer` is whatever the caller hands over, so the
+    // class written on it is no model and its attribute default is not a
+    // field's. Stripping it left `outer(Plain).x` raising `AttributeError`,
+    // and the construction in the same body was rewritten to `C(x=1)`, which
+    // `Plain` never accepts.
+    let source = "from pydantic import BaseModel\n\n\nclass Plain:\n    pass\n\n\ndef outer(BaseModel):\n    class C(BaseModel):\n        x: int = 1\n\n    return C()\n\n\nassert outer(Plain).x == 1\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

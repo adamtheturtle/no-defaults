@@ -151,7 +151,14 @@ impl FieldBases {
 
     fn matches(&self, base: &Expr, aliases: &Aliases) -> bool {
         match base {
-            Expr::Name(name) => self.names.contains(aliases.resolve(name.id.as_str())),
+            // A configured base is matched by its bare spelling, so a
+            // parameter named after one would otherwise keep matching inside
+            // the function it is bound in, where the name stands for whatever
+            // the caller passed rather than for the library's class.
+            Expr::Name(name) => {
+                !aliases.parameter_bindings.contains(name.id.as_str())
+                    && self.names.contains(aliases.resolve(name.id.as_str()))
+            }
             Expr::Attribute(attribute) => self.names.contains(attribute.attr.as_str()),
             // `class Job(BaseModel, Generic[T])` names its base through a
             // subscript, as a generic model does.
@@ -6191,6 +6198,7 @@ struct Aliases {
     invalidated_import_bindings: BTreeSet<String>,
     type_checking: BTreeSet<String>,
     kw_only_markers: BTreeSet<String>,
+    parameter_bindings: BTreeSet<String>,
 }
 
 impl Aliases {
@@ -6220,6 +6228,7 @@ impl Aliases {
         self.structural_bases.remove(name);
         self.type_checking.remove(name);
         self.kw_only_markers.remove(name);
+        self.parameter_bindings.remove(name);
     }
 
     fn invalidate_parameter(&mut self, name: &str) {
@@ -6237,6 +6246,7 @@ impl Aliases {
             self.invalidated_import_bindings.insert(name.to_owned());
         }
         self.invalidate(name);
+        self.parameter_bindings.insert(name.to_owned());
     }
 
     /// The `dataclasses` or `pydantic` member `name` was imported as, or `name`
@@ -6390,11 +6400,24 @@ impl Aliases {
         }
     }
 
+    /// A parameter holds its name for the whole call, but an import written
+    /// under it rebinds that name for everything below, so a base spelled with
+    /// that name after the import is the imported class again.
+    fn reclaim_parameter_imports(&mut self, import: &ast::StmtImportFrom) {
+        for alias in &import.names {
+            if alias.name.as_str() != "*" {
+                self.parameter_bindings
+                    .remove(alias.asname.as_ref().unwrap_or(&alias.name).as_str());
+            }
+        }
+    }
+
     fn collect(&mut self, statements: &[Stmt]) {
         for statement in statements {
             match statement {
                 Stmt::Import(import) => self.collect_module_aliases(import),
                 Stmt::ImportFrom(import) => {
+                    self.reclaim_parameter_imports(import);
                     self.import_bindings.extend(
                         import
                             .names
@@ -20933,5 +20956,53 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
+    fn function_parameters_shadow_configured_field_bases() -> Result<(), String> {
+        // A configured base is recognised by the bare name it is written
+        // with, so a parameter spelled the same way would go on matching
+        // inside the function even though the class it heads is built from
+        // whatever the caller handed over.
+        let source = "from pydantic import BaseModel\n\nclass Plain:\n    pass\n\ndef outer(BaseModel):\n    class C(BaseModel):\n        x: int = 1\n    return C\n\nassert outer(Plain).x == 1\n";
+        assert_eq!(fixed(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameter_shadowing_a_configured_base_leaves_its_calls_alone() -> Result<(), String> {
+        // Rewriting the call would be the worse half of the same mistake: the
+        // default moves into a constructor the caller's class never accepts.
+        let source = "from pydantic import BaseModel\n\nclass Plain:\n    pass\n\ndef outer(BaseModel):\n    class C(BaseModel):\n        x: int = 1\n    return C()\n\nassert outer(Plain).x == 1\n";
+        assert_eq!(fixed(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn imports_reclaim_parameter_shadowed_field_bases() -> Result<(), String> {
+        // A parameter holds its name for the whole call, but an import written
+        // under it rebinds that name for everything below, so a class written
+        // after the import is built on the imported model whatever the caller
+        // handed in. Reading the base as the caller's would leave the field
+        // where it is and the call unchanged.
+        let source = "def outer(BaseModel):\n    from pydantic import BaseModel\n    class C(BaseModel):\n        x: int = 1\n    return C()\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer(BaseModel):\n    from pydantic import BaseModel\n    class C(BaseModel):\n        x: int\n    return C(x=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_import_reclaims_a_parameter_shadowed_field_base() -> Result<(), String> {
+        // The same reclaim through the module a plain `import` binds, where the
+        // base is spelled out with the module rather than with a name the file
+        // imported on its own.
+        let source = "def outer(pydantic):\n    import pydantic\n    class C(pydantic.BaseModel):\n        x: int = 1\n    return C()\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer(pydantic):\n    import pydantic\n    class C(pydantic.BaseModel):\n        x: int\n    return C(x=1)\n"
+        );
+        Ok(())
     }
 }

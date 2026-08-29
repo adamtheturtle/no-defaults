@@ -61,6 +61,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A construction of a class that inherits its constructor is reported, and the inherited default retained, when the pass cannot say which class the name holds. Previously only the base's default went and the call was left bare, with nothing said about it.
 - Class-body aliases created with `staticmethod()` and `classmethod()` carry the wrapper's receiver convention; `property()` aliases retain defaults consumed by descriptor access.
 - Class-body control-flow suites are scanned conservatively for method aliases, while nested definition scopes remain excluded.
 - Annotated assignments, statically paired destructuring, and named expressions in class bodies record method aliases for call rewriting.
@@ -156,6 +157,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A base spelled with a name the same suite writes a class of further down reads the class a scope around it bound, rather than that later class. A class body is entered before its own names exist, so `class Child(Helper)` written above a nested `Helper` inherits the module-level one exactly as CPython binds it; reading the nested class instead wrote its defaults into the subclass's inherited calls and silently changed what the program returned. A scope written inside a class body reads none of that body's names either, since neither a method nor a class written in one does, so a base spelled in there reaches past the class holding it. A function that writes a class under a spelling binds it for the whole function, so a scope nested in one reads that binding rather than an outer namesake, and where the class statement stands below the nested scope the spelling is left unresolved rather than answered with the outer class.
 - A `continue` written above a loop's trailing `break` leaves the `else` suite standing. The suite was read as always leaving through that `break`, so an import written in the `else` was discarded and a later call was rewritten against the definition the `else` had replaced, writing `helper(1, flag=True)` against a `helper` that takes no `flag` and ending in `TypeError`. A `continue` starts the next iteration without reaching the `break`, so the loop can run out and the `else` does run. A `continue` inside a loop nested in the suite belongs to that loop instead, and leaves the outer trailing `break` as definite as it was.
 - A display written out of nothing but unpacks is no longer read as iterating. `for item in [*values]` counted as non-empty because the list has an element in its syntax, so a trailing `break` was taken to skip the `else` suite and the import written there was discarded, rewriting a later call against the wrong definition. What `*values` or `**mapping` contributes is unknown and may be nothing, so a tuple, list, set or mapping is known to hold something only where a plain element stands beside them, as in `[*values, 1]`.
+
+### Documentation
+
+- `README.md` is an overview again: what the tool is, how to install and run it, what `--fix` does and cannot do, the configuration keys, and pre-commit. The behaviour it used to spell out in full moved to `docs/reference.md`, which it links to, with nothing dropped.
+- The `.pyi` note said only `= ...` was reported without being fixed. Every default in a stub has been reported and retained since that change, so the note now says so.
 
 ## 2.1.0 - 2026-08-07
 

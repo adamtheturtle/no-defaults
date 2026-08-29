@@ -18,6 +18,6 @@ Use `cargo run -- path/to/project` to exercise a development build. Add regressi
 ## Pull requests
 
 - Keep each pull request focused.
-- Document user-visible behavior in `README.md` and `CHANGELOG.md`.
+- Document user-visible behavior in `CHANGELOG.md`, and in `docs/reference.md`. `README.md` is a short overview: add to it only when the change alters what the tool is for, how it is installed, or how it is invoked.
 - Do not weaken the zero-warning Clippy gate.
 - Add a `noqa` or declined fix only when the behavior is intentional and explained.

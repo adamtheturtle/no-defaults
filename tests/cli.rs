@@ -6671,3 +6671,27 @@ fn a_parameter_shadowing_pydantic_field_keeps_the_default() -> Result<(), Box<dy
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn an_inherited_constructor_keeps_its_default_when_a_construction_is_unresolved(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let user = directory.path().join("user.py");
+    // `Child` inherits `Base.__init__`, and the guarded import may put another
+    // class behind the name before it is constructed, so the pass cannot tie
+    // `Child()` to the constructor it fixed. Deleting the base's default anyway
+    // left that call raising `TypeError`, and nothing was said about it.
+    let base = "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n";
+    let caller = "import os\n\nfrom api import Child\n\nif os.environ.get('X'):\n    from other import Child\n\nassert Child().value == 1\n";
+    std::fs::write(&api, base)?;
+    std::fs::write(&user, caller)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&api)?, base);
+    assert_eq!(std::fs::read_to_string(&user)?, caller);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

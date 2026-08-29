@@ -6378,6 +6378,7 @@ fn rewrite_calls(
         class_direct_statements: Vec::new(),
         lexical_is_class: Vec::new(),
         implicit_receivers: Vec::new(),
+        implicit_receiver_is_class: Vec::new(),
         lexical_scope: Vec::new(),
         called: BTreeSet::new(),
         scopes: Vec::new(),
@@ -7567,6 +7568,9 @@ struct Rewriter<'a> {
     /// The implicit receiver name of each enclosing function. Static methods
     /// and module functions contribute `None`.
     implicit_receivers: Vec<Option<String>>,
+    /// Whether each implicit receiver is a classmethod's class rather than an
+    /// instance method's instance.
+    implicit_receiver_is_class: Vec<bool>,
     /// Enclosing class and function names, matching the checker's lexical
     /// identity for nested functions.
     lexical_scope: Vec<String>,
@@ -7848,7 +7852,11 @@ impl Rewriter<'_> {
                 return Some((
                     self.physical.to_path_buf(),
                     self.classes.last()?.clone(),
-                    true,
+                    !self
+                        .implicit_receiver_is_class
+                        .last()
+                        .copied()
+                        .unwrap_or(false),
                     false,
                 ));
             }
@@ -9330,23 +9338,35 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_annotation(returns);
                 }
                 let function_scope = BoundNames::of_function(function);
-                let receiver = if self.class_scope_depths.last() == Some(&self.scopes.len())
-                    && method_receiver(function, &self.aliases, &self.module_bindings)
-                        != Receiver::None
-                {
-                    function
+                let receiver_kind = if self.class_scope_depths.last() == Some(&self.scopes.len()) {
+                    method_receiver(function, &self.aliases, &self.module_bindings)
+                } else {
+                    Receiver::None
+                };
+                let (receiver, receiver_is_class) = if receiver_kind == Receiver::None {
+                    let receiver = self
+                        .implicit_receivers
+                        .last()
+                        .and_then(Clone::clone)
+                        .filter(|name| !function_scope.names.contains(name));
+                    let is_class = receiver.is_some()
+                        && self
+                            .implicit_receiver_is_class
+                            .last()
+                            .copied()
+                            .unwrap_or(false);
+                    (receiver, is_class)
+                } else {
+                    let receiver = function
                         .parameters
                         .posonlyargs
                         .first()
                         .or_else(|| function.parameters.args.first())
-                        .map(|parameter| parameter.parameter.name.to_string())
-                } else {
-                    self.implicit_receivers
-                        .last()
-                        .and_then(Clone::clone)
-                        .filter(|name| !function_scope.names.contains(name))
+                        .map(|parameter| parameter.parameter.name.to_string());
+                    (receiver, receiver_kind == Receiver::Class)
                 };
                 self.implicit_receivers.push(receiver);
+                self.implicit_receiver_is_class.push(receiver_is_class);
                 self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
                 self.binding_scope_depths.push(self.scopes.len() - 1);
@@ -9358,6 +9378,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.scopes.pop();
                 self.bindings.pop();
                 self.binding_scope_depths.pop();
+                self.implicit_receiver_is_class.pop();
                 self.implicit_receivers.pop();
                 if !module_scope && !self.in_class_scope() {
                     if let Some(bindings) = self.bindings.last_mut() {
@@ -12983,6 +13004,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "class Base:\n    def target(self, value): pass\n\nclass Child(Base):\n    def run(self):\n        return super().target(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn classmethod_cls_calls_construct_known_instances() -> Result<(), String> {
+        let source = "class C:\n    def target(self, value=1): return value\n\n    @classmethod\n    def run(cls): return cls().target()\n\nassert C.run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class C:\n    def target(self, value): return value\n\n    @classmethod\n    def run(cls): return cls().target(value=1)\n\nassert C.run() == 1\n"
         );
         Ok(())
     }

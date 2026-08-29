@@ -4298,7 +4298,7 @@ impl Checker<'_> {
         self.invalidate_bound_names(bound.names.iter().map(String::as_str));
     }
 
-    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, statement: &'a Stmt)
+    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor)
     where
         Self: Visitor<'a>,
     {
@@ -4314,8 +4314,16 @@ impl Checker<'_> {
         if statically_empty {
             self.visit_body(&loop_.orelse);
         } else {
-            self.visit_uncertain(statement);
+            // The iterable is evaluated before the target is assigned. The
+            // body sees the target binding, and an import in that body may
+            // establish the name that remains after an iteration.
+            self.visit_expr(&loop_.iter);
             self.invalidate_target_aliases(&loop_.target);
+            self.conditional_depth += 1;
+            self.visit_expr(&loop_.target);
+            self.visit_body(&loop_.body);
+            self.visit_body(&loop_.orelse);
+            self.conditional_depth -= 1;
         }
     }
 
@@ -5449,7 +5457,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::If(branch) => self.visit_conditional(branch),
             Stmt::Try(_) => self.visit_uncertain(statement),
             Stmt::Match(block) => self.visit_match(block),
-            Stmt::For(loop_) => self.visit_loop(loop_, statement),
+            Stmt::For(loop_) => self.visit_loop(loop_),
             Stmt::While(loop_) => self.visit_while(loop_, statement),
             Stmt::With(block) => self.visit_with(block),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
@@ -18820,6 +18828,32 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn qualified_pydantic_private_attributes_are_not_model_fields() {
+        // `pydantic` may be reached under its own name or an alias, and either
+        // spelling is the same `PrivateAttr` call: per-instance state rather
+        // than a field the constructor takes. A model base answers that on its
+        // own, since an underscore name is no field there whatever it holds,
+        // so the class here is a plain dataclass and the call is all there is
+        // to read.
+        for source in [
+            "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pydantic.PrivateAttr(default=1)\n",
+            "import pydantic as pd\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pd.PrivateAttr(default=1)\n",
+        ] {
+            assert!(messages(source, false).is_empty(), "{source}");
+        }
+        // An ordinary default in the same class is still reported, so the
+        // silence above is the call being read rather than the shape being
+        // passed over.
+        assert_eq!(
+            messages(
+                "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = 1\n",
+                false,
+            ),
+            ["dataclass field `_value` has a default"]
+        );
     }
 
     #[test]

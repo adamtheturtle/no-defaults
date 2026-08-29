@@ -1041,7 +1041,7 @@ fn index_method_bases(
                     definitions,
                 );
             }
-            Stmt::FunctionDef(function) => index_method_bases(
+            Stmt::FunctionDef(function) => index_function_body_bases(
                 &function.body,
                 importer,
                 bindings,
@@ -1085,6 +1085,35 @@ fn index_method_bases(
             _ => {}
         }
     }
+}
+
+/// Index the bases of the classes written in a function body.
+///
+/// The file-wide offsets stop at function bodies, because a class written in
+/// one is out of reach of the names the rest of the file spells. Inside the
+/// body it is in reach, and it takes the name over from whatever an enclosing
+/// scope bound it to, so the walk of the body carries the body's own classes
+/// ahead of the file's.
+fn index_function_body_bases(
+    body: &[Stmt],
+    importer: &Path,
+    bindings: &BTreeMap<String, Binding>,
+    local_classes: &BTreeMap<String, TextSize>,
+    parent_class: Option<&str>,
+    definitions: &mut Definitions,
+) {
+    let mut body_classes = BTreeMap::new();
+    collect_local_class_offsets(body, parent_class, &mut body_classes);
+    let mut offsets = local_classes.clone();
+    offsets.extend(body_classes);
+    index_method_bases(
+        body,
+        importer,
+        bindings,
+        &offsets,
+        parent_class,
+        definitions,
+    );
 }
 
 /// The classes a file defines, as a base expression written at one point in
@@ -16886,5 +16915,31 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 2);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_function_local_class_holds_a_base_name_against_an_import() -> Result<(), String> {
+        // The class written in the function body takes `Helper` over from the
+        // import for the rest of that body, so `Child` is built on the local
+        // class and `super().target()` reaches the parameter it declares. The
+        // imported class of the same name is never the base here, and passing
+        // the parameter it declares would raise `TypeError`.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Helper:\n    def target(self, imported=1): return imported\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from other import Helper\n\n\ndef outer():\n    class Helper:\n        def target(self, local=2): return local\n\n    class Child(Helper):\n        def run(self):\n            return super().target()\n\n    return Child().run()\n\n\nassert outer() == 2\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.contains("super().target(local=2)"), "{updated}");
+        Ok(())
     }
 }

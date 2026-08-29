@@ -9102,6 +9102,15 @@ impl Rewriter<'_> {
     /// and whether it was reached through a zero-argument `super()`, whose
     /// lookup starts after the class the call appears in.
     fn receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
+        if let Expr::Subscript(subscript) = receiver {
+            // `Box[int]` parameterizes a generic and still names the class, so
+            // a call through it reaches the same definition. Subscripting an
+            // instance instead runs `__getitem__`, whose result is an
+            // unrelated object, so only a receiver that resolves to a class
+            // may be unwrapped.
+            let class = self.receiving_class(&subscript.value)?;
+            return (!class.2).then_some(class);
+        }
         if let Expr::Call(call) = receiver {
             if let Some(class) = self.type_of_implicit_instance(call) {
                 return Some(class);
@@ -9342,6 +9351,7 @@ impl Rewriter<'_> {
 
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
+            Expr::Subscript(subscript) => self.resolve(&subscript.value),
             Expr::Name(name)
                 if self.in_class_scope()
                     && self
@@ -9491,6 +9501,11 @@ impl Rewriter<'_> {
         let name = match &*call.func {
             Expr::Name(name) => name.id.as_str(),
             Expr::Attribute(attribute) => attribute.attr.as_str(),
+            Expr::Subscript(subscript) => match subscript.value.as_ref() {
+                Expr::Name(name) => name.id.as_str(),
+                Expr::Attribute(attribute) => attribute.attr.as_str(),
+                _ => return,
+            },
             _ => return,
         };
         let Some((signature, bound)) = self.resolve(&call.func) else {
@@ -20633,6 +20648,41 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn parameterized_generic_constructor_calls_are_updated() -> Result<(), String> {
+        let source = "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar('T')\n@dataclass\nclass Box(Generic[T]):\n    value: int = 1\n\nBox[int]()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\n\nT = TypeVar('T')\n@dataclass\nclass Box(Generic[T]):\n    value: int\n\nBox[int](value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parameterized_generic_method_calls_are_updated() -> Result<(), String> {
+        let source = "from typing import Generic, TypeVar\n\nT = TypeVar('T')\nclass Box(Generic[T]):\n    @classmethod\n    def make(cls, value=1):\n        return cls()\n\nBox[int].make()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from typing import Generic, TypeVar\n\nT = TypeVar('T')\nclass Box(Generic[T]):\n    @classmethod\n    def make(cls, value):\n        return cls()\n\nBox[int].make(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_indexed_instance_receiver_keeps_its_own_default() -> Result<(), String> {
+        // `self[0]` and `C()[0]` run `__getitem__`, so the call lands on
+        // whatever that returns rather than on `C`, and borrowing `C`'s
+        // default would pass the wrong value.
+        let source = "class Other:\n    def target(self, value=2):\n        pass\n\nclass C:\n    def target(self, value=1):\n        pass\n\n    def __getitem__(self, index):\n        return Other()\n\n    def run(self):\n        self[0].target()\n        C()[0].target()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("def target(self, value):"), "{updated}");
+        assert!(!updated.contains("value=1"), "{updated}");
+        assert!(!updated.contains("value=2"), "{updated}");
+        assert!(updated.contains("self[0].target()\n"), "{updated}");
+        assert!(updated.contains("C()[0].target()\n"), "{updated}");
+        Ok(())
     }
 
     #[test]

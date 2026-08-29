@@ -4204,6 +4204,7 @@ impl Checker<'_> {
             }
             self.shapes
                 .remove(&qualified_class_name(&self.lexical_scope, name));
+            self.local_enum_classes.remove(name);
             if let Some(bindings) = self.lexical_bindings.last_mut() {
                 bindings.insert(name.to_owned());
             }
@@ -4587,6 +4588,7 @@ impl Checker<'_> {
         let parameter_names = parameters.names.clone();
         for name in parameters.names {
             self.aliases.invalidate_parameter(&name);
+            self.local_enum_classes.remove(&name);
         }
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
@@ -19264,5 +19266,58 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
+    }
+    #[test]
+    fn a_rebinding_takes_the_name_off_a_local_enum() {
+        // Whatever now stands under the name is what the base below spells, so
+        // this class is ordinary and nothing creates members of it.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nBase = object\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_parameter_takes_the_name_off_a_local_enum() {
+        // The parameter holds the name for the whole body, so the class
+        // written there is built on what the caller passed.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\ndef build(Base):\n    class Child(Base):\n        def __init__(self, value, label='x'): self.label = label\n    return Child\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_loop_target_takes_the_name_off_a_local_enum() {
+        // Every rebinding form goes through the same invalidation, so a loop
+        // target hides the enumeration exactly as an assignment does.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nfor Base in bases:\n    pass\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
     }
 }

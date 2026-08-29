@@ -285,6 +285,23 @@ enum Receiver {
     None,
 }
 
+/// The receiver a function body sees without naming it, and what it stands for.
+///
+/// The class travels with the receiver rather than being read back off the
+/// class stack, because a class nested inside a method pushes its own name
+/// while the method's receiver stays in view. Reading the top of that stack
+/// from in there would name the nested class for a receiver belonging to the
+/// enclosing one.
+#[derive(Clone, Debug)]
+struct ImplicitReceiver {
+    /// The parameter name, conventionally `self` or `cls`.
+    name: String,
+    /// The qualified name of the class the receiver stands for.
+    class: String,
+    /// Whether it is a `classmethod`'s class rather than an instance.
+    is_class: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MethodAliasKind {
     Direct,
@@ -322,8 +339,10 @@ enum Binding {
     Module(PathBuf),
     /// A symbol imported from a module, so `name(...)` resolves to it.
     Symbol(PathBuf, String),
-    /// A name definitely bound by an import whose checked definition is
-    /// ambiguous. It shadows earlier candidates but cannot be resolved.
+    /// A name definitely bound, by an import whose checked definition is
+    /// ambiguous or by a parameter of the scope being read, to something this
+    /// file cannot follow. It shadows earlier candidates but cannot be
+    /// resolved, and it is not free for a later definition to answer to.
     Unknown,
 }
 
@@ -375,21 +394,42 @@ struct Definitions {
     bindings: BTreeMap<(PathBuf, String), Binding>,
     /// Direct statically resolved base classes for method lookup.
     bases: BTreeMap<(PathBuf, String), Vec<(PathBuf, String)>>,
-    /// Classes whose competing control-flow definitions have different bases.
-    ambiguous_bases: BTreeSet<(PathBuf, String)>,
-    /// Every direct base seen for those competing definitions.
-    ambiguous_base_options: BTreeMap<(PathBuf, String), BTreeSet<(PathBuf, String)>>,
+    /// Classes two suites of one statement gave different bases, so which
+    /// ancestry the file ends up with is not known.
+    uncertain_bases: BTreeSet<(PathBuf, String)>,
     /// Every name a fixed callable goes by, so a call that cannot be resolved
     /// to one can still be reported rather than silently left behind.
     names: BTreeSet<String>,
     /// Default deletions grouped by every callable spelling, used to retain
     /// them when an unresolved checked call may refer to that callable.
     fixes_by_name: BTreeMap<String, BTreeSet<FixKey>>,
-    /// Removed defaults owned by an exact method identity.
-    fixes_by_method: BTreeMap<(PathBuf, String, String), BTreeSet<FixKey>>,
 }
 
 impl Definitions {
+    /// Record the bases a class definition names.
+    ///
+    /// Two suites of the same statement are alternatives: only one of them
+    /// runs, and a class each writes under the same name is one class at
+    /// runtime rather than two. Where they disagree on its bases, nothing here
+    /// says which set the file ends up with, so the ancestry is held unknown
+    /// and the inherited calls it would have answered are left alone. A
+    /// definition that certainly runs settles the question again, since it is
+    /// the one standing when the module is done.
+    fn record_bases(
+        &mut self,
+        class: (PathBuf, String),
+        bases: Vec<(PathBuf, String)>,
+        alternative: bool,
+    ) {
+        if !alternative {
+            self.uncertain_bases.remove(&class);
+        } else if self.bases.get(&class).is_some_and(|held| *held != bases) {
+            self.uncertain_bases.insert(class);
+            return;
+        }
+        self.bases.insert(class, bases);
+    }
+
     fn symbol(&self, file: &Path, name: &str) -> Option<&Signature> {
         let mut file = file.to_path_buf();
         let mut name = name.to_owned();
@@ -413,40 +453,6 @@ impl Definitions {
 
     fn method(&self, file: &Path, class: &str, name: &str) -> Option<&Signature> {
         self.method_in_mro(file, class, name, false)
-    }
-
-    fn ambiguous_inherited_fixes(&self) -> BTreeSet<FixKey> {
-        let mut fixes = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        for class in &self.ambiguous_bases {
-            self.collect_inherited_fixes(class, &mut seen, &mut fixes);
-        }
-        fixes
-    }
-
-    fn collect_inherited_fixes(
-        &self,
-        class: &(PathBuf, String),
-        seen: &mut BTreeSet<(PathBuf, String)>,
-        fixes: &mut BTreeSet<FixKey>,
-    ) {
-        if !seen.insert(class.clone()) {
-            return;
-        }
-        for ((file, owner, _), method_fixes) in &self.fixes_by_method {
-            if file == &class.0 && owner == &class.1 {
-                fixes.extend(method_fixes.iter().cloned());
-            }
-        }
-        if let Some(bases) = self.ambiguous_base_options.get(class) {
-            for base in bases {
-                self.collect_inherited_fixes(base, seen, fixes);
-            }
-        } else if let Some(bases) = self.bases.get(class) {
-            for base in bases {
-                self.collect_inherited_fixes(base, seen, fixes);
-            }
-        }
     }
 
     fn class_identity(&self, file: &Path, class: &str) -> Option<(PathBuf, String)> {
@@ -480,6 +486,13 @@ impl Definitions {
         self.method_in_mro(file, class, name, true)
     }
 
+    /// Whether this class, or a class it inherits from, has an ancestry the
+    /// file does not settle. Nothing a lookup through it answers is reliable,
+    /// so a default behind such a call has to stay where it is.
+    fn ancestry_is_uncertain(&self, class: &(PathBuf, String)) -> bool {
+        self.linearized_mro(class, &mut BTreeSet::new()).is_none()
+    }
+
     fn method_in_mro(
         &self,
         file: &Path,
@@ -487,10 +500,15 @@ impl Definitions {
         name: &str,
         skip_class: bool,
     ) -> Option<&Signature> {
-        let mro = self.linearized_mro(
-            &(file.to_path_buf(), class.to_owned()),
-            &mut BTreeSet::new(),
-        )?;
+        let identity = (file.to_path_buf(), class.to_owned());
+        // Where no whole order can be walked the lookup still walks the start
+        // of it, so a method written on the class itself, or on a base between
+        // it and whatever left the rest unknown, resolves as it always did.
+        // Only a lookup that would have to read past that point gives up, and
+        // the call it belongs to is then reported and its default held back.
+        let mro = self
+            .linearized_mro(&identity, &mut BTreeSet::new())
+            .unwrap_or_else(|| self.settled_ancestry(&identity));
         for identity in mro.iter().skip(usize::from(skip_class)) {
             if let Some(method) = self
                 .methods
@@ -503,12 +521,38 @@ impl Definitions {
         None
     }
 
+    /// The classes a lookup certainly reaches before the order stops being
+    /// known, in the order it reaches them.
+    ///
+    /// A class holds its own methods however its ancestry turns out, and so
+    /// does each class on a chain of single bases leading down from it: with
+    /// one base at each step the order is the chain itself, whatever the
+    /// classes further down are. The walk stops at the first class whose bases
+    /// the file does not settle, which is where a whole order would have had
+    /// to pick one set of them, and at a class with several bases, whose order
+    /// depends on ancestries that may be among the ones in doubt.
+    fn settled_ancestry(&self, class: &(PathBuf, String)) -> Vec<(PathBuf, String)> {
+        let mut settled: Vec<(PathBuf, String)> = Vec::new();
+        let mut current = class.clone();
+        while !self.uncertain_bases.contains(&current) && !settled.contains(&current) {
+            settled.push(current.clone());
+            let Some([base]) = self.bases.get(&current).map(Vec::as_slice) else {
+                break;
+            };
+            current = base.clone();
+        }
+        settled
+    }
+
     fn linearized_mro(
         &self,
         class: &(PathBuf, String),
         visiting: &mut BTreeSet<(PathBuf, String)>,
     ) -> Option<Vec<(PathBuf, String)>> {
-        if self.ambiguous_bases.contains(class) {
+        // A class whose bases are not known has no resolution order to walk:
+        // answering with one set of them would rewrite calls against ancestors
+        // the class may never have had.
+        if self.uncertain_bases.contains(class) {
             return None;
         }
         if !visiting.insert(class.clone()) {
@@ -905,18 +949,6 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                     .map(|removed| fix_key(&signature.path, removed.fix)),
             );
         let defining = physical_path(&signature.path);
-        if let Callable::Method { class, .. } = &signature.kind {
-            definitions
-                .fixes_by_method
-                .entry((defining.clone(), class.clone(), signature.name.clone()))
-                .or_default()
-                .extend(signature.removed.iter().flat_map(|removed| {
-                    [
-                        fix_key(&signature.path, removed.fix),
-                        fix_key(&defining, removed.fix),
-                    ]
-                }));
-        }
         let table = match &signature.kind {
             Callable::Method { class, .. } => definitions
                 .methods
@@ -950,12 +982,15 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
+        let mut outside_functions = BTreeSet::new();
+        collect_indexed_class_names(parsed.suite(), None, &mut outside_functions);
         index_method_bases(
             parsed.suite(),
             &importer,
+            &known,
             &bindings,
-            None,
-            &mut Vec::new(),
+            ClassNamespace::module(),
+            LexicalClasses::of_module(&outside_functions),
             &mut definitions,
         );
         definitions.bindings.extend(
@@ -965,9 +1000,6 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         );
     }
     definitions.index_inherited_constructors();
-    call_sites
-        .retained
-        .extend(definitions.ambiguous_inherited_fixes());
     let results: Vec<Result<FileCallSites, String>> = files
         .par_iter()
         .map(|path| {
@@ -1005,146 +1037,493 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
     Ok(call_sites)
 }
 
+/// The classes `index_method_bases` records without entering a function.
+///
+/// The walk descends into a class body, a function body and the suites of a
+/// control-flow statement, and nothing else. A name it reaches must not be
+/// held against a class in a function body: holding a name for a class that is
+/// never recorded would leave both of them unindexed, and an inherited call in
+/// the one that is written would be left alone after the default behind it was
+/// removed. This mirrors the statements the walk itself matches on, and has to
+/// keep mirroring them.
+fn collect_indexed_class_names(
+    statements: &[Stmt],
+    parent_class: Option<&str>,
+    found: &mut BTreeSet<String>,
+) {
+    for statement in statements {
+        if let Stmt::ClassDef(class) = statement {
+            let identity = qualified_name(parent_class, class.name.as_str());
+            collect_indexed_class_names(&class.body, Some(&identity), found);
+            found.insert(identity);
+            continue;
+        }
+        for suite in control_flow_suites(statement) {
+            collect_indexed_class_names(suite, parent_class, found);
+        }
+    }
+}
+
+/// The class names a file reaches without entering a function, and whether the
+/// walk has entered one.
+///
+/// Nothing that names a class puts the function holding it in the name, here
+/// or anywhere else a class is identified, so a class written in a function
+/// body is spelled exactly as a namesake written outside one. The class
+/// outside keeps the name, since it is the only one another file can reach.
+#[derive(Clone, Copy)]
+struct LexicalClasses<'a> {
+    names: &'a BTreeSet<String>,
+    in_function: bool,
+}
+
+impl<'a> LexicalClasses<'a> {
+    fn of_module(names: &'a BTreeSet<String>) -> Self {
+        Self {
+            names,
+            in_function: false,
+        }
+    }
+
+    fn entering_function(self) -> Self {
+        Self {
+            in_function: true,
+            ..self
+        }
+    }
+
+    /// Whether a class of this identity holds the name where it is written.
+    fn holds(self, identity: &str) -> bool {
+        !self.in_function || !self.names.contains(identity)
+    }
+}
+
+/// Where the walk stands, for naming the classes it finds and for judging
+/// whether each one is the class the file ends up with.
+///
+/// A class body is a namespace a name reaches from outside it, so a class
+/// written in one is named under the class holding it. A function body is not:
+/// each call makes its classes afresh, and two functions defining a class of
+/// the same name define two classes. Naming those under the scopes around them
+/// keeps them apart, and matches the identity the checker gives the same class.
+#[derive(Clone, Copy)]
+struct ClassNamespace<'a> {
+    /// The class whose body is being walked, when the statements are directly
+    /// in one.
+    parent: Option<&'a str>,
+    /// The enclosing class and function names, outermost first.
+    lexical_scope: &'a [String],
+    /// Whether the statements sit in one of several suites of a control-flow
+    /// statement of which only one runs, so a class written here stands beside
+    /// whatever a sibling suite writes under the same name.
+    alternative: bool,
+}
+
+impl ClassNamespace<'_> {
+    fn module() -> Self {
+        Self {
+            parent: None,
+            lexical_scope: &[],
+            alternative: false,
+        }
+    }
+
+    /// The identity a class of this spelling is indexed under.
+    fn identity(self, spelling: &str) -> String {
+        self.parent.map_or_else(
+            || qualified_lexical_name(self.lexical_scope, spelling),
+            |parent| qualified_name(Some(parent), spelling),
+        )
+    }
+}
+
+/// The classes a scope defines, under the spelling a base expression uses for
+/// each one there.
+///
+/// A class this scope defines itself takes the name over from an import of the
+/// same name, so a subclass written after it is built on the local class. One
+/// written before it still reaches the import, which is what the offset each
+/// spelling carries decides. The identity beside it is the one the class is
+/// indexed under, which the scopes around it name.
+fn local_class_identities(
+    statements: &[Stmt],
+    namespace: ClassNamespace<'_>,
+) -> BTreeMap<String, (String, TextSize)> {
+    let mut spellings = BTreeMap::new();
+    collect_local_class_offsets(statements, None, &mut spellings);
+    spellings
+        .into_iter()
+        .map(|(spelling, offset)| {
+            let identity = namespace.identity(&spelling);
+            (spelling, (identity, offset))
+        })
+        .collect()
+}
+
+/// Record the bases and attribute names of every class a file defines.
+///
+/// A class body and a function body each open a namespace of their own, so the
+/// walk descends into both, naming what it finds under the class it is written
+/// in, and leaving a name alone where `LexicalClasses` says another class
+/// holds it.
 fn index_method_bases(
     statements: &[Stmt],
     importer: &Path,
+    known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
-    parent_class: Option<&str>,
-    lexical_scope: &mut Vec<String>,
+    namespace: ClassNamespace<'_>,
+    lexical_classes: LexicalClasses<'_>,
     definitions: &mut Definitions,
 ) {
-    index_method_bases_with_environment(
+    let classes = local_class_identities(statements, namespace);
+    let mut scope = BaseScope {
+        namespace,
+        lexical_classes,
+        classes: &classes,
+        aliases: BTreeMap::new(),
+        contested: BTreeSet::new(),
+    };
+    index_scope_method_bases(
         statements,
         importer,
+        known,
         bindings,
-        parent_class,
-        lexical_scope,
         definitions,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
+        &mut scope,
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn index_method_bases_with_environment(
+/// What a scope has bound where a class written in it is read.
+///
+/// A control-flow suite opens no scope of its own: a class written in one is
+/// spelled as a class beside it, and it reaches the classes the scope around it
+/// defines and the aliases that scope had already bound. Carrying this into the
+/// suite is what keeps a base written outside it in reach.
+struct BaseScope<'a> {
+    namespace: ClassNamespace<'a>,
+    lexical_classes: LexicalClasses<'a>,
+    /// Every class the scope defines, under the spelling a base expression
+    /// uses for it, beside where it is written.
+    classes: &'a BTreeMap<String, (String, TextSize)>,
+    /// The classes the scope's assignments have named so far.
+    aliases: BTreeMap<String, (PathBuf, String)>,
+    /// Names alternative suites bind to different classes, which therefore
+    /// stand for no one class in the scope holding them.
+    contested: BTreeSet<String>,
+}
+
+impl<'a> BaseScope<'a> {
+    /// The same scope as one of a statement's suites sees it. An alternative
+    /// suite is one of several of which only one runs, so a class it defines
+    /// may not be the class the file ends up with.
+    fn in_suite(&self, alternative: bool) -> BaseScope<'a> {
+        BaseScope {
+            namespace: ClassNamespace {
+                alternative: self.namespace.alternative || alternative,
+                ..self.namespace
+            },
+            lexical_classes: self.lexical_classes,
+            classes: self.classes,
+            aliases: self.aliases.clone(),
+            contested: self.contested.clone(),
+        }
+    }
+}
+
+fn index_scope_method_bases(
     statements: &[Stmt],
     importer: &Path,
+    known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
-    parent_class: Option<&str>,
-    lexical_scope: &mut Vec<String>,
     definitions: &mut Definitions,
-    inherited_local_classes: &BTreeMap<String, String>,
-    inherited_aliases: &BTreeMap<String, (PathBuf, String)>,
+    scope: &mut BaseScope<'_>,
 ) {
-    let mut local_classes = inherited_local_classes.clone();
-    let mut aliases = inherited_aliases.clone();
+    let namespace = scope.namespace;
+    let lexical_classes = scope.lexical_classes;
     for statement in statements {
+        let defined_at = statement.start();
         match statement {
             Stmt::ClassDef(class) => {
-                let identity = parent_class.map_or_else(
-                    || qualified_lexical_name(lexical_scope, class.name.as_str()),
-                    |parent| qualified_name(Some(parent), class.name.as_str()),
+                let identity = namespace.identity(class.name.as_str());
+                record_class_bases_and_attributes(
+                    class,
+                    &identity,
+                    importer,
+                    bindings,
+                    definitions,
+                    scope,
                 );
-                let bases = class
-                    .arguments
-                    .iter()
-                    .flat_map(|arguments| arguments.args.iter())
-                    .filter_map(|base| {
-                        method_base_identity(
-                            base,
-                            importer,
-                            bindings,
-                            &local_classes,
-                            &aliases,
-                            &definitions.methods,
-                        )
-                    })
-                    .collect();
-                // The new class name is bound only after its header has been
-                // evaluated. This matters for `class Base(Base)`, whose base
-                // still denotes the import or earlier local binding.
-                local_classes.insert(class.name.to_string(), identity.clone());
-                let methods = definitions
-                    .methods
-                    .entry((importer.to_path_buf(), identity.clone()))
-                    .or_default();
-                for statement in &class.body {
-                    if let Stmt::FunctionDef(function) = statement {
-                        methods.entry(function.name.to_string()).or_insert(None);
-                    }
-                }
-                definitions
-                    .bases
-                    .insert((importer.to_path_buf(), identity.clone()), bases);
-                lexical_scope.push(class.name.to_string());
+                let mut inner = namespace.lexical_scope.to_vec();
+                inner.push(class.name.to_string());
                 index_method_bases(
                     &class.body,
                     importer,
-                    bindings,
-                    Some(&identity),
-                    lexical_scope,
+                    known,
+                    &scoped_bindings(&class.body, None, importer, known, bindings),
+                    ClassNamespace {
+                        parent: Some(&identity),
+                        lexical_scope: &inner,
+                        alternative: namespace.alternative,
+                    },
+                    lexical_classes,
                     definitions,
                 );
-                lexical_scope.pop();
             }
             Stmt::FunctionDef(function) => {
-                lexical_scope.push(function.name.to_string());
+                let mut inner = namespace.lexical_scope.to_vec();
+                inner.push(function.name.to_string());
                 index_method_bases(
                     &function.body,
                     importer,
-                    bindings,
-                    None,
-                    lexical_scope,
+                    known,
+                    &scoped_bindings(
+                        &function.body,
+                        Some(&function.parameters),
+                        importer,
+                        known,
+                        bindings,
+                    ),
+                    ClassNamespace {
+                        parent: None,
+                        lexical_scope: &inner,
+                        alternative: namespace.alternative,
+                    },
+                    lexical_classes.entering_function(),
                     definitions,
                 );
-                lexical_scope.pop();
             }
-            Stmt::Assign(assign) => {
+            Stmt::Assign(_) | Stmt::AnnAssign(_) => {
+                let Some((value, targets)) = assigned_value_and_targets(statement) else {
+                    continue;
+                };
                 let Some(identity) = method_base_identity(
-                    &assign.value,
+                    value,
                     importer,
                     bindings,
-                    &local_classes,
-                    &aliases,
+                    scope.classes,
+                    defined_at,
+                    &scope.aliases,
                     &definitions.methods,
                 ) else {
                     continue;
                 };
-                for target in &assign.targets {
+                // A name that stands for either of two classes hands that
+                // doubt on: what is read here is whichever class the name it
+                // was read from turned out to be, so the target is no more
+                // settled than the source was.
+                let contested_source =
+                    base_root_name(value).is_some_and(|name| scope.contested.contains(name));
+                for target in targets {
                     if let Expr::Name(alias) = target {
-                        aliases.insert(alias.id.to_string(), identity.clone());
+                        // An assignment no alternative suite guards takes the
+                        // name over for good, which settles it again after
+                        // competing suites left it standing for either class.
+                        if contested_source {
+                            scope.contested.insert(alias.id.to_string());
+                        } else if !scope.namespace.alternative {
+                            scope.contested.remove(alias.id.as_str());
+                        }
+                        scope.aliases.insert(alias.id.to_string(), identity.clone());
                     }
                 }
             }
             _ => index_control_flow_method_bases(
                 statement,
                 importer,
+                known,
                 bindings,
-                parent_class,
-                lexical_scope,
                 definitions,
-                &local_classes,
-                &aliases,
+                scope,
             ),
         }
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "control-flow suites inherit both lexical resolution environments"
-)]
+/// Record one class's bases and the attribute names its body leaves behind.
+fn record_class_bases_and_attributes(
+    class: &ast::StmtClassDef,
+    identity: &str,
+    importer: &Path,
+    bindings: &BTreeMap<String, Binding>,
+    definitions: &mut Definitions,
+    scope: &BaseScope<'_>,
+) {
+    // A class written in a function body leaves the name to a namesake written
+    // outside one: recording this one under it would replace that class's bases
+    // with these and leave its calls resolved against the wrong ancestry. A
+    // class nested in here can still hold a name of its own, so the walk goes on
+    // either way.
+    if !scope.lexical_classes.holds(identity) {
+        return;
+    }
+    let bases = class
+        .arguments
+        .iter()
+        .flat_map(|arguments| arguments.args.iter())
+        .filter_map(|base| {
+            method_base_identity(
+                base,
+                importer,
+                bindings,
+                scope.classes,
+                class.start(),
+                &scope.aliases,
+                &definitions.methods,
+            )
+        })
+        .collect();
+    let methods = definitions
+        .methods
+        .entry((importer.to_path_buf(), identity.to_owned()))
+        .or_default();
+    // Every name the body still holds at the end of it is an attribute of the
+    // class, whether a `def` wrote it or an assignment such as
+    // `__init__ = setup` did. Recording the assigned ones too keeps them
+    // shadowing what the bases hold: a subclass that binds `__init__` has a
+    // constructor of its own, and rewriting its calls against an ancestor's
+    // `__init__` would pass parameters the binding does not take. A name the
+    // body never leaves behind is a shadow that does not exist, and recording
+    // it would stop the lookup that should have walked on to a base.
+    for name in BoundNames::of_class_attributes(&class.body) {
+        methods.entry(name).or_insert(None);
+    }
+    definitions.record_bases(
+        (importer.to_path_buf(), identity.to_owned()),
+        bases,
+        scope.namespace.alternative,
+    );
+    // A base spelled with a name competing suites bind to different classes
+    // names a different ancestry depending on which of them ran, so the file
+    // settles none of them, exactly as it settles none for a class those
+    // suites give different bases. The name is read at the root of the base,
+    // so a parameterized `Alias[int]` and a member of one are caught with it.
+    if class_bases(class)
+        .filter_map(base_root_name)
+        .any(|name| scope.contested.contains(name))
+    {
+        definitions
+            .uncertain_bases
+            .insert((importer.to_path_buf(), identity.to_owned()));
+    }
+}
+
+/// Record the bases of every class a control-flow suite holds.
+///
+/// A suite opens no namespace of its own, so a class written in one is named
+/// exactly as a class beside it is, and a subclass written after it in the
+/// same suite inherits from it. Leaving these bodies unwalked would record no
+/// bases for either, and an inherited call would keep its arguments while the
+/// default behind it was stripped. The suite is read with the scope around it
+/// rather than afresh, so a base written above the statement is still in reach.
 fn index_control_flow_method_bases(
     statement: &Stmt,
     importer: &Path,
+    known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
-    parent_class: Option<&str>,
-    lexical_scope: &mut Vec<String>,
     definitions: &mut Definitions,
-    local_classes: &BTreeMap<String, String>,
-    aliases: &BTreeMap<String, (PathBuf, String)>,
+    scope: &mut BaseScope<'_>,
 ) {
-    let suites: Vec<&[Stmt]> = match statement {
+    let suites = runnable_suites(statement);
+    let alternative = suites.len() > 1;
+    // One suite the statement is certain to enter binds for the code after it
+    // just as a statement written beside that code would. Anything else may
+    // leave a name as it found it.
+    let settles = !alternative && a_suite_certainly_runs(statement);
+    for suite in suites {
+        let mut inner = scope.in_suite(alternative);
+        index_scope_method_bases(suite, importer, known, bindings, definitions, &mut inner);
+        carry_suite_aliases(scope, &inner, settles);
+    }
+}
+
+/// Whether a statement is certain to run one of the suites it holds.
+///
+/// A `with` body runs. An `if` chain runs one of its suites only when a test
+/// the tool can read is true, or an `else` catches what the tests do not; an
+/// `if` without either may bind nothing at all. A loop body may never be
+/// entered, a `try` may leave part-way through, and a `match` without a
+/// wildcard may match nothing, so none of those settles a name either.
+fn a_suite_certainly_runs(statement: &Stmt) -> bool {
+    let Stmt::If(branch) = statement else {
+        return matches!(statement, Stmt::With(_));
+    };
+    std::iter::once(Some(branch.test.as_ref()))
+        .chain(
+            branch
+                .elif_else_clauses
+                .iter()
+                .map(|clause| clause.test.as_ref()),
+        )
+        .any(|test| {
+            test.is_none_or(|test| {
+                matches!(
+                    Truthiness::from_expr(test, |_| false),
+                    Truthiness::True | Truthiness::Truthy
+                )
+            })
+        })
+}
+
+/// Carry what a suite bound out into the scope around it.
+///
+/// A suite the statement is certain to enter leaves its names standing for the
+/// code after it. Any other may not run, so a name it binds stands for either
+/// what it bound or what was there before: a class built on such a name has an
+/// ancestry for each candidate, and resolving its inherited calls against any
+/// one of them strips the defaults behind the others. A contest the suite
+/// itself found travels out whichever kind of suite it is, since a wrapper
+/// that is certain to run settles nothing the branches inside it left open.
+fn carry_suite_aliases(scope: &mut BaseScope<'_>, suite: &BaseScope<'_>, settles: bool) {
+    for (spelling, identity) in &suite.aliases {
+        if settles {
+            // Binding what the scope already held still settles the name: an
+            // earlier branch may have left another candidate standing, and
+            // this assignment runs whatever that branch did.
+            scope.contested.remove(spelling);
+            scope.aliases.insert(spelling.clone(), identity.clone());
+        } else if scope.aliases.get(spelling) != Some(identity) {
+            scope.contested.insert(spelling.clone());
+        }
+    }
+    scope.contested.extend(suite.contested.iter().cloned());
+}
+
+/// The suites of a statement whose classes the file can end up with.
+///
+/// A test the tool can already read leaves only one suite of an `if` chain
+/// standing, and a suite behind a test that is never true defines nothing the
+/// file keeps. Dropping those here is what lets a class guarded by `if True`
+/// still be resolved against the base it names.
+fn runnable_suites(statement: &Stmt) -> Vec<&[Stmt]> {
+    let Stmt::If(branch) = statement else {
+        return control_flow_suites(statement);
+    };
+    let clauses = std::iter::once((Some(branch.test.as_ref()), branch.body.as_slice())).chain(
+        branch
+            .elif_else_clauses
+            .iter()
+            .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
+    );
+    let mut suites = Vec::new();
+    for (test, body) in clauses {
+        match test.map_or(Truthiness::True, |test| {
+            Truthiness::from_expr(test, |_| false)
+        }) {
+            Truthiness::False | Truthiness::Falsey | Truthiness::None => {}
+            Truthiness::True | Truthiness::Truthy => {
+                suites.push(body);
+                return suites;
+            }
+            Truthiness::Unknown => suites.push(body),
+        }
+    }
+    suites
+}
+
+/// The statement bodies a control-flow statement holds, in the order they are
+/// written. Anything else holds none.
+fn control_flow_suites(statement: &Stmt) -> Vec<&[Stmt]> {
+    match statement {
         Stmt::If(branch) => std::iter::once(branch.body.as_slice())
             .chain(
                 branch
@@ -1169,28 +1548,96 @@ fn index_control_flow_method_bases(
             .map(|case| case.body.as_slice())
             .collect(),
         _ => Vec::new(),
-    };
-    for suite in suites {
-        let before = definitions.bases.clone();
-        index_method_bases_with_environment(
-            suite,
-            importer,
-            bindings,
-            parent_class,
-            lexical_scope,
-            definitions,
-            local_classes,
-            aliases,
-        );
-        for (class, bases) in &definitions.bases {
-            if let Some(previous) = before.get(class).filter(|previous| *previous != bases) {
-                definitions.ambiguous_bases.insert(class.clone());
-                definitions
-                    .ambiguous_base_options
-                    .entry(class.clone())
-                    .or_default()
-                    .extend(previous.iter().chain(bases).cloned());
+    }
+}
+
+/// The value an assignment binds and the targets it binds it to.
+///
+/// An annotated binding names a class just as a plain one does, so a subclass
+/// reaching the original through it is linked the same way.
+fn assigned_value_and_targets(statement: &Stmt) -> Option<(&Expr, &[Expr])> {
+    match statement {
+        Stmt::Assign(assign) => Some((assign.value.as_ref(), assign.targets.as_slice())),
+        Stmt::AnnAssign(assign) => assign
+            .value
+            .as_deref()
+            .map(|value| (value, std::slice::from_ref(&*assign.target))),
+        _ => None,
+    }
+}
+
+/// The bindings a nested scope sees: the ones the scopes around it left
+/// standing, less the names the scope's own parameters claim, plus the imports
+/// the scope makes for itself. `collect_bindings` stops at every scope
+/// boundary, so a body is read for its own imports as it is entered; without
+/// that, a `from module import Base` written beside the class that inherits
+/// from it would name nothing, though the same pair at module level resolves.
+/// A parameter pushes the other way: it takes its name over for the whole
+/// call, so a base spelled with it is whatever the caller handed in, and
+/// linking the subclass to the import of that spelling would rewrite inherited
+/// calls against a class the subclass never had.
+fn scoped_bindings(
+    body: &[Stmt],
+    parameters: Option<&ast::Parameters>,
+    importer: &Path,
+    known: &BTreeSet<&Path>,
+    bindings: &BTreeMap<String, Binding>,
+) -> BTreeMap<String, Binding> {
+    let mut scoped = bindings.clone();
+    for name in parameters.into_iter().flat_map(BoundNames::of_parameters) {
+        // Claimed, not vacated. Merely dropping the name would leave it free
+        // for a class written later in the same body to answer to, and that
+        // class does not exist yet where the subclass is written.
+        scoped.insert(name, Binding::Unknown);
+    }
+    collect_bindings(body, importer, known, &mut scoped);
+    scoped
+}
+
+/// Where each class this file defines is written, under the name a base
+/// expression would spell it with — nested classes included, so `Outer.Inner`
+/// is found as readily as a class at the top level.
+fn collect_local_class_offsets(
+    statements: &[Stmt],
+    prefix: Option<&str>,
+    found: &mut BTreeMap<String, TextSize>,
+) {
+    for statement in statements {
+        match statement {
+            Stmt::ClassDef(class) => {
+                let qualified = qualified_name(prefix, class.name.as_str());
+                found.entry(qualified.clone()).or_insert(statement.start());
+                collect_local_class_offsets(&class.body, Some(&qualified), found);
             }
+            _ => {
+                for suite in control_flow_suites(statement) {
+                    collect_local_class_offsets(suite, prefix, found);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a class written in this file above `defined_at` holds the spelling
+/// a base expression's prefix uses, so the prefix is that class rather than
+/// whatever a module of the same dotted name would be.
+fn prefix_names_a_local_class(
+    prefix: &Expr,
+    local_classes: &BTreeMap<String, (String, TextSize)>,
+    defined_at: TextSize,
+) -> bool {
+    let mut expression = prefix;
+    loop {
+        if dotted_name(expression).is_some_and(|spelling| {
+            local_classes
+                .get(&spelling)
+                .is_some_and(|(_, offset)| *offset < defined_at)
+        }) {
+            return true;
+        }
+        match expression {
+            Expr::Attribute(attribute) => expression = attribute.value.as_ref(),
+            _ => return false,
         }
     }
 }
@@ -1200,7 +1647,8 @@ fn method_base_identity(
     expression: &Expr,
     importer: &Path,
     bindings: &BTreeMap<String, Binding>,
-    local_classes: &BTreeMap<String, String>,
+    local_classes: &BTreeMap<String, (String, TextSize)>,
+    defined_at: TextSize,
     aliases: &BTreeMap<String, (PathBuf, String)>,
     methods: &BTreeMap<(PathBuf, String), BTreeMap<String, Option<Signature>>>,
 ) -> Option<(PathBuf, String)> {
@@ -1210,41 +1658,56 @@ fn method_base_identity(
             importer,
             bindings,
             local_classes,
+            defined_at,
             aliases,
             methods,
         ),
-        Expr::Name(name) => aliases
-            .get(name.id.as_str())
-            .cloned()
-            .or_else(|| {
-                local_classes
-                    .get(name.id.as_str())
-                    .map(|class| (importer.to_path_buf(), class.clone()))
-            })
-            .or_else(|| match bindings.get(name.id.as_str()) {
+        Expr::Name(name) => aliases.get(name.id.as_str()).cloned().or_else(|| {
+            let local = local_classes.get(name.id.as_str());
+            // A class already defined here holds the name, whatever an import
+            // of the same name bound earlier.
+            if let Some((identity, _)) = local.filter(|(_, offset)| *offset < defined_at) {
+                return Some((importer.to_path_buf(), identity.clone()));
+            }
+            match bindings.get(name.id.as_str()) {
                 Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
-                _ => None,
-            }),
+                // Something holds the name here that cannot be followed, so
+                // the class it stands for is unknown. Reading on to a class
+                // of the same spelling written further down the scope would
+                // answer with one the subclass was never built on.
+                Some(Binding::Unknown) => None,
+                _ => local.map(|(identity, _)| (importer.to_path_buf(), identity.clone())),
+            }
+        }),
         Expr::Attribute(attribute) => {
-            // A dotted submodule binding is more specific than interpreting
-            // its components as nested classes in a package initializer.
-            let local_owner = dotted_name(&attribute.value).is_some_and(|owner| {
-                owner.split('.').next().is_some_and(|root| {
-                    local_classes.contains_key(root) || aliases.contains_key(root)
-                })
-            });
-            if !local_owner {
+            // A dotted submodule binding names the module its components spell
+            // out, which is more specific than reading those same components
+            // as classes nested in the package initializer — the reading the
+            // prefix would otherwise be given, since the initializer's own
+            // namesake answers before the module lookup below is reached.
+            //
+            // A class written here still holds the spelling first: the checks
+            // that follow settle that, so the shortcut only fires where no
+            // local class of that name is written above.
+            if !prefix_names_a_local_class(&attribute.value, local_classes, defined_at) {
                 if let Some(module) = dotted_name(&attribute.value) {
                     if let Some(Binding::Module(file)) = bindings.get(&module) {
                         return Some((file.clone(), attribute.attr.to_string()));
                     }
                 }
             }
+            // The prefix may be a name this scope bound to a class rather than
+            // a spelling written out in full, and an alias of an enclosing
+            // class reaches the same nested class the dotted form does. The
+            // member is only taken when the class it names is one this pass
+            // has recorded methods for, so an ordinary attribute access is
+            // left to the module lookup below.
             if let Some((file, parent)) = method_base_identity(
                 &attribute.value,
                 importer,
                 bindings,
                 local_classes,
+                defined_at,
                 aliases,
                 methods,
             ) {
@@ -1254,13 +1717,25 @@ fn method_base_identity(
                 }
             }
             let qualified = dotted_name(expression)?;
-            if methods
-                .keys()
-                .any(|(file, class)| file == importer && class == &qualified)
+            // A nested class holds the dotted name only once it is written,
+            // the same rule a simple name follows above. Before that the
+            // prefix still names whatever an import bound.
+            if let Some((identity, _)) = local_classes
+                .get(&qualified)
+                .filter(|(_, offset)| *offset < defined_at)
+                .filter(|(identity, _)| {
+                    methods
+                        .keys()
+                        .any(|(file, class)| file == importer && class == identity)
+                })
             {
-                return Some((importer.to_path_buf(), qualified));
+                return Some((importer.to_path_buf(), identity.clone()));
             }
-            None
+            let module = dotted_name(&attribute.value)?;
+            let Binding::Module(file) = bindings.get(&module)? else {
+                return None;
+            };
+            Some((file.clone(), attribute.attr.to_string()))
         }
         _ => None,
     }
@@ -2603,6 +3078,12 @@ fn is_python(path: &Path) -> bool {
         .is_some_and(|extension| extension == "py" || extension == "pyi")
 }
 
+/// Whether `path` is a type stub, whose contents describe an interface rather
+/// than run.
+fn is_stub(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "pyi")
+}
+
 /// The UTF-8 byte-order mark, which Windows editors write and which is not part
 /// of the program.
 const BOM: &str = "\u{feff}";
@@ -2691,6 +3172,187 @@ fn source_error(path: &Path, error: String) -> Checked {
 /// `with`, a `try` — holds definitions that compete for the same name just as
 /// two definitions written side by side do. Only one of them survives, and
 /// which one is not knowable, so neither may have its defaults removed.
+/// The local names that mean the `property` builtin: the name itself and
+/// anything an import bound it to.
+///
+/// This runs before the alias table exists, so the import statements are read
+/// directly. A module-qualified `builtins.property` needs no entry — the
+/// attribute is matched by its own name.
+fn property_alias_names(statements: &[Stmt], names: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            Stmt::ImportFrom(import) => {
+                for alias in &import.names {
+                    if alias.name.as_str() == "property" {
+                        names.insert(
+                            alias
+                                .asname
+                                .as_ref()
+                                .map_or_else(|| alias.name.to_string(), ToString::to_string),
+                        );
+                    }
+                }
+            }
+            Stmt::ClassDef(class) => property_alias_names(&class.body, names),
+            Stmt::FunctionDef(function) => property_alias_names(&function.body, names),
+            Stmt::If(branch) => {
+                property_alias_names(&branch.body, names);
+                for clause in &branch.elif_else_clauses {
+                    property_alias_names(&clause.body, names);
+                }
+            }
+            Stmt::For(loop_) => {
+                property_alias_names(&loop_.body, names);
+                property_alias_names(&loop_.orelse, names);
+            }
+            Stmt::While(loop_) => {
+                property_alias_names(&loop_.body, names);
+                property_alias_names(&loop_.orelse, names);
+            }
+            Stmt::With(block) => property_alias_names(&block.body, names),
+            Stmt::Try(block) => {
+                property_alias_names(&block.body, names);
+                property_alias_names(&block.orelse, names);
+                property_alias_names(&block.finalbody, names);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    property_alias_names(&handler.body, names);
+                }
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    property_alias_names(&case.body, names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The methods a single class body hands to `property()` under another name,
+/// including the ones written inside its control flow.
+fn class_property_aliases(
+    statements: &[Stmt],
+    names: &BTreeSet<String>,
+    found: &mut BTreeSet<(String, String)>,
+) {
+    for statement in statements {
+        let value = match statement {
+            Stmt::Assign(assign) => Some(assign.value.as_ref()),
+            Stmt::AnnAssign(assign) => assign.value.as_deref(),
+            Stmt::If(branch) => {
+                class_property_aliases(&branch.body, names, found);
+                for clause in &branch.elif_else_clauses {
+                    class_property_aliases(&clause.body, names, found);
+                }
+                None
+            }
+            Stmt::For(loop_) => {
+                class_property_aliases(&loop_.body, names, found);
+                class_property_aliases(&loop_.orelse, names, found);
+                None
+            }
+            Stmt::While(loop_) => {
+                class_property_aliases(&loop_.body, names, found);
+                class_property_aliases(&loop_.orelse, names, found);
+                None
+            }
+            Stmt::With(block) => {
+                class_property_aliases(&block.body, names, found);
+                None
+            }
+            Stmt::Try(block) => {
+                class_property_aliases(&block.body, names, found);
+                class_property_aliases(&block.orelse, names, found);
+                class_property_aliases(&block.finalbody, names, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    class_property_aliases(&handler.body, names, found);
+                }
+                None
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    class_property_aliases(&case.body, names, found);
+                }
+                None
+            }
+            _ => None,
+        };
+        let Some(Expr::Call(call)) = value else {
+            continue;
+        };
+        let names_property = match call.func.as_ref() {
+            Expr::Name(name) => names.contains(name.id.as_str()),
+            Expr::Attribute(attribute) => attribute.attr.as_str() == "property",
+            _ => false,
+        };
+        if !names_property || call.arguments.args.len() != 1 {
+            continue;
+        }
+        if let Expr::Attribute(source) = &call.arguments.args[0] {
+            if let Expr::Name(owner) = source.value.as_ref() {
+                found.insert((owner.id.to_string(), source.attr.to_string()));
+            }
+        }
+    }
+}
+
+/// Methods that some class body hands to `property()` under another name,
+/// as `(class, method)`.
+///
+/// Attribute access runs a property's getter, so a default on the method
+/// behind such an alias has no call site a fixer could update — and the class
+/// holding the alias may be written after the one defining the method, so this
+/// is gathered before checking starts.
+fn collect_property_aliased_methods(
+    statements: &[Stmt],
+    names: &BTreeSet<String>,
+    found: &mut BTreeSet<(String, String)>,
+) {
+    for statement in statements {
+        match statement {
+            Stmt::ClassDef(class) => {
+                class_property_aliases(&class.body, names, found);
+                collect_property_aliased_methods(&class.body, names, found);
+            }
+            Stmt::FunctionDef(function) => {
+                collect_property_aliased_methods(&function.body, names, found);
+            }
+            Stmt::If(branch) => {
+                collect_property_aliased_methods(&branch.body, names, found);
+                for clause in &branch.elif_else_clauses {
+                    collect_property_aliased_methods(&clause.body, names, found);
+                }
+            }
+            Stmt::For(loop_) => {
+                collect_property_aliased_methods(&loop_.body, names, found);
+                collect_property_aliased_methods(&loop_.orelse, names, found);
+            }
+            Stmt::While(loop_) => {
+                collect_property_aliased_methods(&loop_.body, names, found);
+                collect_property_aliased_methods(&loop_.orelse, names, found);
+            }
+            Stmt::With(block) => collect_property_aliased_methods(&block.body, names, found),
+            Stmt::Try(block) => {
+                collect_property_aliased_methods(&block.body, names, found);
+                collect_property_aliased_methods(&block.orelse, names, found);
+                collect_property_aliased_methods(&block.finalbody, names, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_property_aliased_methods(&handler.body, names, found);
+                }
+            }
+            Stmt::Match(block) => {
+                for case in &block.cases {
+                    collect_property_aliased_methods(&case.body, names, found);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_repeated_functions(
     suite: &[Stmt],
     seen: &mut BTreeSet<String>,
@@ -2789,11 +3451,19 @@ fn check_source(
         return Checked::default();
     }
     let aliases = Aliases::default();
-    let module_bindings = BoundNames::of_body(parsed.suite()).names;
+    let module_bindings = BoundNames::of_module(parsed.suite());
     let metaclass_intercepted_classes = metaclass_intercepted_classes(parsed.suite());
     let mut function_names = BTreeSet::new();
     let mut repeated_functions = BTreeSet::new();
     collect_repeated_functions(parsed.suite(), &mut function_names, &mut repeated_functions);
+    let mut property_names = BTreeSet::from(["property".to_owned()]);
+    property_alias_names(parsed.suite(), &mut property_names);
+    let mut property_aliased_methods = BTreeSet::new();
+    collect_property_aliased_methods(
+        parsed.suite(),
+        &property_names,
+        &mut property_aliased_methods,
+    );
     let mut checker = Checker {
         path,
         source,
@@ -2805,18 +3475,21 @@ fn check_source(
         module_bindings,
         local_classes: BTreeSet::new(),
         metaclass_classes: BTreeSet::new(),
-        imported_metaclass_classes: BTreeSet::new(),
-        defined_class_identities: BTreeSet::new(),
-        enum_class_identities: BTreeSet::new(),
+        entered_class_metaclass_classes: Vec::new(),
         metaclass_definitions: BTreeSet::new(),
+        enum_classes: BTreeSet::new(),
         metaclass_intercepted_classes,
         repeated_functions,
+        property_aliased_methods,
         base_field_classes: BTreeSet::new(),
         shapes: BTreeMap::new(),
         shape_namespaces: BTreeSet::new(),
         known_truthiness: BTreeMap::new(),
+        rebound_globals: BTreeSet::new(),
         lexical_scope: Vec::new(),
-        class_scope_depths: Vec::new(),
+        lexical_is_class: Vec::new(),
+        lexical_bindings: Vec::new(),
+        lambda_bodies: 0,
         conditional_depth: 0,
         scope: Scope {
             private: is_private_module(path, project_root, reexports),
@@ -2832,6 +3505,7 @@ fn check_source(
         instance_attributes: Vec::new(),
         class_deletions: Vec::new(),
         class_assignments: Vec::new(),
+        class_rewraps: Vec::new(),
         method_aliases: Vec::new(),
         signatures: Vec::new(),
         skipped: Vec::new(),
@@ -3100,23 +3774,25 @@ struct Checker<'a> {
     /// through a base. A metaclass is inherited, so a subclass is built by it
     /// too even when it names no `metaclass=` of its own.
     metaclass_classes: BTreeSet<String>,
-    /// Local classes that transitively inherit a possibly custom metaclass
-    /// from an ordinary imported base.
-    imported_metaclass_classes: BTreeSet<String>,
-    /// Every class identity visited, including safe redefinitions used to
-    /// shadow earlier imported-metaclass uncertainty.
-    defined_class_identities: BTreeSet<String>,
-    /// Same-file Enum subclasses, keyed by lexical identity so nested Enum
-    /// subclasses retain defaults used by implicit member construction.
-    enum_class_identities: BTreeSet<String>,
+    /// What `metaclass_classes` held as each enclosing class body was entered.
+    /// A class body is not a closure scope, so a class the body writes stands
+    /// for nothing inside a function or a class written there, which reads the
+    /// names the class statement began with instead.
+    entered_class_metaclass_classes: Vec<BTreeSet<String>>,
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
+    /// Same-file classes that are enumerations, directly or through a base
+    /// written here. Enumeration membership is inherited, so a subclass of one
+    /// builds its members through the same implicit calls.
+    enum_classes: BTreeSet<String>,
     /// Same-file classes whose metaclass can replace class attributes.
     metaclass_intercepted_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
     /// call-site signature, so their defaults are reported but retained.
     repeated_functions: BTreeSet<String>,
+    /// Methods another class aliases as a property, by `(class, method)`.
+    property_aliased_methods: BTreeSet<(String, String)>,
     /// Classes already visited in this scope that carry fields through a
     /// configured base, so their local subclasses carry fields too.
     base_field_classes: BTreeSet<String>,
@@ -3128,12 +3804,27 @@ struct Checker<'a> {
     shape_namespaces: BTreeSet<String>,
     /// Unconditional module assignments whose truth value is statically known.
     known_truthiness: BTreeMap<String, Truthiness>,
+    /// Names some body has declared `global` and then rebound. What they were
+    /// imported as is gone from the module namespace from then on, and unlike
+    /// the shapes and the truthiness flags the alias table is saved and put
+    /// back around every nested body, so the loss has to be recorded to
+    /// outlive that.
+    rebound_globals: BTreeSet<String>,
     /// Enclosing definitions, used to keep same-named nested class shapes
     /// separate from classes in other lexical scopes.
     lexical_scope: Vec<String>,
-    /// Prefix lengths in `lexical_scope` that name class bodies. They are not
-    /// closure scopes for code in a nested class.
-    class_scope_depths: Vec<usize>,
+    /// Whether each entry of `lexical_scope` is a class body. A class
+    /// namespace is not a closure scope, so code in a nested definition never
+    /// reads names from it.
+    lexical_is_class: Vec<bool>,
+    /// The names each entry of `lexical_scope` binds. A scope that binds a
+    /// name hides whatever the scopes outside it call by the same name, even
+    /// where nothing about the class it now stands for is known.
+    lexical_bindings: Vec<BTreeSet<String>>,
+    /// How many lambda bodies enclose the expression being visited. A walrus
+    /// in one binds in the lambda's own scope, which nothing outside it sees,
+    /// and `lexical_scope` has no entry to say so.
+    lambda_bodies: usize,
     /// Unknown control-flow branches do not describe one reliable constructor.
     conditional_depth: usize,
     scope: Scope,
@@ -3158,6 +3849,9 @@ struct Checker<'a> {
     instance_attributes: Vec<BTreeSet<String>>,
     class_deletions: Vec<BTreeSet<String>>,
     class_assignments: Vec<BTreeMap<String, Vec<TextSize>>>,
+    /// Class-body assignments that put the same function back under its own
+    /// name, which replace nothing.
+    class_rewraps: Vec<BTreeMap<String, Vec<TextSize>>>,
     /// Direct `alias = method` bindings for each enclosing class, keyed by the
     /// original method name.
     method_aliases: Vec<BTreeMap<String, Vec<MethodAlias>>>,
@@ -3176,8 +3870,8 @@ struct Scope {
     fields: Option<FieldStyle>,
     /// What kind of class body definitions here sit directly in, if any.
     class: ClassScope,
-    /// Whether this is an `enum.Enum` body whose members are initialized
-    /// implicitly while the class is created.
+    /// Whether this is an `enum.Enum` body, whose members the class statement
+    /// itself builds by calling the initializer it holds.
     enum_class: bool,
     /// Whether a field of this class has kept its default, which forces every
     /// field after it to keep its own: `dataclasses` rejects a field without a
@@ -3321,25 +4015,56 @@ impl Checker<'_> {
         }
     }
 
-    /// Find the nearest class shape visible from the current lexical scope.
+    /// The class shape a bare name reaches from the scope being visited.
+    ///
+    /// Python resolves a free name against the enclosing functions and then
+    /// the module. A class namespace is not one of those scopes, so a body
+    /// written inside a class sees nothing an outer class body bound; only the
+    /// scope the name is written in answers when that scope is a class body.
+    ///
+    /// The search stops at the nearest scope that binds the name, whether or
+    /// not a shape was recorded there. A parameter or a rebinding stands
+    /// between the name and the enclosing class it would otherwise have
+    /// reached, and reading past it would give a subclass the fields of a
+    /// class its constructor never sees.
     fn visible_shape(&self, name: &str) -> Option<&Option<Shape>> {
         (0..=self.lexical_scope.len())
             .rev()
             .filter(|depth| {
-                *depth == self.lexical_scope.len() || !self.class_scope_depths.contains(depth)
+                *depth == self.lexical_scope.len()
+                    || *depth == 0
+                    || self.lexical_is_class.get(depth - 1) != Some(&true)
             })
             .find_map(|depth| {
-                self.shapes
+                if let Some(shape) = self
+                    .shapes
                     .get(&qualified_class_name(&self.lexical_scope[..depth], name))
+                {
+                    return Some(Some(shape));
+                }
+                let hidden = depth > 0
+                    && self
+                        .lexical_bindings
+                        .get(depth - 1)
+                        .is_some_and(|bindings| bindings.contains(name));
+                hidden.then_some(None)
             })
+            .flatten()
     }
 
     fn unknown_base_may_end_in_default(&self, class: &ast::StmtClassDef) -> bool {
         class_bases(class).any(|base| {
-            if base_root_name(base).is_some_and(|name| self.aliases.import_bindings.contains(name))
-            {
+            // A parameter shadowing the import hides the base further rather
+            // than revealing it, so the name it took over counts too.
+            if base_root_name(base).is_some_and(|name| {
+                self.aliases.import_bindings.contains(name)
+                    || self.aliases.invalidated_import_bindings.contains(name)
+            }) {
                 return true;
             }
+            // `Middle[int]` names the class `Middle` names, so a local base
+            // that may end in a default is one whether or not the subclass
+            // parameterizes it.
             let base = match base {
                 Expr::Subscript(subscript) => subscript.value.as_ref(),
                 expression => expression,
@@ -3382,63 +4107,206 @@ impl Checker<'_> {
                     bound.bind(target);
                 }
             }
-            Stmt::AnnAssign(assign) => bound.bind(&assign.target),
+            // `name: int` declares a type without rebinding anything, so the
+            // alias, truthiness and dataclass shape already recorded for the
+            // name still describe it.
+            Stmt::AnnAssign(assign) => {
+                if assign.value.is_some() {
+                    bound.bind(&assign.target);
+                }
+            }
             Stmt::AugAssign(assign) => bound.bind(&assign.target),
             _ => return,
         }
-        for name in &bound.names {
-            self.aliases.invalidate(name);
-            self.known_truthiness.remove(name);
-            self.shapes
-                .remove(&qualified_class_name(&self.lexical_scope, name));
-        }
-        if let Stmt::Assign(assign) = statement {
-            if let Some(Expr::Name(target)) =
-                assign.targets.first().filter(|_| assign.targets.len() == 1)
-            {
-                if self.conditional_depth == 0 && self.lexical_scope.is_empty() {
-                    let truth = Truthiness::from_expr(&assign.value, |_| false);
-                    if truth != Truthiness::Unknown {
-                        self.known_truthiness.insert(target.id.to_string(), truth);
-                    }
+        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
+        // An annotated assignment binds its target every bit as much as a plain
+        // one does, so an annotation is no reason to forget what the name was
+        // just given. Reading only plain assignments left `Alias: object = Base`
+        // cleared above and never restored, handing every subclass of `Alias` an
+        // unknown constructor.
+        let assigned = match statement {
+            Stmt::Assign(assign) => assign
+                .targets
+                .first()
+                .filter(|_| assign.targets.len() == 1)
+                .and_then(|target| match target {
+                    Expr::Name(name) => Some((name, assign.value.as_ref())),
+                    _ => None,
+                }),
+            Stmt::AnnAssign(assign) => match (assign.target.as_ref(), assign.value.as_deref()) {
+                (Expr::Name(name), Some(value)) => Some((name, value)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((target, value)) = assigned {
+            if self.conditional_depth == 0 && self.lexical_scope.is_empty() {
+                let truth = Truthiness::from_expr(value, |_| false);
+                if truth != Truthiness::Unknown {
+                    self.known_truthiness.insert(target.id.to_string(), truth);
                 }
-                let target = qualified_class_name(&self.lexical_scope, target.id.as_str());
-                if let Expr::Name(value) = assign.value.as_ref() {
-                    if let Some(shape) = self.visible_shape(value.id.as_str()).cloned() {
-                        self.shapes.insert(target, shape);
-                    }
-                } else if self.lexical_scope.is_empty() {
-                    if let Expr::Call(call) = assign.value.as_ref() {
-                        if let Expr::Name(namespace) = call.func.as_ref() {
-                            let prefix = format!("{}.", namespace.id);
-                            let aliases: Vec<(String, Option<Shape>)> = self
-                                .shapes
-                                .iter()
-                                .filter_map(|(name, shape)| {
-                                    name.strip_prefix(&prefix)
-                                        .map(|member| (format!("{target}.{member}"), shape.clone()))
-                                })
-                                .collect();
-                            if !aliases.is_empty() {
-                                self.shape_namespaces.insert(target.clone());
-                            }
-                            self.shapes.extend(aliases);
+            }
+            let target = qualified_class_name(&self.lexical_scope, target.id.as_str());
+            if let Expr::Name(value) = value {
+                if let Some(shape) = self.visible_shape(value.id.as_str()).cloned() {
+                    self.shapes.insert(target, shape);
+                }
+            } else if self.lexical_scope.is_empty() {
+                if let Expr::Call(call) = value {
+                    if let Expr::Name(namespace) = call.func.as_ref() {
+                        let prefix = format!("{}.", namespace.id);
+                        let aliases: Vec<(String, Option<Shape>)> = self
+                            .shapes
+                            .iter()
+                            .filter_map(|(name, shape)| {
+                                name.strip_prefix(&prefix)
+                                    .map(|member| (format!("{target}.{member}"), shape.clone()))
+                            })
+                            .collect();
+                        if !aliases.is_empty() {
+                            self.shape_namespaces.insert(target.clone());
                         }
+                        self.shapes.extend(aliases);
                     }
                 }
             }
         }
     }
 
-    fn invalidate_target_aliases(&mut self, target: &Expr) {
-        let mut bound = BoundNames::default();
-        bound.bind(target);
-        for name in bound.names {
-            self.aliases.invalidate(&name);
+    /// Forget everything a name was known to stand for, because something
+    /// else now stands there. A stale shape would write a rebound base's old
+    /// fields into a subclass's constructor, and stale truthiness would take
+    /// a branch the rebinding decided against.
+    fn invalidate_bound_names<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+        // Truthiness is recorded for module-level names and consulted only
+        // where a module-level test can see them. A binding in a function or
+        // class body names something else that leaves the module name alone,
+        // so forgetting the flag there would make a later module branch
+        // uncertain about a value still true when it runs.
+        let rebinds_module_name =
+            self.scope.class == ClassScope::None && self.lexical_scope.is_empty();
+        for name in names {
+            self.aliases.invalidate(name);
+            if rebinds_module_name {
+                self.known_truthiness.remove(name);
+            }
+            self.shapes
+                .remove(&qualified_class_name(&self.lexical_scope, name));
+            if let Some(bindings) = self.lexical_bindings.last_mut() {
+                bindings.insert(name.to_owned());
+            }
         }
     }
 
-    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor, _statement: &'a Stmt)
+    /// Forget everything recorded about every name `body` declares `global`
+    /// and then binds, because such a binding lands in the module namespace
+    /// and not in the body's own.
+    ///
+    /// A function body and a class body both need this, for opposite reasons.
+    /// A function body may never run at all, so nothing there can be trusted
+    /// to leave the module flag as it was; a class body always runs when the
+    /// class statement does, so its rebinding definitely happens. Either way
+    /// what a later module-level test would read is no longer the value
+    /// recorded here, and a branch settled by the stale flag picked a base the
+    /// subclass never had.
+    ///
+    /// The shape needs the same treatment for the same reason. A name bound
+    /// inside a body ordinarily stands for something only that body can see,
+    /// so shapes are keyed by the enclosing scope and the module entry rightly
+    /// survives; `global` breaks that, and a module-level class built on the
+    /// stale entry inherited fields the rebound base no longer has.
+    ///
+    /// So does what the name was imported as, except that the alias table is
+    /// the one piece of this state a nested body saves and puts back. Dropping
+    /// the name here is therefore not enough on its own, so the name is also
+    /// recorded for `restore_aliases` to drop again; otherwise an imported
+    /// `Protocol` or `ABC` came back as a structural base, and a dataclass
+    /// built on the rebound name was called with only the fields its own body
+    /// wrote.
+    ///
+    /// Only a binding that puts something behind the name counts. `global X`
+    /// followed by `X: int` declares a type and assigns nothing, so the module
+    /// name still stands for whatever it was imported or assigned as, and
+    /// forgetting it there left a later subclass with no base it could name.
+    fn forget_globals_rebound_in<'b>(&mut self, body: &'b [Stmt])
+    where
+        BoundNames: Visitor<'b>,
+    {
+        let mut declared = BoundNames::default();
+        declared.visit_body(body);
+        for name in declared.globals.intersection(&declared.names) {
+            self.aliases.invalidate(name);
+            self.known_truthiness.remove(name);
+            self.shapes.remove(name);
+            self.rebound_globals.insert(name.clone());
+        }
+    }
+
+    /// Put back the alias table a nested body was entered with, minus every
+    /// name a `global` rebinding has taken away in the meantime.
+    ///
+    /// A rebinding directly inside the body is forgotten before the table is
+    /// saved, so the saved copy already lacks it. One a scope deeper is not:
+    /// the enclosing body saved its table before the inner body was reached,
+    /// so restoring it verbatim handed a later module-level subclass an
+    /// import the module namespace no longer holds.
+    fn restore_aliases(&mut self, outer: Aliases) {
+        self.aliases = outer;
+        for name in &self.rebound_globals {
+            self.aliases.invalidate(name);
+        }
+    }
+
+    fn invalidate_target_aliases(&mut self, target: &Expr) {
+        let mut bound = BoundNames::default();
+        bound.bind(target);
+        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
+    }
+
+    /// Forget what a walrus in a `def` or `class` header rebinds.
+    ///
+    /// A header is evaluated where the statement is written, not in the scope
+    /// the statement opens: the decorators, the type parameters, a function's
+    /// parameter defaults and annotations, and a class's bases all run in the
+    /// enclosing namespace before there is anything to enter. The traversal
+    /// reaches them only after that scope has been pushed, which recorded a
+    /// module-level rebinding against the definition's own name and left the
+    /// stale module shape to write a vanished base's fields into a subclass's
+    /// constructor. The walk below stops at the body of a nested lambda, which
+    /// binds its own names; the defaults of that lambda's parameters are
+    /// evaluated in the header itself and count as part of it.
+    fn invalidate_function_header(&mut self, function: &ast::StmtFunctionDef) {
+        let mut bound = BoundNames::default();
+        for decorator in &function.decorator_list {
+            bound.visit_decorator(decorator);
+        }
+        if let Some(type_params) = &function.type_params {
+            bound.visit_type_params(type_params);
+        }
+        bound.visit_parameters(&function.parameters);
+        if let Some(returns) = &function.returns {
+            bound.visit_annotation(returns);
+        }
+        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
+    }
+
+    /// Forget what a walrus in a class header rebinds, as
+    /// `invalidate_function_header` does for a `def`.
+    fn invalidate_class_header(&mut self, class: &ast::StmtClassDef) {
+        let mut bound = BoundNames::default();
+        for decorator in &class.decorator_list {
+            bound.visit_decorator(decorator);
+        }
+        if let Some(type_params) = &class.type_params {
+            bound.visit_type_params(type_params);
+        }
+        if let Some(arguments) = &class.arguments {
+            bound.visit_arguments(arguments);
+        }
+        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
+    }
+
+    fn visit_loop<'a>(&mut self, loop_: &'a ast::StmtFor)
     where
         Self: Visitor<'a>,
     {
@@ -3491,9 +4359,7 @@ impl Checker<'_> {
             self.visit_pattern(&case.pattern);
             let mut captures = BoundNames::default();
             captures.visit_pattern(&case.pattern);
-            for name in captures.names {
-                self.aliases.invalidate(&name);
-            }
+            self.invalidate_bound_names(captures.names.iter().map(String::as_str));
             if let Some(guard) = &case.guard {
                 self.visit_expr(guard);
             }
@@ -3537,62 +4403,26 @@ impl Checker<'_> {
 
     fn class_constructs_safely(&self, class: &ast::StmtClassDef) -> bool {
         class_constructs_safely(class, &self.aliases, &self.metaclass_classes)
-            && !self.may_inherit_imported_metaclass(class)
+            && !self.inherits_unseen_import(class)
     }
 
-    fn may_inherit_imported_metaclass(&self, class: &ast::StmtClassDef) -> bool {
+    /// Whether a base of this class is an import whose fields, and whatever
+    /// metaclass builds it, this file cannot see.
+    ///
+    /// A parameter shadowing the import hides the base further rather than
+    /// revealing it, so the name it took over counts too.
+    fn inherits_unseen_import(&self, class: &ast::StmtClassDef) -> bool {
         class_bases(class).any(|base| {
-            let ordinary_import = base_root_name(base)
-                .is_some_and(|name| self.aliases.import_bindings.contains(name))
-                && !self.field_bases.matches(base, &self.aliases)
+            base_root_name(base).is_some_and(|name| {
+                self.aliases.import_bindings.contains(name)
+                    || self.aliases.invalidated_import_bindings.contains(name)
+            }) && !self.field_bases.matches(base, &self.aliases)
                 && !carries_no_fields(
                     base,
                     &self.aliases,
                     &self.local_classes,
                     &self.module_bindings,
-                );
-            if ordinary_import {
-                return true;
-            }
-            let base = match base {
-                Expr::Subscript(subscript) => subscript.value.as_ref(),
-                expression => expression,
-            };
-            let Expr::Name(name) = base else {
-                return false;
-            };
-            (0..=self.lexical_scope.len())
-                .rev()
-                .filter(|depth| !self.class_scope_depths.contains(depth))
-                .find_map(|depth| {
-                    let identity =
-                        qualified_class_name(&self.lexical_scope[..depth], name.id.as_str());
-                    self.defined_class_identities
-                        .contains(&identity)
-                        .then(|| self.imported_metaclass_classes.contains(&identity))
-                })
-                == Some(true)
-        })
-    }
-
-    fn is_enum_class(&self, class: &ast::StmtClassDef) -> bool {
-        class_bases(class).any(|base| match base {
-            Expr::Name(name) if self.aliases.enum_classes.contains(name.id.as_str()) => true,
-            Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
-                matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
-            }
-            Expr::Name(name) => (0..=self.lexical_scope.len())
-                .rev()
-                .filter(|depth| !self.class_scope_depths.contains(depth))
-                .find_map(|depth| {
-                    let identity =
-                        qualified_class_name(&self.lexical_scope[..depth], name.id.as_str());
-                    self.defined_class_identities
-                        .contains(&identity)
-                        .then(|| self.enum_class_identities.contains(&identity))
-                })
-                == Some(true),
-            _ => false,
+                )
         })
     }
 
@@ -3600,12 +4430,40 @@ impl Checker<'_> {
         generates_init(class, &self.aliases, &self.metaclass_classes)
     }
 
+    /// Whether the class is an enumeration, so the class statement itself
+    /// builds its members. Each one is created by calling the initializer the
+    /// body holds with the member's value alone, and a lookup miss reaches
+    /// `_missing_` with the value alone as well, neither through a call the
+    /// fixer can see. A base written here that is already an enumeration makes
+    /// this class one too, because enumeration membership is inherited.
+    fn is_enum_class(&self, class: &ast::StmtClassDef) -> bool {
+        class_bases(class).any(|base| match base {
+            Expr::Name(name) => {
+                self.aliases.enum_classes.contains(name.id.as_str())
+                    || self.enum_classes.contains(name.id.as_str())
+            }
+            Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
+                matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
+            }
+            _ => false,
+        })
+    }
+
     /// Note that a metaclass builds this class, so a later subclass of it is
-    /// built by that metaclass too. A later redefinition without a metaclass
-    /// clears the name so a sibling that inherits the new class is not treated
-    /// as metaclass-built.
-    fn record_metaclass_construction(&mut self, class: &ast::StmtClassDef) {
-        if declares_metaclass(class) || inherits_metaclass(class, &self.metaclass_classes) {
+    /// built by that metaclass too. An unseen imported base counts as one: the
+    /// metaclass it may carry reaches every class beneath it alike, and a
+    /// subclass written here sees no more of it than this class does. A later
+    /// redefinition without either clears the name so a sibling that inherits
+    /// the new class is not treated as metaclass-built.
+    fn record_metaclass_construction(
+        &mut self,
+        class: &ast::StmtClassDef,
+        unseen_import_base: bool,
+    ) {
+        if declares_metaclass(class)
+            || inherits_metaclass(class, &self.metaclass_classes)
+            || unseen_import_base
+        {
             self.metaclass_classes.insert(class.name.to_string());
         } else {
             self.metaclass_classes.remove(class.name.as_str());
@@ -3689,14 +4547,29 @@ impl Checker<'_> {
         Self: Visitor<'a>,
     {
         self.check_function(function);
+        self.invalidate_function_header(function);
+        self.forget_globals_rebound_in(&function.body);
         let outer = self.scope;
         let outer_aliases = self.aliases.clone();
         let outer_local_classes = self.local_classes.clone();
         let outer_metaclass_classes = self.metaclass_classes.clone();
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
-        let outer_known_truthiness = self.known_truthiness.clone();
+        let outer_enum_classes = self.enum_classes.clone();
+        // Written straight in a class body, this function sees none of the
+        // names that body binds: a class written above it there is not in
+        // scope here, and reading a base through it would answer with a class
+        // the method never builds on. What the class statement started with is
+        // what the body reaches instead.
+        if self.lexical_is_class.last() == Some(&true) {
+            if let Some(entered) = self.entered_class_metaclass_classes.last() {
+                self.metaclass_classes.clone_from(entered);
+            }
+        }
         let mut parameters = BoundNames::default();
         parameters.parameters(&function.parameters);
+        // A parameter is bound the moment the body starts, so it hides an
+        // enclosing class of the same name for everything the body does.
+        let parameter_names = parameters.names.clone();
         for name in parameters.names {
             self.aliases.invalidate_parameter(&name);
         }
@@ -3713,22 +4586,24 @@ impl Checker<'_> {
         collect_repeated_functions(&function.body, &mut function_names, &mut repeated_functions);
         self.repeated_functions = repeated_functions;
         self.lexical_scope.push(function.name.to_string());
+        self.lexical_is_class.push(false);
+        self.lexical_bindings.push(parameter_names);
         walk_stmt(self, statement);
+        self.lexical_bindings.pop();
+        self.lexical_is_class.pop();
         self.lexical_scope.pop();
         self.repeated_functions = outer_repeated_functions;
-        self.aliases = outer_aliases;
+        self.restore_aliases(outer_aliases);
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
         self.metaclass_definitions = outer_metaclass_definitions;
-        self.known_truthiness = outer_known_truthiness;
+        self.enum_classes = outer_enum_classes;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
 
     fn is_stub(&self) -> bool {
-        self.path
-            .extension()
-            .is_some_and(|extension| extension == "pyi")
+        is_stub(self.path)
     }
 
     fn qualified_class(&self, name: &str, direct_class_member: bool) -> String {
@@ -3749,6 +4624,7 @@ impl Checker<'_> {
         self.instance_attributes.pop();
         self.class_deletions.pop();
         self.class_assignments.pop();
+        self.class_rewraps.pop();
         self.method_aliases.pop();
     }
 
@@ -3839,11 +4715,7 @@ impl Checker<'_> {
     /// legitimately omit the argument. Nothing in the source code changes to
     /// match, because a stub has no runtime behaviour to change.
     fn fixable(&self, default: &Expr, fix: TextRange) -> Option<TextRange> {
-        let stub = self
-            .path
-            .extension()
-            .is_some_and(|extension| extension == "pyi");
-        if stub && matches!(default, Expr::EllipsisLiteral(_)) {
+        if self.is_stub() && matches!(default, Expr::EllipsisLiteral(_)) {
             return None;
         }
         Some(fix)
@@ -3970,10 +4842,28 @@ impl Checker<'_> {
         });
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "all default-retention conditions share the same ordered parameter pass"
-    )]
+    /// Whether reading an attribute runs `function`, leaving no call site a
+    /// fixer could update. That holds for a `@property`, for a property alias
+    /// in the same class body, and for one in another class that names this
+    /// method.
+    fn descriptor_invokes(&self, function: &ast::StmtFunctionDef) -> bool {
+        if self.scope.class == ClassScope::None {
+            return false;
+        }
+        is_property(function, &self.aliases, &self.module_bindings)
+            || self.method_aliases.last().is_some_and(|aliases| {
+                aliases.get(function.name.as_str()).is_some_and(|aliases| {
+                    aliases
+                        .iter()
+                        .any(|alias| alias.kind == MethodAliasKind::Property)
+                })
+            })
+            || self.classes.last().is_some_and(|class| {
+                self.property_aliased_methods
+                    .contains(&(class.name.clone(), function.name.to_string()))
+            })
+    }
+
     fn check_function(&mut self, function: &ast::StmtFunctionDef) {
         if !self.enabled(function.name.as_str()) {
             return;
@@ -3982,18 +4872,9 @@ impl Checker<'_> {
         // locates the `def` line that a signature-wide directive sits on.
         let enclosing = self.header;
         self.header = Some(line_start(self.source, function.name.start()));
-        let descriptor_invoked = self.scope.class != ClassScope::None
-            && (is_property(function, &self.aliases, &self.module_bindings)
-                || self.method_aliases.last().is_some_and(|aliases| {
-                    aliases.get(function.name.as_str()).is_some_and(|aliases| {
-                        aliases
-                            .iter()
-                            .any(|alias| alias.kind == MethodAliasKind::Property)
-                    })
-                }));
+        let descriptor_invoked = self.descriptor_invokes(function);
         let implicitly_called = self.scope.class != ClassScope::None
-            && self.scope.fields == Some(FieldStyle::Dataclass)
-            && function.name.as_str() == "__post_init__";
+            && self.generated_code_calls(function.name.as_str());
         let mut removed = Vec::new();
         let known_descriptor = |expression: &Expr| match expression {
             Expr::Name(name) => {
@@ -4101,18 +4982,45 @@ impl Checker<'_> {
                     aliases.iter().any(|alias| {
                         implicitly_called_method(&alias.name)
                             || matches!(alias.name.as_str(), "__init__" | "__new__")
+                            || self.generated_code_calls(&alias.name)
                     })
                 })
             })
     }
 
+    /// Whether a method of this name is reached from code the decorator
+    /// generates rather than from a call written in the source.
+    ///
+    /// `@dataclass` writes an `__init__` that calls `__post_init__` with the
+    /// `InitVar` fields and nothing else, so a default there has no call site
+    /// to be carried to and has to stay where it is. The same holds when the
+    /// hook is a method defined under another name and then aliased, because
+    /// the generated call finds it by the name it is bound to.
+    fn generated_code_calls(&self, name: &str) -> bool {
+        self.scope.fields == Some(FieldStyle::Dataclass) && name == "__post_init__"
+    }
+
     fn method_is_rebound_later(&self, function: &ast::StmtFunctionDef) -> bool {
-        self.scope.class != ClassScope::None
-            && self.class_assignments.last().is_some_and(|assignments| {
-                assignments
-                    .get(function.name.as_str())
-                    .is_some_and(|offsets| offsets.iter().any(|offset| *offset > function.start()))
-            })
+        if self.scope.class == ClassScope::None {
+            return false;
+        }
+        // `target = staticmethod(target)` assigns the name a second time but
+        // keeps the same function behind it, so it replaces nothing. Every
+        // other later assignment does, including one that follows a rewrap.
+        let rewraps = self
+            .class_rewraps
+            .last()
+            .and_then(|rewraps| rewraps.get(function.name.as_str()));
+        self.class_assignments.last().is_some_and(|assignments| {
+            assignments
+                .get(function.name.as_str())
+                .is_some_and(|offsets| {
+                    offsets.iter().any(|offset| {
+                        *offset > function.start()
+                            && !rewraps.is_some_and(|rewraps| rewraps.contains(offset))
+                    })
+                })
+        })
     }
 
     /// Record what a call to this function has to be given back, under every
@@ -4120,7 +5028,7 @@ impl Checker<'_> {
     fn record_signature(&mut self, function: &ast::StmtFunctionDef, removed: Vec<Removed>) {
         let parameter_name =
             |parameter: &ast::ParameterWithDefault| parameter.parameter.name.to_string();
-        let signature = Signature {
+        let mut signature = Signature {
             name: if self.scope.class == ClassScope::None {
                 qualified_lexical_name(&self.lexical_scope, function.name.as_str())
             } else {
@@ -4150,20 +5058,40 @@ impl Checker<'_> {
                 .method_aliases
                 .last()
                 .and_then(|aliases| aliases.get(function.name.as_str()))
+                .cloned()
             {
+                // Another name still takes the receiver the method itself
+                // declared, so read that before a same-name wrapper rewrites
+                // it below.
+                let declared = match &signature.kind {
+                    Callable::Method { receiver, .. } => *receiver,
+                    _ => Receiver::None,
+                };
+                // `target = staticmethod(target)` rebinds the method's own
+                // name rather than adding a second one. The wrapper decides
+                // how the one name is called, so it belongs on the signature
+                // already being emitted: a second signature under that name
+                // would collide with it and lose both.
+                if let Some(rebound) = aliases
+                    .iter()
+                    .rev()
+                    .find(|alias| alias.name == function.name.as_str())
+                {
+                    if let Callable::Method { receiver, .. } = &mut signature.kind {
+                        *receiver = alias_receiver(rebound.kind, declared);
+                    }
+                }
                 self.signatures.extend(aliases.iter().filter_map(|alias| {
-                    if alias.original_class.is_some() || alias.kind == MethodAliasKind::Property {
+                    if alias.original_class.is_some()
+                        || alias.kind == MethodAliasKind::Property
+                        || alias.name == function.name.as_str()
+                    {
                         return None;
                     }
                     let mut alias_signature = signature.clone();
                     alias_signature.name.clone_from(&alias.name);
                     if let Callable::Method { receiver, .. } = &mut alias_signature.kind {
-                        *receiver = match alias.kind {
-                            MethodAliasKind::Direct => *receiver,
-                            MethodAliasKind::Static => Receiver::None,
-                            MethodAliasKind::Class => Receiver::Class,
-                            MethodAliasKind::Property => unreachable!(),
-                        };
+                        *receiver = alias_receiver(alias.kind, declared);
                     }
                     Some(alias_signature)
                 }));
@@ -4289,7 +5217,11 @@ impl Checker<'_> {
 
     /// Index aliases copied from a same-file class whose signature has already
     /// been collected. Unknown and forward-referenced classes stay unresolved.
-    fn record_inherited_method_aliases(&mut self) {
+    ///
+    /// `direct_class_member` says whether the class being collected is written
+    /// straight in a class body, which is what decides how the class it copies
+    /// from is named.
+    fn record_inherited_method_aliases(&mut self, direct_class_member: bool) {
         let (Some(class), Some(aliases)) = (self.classes.last(), self.method_aliases.last()) else {
             return;
         };
@@ -4299,7 +5231,31 @@ impl Checker<'_> {
                 let Some(original_class) = &alias.original_class else {
                     continue;
                 };
-                let original_class = qualified_class_name(&self.lexical_scope, original_class);
+                // Reading the attribute runs the getter, so a property alias
+                // names no call for the fixer to rewrite.
+                if alias.kind == MethodAliasKind::Property {
+                    continue;
+                }
+                // The class an alias copies from is written beside the one
+                // being collected, so it is identified the way that one is:
+                // under the class holding both where both are written straight
+                // in a class body, and under the scopes around them where they
+                // are not. A function body is one of those scopes, and naming a
+                // class in there as though it sat beside a module-level one
+                // matches nothing, or matches a namesake written elsewhere and
+                // takes its parameters.
+                let original_class = if direct_class_member {
+                    qualified_name(
+                        self.classes
+                            .len()
+                            .checked_sub(2)
+                            .and_then(|parent| self.classes.get(parent))
+                            .map(|parent| parent.qualified.as_str()),
+                        original_class,
+                    )
+                } else {
+                    qualified_lexical_name(&self.lexical_scope, original_class)
+                };
                 let Some(signature) = self.signatures.iter().find(|signature| {
                     signature.name == *method
                         && matches!(
@@ -4311,8 +5267,13 @@ impl Checker<'_> {
                 };
                 let mut signature = signature.clone();
                 signature.name.clone_from(&alias.name);
-                if let Callable::Method { class: owner, .. } = &mut signature.kind {
+                if let Callable::Method {
+                    class: owner,
+                    receiver,
+                } = &mut signature.kind
+                {
                     owner.clone_from(&class.qualified);
+                    *receiver = alias_receiver(alias.kind, *receiver);
                 }
                 inherited.push(signature);
             }
@@ -4528,18 +5489,21 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::If(branch) => self.visit_conditional(branch),
             Stmt::Try(_) => self.visit_uncertain(statement),
             Stmt::Match(block) => self.visit_match(block),
-            Stmt::For(loop_) => self.visit_loop(loop_, statement),
+            Stmt::For(loop_) => self.visit_loop(loop_),
             Stmt::While(loop_) => self.visit_while(loop_, statement),
             Stmt::With(block) => self.visit_with(block),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
             Stmt::ClassDef(class) => {
+                self.invalidate_class_header(class);
+                self.forget_globals_rebound_in(&class.body);
                 let outer = self.scope;
                 let outer_aliases = self.aliases.clone();
                 let outer_local_classes = self.local_classes.clone();
                 let outer_metaclass_classes = self.metaclass_classes.clone();
                 let outer_metaclass_definitions = self.metaclass_definitions.clone();
-                let outer_known_truthiness = self.known_truthiness.clone();
+                let outer_enum_classes = self.enum_classes.clone();
+                let enum_class = self.is_enum_class(class);
                 let outer_repeated_functions = self.repeated_functions.clone();
                 let mut method_names = BTreeSet::new();
                 let mut repeated_methods = BTreeSet::new();
@@ -4548,18 +5512,6 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let old_header = self.header;
                 self.header = Some(line_start(self.source, class.name.start()));
                 let style = self.class_field_style(class);
-                let identity = qualified_class_name(&self.lexical_scope, class.name.as_str());
-                let inherits_imported_metaclass = self.may_inherit_imported_metaclass(class);
-                let enum_class = self.is_enum_class(class);
-                self.defined_class_identities.insert(identity.clone());
-                self.imported_metaclass_classes.remove(&identity);
-                if inherits_imported_metaclass {
-                    self.imported_metaclass_classes.insert(identity.clone());
-                }
-                self.enum_class_identities.remove(&identity);
-                if enum_class {
-                    self.enum_class_identities.insert(identity);
-                }
                 self.scope = Scope {
                     private: self.encloses_private(class.name.as_str(), outer),
                     fields: style,
@@ -4573,6 +5525,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     // written here.
                     kept_default: false,
                 };
+                // Read where the header is: the tables the predicate consults
+                // are the enclosing scope's until the body has been walked,
+                // and a name the body binds says nothing about the base the
+                // header already resolved.
+                let unseen_import_base = self.inherits_unseen_import(class);
                 self.class_constructs
                     .push(self.class_constructs_safely(class));
                 let defines_iterator_method = |expected: &str| {
@@ -4591,7 +5548,17 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.instance_attributes.push(instance_attributes(class));
                 self.class_deletions.push(deleted_names(&class.body));
                 self.class_assignments.push(class_assignments(&class.body));
-                self.method_aliases.push(class_method_aliases(class));
+                self.class_rewraps.push(class_rewraps(
+                    &class.body,
+                    &self.aliases,
+                    &self.module_bindings,
+                ));
+                let context = AliasContext {
+                    aliases: &self.aliases,
+                    module_bindings: &self.module_bindings,
+                };
+                self.method_aliases
+                    .push(class_method_aliases(class, context));
                 if self.collect_signatures {
                     let inherited = self.inherited_fields(class, style);
                     // A base of this file's own contributes its fields ahead of
@@ -4622,21 +5589,58 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         fields,
                         removed,
                     });
-                    self.record_inherited_method_aliases();
+                    self.record_inherited_method_aliases(outer.class != ClassScope::None);
                 }
+                // A class written in another class body is built from the
+                // names that body holds, so its bases were read above with
+                // them in place. Its own body reaches past them, though:
+                // neither class scope is a closure, so what the enclosing
+                // class statement started with is what this body starts with.
+                let body_metaclass_classes = if self.lexical_is_class.last() == Some(&true) {
+                    self.entered_class_metaclass_classes
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| outer_metaclass_classes.clone())
+                } else {
+                    outer_metaclass_classes.clone()
+                };
                 self.lexical_scope.push(class.name.to_string());
-                self.class_scope_depths.push(self.lexical_scope.len());
+                self.lexical_is_class.push(true);
+                self.lexical_bindings.push(BTreeSet::new());
+                self.metaclass_classes.clone_from(&body_metaclass_classes);
+                self.entered_class_metaclass_classes
+                    .push(body_metaclass_classes);
                 walk_stmt(self, statement);
-                self.class_scope_depths.pop();
+                self.entered_class_metaclass_classes.pop();
+                self.lexical_bindings.pop();
+                self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 // The class name becomes visible only after its body has
                 // executed. A later class with the same name must not change
                 // how this class's bases were resolved.
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
+                // The statement binds the name in the scope around it whether
+                // or not the class it writes has a shape worth recording. A
+                // plain class stands between the name and an enclosing
+                // dataclass of the same spelling exactly as a parameter or a
+                // rebinding does, and reading past it would hand a subclass
+                // fields its base has never had.
+                if let Some(bindings) = self.lexical_bindings.last_mut() {
+                    bindings.insert(class.name.to_string());
+                }
                 self.metaclass_classes = outer_metaclass_classes;
-                self.record_metaclass_construction(class);
+                self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
+                self.enum_classes = outer_enum_classes;
+                // A later class of the same name that is no enumeration clears
+                // the name, so a sibling built on the new class is not treated
+                // as one.
+                if enum_class {
+                    self.enum_classes.insert(class.name.to_string());
+                } else {
+                    self.enum_classes.remove(class.name.as_str());
+                }
                 self.repeated_functions = outer_repeated_functions;
                 if defines_metaclass(class, &self.metaclass_definitions) {
                     self.metaclass_definitions.insert(class.name.to_string());
@@ -4679,9 +5683,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     }
                 }
                 self.header = old_header;
-                self.aliases = outer_aliases;
+                self.restore_aliases(outer_aliases);
                 self.aliases.invalidate(class.name.as_str());
-                self.known_truthiness = outer_known_truthiness;
                 self.scope = outer;
             }
             _ => {
@@ -4695,51 +5698,28 @@ impl<'a> Visitor<'a> for Checker<'a> {
     }
 
     fn visit_expr(&mut self, expression: &'a Expr) {
-        if let Expr::Lambda(lambda) = expression {
-            self.check_lambda(lambda);
-            if let Some(parameters) = &lambda.parameters {
-                for default in parameters
-                    .posonlyargs
-                    .iter()
-                    .chain(&parameters.args)
-                    .chain(&parameters.kwonlyargs)
-                    .filter_map(|parameter| parameter.default.as_deref())
-                {
-                    self.visit_expr(default);
-                }
-            }
-            let outer_aliases = self.aliases.clone();
-            self.visit_expr(&lambda.body);
-            self.aliases = outer_aliases;
-            return;
-        }
-        if let Expr::Generator(generator) = expression {
-            let Some((first, rest)) = generator.generators.split_first() else {
-                return;
-            };
-            // Creating a generator evaluates only its leftmost iterable. The
-            // targets, filters, remaining iterables, and element run later.
-            self.visit_expr(&first.iter);
-            let outer_aliases = self.aliases.clone();
-            self.visit_expr(&first.target);
-            for condition in &first.ifs {
-                self.visit_expr(condition);
-            }
-            for clause in rest {
-                self.visit_expr(&clause.iter);
-                self.visit_expr(&clause.target);
-                for condition in &clause.ifs {
-                    self.visit_expr(condition);
-                }
-            }
-            self.visit_expr(&generator.elt);
-            self.aliases = outer_aliases;
-            return;
-        }
         if let Expr::Named(named) = expression {
             self.visit_expr(&named.value);
             self.visit_expr(&named.target);
-            self.invalidate_target_aliases(&named.target);
+            // A walrus in a lambda binds in the lambda's own scope, which
+            // nothing outside the lambda ever reads, so the name it shares a
+            // spelling with still stands for what the enclosing scope gave it.
+            if self.lambda_bodies == 0 {
+                self.invalidate_target_aliases(&named.target);
+            }
+            return;
+        }
+        if let Expr::Lambda(lambda) = expression {
+            self.check_lambda(lambda);
+            // Only the body runs in the lambda's scope. Its parameter defaults
+            // and annotations are evaluated where the lambda is written, so a
+            // walrus among them rebinds there.
+            if let Some(parameters) = &lambda.parameters {
+                self.visit_parameters(parameters);
+            }
+            self.lambda_bodies += 1;
+            self.visit_expr(&lambda.body);
+            self.lambda_bodies -= 1;
             return;
         }
         walk_expr(self, expression);
@@ -4944,8 +5924,6 @@ struct Aliases {
     pydantic_private_attrs: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
     pydantic_modules: BTreeSet<String>,
-    enum_classes: BTreeSet<String>,
-    enum_modules: BTreeSet<String>,
     staticmethods: BTreeSet<String>,
     classmethods: BTreeSet<String>,
     properties: BTreeSet<String>,
@@ -4954,8 +5932,11 @@ struct Aliases {
     class_vars: BTreeSet<String>,
     typing_modules: BTreeSet<String>,
     abc_modules: BTreeSet<String>,
+    enum_modules: BTreeSet<String>,
+    enum_classes: BTreeSet<String>,
     structural_bases: BTreeSet<String>,
     invalidated_structural_bases: BTreeSet<String>,
+    invalidated_import_bindings: BTreeSet<String>,
     type_checking: BTreeSet<String>,
     kw_only_markers: BTreeSet<String>,
 }
@@ -4975,8 +5956,6 @@ impl Aliases {
         self.pydantic_private_attrs.remove(name);
         self.dataclasses_modules.remove(name);
         self.pydantic_modules.remove(name);
-        self.enum_classes.remove(name);
-        self.enum_modules.remove(name);
         self.staticmethods.remove(name);
         self.classmethods.remove(name);
         self.supers.remove(name);
@@ -4984,6 +5963,8 @@ impl Aliases {
         self.class_vars.remove(name);
         self.typing_modules.remove(name);
         self.abc_modules.remove(name);
+        self.enum_modules.remove(name);
+        self.enum_classes.remove(name);
         self.structural_bases.remove(name);
         self.type_checking.remove(name);
         self.kw_only_markers.remove(name);
@@ -4996,6 +5977,12 @@ impl Aliases {
             || self.structural_bases.contains(name)
         {
             self.invalidated_structural_bases.insert(name.to_owned());
+        }
+        // Whatever the caller passes is no more visible than the import it
+        // covers, so a base spelled with the parameter's name is still one
+        // whose fields this file cannot see.
+        if self.import_bindings.contains(name) {
+            self.invalidated_import_bindings.insert(name.to_owned());
         }
         self.invalidate(name);
     }
@@ -5079,6 +6066,22 @@ impl Aliases {
         }
     }
 
+    fn collect_enum_members(&mut self, import: &ast::StmtImportFrom) {
+        if import
+            .module
+            .as_ref()
+            .is_none_or(|module| module.as_str() != "enum")
+        {
+            return;
+        }
+        for alias in &import.names {
+            if alias.name.as_str() == "Enum" {
+                self.enum_classes
+                    .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
+            }
+        }
+    }
+
     /// Collect the renaming imports visible in one lexical scope, including
     /// those nested in control-flow blocks but not nested definitions.
     /// The names a plain `import` binds for the modules whose members matter.
@@ -5103,13 +6106,6 @@ impl Aliases {
                         .as_ref()
                         .map_or_else(|| "pydantic".to_owned(), ToString::to_string),
                 );
-            } else if alias.name.as_str() == "enum" {
-                self.enum_modules.insert(
-                    alias
-                        .asname
-                        .as_ref()
-                        .map_or_else(|| "enum".to_owned(), ToString::to_string),
-                );
             } else if alias.name.as_str() == "builtins" {
                 self.builtins_modules.insert(
                     alias
@@ -5131,22 +6127,13 @@ impl Aliases {
                         .as_ref()
                         .map_or_else(|| "abc".to_owned(), ToString::to_string),
                 );
-            }
-        }
-    }
-
-    fn collect_enum_members(&mut self, import: &ast::StmtImportFrom) {
-        if import
-            .module
-            .as_ref()
-            .is_none_or(|module| module.as_str() != "enum")
-        {
-            return;
-        }
-        for alias in &import.names {
-            if alias.name.as_str() == "Enum" {
-                self.enum_classes
-                    .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
+            } else if alias.name.as_str() == "enum" {
+                self.enum_modules.insert(
+                    alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| "enum".to_owned(), ToString::to_string),
+                );
             }
         }
     }
@@ -5373,54 +6360,59 @@ fn defines_metaclass(class: &ast::StmtClassDef, known: &BTreeSet<String>) -> boo
     })
 }
 
-type LexicalClass<'a> = (&'a ast::StmtClassDef, String, Vec<String>);
+/// A class the file defines, the name it is spelled with from the module, the
+/// scopes holding it, and whether a function body defers its creation — one
+/// written in a function is built when that function runs, so it sees names
+/// the module binds after it.
+type LexicalClass<'a> = (&'a ast::StmtClassDef, String, Vec<String>, bool);
 
 fn collect_lexical_classes<'a>(
     suite: &'a [Stmt],
     scope: &mut Vec<String>,
+    deferred: bool,
     classes: &mut Vec<LexicalClass<'a>>,
 ) {
     for statement in suite {
         match statement {
             Stmt::ClassDef(class) => {
                 let qualified = qualified_class_name(scope, class.name.as_str());
-                classes.push((class, qualified, scope.clone()));
+                classes.push((class, qualified, scope.clone(), deferred));
                 scope.push(class.name.to_string());
-                collect_lexical_classes(&class.body, scope, classes);
+                collect_lexical_classes(&class.body, scope, deferred, classes);
                 scope.pop();
             }
             Stmt::FunctionDef(function) => {
                 scope.push(function.name.to_string());
-                collect_lexical_classes(&function.body, scope, classes);
+                collect_lexical_classes(&function.body, scope, true, classes);
                 scope.pop();
             }
             Stmt::If(branch) => {
-                collect_lexical_classes(&branch.body, scope, classes);
+                collect_lexical_classes(&branch.body, scope, deferred, classes);
                 for clause in &branch.elif_else_clauses {
-                    collect_lexical_classes(&clause.body, scope, classes);
+                    collect_lexical_classes(&clause.body, scope, deferred, classes);
                 }
             }
             Stmt::For(loop_) => {
-                collect_lexical_classes(&loop_.body, scope, classes);
-                collect_lexical_classes(&loop_.orelse, scope, classes);
+                collect_lexical_classes(&loop_.body, scope, deferred, classes);
+                collect_lexical_classes(&loop_.orelse, scope, deferred, classes);
             }
             Stmt::While(loop_) => {
-                collect_lexical_classes(&loop_.body, scope, classes);
-                collect_lexical_classes(&loop_.orelse, scope, classes);
+                collect_lexical_classes(&loop_.body, scope, deferred, classes);
+                collect_lexical_classes(&loop_.orelse, scope, deferred, classes);
             }
-            Stmt::With(block) => collect_lexical_classes(&block.body, scope, classes),
+            Stmt::With(block) => collect_lexical_classes(&block.body, scope, deferred, classes),
             Stmt::Try(block) => {
-                collect_lexical_classes(&block.body, scope, classes);
+                collect_lexical_classes(&block.body, scope, deferred, classes);
                 for handler in &block.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                    collect_lexical_classes(&handler.body, scope, classes);
+                    collect_lexical_classes(&handler.body, scope, deferred, classes);
                 }
-                collect_lexical_classes(&block.orelse, scope, classes);
-                collect_lexical_classes(&block.finalbody, scope, classes);
+                collect_lexical_classes(&block.orelse, scope, deferred, classes);
+                collect_lexical_classes(&block.finalbody, scope, deferred, classes);
             }
             Stmt::Match(block) => {
                 for case in &block.cases {
-                    collect_lexical_classes(&case.body, scope, classes);
+                    collect_lexical_classes(&case.body, scope, deferred, classes);
                 }
             }
             _ => {}
@@ -5429,16 +6421,30 @@ fn collect_lexical_classes<'a>(
 }
 
 /// Same-file classes whose metaclass can replace attributes read on the class.
+/// The name a base expression is written with, seeing through a subscript.
+///
+/// `Parent[int]` builds on `Parent`, so a subclass written that way inherits
+/// whatever `Parent` carries, and `pkg.Parent[int]` keeps its dotted spelling
+/// for the scope lookup to resolve.
+fn base_dotted_name(base: &Expr) -> Option<String> {
+    match base {
+        Expr::Subscript(subscript) => base_dotted_name(&subscript.value),
+        _ => dotted_name(base),
+    }
+}
+
 fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
     let mut classes = Vec::new();
-    collect_lexical_classes(suite, &mut Vec::new(), &mut classes);
+    collect_lexical_classes(suite, &mut Vec::new(), false, &mut classes);
     let resolve = |name: &str, scope: &[String], before: usize| {
         (0..=scope.len()).rev().find_map(|length| {
             let candidate = qualified_class_name(&scope[..length], name);
             let matches: Vec<usize> = classes[..before]
                 .iter()
                 .enumerate()
-                .filter_map(|(index, (_, qualified, _))| (qualified == &candidate).then_some(index))
+                .filter_map(|(index, (_, qualified, _, _))| {
+                    (qualified == &candidate).then_some(index)
+                })
                 .collect();
             (!matches.is_empty()).then_some(matches)
         })
@@ -5449,17 +6455,20 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
     let mut changed = true;
     while changed {
         changed = false;
-        for (index, (class, _, scope)) in classes.iter().enumerate() {
+        for (index, (class, _, scope, deferred)) in classes.iter().enumerate() {
+            // A class built when a function runs sees every module-level name,
+            // including those bound after the function was written.
+            let visible = if *deferred { classes.len() } else { index };
             let bases = class
                 .arguments
                 .as_deref()
                 .into_iter()
                 .flat_map(|arguments| &arguments.args)
-                .filter_map(dotted_name);
+                .filter_map(base_dotted_name);
             let base_names: Vec<String> = bases.collect();
             let is_metaclass = base_names.iter().any(|base| {
                 base == "type"
-                    || resolve(base, scope, index)
+                    || resolve(base, scope, visible)
                         .is_some_and(|bases| bases.iter().any(|base| metaclasses.contains(base)))
             });
             if is_metaclass && metaclasses.insert(index) {
@@ -5471,7 +6480,7 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
             if is_metaclass
                 && (defines_getattribute
                     || base_names.iter().any(|base| {
-                        resolve(base, scope, index).is_some_and(|bases| {
+                        resolve(base, scope, visible).is_some_and(|bases| {
                             bases
                                 .iter()
                                 .any(|base| intercepting_metaclasses.contains(base))
@@ -5488,7 +6497,7 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
                         .as_ref()
                         .is_some_and(|name| name.as_str() == "metaclass")
                         && dotted_name(&keyword.value).is_some_and(|name| {
-                            resolve(&name, scope, index).is_some_and(|bases| {
+                            resolve(&name, scope, visible).is_some_and(|bases| {
                                 bases
                                     .iter()
                                     .any(|base| intercepting_metaclasses.contains(base))
@@ -5498,7 +6507,7 @@ fn metaclass_intercepted_classes(suite: &[Stmt]) -> BTreeSet<String> {
             });
             if (declared_interceptor
                 || base_names.iter().any(|base| {
-                    resolve(base, scope, index)
+                    resolve(base, scope, visible)
                         .is_some_and(|bases| bases.iter().any(|base| intercepted.contains(base)))
                 }))
                 && intercepted.insert(index)
@@ -5519,11 +6528,8 @@ fn inherits_metaclass(class: &ast::StmtClassDef, metaclass_classes: &BTreeSet<St
         arguments
             .args
             .iter()
-            .filter_map(|base| match base {
-                Expr::Name(name) => Some(name.id.as_str()),
-                _ => None,
-            })
-            .any(|base| metaclass_classes.contains(base))
+            .filter_map(base_dotted_name)
+            .any(|base| metaclass_classes.contains(&base))
     })
 }
 
@@ -5566,15 +6572,38 @@ fn generates_init(
 /// Direct method aliases created in a class namespace. Python applies the
 /// descriptor protocol to both names, so calls through either spelling have
 /// the same implicit receiver and parameters.
-fn class_method_aliases(class: &ast::StmtClassDef) -> BTreeMap<String, Vec<MethodAlias>> {
+/// How a call through an alias passes its receiver. A `staticmethod` wrapper
+/// takes none and a `classmethod` wrapper takes the class, whatever the
+/// original method declared.
+fn alias_receiver(kind: MethodAliasKind, original: Receiver) -> Receiver {
+    match kind {
+        MethodAliasKind::Direct | MethodAliasKind::Property => original,
+        MethodAliasKind::Static => Receiver::None,
+        MethodAliasKind::Class => Receiver::Class,
+    }
+}
+
+/// What class-body alias collection reads to recognise a descriptor wrapper
+/// written under an alias or qualified through a `builtins` import.
+#[derive(Clone, Copy)]
+struct AliasContext<'a> {
+    aliases: &'a Aliases,
+    module_bindings: &'a BTreeSet<String>,
+}
+
+fn class_method_aliases(
+    class: &ast::StmtClassDef,
+    context: AliasContext<'_>,
+) -> BTreeMap<String, Vec<MethodAlias>> {
     let mut aliases = BTreeMap::<String, Vec<MethodAlias>>::new();
     let mut origins = BTreeMap::<String, (String, MethodAliasKind, Option<String>)>::new();
-    collect_class_method_aliases(&class.body, &mut aliases, &mut origins);
+    collect_class_method_aliases(&class.body, context, &mut aliases, &mut origins);
     aliases
 }
 
 fn collect_class_method_aliases(
     statements: &[Stmt],
+    context: AliasContext<'_>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
     origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
@@ -5582,17 +6611,17 @@ fn collect_class_method_aliases(
         match statement {
             Stmt::Assign(assign) => {
                 for target in &assign.targets {
-                    record_method_alias(target, &assign.value, aliases, origins);
+                    record_method_alias(target, &assign.value, context, aliases, origins);
                 }
             }
             Stmt::AnnAssign(assign) => {
                 if let Some(value) = &assign.value {
-                    record_method_alias(&assign.target, value, aliases, origins);
+                    record_method_alias(&assign.target, value, context, aliases, origins);
                 }
             }
             Stmt::Expr(expression) => {
                 if let Expr::Named(named) = expression.value.as_ref() {
-                    record_method_alias(&named.target, &named.value, aliases, origins);
+                    record_method_alias(&named.target, &named.value, context, aliases, origins);
                 }
             }
             Stmt::If(branch) => {
@@ -5603,23 +6632,26 @@ fn collect_class_method_aliases(
                             .iter()
                             .map(|clause| clause.body.as_slice()),
                     ),
+                    context,
                     aliases,
                     origins,
                 );
             }
             Stmt::For(loop_) => collect_alias_branches(
                 [loop_.body.as_slice(), loop_.orelse.as_slice()],
+                context,
                 aliases,
                 origins,
             ),
             Stmt::While(loop_) => collect_alias_branches(
                 [loop_.body.as_slice(), loop_.orelse.as_slice()],
+                context,
                 aliases,
                 origins,
             ),
             Stmt::With(block) => {
                 let mut branch_origins = origins.clone();
-                collect_class_method_aliases(&block.body, aliases, &mut branch_origins);
+                collect_class_method_aliases(&block.body, context, aliases, &mut branch_origins);
             }
             Stmt::Try(block) => {
                 let handlers = block.handlers.iter().map(|handler| {
@@ -5634,12 +6666,14 @@ fn collect_class_method_aliases(
                     ]
                     .into_iter()
                     .chain(handlers),
+                    context,
                     aliases,
                     origins,
                 );
             }
             Stmt::Match(block) => collect_alias_branches(
                 block.cases.iter().map(|case| case.body.as_slice()),
+                context,
                 aliases,
                 origins,
             ),
@@ -5650,24 +6684,28 @@ fn collect_class_method_aliases(
 
 fn collect_alias_branches<'a>(
     branches: impl IntoIterator<Item = &'a [Stmt]>,
+    context: AliasContext<'_>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
     origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     for branch in branches {
         let mut branch_origins = origins.clone();
-        collect_class_method_aliases(branch, aliases, &mut branch_origins);
+        collect_class_method_aliases(branch, context, aliases, &mut branch_origins);
     }
 }
 
 fn record_method_alias(
     target: &Expr,
     value: &Expr,
+    context: AliasContext<'_>,
     aliases: &mut BTreeMap<String, Vec<MethodAlias>>,
     origins: &mut BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) {
     match (target, value) {
         (Expr::Name(alias), value) => {
-            let Some((original, kind, original_class)) = method_alias_origin(value, origins) else {
+            let Some((original, kind, original_class)) =
+                method_alias_origin(value, context, origins)
+            else {
                 return;
             };
             aliases
@@ -5682,12 +6720,12 @@ fn record_method_alias(
         }
         (Expr::Tuple(targets), Expr::Tuple(values)) if targets.elts.len() == values.elts.len() => {
             for (target, value) in targets.elts.iter().zip(&values.elts) {
-                record_method_alias(target, value, aliases, origins);
+                record_method_alias(target, value, context, aliases, origins);
             }
         }
         (Expr::List(targets), Expr::List(values)) if targets.elts.len() == values.elts.len() => {
             for (target, value) in targets.elts.iter().zip(&values.elts) {
-                record_method_alias(target, value, aliases, origins);
+                record_method_alias(target, value, context, aliases, origins);
             }
         }
         _ => {}
@@ -5696,6 +6734,7 @@ fn record_method_alias(
 
 fn method_alias_origin(
     value: &Expr,
+    context: AliasContext<'_>,
     origins: &BTreeMap<String, (String, MethodAliasKind, Option<String>)>,
 ) -> Option<(String, MethodAliasKind, Option<String>)> {
     match value {
@@ -5718,22 +6757,14 @@ fn method_alias_origin(
         Expr::Call(call)
             if call.arguments.args.len() == 1 && call.arguments.keywords.is_empty() =>
         {
-            let Expr::Name(wrapper) = call.func.as_ref() else {
-                return None;
-            };
-            let kind = match wrapper.id.as_str() {
-                "staticmethod" => MethodAliasKind::Static,
-                "classmethod" => MethodAliasKind::Class,
-                "property" => MethodAliasKind::Property,
-                _ => return None,
-            };
-            let Expr::Name(original) = &call.arguments.args[0] else {
-                return None;
-            };
-            let (root, original_class) = origins.get(original.id.as_str()).map_or_else(
-                || (original.id.to_string(), None),
-                |(root, _, original_class)| (root.clone(), original_class.clone()),
-            );
+            let kind =
+                descriptor_wrapper_kind(&call.func, context.aliases, context.module_bindings)?;
+            // The wrapper decides how the alias is called; what it wraps
+            // decides which method it names, so resolve that the same way a
+            // bare value is resolved. `staticmethod(Base.target)` names the
+            // same method as a plain `Base.target`.
+            let (root, _, original_class) =
+                method_alias_origin(&call.arguments.args[0], context, origins)?;
             Some((root, kind, original_class))
         }
         _ => None,
@@ -6118,6 +7149,51 @@ fn field_argument_removal_range(
     TextRange::new(target.start(), target.end() + text_size(comma + 1))
 }
 
+/// The descriptor a class-body wrapper call applies, written bare, under an
+/// alias, or qualified through a `builtins` import — the same spellings the
+/// decorator forms accept.
+fn descriptor_wrapper_kind(
+    expression: &Expr,
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> Option<MethodAliasKind> {
+    match expression {
+        Expr::Name(name) => {
+            let bare = !module_bindings.contains(name.id.as_str());
+            match name.id.as_str() {
+                "staticmethod" if bare => Some(MethodAliasKind::Static),
+                "classmethod" if bare => Some(MethodAliasKind::Class),
+                "property" if bare => Some(MethodAliasKind::Property),
+                _ if aliases.staticmethods.contains(name.id.as_str()) => {
+                    Some(MethodAliasKind::Static)
+                }
+                _ if aliases.classmethods.contains(name.id.as_str()) => {
+                    Some(MethodAliasKind::Class)
+                }
+                _ if aliases.properties.contains(name.id.as_str()) => {
+                    Some(MethodAliasKind::Property)
+                }
+                _ => None,
+            }
+        }
+        Expr::Attribute(attribute) => {
+            let Expr::Name(module) = attribute.value.as_ref() else {
+                return None;
+            };
+            if !aliases.builtins_modules.contains(module.id.as_str()) {
+                return None;
+            }
+            match attribute.attr.as_str() {
+                "staticmethod" => Some(MethodAliasKind::Static),
+                "classmethod" => Some(MethodAliasKind::Class),
+                "property" => Some(MethodAliasKind::Property),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// What a method is given ahead of its written arguments, from its decorators.
 fn method_receiver(
     function: &ast::StmtFunctionDef,
@@ -6226,6 +7302,47 @@ fn factory_call_text(factory: &Expr, module_bindings: &BTreeSet<String>) -> Opti
     }
 }
 
+/// Module-level names that something other than an import binds.
+///
+/// The module body has run in full before any function it defines is called,
+/// so a `def`, a `class`, or an assignment that takes a name over leaves the
+/// import behind however the two are ordered. The names a module ends up
+/// bound to cannot tell the two apart on their own, which is why the imports
+/// are the one kind of statement passed over here. A conditional import is
+/// still an import, so the branches that can hold one are looked into rather
+/// than counted whole.
+fn module_rebindings(statements: &[Stmt]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_module_rebindings(statements, &mut names);
+    names
+}
+
+fn collect_module_rebindings(statements: &[Stmt], found: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            Stmt::Import(_) | Stmt::ImportFrom(_) => {}
+            Stmt::If(branch) => {
+                collect_module_rebindings(&branch.body, found);
+                for clause in &branch.elif_else_clauses {
+                    collect_module_rebindings(&clause.body, found);
+                }
+            }
+            // An `except` target is unbound again as the handler ends, so the
+            // handler binds nothing that outlives it.
+            Stmt::Try(block) => {
+                collect_module_rebindings(&block.body, found);
+                collect_module_rebindings(&block.orelse, found);
+                collect_module_rebindings(&block.finalbody, found);
+                for handler in &block.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_module_rebindings(&handler.body, found);
+                }
+            }
+            _ => found.extend(BoundNames::of_module(std::slice::from_ref(statement))),
+        }
+    }
+}
+
 /// Find the calls in `source` that relied on a default `--fix` removed, and
 /// build the edits that pass that default explicitly instead.
 fn rewrite_calls(
@@ -6245,24 +7362,27 @@ fn rewrite_calls(
         source,
         definitions,
         aliases,
-        future_annotations: parsed.suite().iter().any(|statement| {
-            matches!(statement, Stmt::ImportFrom(import)
-                if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
-                    && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
-        }),
-        module_bindings: BoundNames::of_body(parsed.suite()).names,
+        postponed_annotations: is_stub(path)
+            || parsed.suite().iter().any(|statement| {
+                matches!(statement, Stmt::ImportFrom(import)
+                    if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
+                        && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+            }),
+        module_bindings: BoundNames::of_module(parsed.suite()),
+        module_rebindings: module_rebindings(parsed.suite()),
         bindings: vec![BTreeMap::new()],
         binding_scope_depths: vec![0],
         lambda_scope_depths: Vec::new(),
         class_bindings: Vec::new(),
+        conditional_class_definitions: Vec::new(),
         invalidated_bindings: BTreeSet::new(),
         rebound_classes: BTreeSet::new(),
         known,
         classes: Vec::new(),
         class_scope_depths: Vec::new(),
         class_direct_statements: Vec::new(),
+        lexical_is_class: Vec::new(),
         implicit_receivers: Vec::new(),
-        implicit_receiver_is_class: Vec::new(),
         implicit_receiver_classes: Vec::new(),
         lexical_scope: Vec::new(),
         called: BTreeSet::new(),
@@ -6351,7 +7471,15 @@ fn collect_bindings(
                         .as_ref()
                         .filter(|file| source_binds_name(file, name))
                         .cloned();
-                    let implicit_sibling = import.module.is_none() && import.level > 0;
+                    // `from . import name` reaches the submodule, unless the
+                    // package defines `name` itself: the package attribute is
+                    // already set by the time the submodule would be imported,
+                    // so that is what Python hands out.
+                    let implicit_sibling = import.module.is_none()
+                        && import.level > 0
+                        && !parent
+                            .as_ref()
+                            .is_some_and(|file| source_defines_symbol(file, name));
                     let binding = match (package_member, submodule, &parent) {
                         (_, Some(file), _) if implicit_sibling => Binding::Module(file),
                         (Some(file), _, _) => Binding::Symbol(file, name.to_owned()),
@@ -6367,8 +7495,10 @@ fn collect_bindings(
                     bindings.insert(bound, binding);
                 }
             }
-            Stmt::Assign(assign) => {
-                collect_assignment_bindings(assign, bindings);
+            // An annotated binding names the same thing a plain one does, so
+            // `target: Final = api.target` has to be followed too.
+            Stmt::Assign(_) | Stmt::AnnAssign(_) => {
+                collect_assignment_binding(statement, bindings);
             }
             Stmt::If(branch) => {
                 collect_conditional_bindings(branch, importer, known, bindings);
@@ -6395,25 +7525,6 @@ fn collect_bindings(
             // Definitions introduce lexical scopes whose imports are collected
             // separately when the rewriter enters them.
             _ => {}
-        }
-    }
-}
-
-fn collect_assignment_bindings(assign: &ast::StmtAssign, bindings: &mut BTreeMap<String, Binding>) {
-    let binding = assignment_binding(&assign.value, bindings);
-    for target in &assign.targets {
-        if let Expr::Name(target) = target {
-            if let Some(binding) = &binding {
-                bindings.insert(target.id.to_string(), binding.clone());
-            } else {
-                bindings.remove(target.id.as_str());
-            }
-        } else {
-            let mut bound = BoundNames::default();
-            bound.bind(target);
-            for name in bound.names {
-                bindings.remove(&name);
-            }
         }
     }
 }
@@ -6468,6 +7579,132 @@ fn retain_common_bindings(
             .skip(1)
             .all(|path| path.get(name) == Some(binding))
     });
+}
+
+/// Whether none of an `if` statement's suites can run.
+fn if_cannot_run(branch: &ast::StmtIf) -> bool {
+    let falsey = |test: &Expr| {
+        matches!(
+            Truthiness::from_expr(test, |_| false),
+            Truthiness::False | Truthiness::Falsey | Truthiness::None
+        )
+    };
+    falsey(&branch.test)
+        && branch
+            .elif_else_clauses
+            .iter()
+            .all(|clause| clause.test.as_ref().is_some_and(falsey))
+}
+
+/// Reconcile the bindings a suite inside a function changed against the ones
+/// it started from.
+///
+/// A suite that cannot run leaves the earlier bindings standing. One that may
+/// or may not run leaves every name it rebinds uncertain, and an uncertain
+/// name is better left alone than rewritten against a guess.
+fn reconcile_suite_bindings(
+    statement: &Stmt,
+    before: &BTreeMap<String, Binding>,
+    after: &mut BTreeMap<String, Binding>,
+) {
+    let unreachable = match statement {
+        Stmt::If(branch) => if_cannot_run(branch),
+        // A loop that never iterates still runs its `else`, so only one
+        // without that suite leaves nothing behind.
+        Stmt::While(loop_) => {
+            loop_.orelse.is_empty()
+                && matches!(
+                    Truthiness::from_expr(&loop_.test, |_| false),
+                    Truthiness::False | Truthiness::Falsey | Truthiness::None
+                )
+        }
+        _ => false,
+    };
+    let changed: Vec<String> = after
+        .iter()
+        .filter(|(name, binding)| before.get(name.as_str()) != Some(binding))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in changed {
+        match before.get(&name) {
+            Some(binding) if unreachable => {
+                after.insert(name, binding.clone());
+            }
+            _ => {
+                after.remove(&name);
+            }
+        }
+    }
+}
+
+/// Follow an assignment, annotated or not, into the binding index.
+fn collect_assignment_binding(statement: &Stmt, bindings: &mut BTreeMap<String, Binding>) {
+    let bound: Option<(&Expr, &[Expr])> = match statement {
+        Stmt::Assign(assign) => Some((assign.value.as_ref(), assign.targets.as_slice())),
+        Stmt::AnnAssign(assign) => assign
+            .value
+            .as_deref()
+            .map(|value| (value, std::slice::from_ref(&*assign.target))),
+        _ => None,
+    };
+    let Some((value, targets)) = bound else {
+        return;
+    };
+    let binding = assignment_binding(value, bindings);
+    for target in targets {
+        if let Expr::Name(target) = target {
+            if let Some(binding) = &binding {
+                bindings.insert(target.id.to_string(), binding.clone());
+            } else {
+                bindings.remove(target.id.as_str());
+            }
+        } else {
+            // Unpacking binds names this cannot be followed through, so what
+            // they held before is no longer what they hold.
+            let mut bound = BoundNames::default();
+            bound.bind(target);
+            for name in bound.names {
+                bindings.remove(&name);
+            }
+        }
+    }
+}
+
+/// Whether a module defines `name` itself, rather than merely binding it by
+/// importing something of that name.
+///
+/// A package whose `__init__.py` re-exports its own submodule still hands out
+/// the submodule, so only a definition or an assignment counts here.
+fn source_defines_symbol(path: &Path, name: &str) -> bool {
+    let Some(parsed) = read_source(path)
+        .ok()
+        .and_then(|source| parse_module(&source).ok())
+    else {
+        return false;
+    };
+    parsed.suite().iter().any(|statement| match statement {
+        Stmt::FunctionDef(function) => function.name.as_str() == name,
+        Stmt::ClassDef(class) => class.name.as_str() == name,
+        Stmt::Assign(assign) => assign
+            .targets
+            .iter()
+            .any(|target| matches!(target, Expr::Name(target) if target.id.as_str() == name)),
+        Stmt::AnnAssign(assign) => {
+            assign.value.is_some()
+                && matches!(assign.target.as_ref(), Expr::Name(target) if target.id.as_str() == name)
+        }
+        // `from .impl import name` puts a symbol under the name just as an
+        // assignment would. `from . import name` is the submodule itself, and
+        // is what the caller is deciding against.
+        Stmt::ImportFrom(import) => {
+            import.module.is_some()
+                && import.names.iter().any(|alias| {
+                    alias.asname.as_ref().unwrap_or(&alias.name).as_str() == name
+                        && alias.name.as_str() != "*"
+                })
+        }
+        _ => false,
+    })
 }
 
 fn source_binds_name(path: &Path, name: &str) -> bool {
@@ -6842,6 +8079,63 @@ fn common_all_state(outcomes: &[Option<BTreeSet<String>>]) -> Option<BTreeSet<St
 /// A nested `def` or `class` is a scope of its own, and the rewriter pushes one
 /// for it on the way in, so what it binds is left to it. Only its own name is
 /// taken, because that is what the body being collected binds.
+/// The class-body assignments that put the same function back under its own
+/// name, such as `target = staticmethod(target)`.
+///
+/// These are not overwrites: a call still reaches the function defined above,
+/// so its default is still the one to give back. Anything else assigned to the
+/// name is a replacement, including a later one that follows a rewrap.
+fn class_rewraps(
+    body: &[Stmt],
+    aliases: &Aliases,
+    module_bindings: &BTreeSet<String>,
+) -> BTreeMap<String, Vec<TextSize>> {
+    struct Collector<'a> {
+        found: BTreeMap<String, Vec<TextSize>>,
+        aliases: &'a Aliases,
+        module_bindings: &'a BTreeSet<String>,
+    }
+
+    impl<'a> Visitor<'a> for Collector<'_> {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            match statement {
+                Stmt::Assign(assign) => {
+                    let [Expr::Name(target)] = assign.targets.as_slice() else {
+                        return;
+                    };
+                    let Expr::Call(call) = assign.value.as_ref() else {
+                        return;
+                    };
+                    // Only the descriptor wrappers are known to leave the
+                    // function's own parameters behind the name. Any other
+                    // call may return something taking anything at all.
+                    let wraps_itself = call.arguments.args.len() == 1
+                        && call.arguments.keywords.is_empty()
+                        && descriptor_wrapper_kind(&call.func, self.aliases, self.module_bindings)
+                            .is_some()
+                        && matches!(&call.arguments.args[0], Expr::Name(wrapped) if wrapped.id == target.id);
+                    if wraps_itself {
+                        self.found
+                            .entry(target.id.to_string())
+                            .or_default()
+                            .push(statement.start());
+                    }
+                }
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                _ => walk_stmt(self, statement),
+            }
+        }
+    }
+
+    let mut collector = Collector {
+        found: BTreeMap::new(),
+        aliases,
+        module_bindings,
+    };
+    collector.visit_body(body);
+    collector.found
+}
+
 fn class_assignments(body: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
     #[derive(Default)]
     struct Collector(BTreeMap<String, Vec<TextSize>>);
@@ -6894,13 +8188,40 @@ fn deleted_names(body: &[Stmt]) -> BTreeSet<String> {
     collector.0
 }
 
+/// Whether an `if` test is the `TYPE_CHECKING` guard.
+///
+/// The name is read from the source rather than resolved back to `typing`,
+/// because this is asked of a class body long after the imports that reached
+/// it have been forgotten. A file that binds `TYPE_CHECKING` to something of
+/// its own is taken at its word.
+fn tests_type_checking(test: &Expr) -> bool {
+    match test {
+        Expr::Name(name) => name.id.as_str() == "TYPE_CHECKING",
+        Expr::Attribute(attribute) => attribute.attr.as_str() == "TYPE_CHECKING",
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 struct BoundNames {
     names: BTreeSet<String>,
+    /// Targets of bare annotations. `name: int` puts nothing behind the name,
+    /// so it rebinds nothing, but it does make the name the scope's own.
+    /// `finish` folds these into `names` for whoever asks what a scope holds;
+    /// a caller that walks a body without finishing is asking what the body
+    /// assigns, and gets only that.
+    annotations: BTreeSet<String>,
     globals: BTreeSet<String>,
     nonlocals: BTreeSet<String>,
     functions: BTreeSet<String>,
     classes: BTreeSet<String>,
+    /// Whether to collect only the names still bound once the body has run.
+    /// An `except ... as` target is deleted when its handler ends, and a
+    /// `TYPE_CHECKING` block is read by type checkers and never run at all,
+    /// so neither leaves anything behind. A caller asking what a scope holds
+    /// wants them anyway, because they are the scope's own while the body is
+    /// running; a caller asking what a class ends up carrying does not.
+    surviving_only: bool,
 }
 
 impl BoundNames {
@@ -6916,6 +8237,13 @@ impl BoundNames {
             Expr::Starred(starred) => self.bind(&starred.value),
             _ => {}
         }
+    }
+
+    /// Collect the name a bare annotation declares without assigning to.
+    fn declare(&mut self, target: &Expr) {
+        let mut declared = Self::default();
+        declared.bind(target);
+        self.annotations.append(&mut declared.names);
     }
 
     fn parameters(&mut self, parameters: &ast::Parameters) {
@@ -6945,6 +8273,7 @@ impl BoundNames {
 
     /// The names bound anywhere inside a function, including its parameters.
     fn finish(mut self) -> Self {
+        self.names.append(&mut self.annotations);
         for name in &self.globals {
             self.names.remove(name);
             self.functions.remove(name);
@@ -6967,12 +8296,73 @@ impl BoundNames {
         collector.finish()
     }
 
+    /// The names a signature claims, without reading the body behind it.
+    fn of_parameters(parameters: &ast::Parameters) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        collector.parameters(parameters);
+        collector.names
+    }
+
     fn of_body(body: &[Stmt]) -> Self {
         let mut collector = Self::default();
         for statement in body {
             collector.visit_stmt(statement);
         }
         collector.finish()
+    }
+
+    /// The names a module actually puts something behind.
+    ///
+    /// A bare annotation is what separates this from `of_body`. Inside a
+    /// function or a class body `name: int` still makes the name that
+    /// scope's own, so `finish` folds it in; at module level there is no
+    /// enclosing scope to be claimed from, only the builtins, and those an
+    /// annotation leaves entirely alone. `super: object` next to a
+    /// `super()` call reaches the builtin exactly as it would have without
+    /// the annotation.
+    fn of_module(body: &[Stmt]) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        for statement in body {
+            collector.visit_stmt(statement);
+        }
+        collector.annotations.clear();
+        collector.finish().names
+    }
+
+    /// The names a class body leaves on the class once it has run.
+    ///
+    /// A class body is executed and whatever is still bound at the end of it
+    /// becomes an attribute, so a name that does not survive the body cannot
+    /// shadow what the bases hold. `finish` is deliberately not called: as at
+    /// module level, a bare annotation puts nothing behind the name. A
+    /// `global` or `nonlocal` declaration is honoured for the opposite
+    /// reason: an assignment under one reaches past the class body entirely.
+    fn of_class_attributes(body: &[Stmt]) -> BTreeSet<String> {
+        let mut collector = Self {
+            surviving_only: true,
+            ..Self::default()
+        };
+        for statement in body {
+            collector.visit_stmt(statement);
+            // A `del` written straight in the body takes the name back off
+            // the class, and one written after a rebinding of it does not,
+            // so the statements are read in order. A `del` nested in a branch
+            // or a loop may never run, and is left to stand as written.
+            if let Stmt::Delete(delete) = statement {
+                let mut deleted = Self::default();
+                for target in &delete.targets {
+                    deleted.bind(target);
+                }
+                collector.names.retain(|name| !deleted.names.contains(name));
+            }
+        }
+        let declared: BTreeSet<String> = collector
+            .globals
+            .union(&collector.nonlocals)
+            .cloned()
+            .collect();
+        collector.names.retain(|name| !declared.contains(name));
+        collector.names
     }
 
     fn of_lambda(lambda: &ast::ExprLambda) -> Self {
@@ -6988,7 +8378,13 @@ impl<'a> Visitor<'a> for BoundNames {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
         match statement {
             Stmt::Assign(assign) => assign.targets.iter().for_each(|target| self.bind(target)),
-            Stmt::AnnAssign(assign) => self.bind(&assign.target),
+            Stmt::AnnAssign(assign) => {
+                if assign.value.is_some() {
+                    self.bind(&assign.target);
+                } else {
+                    self.declare(&assign.target);
+                }
+            }
             Stmt::AugAssign(assign) => self.bind(&assign.target),
             Stmt::For(loop_statement) => self.bind(&loop_statement.target),
             Stmt::With(block) => {
@@ -7035,13 +8431,33 @@ impl<'a> Visitor<'a> for BoundNames {
                     self.names.insert(bound);
                 }
             }
-            Stmt::Try(block) => {
+            Stmt::Try(block) if !self.surviving_only => {
                 for handler in &block.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
                     if let Some(name) = &handler.name {
                         self.names.insert(name.to_string());
                     }
                 }
+            }
+            // A `TYPE_CHECKING` block is read by type checkers and never run,
+            // so the names in it are bound at no point. The guard is
+            // recognised by the name it is written under, which is how it is
+            // always spelled; anything else is walked like an ordinary branch.
+            Stmt::If(branch) if self.surviving_only => {
+                self.visit_expr(&branch.test);
+                if !tests_type_checking(&branch.test) {
+                    self.visit_body(&branch.body);
+                }
+                for clause in &branch.elif_else_clauses {
+                    if let Some(test) = &clause.test {
+                        self.visit_expr(test);
+                    }
+                    if clause.test.as_ref().is_some_and(tests_type_checking) {
+                        continue;
+                    }
+                    self.visit_body(&clause.body);
+                }
+                return;
             }
             Stmt::Global(global) => {
                 self.globals
@@ -7060,8 +8476,24 @@ impl<'a> Visitor<'a> for BoundNames {
         match expression {
             Expr::Named(named) => self.bind(&named.target),
             // As with a nested `def`, a lambda's parameters belong to the
-            // lambda, and the rewriter pushes a scope for it.
-            Expr::Lambda(_) => return,
+            // lambda, and the rewriter pushes a scope for it. Only the body
+            // runs in that scope: the parameter defaults are evaluated where
+            // the lambda is written, so a walrus among them binds out here and
+            // is collected before the body is left alone.
+            Expr::Lambda(lambda) => {
+                if let Some(parameters) = &lambda.parameters {
+                    for default in parameters
+                        .posonlyargs
+                        .iter()
+                        .chain(&parameters.args)
+                        .chain(&parameters.kwonlyargs)
+                        .filter_map(|parameter| parameter.default.as_deref())
+                    {
+                        self.visit_expr(default);
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         walk_expr(self, expression);
@@ -7113,8 +8545,9 @@ struct Rewriter<'a> {
     definitions: &'a Definitions,
     aliases: Aliases,
     /// Annotation expressions are stored as strings and never evaluated when
-    /// the future annotations feature is active.
-    future_annotations: bool,
+    /// the future annotations feature is active. A stub postpones them the
+    /// same way without the import, because nothing in it runs.
+    postponed_annotations: bool,
     module_bindings: BTreeSet<String>,
     /// What each imported name in this file refers to.
     bindings: Vec<BTreeMap<String, Binding>>,
@@ -7124,10 +8557,17 @@ struct Rewriter<'a> {
     lambda_scope_depths: Vec<usize>,
     /// Imports bound directly in each enclosing class namespace.
     class_bindings: Vec<BTreeMap<String, Binding>>,
+    /// Imports in each enclosing class namespace that a `def` or a `class`
+    /// nested in control flow may have taken the name of. A call below reaches
+    /// the definition or the import, so the import's default has to stay.
+    conditional_class_definitions: Vec<BTreeSet<String>>,
     /// Imported module-scope names replaced by an assignment already visited.
     invalidated_bindings: BTreeSet<String>,
     /// Module names that can no longer be assumed to denote an earlier class.
     rebound_classes: BTreeSet<String>,
+    /// Module-level names that something other than an import binds, so an
+    /// import of the name no longer says what a call to it reaches.
+    module_rebindings: BTreeSet<String>,
     known: &'a BTreeSet<&'a Path>,
     /// The class bodies being walked, so `self.method(...)` can be resolved.
     classes: Vec<String>,
@@ -7137,12 +8577,12 @@ struct Rewriter<'a> {
     /// Statements directly in each class suite. A nested control-flow delete
     /// is conditional and cannot definitely remove an earlier class binding.
     class_direct_statements: Vec<BTreeSet<TextSize>>,
-    /// The implicit receiver name of each enclosing function. Static methods
-    /// and module functions contribute `None`.
-    implicit_receivers: Vec<Option<String>>,
-    /// Whether each implicit receiver is a classmethod's class rather than an
-    /// instance method's instance.
-    implicit_receiver_is_class: Vec<bool>,
+    /// Whether each `lexical_scope` entry is a class body rather than a
+    /// function, so a lookup can pass over the ones that are not closures.
+    lexical_is_class: Vec<bool>,
+    /// The implicit receiver of each enclosing function. Static methods and
+    /// module functions contribute `None`.
+    implicit_receivers: Vec<Option<ImplicitReceiver>>,
     /// The class cell owned by each enclosing function, independently of
     /// whether that function has an implicit descriptor receiver.
     implicit_receiver_classes: Vec<Option<String>>,
@@ -7188,10 +8628,32 @@ impl Rewriter<'_> {
         }
     }
 
-    fn bind_definition_in_class(&mut self, name: &str, is_class: bool) {
+    fn bind_definition_in_class(&mut self, name: &str, is_class: bool, start: TextSize) {
         if !self.in_class_scope() {
             return;
         }
+        // A `def` or `class` takes the name over in the class namespace, so an
+        // import that bound it earlier is no longer what a call below reaches.
+        // A definition nested in class-body control flow may never run, but
+        // then the name is whichever of the two the branch left behind, and
+        // that is still not knowable from the source alone.
+        let replaced_import = self
+            .class_bindings
+            .last()
+            .is_some_and(|bindings| bindings.contains_key(name));
+        let direct = self
+            .class_direct_statements
+            .last()
+            .is_some_and(|statements| statements.contains(&start));
+        // Declining to rewrite the call is only half of it: the import is
+        // still one of the two things the name can hold, so removing its
+        // default would leave that call short an argument.
+        if replaced_import && !direct {
+            if let Some(names) = self.conditional_class_definitions.last_mut() {
+                names.insert(name.to_owned());
+            }
+        }
+        self.invalidate_class_bindings([name.to_owned()]);
         if let Some(scope) = self.scopes.last_mut() {
             scope.names.insert(name.to_owned());
             if is_class {
@@ -7204,6 +8666,16 @@ impl Rewriter<'_> {
 
     /// Whether the nearest lexical binding for `name` is a nested callable.
     /// `None` means no enclosing scope binds it at all.
+    /// Record that a module-level name has been rebound: later calls reach
+    /// whatever replaced the import, and no longer the same-file class that
+    /// was defined under that name.
+    fn rebind_module_name(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            self.invalidated_bindings.insert(name.clone());
+            self.rebound_classes.insert(name);
+        }
+    }
+
     fn nested_callable(&self, name: &str) -> Option<bool> {
         self.nested_binding(name).map(|(callable, _)| callable)
     }
@@ -7251,6 +8723,17 @@ impl Rewriter<'_> {
     }
 
     fn function_binding(&self, name: &str) -> Option<&Binding> {
+        // `global name` sends the name to the module namespace, so an import
+        // an enclosing function made under it is not what the call reaches.
+        // `nonlocal` is the opposite: that enclosing binding is exactly it.
+        if self
+            .scopes
+            .last()
+            .is_some_and(|scope| scope.globals.contains(name))
+        {
+            let binding = self.bindings.first()?.get(name)?;
+            return (!self.binding_is_replaced(name)).then_some(binding);
+        }
         let owner = self.nested_binding(name).map(|(_, index)| index);
         self.bindings
             .iter()
@@ -7286,6 +8769,37 @@ impl Rewriter<'_> {
             Expr::Attribute(attribute) => self.has_unknown_receiver_binding(&attribute.value),
             _ => false,
         }
+    }
+
+    /// Whether the call is made on a class whose ancestry two suites of one
+    /// statement disagree on. The method it reaches is one of two, and the
+    /// default behind whichever it is has to survive a call left unrewritten.
+    fn receiver_ancestry_is_uncertain(&self, expression: &Expr) -> bool {
+        let Expr::Attribute(attribute) = expression else {
+            return false;
+        };
+        self.class_ancestry_is_uncertain(&attribute.value)
+    }
+
+    /// Whether the call builds such a class. `Child()` and `api.Child()` name
+    /// the class rather than the `__init__` it inherits, so there is no single
+    /// constructor to give them and the class is left without one. That leaves
+    /// the call bare of the argument the removed default stood in for, which is
+    /// why the deletion has to be held back.
+    ///
+    /// A construction through a module is spelled exactly as a method call is,
+    /// so what tells them apart is whether the callee itself names a class:
+    /// `api.Child` does, and `receiver.method` does not.
+    fn constructs_uncertain_ancestry(&self, expression: &Expr) -> bool {
+        matches!(expression, Expr::Name(_) | Expr::Attribute(_))
+            && self.class_ancestry_is_uncertain(expression)
+    }
+
+    fn class_ancestry_is_uncertain(&self, receiver: &Expr) -> bool {
+        self.receiving_class(receiver)
+            .is_some_and(|(file, class, _, _)| {
+                self.definitions.ancestry_is_uncertain(&(file, class))
+            })
     }
 
     fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
@@ -7343,14 +8857,14 @@ impl Rewriter<'_> {
             if let Some(class) = self.type_of_implicit_instance(call) {
                 return Some(class);
             }
-            let current_class = self.classes.last();
-            let implicit_receiver = self.implicit_receivers.last().and_then(Option::as_deref);
+            let implicit_receiver = self.implicit_receiver();
             let zero_argument_super = call.arguments.args.is_empty() && implicit_receiver.is_some();
             let explicit_super = match &*call.arguments.args {
-                [Expr::Name(class), Expr::Name(receiver)] => {
-                    current_class.and_then(|class| class.rsplit('.').next())
-                        == Some(class.id.as_str())
-                        && implicit_receiver == Some(receiver.id.as_str())
+                [Expr::Name(class), Expr::Name(instance)] => {
+                    implicit_receiver.is_some_and(|receiver| {
+                        receiver.class.rsplit('.').next() == Some(class.id.as_str())
+                            && receiver.name == instance.id.as_str()
+                    })
                 }
                 _ => false,
             };
@@ -7360,7 +8874,7 @@ impl Rewriter<'_> {
             {
                 return Some((
                     self.physical.to_path_buf(),
-                    current_class?.clone(),
+                    implicit_receiver?.class.clone(),
                     true,
                     true,
                 ));
@@ -7380,15 +8894,14 @@ impl Rewriter<'_> {
             return None;
         }
         if let Expr::Name(name) = receiver {
-            if self.implicit_receivers.last().and_then(Option::as_deref) == Some(name.id.as_str()) {
+            if let Some(implicit) = self
+                .implicit_receiver()
+                .filter(|implicit| implicit.name == name.id.as_str())
+            {
                 return Some((
                     self.physical.to_path_buf(),
-                    self.classes.last()?.clone(),
-                    !self
-                        .implicit_receiver_is_class
-                        .last()
-                        .copied()
-                        .unwrap_or(false),
+                    implicit.class.clone(),
+                    !implicit.is_class,
                     false,
                 ));
             }
@@ -7455,9 +8968,14 @@ impl Rewriter<'_> {
 
     fn is_builtin_super_call(&self, call: &ast::ExprCall) -> bool {
         match call.func.as_ref() {
+            // An import of the builtin is checked before the bare name, since
+            // `from builtins import super` binds `super` to the very builtin
+            // the name would have reached anyway. Reading that binding as a
+            // shadow would leave the call pointing at nothing.
             Expr::Name(name) if self.aliases.supers.contains(name.id.as_str()) => {
                 self.nested_binding(name.id.as_str()).is_none()
                     && !self.binding_is_replaced(name.id.as_str())
+                    && !self.module_rebindings.contains(name.id.as_str())
             }
             Expr::Name(name) if name.id.as_str() == "super" => {
                 self.nested_binding("super").is_none()
@@ -7475,18 +8993,14 @@ impl Rewriter<'_> {
         let Expr::Name(instance) = attribute.value.as_ref() else {
             return None;
         };
+        let implicit = self.implicit_receiver()?;
         if attribute.attr.as_str() == "__class__"
-            && self.implicit_receivers.last().and_then(Option::as_deref)
-                == Some(instance.id.as_str())
-            && !self
-                .implicit_receiver_is_class
-                .last()
-                .copied()
-                .unwrap_or(false)
+            && implicit.name == instance.id.as_str()
+            && !implicit.is_class
         {
             Some((
                 self.physical.to_path_buf(),
-                self.classes.last()?.clone(),
+                implicit.class.clone(),
                 false,
                 false,
             ))
@@ -7502,15 +9016,11 @@ impl Rewriter<'_> {
         let [Expr::Name(instance)] = &*call.arguments.args else {
             return None;
         };
+        let implicit = self.implicit_receiver()?;
         if !call.arguments.keywords.is_empty()
             || !matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "type")
-            || self.implicit_receivers.last().and_then(Option::as_deref)
-                != Some(instance.id.as_str())
-            || self
-                .implicit_receiver_is_class
-                .last()
-                .copied()
-                .unwrap_or(false)
+            || implicit.name != instance.id.as_str()
+            || implicit.is_class
             || self.nested_binding("type").is_some()
             || self.binding("type").is_some()
             || self.module_bindings.contains("type")
@@ -7519,14 +9029,68 @@ impl Rewriter<'_> {
         }
         Some((
             self.physical.to_path_buf(),
-            self.classes.last()?.clone(),
+            implicit.class.clone(),
             false,
             false,
         ))
     }
 
+    /// The receiver the body being walked sees without naming it.
+    fn implicit_receiver(&self) -> Option<&ImplicitReceiver> {
+        self.implicit_receivers.last()?.as_ref()
+    }
+
     /// The callable an expression names, when the file's own imports say so,
     /// and how many parameters the call has already been given implicitly.
+    /// The signature a bare nested name refers to at this call site.
+    ///
+    /// A nested definition is visible throughout the scope holding it, so the
+    /// search runs outwards from the call site. It stops at the nearest scope
+    /// that binds the name, whether or not anything was recorded for it, and
+    /// passes over class bodies, which are not closure scopes.
+    fn nested_signature(&self, name: &str) -> Option<&Signature> {
+        let symbols = self.definitions.symbols.get(self.physical)?;
+        // A lambda or comprehension written in a class body has a scope of its
+        // own that the class namespace is not part of, so a name bound beside
+        // it is out of reach from in there.
+        if self
+            .scopes
+            .iter()
+            .skip(self.lexical_scope.len())
+            .any(|scope| scope.names.contains(name))
+        {
+            return None;
+        }
+        // A nested function is never reached by its bare name, so that last
+        // step is only for the other callables.
+        let outermost = usize::from(self.nested_function(name));
+        let innermost_class_applies = self.in_class_scope();
+        for depth in (outermost..=self.lexical_scope.len()).rev() {
+            if depth > 0
+                && self.lexical_is_class.get(depth - 1) == Some(&true)
+                && !(depth == self.lexical_scope.len() && innermost_class_applies)
+            {
+                continue;
+            }
+            if let Some(signature) =
+                symbols.get(&qualified_lexical_name(&self.lexical_scope[..depth], name))
+            {
+                return signature.as_ref();
+            }
+            // Nothing was recorded here, but a scope that binds the name still
+            // hides whatever the scopes outside it call by the same name.
+            if depth > 0
+                && self
+                    .scopes
+                    .get(depth - 1)
+                    .is_some_and(|scope| scope.names.contains(name))
+            {
+                return None;
+            }
+        }
+        None
+    }
+
     fn resolve(&self, expression: &Expr) -> Option<(&Signature, usize)> {
         match expression {
             Expr::Name(name)
@@ -7549,21 +9113,7 @@ impl Rewriter<'_> {
             // A bare name is either defined in this file or imported into it —
             // unless an enclosing scope binds it, in which case it is neither.
             Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(true) => {
-                let symbols = self.definitions.symbols.get(self.physical)?;
-                let (_, owner) = self.nested_binding(name.id.as_str())?;
-                let owner_scope = self
-                    .lexical_scope
-                    .get(..=owner)
-                    .unwrap_or(&self.lexical_scope);
-                let qualified = qualified_lexical_name(owner_scope, name.id.as_str());
-                let signature = if self.nested_function(name.id.as_str()) {
-                    symbols.get(&qualified)?
-                } else {
-                    symbols
-                        .get(&qualified)
-                        .or_else(|| symbols.get(name.id.as_str()))?
-                }
-                .as_ref()?;
+                let signature = self.nested_signature(name.id.as_str())?;
                 Some((signature, signature.kind.implicit_bound()))
             }
             Expr::Name(name) if self.invalidated_bindings.contains(name.id.as_str()) => None,
@@ -7638,6 +9188,56 @@ impl Rewriter<'_> {
         }
     }
 
+    /// Report a call that names a fixed callable but reaches something else:
+    /// an unrelated `connect`, a method on a receiver whose type is not known,
+    /// or a call through an unresolved import. Rewriting it would break
+    /// working code, so it is reported instead — and where the name it stands
+    /// for is one of two, the default behind it is held back as well, since
+    /// nothing was written into the call to stand in for it.
+    fn report_unresolved_call(&mut self, call: &ast::ExprCall, name: &str) {
+        // The gate is keyed on the name the fixed callable goes by, which a
+        // construction does not carry: it is spelled with the class's name,
+        // not the inherited `__init__`'s.
+        let constructs_uncertain = self.constructs_uncertain_ancestry(&call.func);
+        if !self.definitions.names.contains(name) && !constructs_uncertain {
+            return;
+        }
+        let replaced_import =
+            dotted_name(&call.func).is_some_and(|binding| self.binding_is_replaced(&binding));
+        let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
+        let ambiguous_import = self.has_unknown_receiver_binding(&call.func);
+        let uncertain_ancestry =
+            constructs_uncertain || self.receiver_ancestry_is_uncertain(&call.func);
+        let conditional_definition = matches!(call.func.as_ref(), Expr::Name(name) if self.in_class_scope()
+            && self
+                .conditional_class_definitions
+                .last()
+                .is_some_and(|names| names.contains(name.id.as_str())));
+        if replaced_import
+            || local_shadow
+            || ambiguous_import
+            || conditional_definition
+            || uncertain_ancestry
+        {
+            if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
+                self.retained.extend(fixes.iter().cloned());
+            }
+            // Asking for the call's own name finds nothing for a construction,
+            // so the inherited constructor is asked for under the name it goes
+            // by.
+            if constructs_uncertain {
+                if let Some(fixes) = self.definitions.fixes_by_name.get("__init__") {
+                    self.retained.extend(fixes.iter().cloned());
+                }
+            }
+        }
+        self.skip(
+            call.start(),
+            name,
+            "this call cannot be tied to the definition that was fixed".to_owned(),
+        );
+    }
+
     fn check_call(&mut self, call: &ast::ExprCall) {
         let name = match &*call.func {
             Expr::Name(name) => name.id.as_str(),
@@ -7645,26 +9245,7 @@ impl Rewriter<'_> {
             _ => return,
         };
         let Some((signature, bound)) = self.resolve(&call.func) else {
-            // A name a fixed callable also goes by, reached some other way: an
-            // unrelated `connect`, a method on a receiver whose type is not
-            // known, or a call through an unresolved import. Rewriting it would
-            // break working code, so say so instead.
-            if self.definitions.names.contains(name) {
-                let replaced_import = dotted_name(&call.func)
-                    .is_some_and(|binding| self.binding_is_replaced(&binding));
-                let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
-                let ambiguous_import = self.has_unknown_receiver_binding(&call.func);
-                if replaced_import || local_shadow || ambiguous_import {
-                    if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
-                        self.retained.extend(fixes.iter().cloned());
-                    }
-                }
-                self.skip(
-                    call.start(),
-                    name,
-                    "this call cannot be tied to the definition that was fixed".to_owned(),
-                );
-            }
+            self.report_unresolved_call(call, name);
             return;
         };
         if !signature.complete {
@@ -7928,7 +9509,13 @@ fn rebound_names(statement: &Stmt) -> BTreeSet<String> {
     let mut bound = BoundNames::default();
     match statement {
         Stmt::Assign(assign) => assign.targets.iter().for_each(|target| bound.bind(target)),
-        Stmt::AnnAssign(assign) if assign.value.is_some() => bound.bind(&assign.target),
+        // `name: int` declares a type without binding anything, so whatever
+        // the name already refers to still stands.
+        Stmt::AnnAssign(assign) => {
+            if assign.value.is_some() {
+                bound.bind(&assign.target);
+            }
+        }
         Stmt::AugAssign(assign) => bound.bind(&assign.target),
         Stmt::For(loop_statement) => bound.bind(&loop_statement.target),
         Stmt::With(block) => {
@@ -8055,6 +9642,99 @@ fn python_number_equals(left: &ComparableNumber<'_>, right: &ComparableNumber<'_
     }
 }
 
+impl<'a> Rewriter<'a> {
+    /// Walk a `match` case body without letting what it binds stand for the
+    /// cases after it.
+    ///
+    /// A later case runs only where this one did not, so an import or a
+    /// capture written here is not something those cases can be assumed to
+    /// see, and a name left uncertain is better than one taken on trust.
+    fn visit_unselected_case_body(&mut self, body: &'a [Stmt]) {
+        let before = self.bindings.first().cloned();
+        self.visit_body(body);
+        let (Some(before), Some(after)) = (before, self.bindings.first_mut()) else {
+            return;
+        };
+        let changed: Vec<String> = after
+            .iter()
+            .filter(|(name, binding)| before.get(name.as_str()) != Some(binding))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in changed {
+            after.remove(&name);
+        }
+    }
+
+    /// Walk a class-body `match` case that cannot be selected statically,
+    /// letting what its pattern captures take those names over, and report
+    /// which names those were.
+    ///
+    /// A capture rebinds its name for the whole case body, so an import the
+    /// class body made earlier no longer stands there. Walking the body
+    /// without recording the capture would let a call in it resolve to that
+    /// import and be rewritten against the wrong callable. A case after this
+    /// one runs only where this pattern did not match, though, and there the
+    /// import does still stand: the capture is undone once its own body has
+    /// been walked, and it is only what follows the whole `match` that has to
+    /// treat the captured names as uncertain.
+    ///
+    /// Undoing a capture puts the name back exactly as the case found it,
+    /// dropping the binding again where there was none to displace. An import
+    /// the body wrote for a captured name reached the later case no more than
+    /// the capture itself did, so leaving that import in place would let the
+    /// later case resolve the name to something it cannot see.
+    fn visit_uncertain_class_case(&mut self, case: &'a ast::MatchCase) -> BTreeSet<String> {
+        self.visit_pattern(&case.pattern);
+        let mut captures = BoundNames::default();
+        captures.visit_pattern(&case.pattern);
+        let displaced: Vec<(String, Option<Binding>)> = self
+            .class_bindings
+            .last()
+            .into_iter()
+            .flat_map(|bindings| {
+                captures
+                    .names
+                    .iter()
+                    .map(|name| (name.clone(), bindings.get(name).cloned()))
+            })
+            .collect();
+        let shadowed: Vec<String> = self
+            .scopes
+            .last()
+            .into_iter()
+            .flat_map(|scope| {
+                captures
+                    .names
+                    .iter()
+                    .filter(|name| !scope.names.contains(*name))
+                    .cloned()
+            })
+            .collect();
+        self.invalidate_class_bindings(captures.names.iter().cloned());
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.names.extend(captures.names.iter().cloned());
+        }
+        if let Some(guard) = &case.guard {
+            self.visit_expr(guard);
+        }
+        self.visit_body(&case.body);
+        if let Some(bindings) = self.class_bindings.last_mut() {
+            for (name, binding) in displaced {
+                match binding {
+                    Some(binding) => bindings.insert(name, binding),
+                    None => bindings.remove(&name),
+                };
+            }
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            for name in shadowed {
+                scope.names.remove(&name);
+            }
+        }
+        captures.names
+    }
+}
+
 fn python_number_equals_bool(number: &ComparableNumber<'_>, value: bool) -> bool {
     let value = u8::from(value);
     match number {
@@ -8084,7 +9764,7 @@ fn python_literals_equal(left: &ComparableLiteral<'_>, right: &ComparableLiteral
 
 impl<'a> Visitor<'a> for Rewriter<'a> {
     fn visit_annotation(&mut self, annotation: &'a Expr) {
-        if !self.future_annotations {
+        if !self.postponed_annotations {
             self.visit_expr(annotation);
         }
     }
@@ -8223,11 +9903,25 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                                     self.known,
                                 )
                                 .is_some();
-                                if alias.asname.is_some() {
+                                // `import pkg as pkg` binds the same package
+                                // the dotted imports are under, so what they
+                                // reached through that name is still there.
+                                let rebinds = alias
+                                    .asname
+                                    .as_ref()
+                                    .is_some_and(|asname| asname.as_str() != alias.name.as_str());
+                                if rebinds {
                                     resolutions.insert(name, (module_resolved, true));
                                     continue;
                                 }
-                                let sibling_resolved = alias.name.contains('.')
+                                // Once an alias has taken the head over, the
+                                // dotted keys under it name what it used to
+                                // be, so they say nothing about this import.
+                                let aliased = resolutions
+                                    .get(&name)
+                                    .is_some_and(|(_, last_was_alias)| *last_was_alias);
+                                let sibling_resolved = !aliased
+                                    && alias.name.contains('.')
                                     && self.bindings.first().is_some_and(|bindings| {
                                         bindings.keys().any(|binding| {
                                             binding.contains('.')
@@ -8239,8 +9933,13 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                                     Entry::Occupied(mut entry) => {
                                         let (known, last_was_alias) = entry.get_mut();
                                         if *last_was_alias {
-                                            *known = resolved;
-                                            *last_was_alias = false;
+                                            // An import that resolves to
+                                            // nothing rebinds nothing, so the
+                                            // alias before it still stands.
+                                            if resolved {
+                                                *known = resolved;
+                                                *last_was_alias = false;
+                                            }
                                         } else {
                                             *known |= resolved;
                                         }
@@ -8325,6 +10024,26 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     );
                 }
                 self.bind_statement_in_class(statement);
+            }
+            // A suite inside a function records its imports as it walks, so
+            // what it leaves behind has to be reconciled with what came before
+            // it: an import in a branch that never runs must not replace the
+            // binding the rest of the function is written against.
+            // A class body has arms of its own further down that bind loop
+            // targets and match captures, and a class nested in a function
+            // would otherwise be caught here first.
+            // `for` and `with` have arms of their own below that invalidate
+            // what their targets bind, and their bodies do run, so an import
+            // written in one stands afterwards. Only the suites that may not
+            // run at all are reconciled here.
+            Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::Match(_)
+                if self.bindings.len() > 1 && !self.in_class_scope() =>
+            {
+                let before = self.bindings.last().cloned();
+                walk_stmt(self, statement);
+                if let (Some(before), Some(after)) = (before, self.bindings.last_mut()) {
+                    reconcile_suite_bindings(statement, &before, after);
+                }
             }
             Stmt::Import(_) | Stmt::ImportFrom(_) => {
                 if let Some(bindings) = self.bindings.last_mut() {
@@ -8441,7 +10160,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     return;
                 }
                 self.visit_expr(&loop_statement.target);
-                self.invalidated_bindings.extend(rebound_names(statement));
+                self.rebind_module_name(rebound_names(statement));
                 self.visit_body(&loop_statement.body);
                 let statically_nonempty = match loop_statement.iter.as_ref() {
                     Expr::Tuple(tuple) => !tuple.elts.is_empty(),
@@ -8468,7 +10187,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         self.visit_expr(target);
                         let mut rebound = BoundNames::default();
                         rebound.bind(target);
-                        self.invalidated_bindings.extend(rebound.names);
+                        self.rebind_module_name(rebound.names);
                     }
                 }
                 self.visit_body(&block.body);
@@ -8495,7 +10214,21 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                 }
                 self.visit_body(&loop_statement.body);
+                // The `else` runs only where the loop was not broken out of,
+                // so what it binds is uncertain and is left alone rather than
+                // taken as replacing what the body left behind.
+                let before = self.bindings.last().cloned();
                 self.visit_body(&loop_statement.orelse);
+                if let (Some(before), Some(after)) = (before, self.bindings.last_mut()) {
+                    let changed: Vec<String> = after
+                        .iter()
+                        .filter(|(name, binding)| before.get(name.as_str()) != Some(binding))
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    for name in changed {
+                        after.remove(&name);
+                    }
+                }
             }
             Stmt::With(block) => {
                 // With-items enter left to right, and each optional target is
@@ -8582,6 +10315,11 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     .subject
                     .as_literal_expr()
                     .map(ComparableLiteral::from);
+                // A capture in a case that cannot be selected statically holds
+                // only for that case's own body, but the class body after the
+                // `match` is reached whichever case ran, so there every name
+                // any of them captured is uncertain.
+                let mut uncertain = BTreeSet::new();
                 for case in &match_statement.cases {
                     let selected = match (&subject, &case.pattern) {
                         (Some(subject), Pattern::MatchSingleton(pattern)) => match pattern.value {
@@ -8595,22 +10333,14 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         },
                         (Some(subject), Pattern::MatchValue(pattern)) => {
                             let Some(pattern) = pattern.value.as_literal_expr() else {
-                                self.visit_pattern(&case.pattern);
-                                if let Some(guard) = &case.guard {
-                                    self.visit_expr(guard);
-                                }
-                                self.visit_body(&case.body);
+                                uncertain.extend(self.visit_uncertain_class_case(case));
                                 continue;
                             };
                             python_literals_equal(subject, &ComparableLiteral::from(pattern))
                         }
                         (_, Pattern::MatchAs(pattern)) if pattern.pattern.is_none() => true,
                         _ => {
-                            self.visit_pattern(&case.pattern);
-                            if let Some(guard) = &case.guard {
-                                self.visit_expr(guard);
-                            }
-                            self.visit_body(&case.body);
+                            uncertain.extend(self.visit_uncertain_class_case(case));
                             continue;
                         }
                     };
@@ -8639,6 +10369,10 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     }
                     self.visit_body(&case.body);
                     break;
+                }
+                self.invalidate_class_bindings(uncertain.iter().cloned());
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.names.extend(uncertain);
                 }
             }
             Stmt::Match(match_statement) if self.scopes.is_empty() => {
@@ -8689,7 +10423,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_pattern(&case.pattern);
                     let mut captures = BoundNames::default();
                     captures.visit_pattern(&case.pattern);
-                    self.invalidated_bindings.extend(captures.names);
+                    self.rebind_module_name(captures.names);
                     if let Some(guard) = &case.guard {
                         self.visit_expr(guard);
                         match Truthiness::from_expr(guard, |_| false) {
@@ -8697,7 +10431,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                                 continue;
                             }
                             Truthiness::Unknown => {
-                                self.visit_body(&case.body);
+                                self.visit_unselected_case_body(&case.body);
                                 continue;
                             }
                             Truthiness::True | Truthiness::Truthy => {}
@@ -8727,19 +10461,23 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 };
                 self.classes.push(qualified);
                 self.lexical_scope.push(class.name.to_string());
+                self.lexical_is_class.push(true);
                 self.scopes.push(BoundNames::default());
                 self.class_bindings.push(BTreeMap::new());
+                self.conditional_class_definitions.push(BTreeSet::new());
                 self.class_scope_depths.push(self.scopes.len());
                 self.class_direct_statements
                     .push(class.body.iter().map(Ranged::start).collect());
                 self.visit_body(&class.body);
                 self.class_direct_statements.pop();
                 self.class_scope_depths.pop();
+                self.conditional_class_definitions.pop();
                 self.class_bindings.pop();
                 self.scopes.pop();
+                self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.classes.pop();
-                self.bind_definition_in_class(class.name.as_str(), true);
+                self.bind_definition_in_class(class.name.as_str(), true, class.start());
                 if !module_scope && !self.in_class_scope() {
                     if let Some(bindings) = self.bindings.last_mut() {
                         bindings.remove(class.name.as_str());
@@ -8782,41 +10520,38 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 } else {
                     self.implicit_receiver_classes.last().cloned().flatten()
                 };
-                let (receiver, receiver_is_class) = if receiver_kind == Receiver::None {
-                    let receiver = self
-                        .implicit_receivers
+                let receiver = if receiver_kind == Receiver::None {
+                    self.implicit_receivers
                         .last()
                         .and_then(Clone::clone)
-                        .filter(|name| !function_scope.names.contains(name));
-                    let is_class = receiver.is_some()
-                        && self
-                            .implicit_receiver_is_class
-                            .last()
-                            .copied()
-                            .unwrap_or(false);
-                    (receiver, is_class)
+                        .filter(|receiver| !function_scope.names.contains(&receiver.name))
                 } else {
-                    let receiver = function
+                    function
                         .parameters
                         .posonlyargs
                         .first()
                         .or_else(|| function.parameters.args.first())
-                        .map(|parameter| parameter.parameter.name.to_string());
-                    (receiver, receiver_kind == Receiver::Class)
+                        .map(|parameter| parameter.parameter.name.to_string())
+                        .zip(self.classes.last().cloned())
+                        .map(|(name, class)| ImplicitReceiver {
+                            name,
+                            class,
+                            is_class: receiver_kind == Receiver::Class,
+                        })
                 };
                 self.implicit_receivers.push(receiver);
-                self.implicit_receiver_is_class.push(receiver_is_class);
                 self.implicit_receiver_classes.push(receiver_class);
                 self.bindings.push(BTreeMap::new());
                 self.scopes.push(function_scope);
                 self.binding_scope_depths.push(self.scopes.len() - 1);
                 self.lexical_scope.push(function.name.to_string());
+                self.lexical_is_class.push(false);
                 self.visit_body(&function.body);
+                self.lexical_is_class.pop();
                 self.lexical_scope.pop();
                 self.scopes.pop();
                 self.bindings.pop();
                 self.binding_scope_depths.pop();
-                self.implicit_receiver_is_class.pop();
                 self.implicit_receiver_classes.pop();
                 self.implicit_receivers.pop();
                 if !module_scope && !self.in_class_scope() {
@@ -8824,7 +10559,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         bindings.remove(function.name.as_str());
                     }
                 }
-                self.bind_definition_in_class(function.name.as_str(), false);
+                self.bind_definition_in_class(function.name.as_str(), false, function.start());
                 if module_scope {
                     self.rebound_classes.insert(function.name.to_string());
                 }
@@ -8859,6 +10594,10 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&named.target);
                 let mut bound = BoundNames::default();
                 bound.bind(&named.target);
+                // The class namespace resolves a name to an import bound in
+                // the same body before anything else, so a target that took
+                // the name over has to drop that import as an assignment does.
+                self.invalidate_class_bindings(bound.names.iter().cloned());
                 if let Some(scope) = self.scopes.last_mut() {
                     scope.names.extend(bound.names);
                 }
@@ -8871,7 +10610,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 self.visit_expr(&named.value);
                 let mut rebound = BoundNames::default();
                 rebound.bind(&named.target);
-                self.invalidated_bindings.extend(rebound.names);
+                self.rebind_module_name(rebound.names);
                 return;
             }
             Expr::Named(named) => {
@@ -8918,14 +10657,29 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     self.visit_parameters(parameters);
                 }
                 let scope = BoundNames::of_lambda(lambda);
-                let receiver = self.implicit_receivers.last().cloned().flatten();
-                let receiver = receiver.filter(|name| !scope.names.contains(name));
+                let receiver = self
+                    .implicit_receivers
+                    .last()
+                    .and_then(Clone::clone)
+                    .filter(|receiver| !scope.names.contains(&receiver.name));
+                // A lambda written straight in a class body belongs to that
+                // class as much as a `def` there does, so Python hands it the
+                // class's own `__class__` cell. Written anywhere else it keeps
+                // the cell of whatever function holds it, which is why the
+                // stack is pushed either way.
+                let receiver_class = if self.class_scope_depths.last() == Some(&self.scopes.len()) {
+                    self.classes.last().cloned()
+                } else {
+                    self.implicit_receiver_classes.last().cloned().flatten()
+                };
                 self.implicit_receivers.push(receiver);
+                self.implicit_receiver_classes.push(receiver_class);
                 self.scopes.push(scope);
                 self.lambda_scope_depths.push(self.scopes.len() - 1);
                 self.visit_expr(&lambda.body);
                 self.lambda_scope_depths.pop();
                 self.scopes.pop();
+                self.implicit_receiver_classes.pop();
                 self.implicit_receivers.pop();
                 return;
             }
@@ -9170,6 +10924,299 @@ mod tests {
     }
 
     #[test]
+    fn an_annotation_does_not_replace_a_class() -> Result<(), String> {
+        // `C: object` declares a type and binds nothing, so `C` is still the
+        // class defined above it.
+        let source = "class C:\n    def method(self, value=1): pass\n\nC: object\n\nC().method()\n";
+        let updated = fixed(source)?;
+        assert!(updated.ends_with("C().method(value=1)\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dead_branch_import_does_not_replace_a_function_binding() -> Result<(), String> {
+        // The `if False:` suite never runs, so `target` is still the one the
+        // function imported above it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def run():\n    from api import target\n    if False:\n        from other import target\n    target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.ends_with("    target(alpha=1)\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebound_name_is_no_longer_the_class() -> Result<(), String> {
+        // A loop, context-manager, or walrus target replaces the class, so a
+        // later call through the name must not be rewritten against it.
+        for rebinding in [
+            "for C in items:\n    pass\n",
+            "with open(path) as C:\n    pass\n",
+            "if (C := make()):\n    pass\n",
+        ] {
+            let source = format!(
+                "class C:\n    def method(self, value=1): pass\n\n{rebinding}\nC().method()\n"
+            );
+            let updated = fixed(&source)?;
+            assert!(updated.ends_with("C().method()\n"), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_package_definition_outranks_a_sibling_submodule() -> Result<(), String> {
+        // `from . import helper` reaches the package's own `helper`, since the
+        // attribute is already set when the submodule would be imported.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let init = package.join("__init__.py");
+        let submodule = package.join("helper.py");
+        let user = package.join("user.py");
+        std::fs::write(&init, "def helper(value=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&submodule, "OTHER = 1\n").map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from . import helper\n\nhelper()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[init, submodule, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from . import helper\n\nhelper(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_dataclass_is_reached_from_a_deeper_scope() -> Result<(), String> {
+        // `C` inside `inner` is the class `outer` holds, not the module-level
+        // one that happens to share its name.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    other: int = 2\n\ndef outer():\n    @dataclass\n    class C:\n        value: int = 1\n    def inner():\n        return C()\n    return inner()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrapper_alias_under_the_method_name_keeps_its_signature() -> Result<(), String> {
+        // `target = staticmethod(target)` renames nothing: the wrapper decides
+        // how the one name is called, so the call still has to be rewritten.
+        for (source, expected) in [
+            (
+                "class C:\n    def target(value=1): pass\n    target = staticmethod(target)\n\nC.target()\n",
+                "class C:\n    def target(value): pass\n    target = staticmethod(target)\n\nC.target(value=1)\n",
+            ),
+            (
+                "class C:\n    def target(cls, value=1): pass\n    target = classmethod(target)\n\nC.target()\n",
+                "class C:\n    def target(cls, value): pass\n    target = classmethod(target)\n\nC.target(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrapped_inherited_attribute_alias_is_indexed() -> Result<(), String> {
+        // The wrapper says how the alias is called; `Base.target` inside it
+        // still names the method the signature was collected for.
+        for (source, expected) in [
+            (
+                "class Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = staticmethod(Base.target)\n\nChild.alias()\n",
+                "class Base:\n    def target(value): pass\n\nclass Child:\n    alias = staticmethod(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+            (
+                "class Base:\n    def target(cls, value=1): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias()\n",
+                "class Base:\n    def target(cls, value): pass\n\nclass Child:\n    alias = classmethod(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn aliased_and_qualified_wrappers_index_class_aliases() -> Result<(), String> {
+        // The decorator forms already accept these spellings, so a class-body
+        // wrapper call has to recognise them too.
+        for (source, expected) in [
+            (
+                "from builtins import staticmethod as sm\n\nclass Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = sm(Base.target)\n\nChild.alias()\n",
+                "from builtins import staticmethod as sm\n\nclass Base:\n    def target(value): pass\n\nclass Child:\n    alias = sm(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+            (
+                "import builtins\n\nclass Base:\n    def target(value=1): pass\n\nclass Child:\n    alias = builtins.staticmethod(Base.target)\n\nChild.alias()\n",
+                "import builtins\n\nclass Base:\n    def target(value): pass\n\nclass Child:\n    alias = builtins.staticmethod(Base.target)\n\nChild.alias(value=1)\n",
+            ),
+        ] {
+            assert_eq!(fixed(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_property_alias_in_another_class_retains_the_default() {
+        // Reading `Child.alias` runs `Base.target`, so there is no call site
+        // to carry the default to — wherever the alias is written.
+        for source in [
+            "class Base:\n    def target(self, value=1): pass\n    alias = property(target)\n",
+            "class Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = property(Base.target)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn property_aliases_are_found_however_they_are_written() {
+        // The wrapper spellings the decorator path accepts, and a class body
+        // suite, all still mean the getter runs on attribute access.
+        for source in [
+            "from builtins import property as prop\n\nclass Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = prop(Base.target)\n",
+            "import builtins\n\nclass Base:\n    def target(self, value=1): pass\n\nclass Child:\n    alias = builtins.property(Base.target)\n",
+            "class Base:\n    def target(self, value=1): pass\n\nclass Child:\n    if cond:\n        alias = property(Base.target)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_nearer_binding_hides_an_outer_callable() -> Result<(), String> {
+        // `inner` binds `C` itself, so the dataclass in `outer` is not what
+        // the call reaches, even though nothing was recorded for the inner one.
+        let source = "from dataclasses import dataclass\n\ndef outer():\n    @dataclass\n    class C:\n        value: int = 1\n    def inner():\n        class C:\n            pass\n        return C()\n    return inner()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C()"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_does_not_see_a_class_nested_callable() -> Result<(), String> {
+        // A class body is not a closure scope: `C` inside the method is the
+        // module-level class, not the one nested beside the method.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n\nclass Holder:\n    @dataclass\n    class C:\n        other: int = 2\n    def method(self):\n        return C()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("return C(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_expression_scope_in_a_class_body_looks_past_the_class() -> Result<(), String> {
+        // A lambda and a comprehension each have a scope the class namespace
+        // is not part of, so `C` in them is the module-level class. Written
+        // directly in the body it is the nested one.
+        let holder = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int = 1\n\nclass Holder:\n    @dataclass\n    class C:\n        other: int = 2\n";
+        for (written, expected) in [
+            (
+                "    factory = lambda: C()\n",
+                "    factory = lambda: C(value=1)\n",
+            ),
+            (
+                "    items = [C() for _ in range(1)]\n",
+                "    items = [C(value=1) for _ in range(1)]\n",
+            ),
+            ("    made = C()\n", "    made = C(other=2)\n"),
+        ] {
+            let updated = fixed(&format!("{holder}{written}"))?;
+            assert!(updated.ends_with(expected), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_package_reexport_outranks_a_sibling_submodule() -> Result<(), String> {
+        // `__init__.py` puts a symbol under `helper`, so that is the package
+        // attribute even though a `helper` submodule sits beside it.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let init = package.join("__init__.py");
+        let implementation = package.join("impl.py");
+        let submodule = package.join("helper.py");
+        let user = package.join("user.py");
+        std::fs::write(&init, "from .impl import helper\n").map_err(|error| error.to_string())?;
+        std::fs::write(&implementation, "def helper(value=1): pass\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&submodule, "OTHER = 1\n").map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from . import helper\n\nhelper()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[init, implementation, submodule, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from . import helper\n\nhelper(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotated_cross_file_alias_is_followed() -> Result<(), String> {
+        // `target: object = api.target` names the same callable a plain
+        // assignment would.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let reexport = directory.path().join("re_export.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(value=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&reexport, "import api\n\ntarget: object = api.target\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&user, "from re_export import target\n\ntarget()\n")
+            .map_err(|error| error.to_string())?;
+        fix_all(&[api, reexport, user.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(&user).map_err(|error| error.to_string())?,
+            "from re_export import target\n\ntarget(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_else_import_is_not_discarded() -> Result<(), String> {
+        // `while False:` never iterates, which is exactly when its `else`
+        // runs, so the import in there is the one that stands.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def run():\n    from api import target\n    while False:\n        pass\n    else:\n        from other import target\n    target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("target(alpha=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
     fn detects_every_parameter_kind() {
         let found = messages("def f(a=1, /, b=2, *, c=3): pass\n", false);
         assert_eq!(found.len(), 3);
@@ -9225,69 +11272,6 @@ mod tests {
             false,
         )
         .is_empty());
-    }
-
-    #[test]
-    fn qualified_pydantic_private_attributes_are_not_model_fields() {
-        for source in [
-            "import pydantic\n\nclass C(pydantic.BaseModel):\n    _value: int = pydantic.PrivateAttr(default=1)\n",
-            "import pydantic as pd\n\nclass C(pd.BaseModel):\n    _value: int = pd.PrivateAttr(default=1)\n",
-        ] {
-            assert!(messages(source, false).is_empty(), "{source}");
-        }
-    }
-
-    #[test]
-    fn enum_member_initializer_defaults_are_retained() {
-        for source in [
-            "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
-            "import enum as enums\n\nclass E(enums.Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
-        ] {
-            let checked = check_source(
-                Path::new("fixture.py"),
-                source,
-                false,
-                Path::new(""),
-                &Reexports::default(),
-                &default_bases(),
-                true,
-            );
-            assert_eq!(checked.diagnostics.len(), 1);
-            assert!(checked.diagnostics[0].fix.is_none());
-        }
-    }
-
-    #[test]
-    fn inherited_enum_member_initializer_defaults_are_retained() {
-        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.signatures.is_empty());
-    }
-
-    #[test]
-    fn enum_missing_hook_defaults_are_retained() {
-        let source = "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
     }
 
     #[test]
@@ -9511,30 +11495,6 @@ mod tests {
             false,
         )
         .is_empty());
-    }
-
-    #[test]
-    fn nested_assignments_do_not_clear_module_truthiness() -> Result<(), String> {
-        let source = "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value=1): return value\n    target()\n";
-        assert_eq!(
-            fixed(source)?,
-            "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value): return value\n    target(value=1)\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn deferred_walruses_do_not_invalidate_live_imports() {
-        for source in [
-            "from dataclasses import dataclass as dc\n\ncallback = lambda: (dc := replacement)\n\n@dc\nclass C:\n    value: int = 1\n",
-            "from dataclasses import dataclass as dc\n\nvalues = ((dc := replacement) for _ in items)\n\n@dc\nclass C:\n    value: int = 1\n",
-        ] {
-            assert_eq!(
-                messages(source, false),
-                ["dataclass field `value` has a default"],
-                "{source}"
-            );
-        }
     }
 
     #[test]
@@ -12293,179 +14253,11 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn control_flow_classes_preserve_inherited_method_calls() -> Result<(), String> {
-        let source = "if True:\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
-        assert_eq!(
-            fixed(source)?,
-            "if True:\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn control_flow_classes_see_enclosing_suite_bases() -> Result<(), String> {
-        let source = "class Base:\n    def target(self, value=1): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
-        assert_eq!(
-            fixed(source)?,
-            "class Base:\n    def target(self, value): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn competing_conditional_class_bases_retain_inherited_defaults() -> Result<(), String> {
-        let source = "class First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif flag:\n    class Child(First):\n        def target(self, value=3): return value\n        def run(self): return self.target()\nelse:\n    class Child(Second):\n        def target(self, value=4): return value\n        def run(self): return self.target()\n\nChild().run()\n";
-        let module = parse_module(source).map_err(|error| error.to_string())?;
-        let mut definitions = Definitions::default();
-        index_method_bases(
-            module.suite(),
-            Path::new("fixture.py"),
-            &BTreeMap::new(),
-            None,
-            &mut Vec::new(),
-            &mut definitions,
-        );
-        assert!(definitions
-            .ambiguous_bases
-            .contains(&(PathBuf::from("fixture.py"), "Child".to_owned())));
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let path = directory.path().join("example.py");
-        std::fs::write(&path, source).map_err(|error| error.to_string())?;
-        let checked = check_file(
-            &path,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        let expected: BTreeSet<FixKey> = checked
-            .diagnostics
-            .iter()
-            .filter_map(|diagnostic| diagnostic.fix.map(|range| fix_key(&diagnostic.path, range)))
-            .collect();
-        let call_sites = call_site_edits(std::slice::from_ref(&path), checked.signatures)?;
-        assert!(call_sites.retained.is_superset(&expected));
-        assert!(call_sites.edits.is_empty());
-        Ok(())
-    }
-
-    #[test]
     fn nested_class_inheritance_is_lexically_scoped() -> Result<(), String> {
         let source = "def first():\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\ndef second():\n    class Base:\n        def target(self, value=2): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert first() == 1\nassert second() == 2\n";
         assert_eq!(
             fixed(source)?,
             "def first():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\ndef second():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=2)\n    return Child().run()\n\nassert first() == 1\nassert second() == 2\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn lexical_attribute_bases_preserve_inherited_method_calls() -> Result<(), String> {
-        let source = "def outer():\n    class Namespace:\n        class Base:\n            def target(self, value=1): return value\n    class Child(Namespace.Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert outer() == 1\n";
-        assert_eq!(
-            fixed(source)?,
-            "def outer():\n    class Namespace:\n        class Base:\n            def target(self, value): return value\n    class Child(Namespace.Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn dotted_submodules_win_over_package_nested_classes() -> Result<(), String> {
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let package = directory.path().join("package");
-        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
-        let initializer = package.join("__init__.py");
-        let module = package.join("module.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(
-            &initializer,
-            "class module:\n    class Base:\n        def target(self, value=1): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &module,
-            "class Base:\n    def target(self, value=2): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 2\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[initializer, module, case.clone()])?;
-        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("self.target(value=2)"), "{updated}");
-        Ok(())
-    }
-
-    #[test]
-    fn local_class_owners_win_over_stale_module_bindings() -> Result<(), String> {
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let package = directory.path().join("package");
-        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
-        let initializer = package.join("__init__.py");
-        let module = package.join("module.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
-        std::fs::write(
-            &module,
-            "class Base:\n    def target(self, value=2): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "import package.module\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[initializer, module, case.clone()])?;
-        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("self.target(value=3)"), "{updated}");
-        Ok(())
-    }
-
-    #[test]
-    fn same_scope_local_bases_shadow_imported_classes() -> Result<(), String> {
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let api = directory.path().join("api.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(
-            &api,
-            "class Base:\n    def target(self, value=9): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "from api import Base\n\ndef outer():\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert outer() == 1\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[api, case.clone()])?;
-        assert_eq!(
-            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
-            "from api import Base\n\ndef outer():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn a_class_does_not_shadow_its_own_imported_base() -> Result<(), String> {
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let api = directory.path().join("api.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(
-            &api,
-            "class Base:\n    def target(self, value=9): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "from api import Base\n\nclass Base(Base):\n    def run(self): return self.target()\n\nassert Base().run() == 9\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[api, case.clone()])?;
-        assert_eq!(
-            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
-            "from api import Base\n\nclass Base(Base):\n    def run(self): return self.target(value=9)\n\nassert Base().run() == 9\n"
         );
         Ok(())
     }
@@ -13418,48 +15210,6 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn a_class_shape_alias_uses_the_nearest_enclosing_scope() -> Result<(), String> {
-        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    module: int = 1\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    class Container:\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n    return Container.Child()\n\nouter()\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        let child = checked
-            .signatures
-            .iter()
-            .find(|signature| signature.positional.iter().any(|field| field == "child"))
-            .ok_or("expected the nested child signature")?;
-        assert_eq!(child.positional, ["local", "child"]);
-        Ok(())
-    }
-
-    #[test]
-    fn a_nested_class_shape_alias_skips_outer_class_scopes() -> Result<(), String> {
-        let source = "from dataclasses import dataclass\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 1\n\n    class Container:\n        @dataclass\n        class Base:\n            class_body: int = 2\n\n        class Nested:\n            Alias = Base\n\n            @dataclass\n            class Child(Alias):\n                child: int = 3\n\n    return Container.Nested.Child\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        let child = checked
-            .signatures
-            .iter()
-            .find(|signature| signature.positional.iter().any(|field| field == "child"))
-            .ok_or("expected the nested child signature")?;
-        assert_eq!(child.positional, ["local", "child"]);
-        Ok(())
-    }
-
-    #[test]
     fn a_qualified_custom_generic_base_is_not_the_typing_construct() -> Result<(), String> {
         let source = "from dataclasses import dataclass\n\nclass helpers:\n    @dataclass\n    class Generic:\n        inherited: int = 1\n\n@dataclass\nclass C(helpers.Generic):\n    value: int = 2\n\nC()\n";
         let updated = fixed(source)?;
@@ -13562,77 +15312,6 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.signatures.is_empty());
-    }
-
-    #[test]
-    fn imported_metaclass_uncertainty_propagates_through_local_bases() {
-        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Middle(Parent):\n    pass\n\n@dataclass\nclass Child(Middle):\n    value: int = field(default=1, kw_only=True)\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.signatures.is_empty());
-    }
-
-    #[test]
-    fn a_self_named_base_uses_the_previous_metaclass_binding() {
-        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base(Base):\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = field(default=1, kw_only=True)\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.signatures.is_empty());
-    }
-
-    #[test]
-    fn imported_metaclass_lookup_skips_enclosing_class_scopes() {
-        let source = "from dataclasses import dataclass, field\n\ndef build():\n    from base import Parent\n\n    class Base(Parent):\n        pass\n\n    class Container:\n        class Base:\n            pass\n\n        @dataclass\n        class Child(Base):\n            value: int = field(default=1, kw_only=True)\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.signatures.is_empty());
-    }
-
-    #[test]
-    fn a_safe_redefinition_clears_imported_metaclass_uncertainty() {
-        let source = "from dataclasses import dataclass\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base:\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = 1\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_some());
-        assert!(checked
-            .signatures
-            .iter()
-            .any(|signature| signature.positional == ["value"]));
     }
 
     #[test]
@@ -14191,22 +15870,6 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn imported_base_default_uncertainty_propagates_through_local_subclasses() {
         let source = "from dataclasses import dataclass\nfrom base import Parent\n\n@dataclass\nclass Middle(Parent):\n    middle: int = 2\n\n@dataclass\nclass Child(Middle):\n    child: int = 3\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 2);
-        assert!(checked.diagnostics.iter().all(|item| item.fix.is_none()));
-    }
-
-    #[test]
-    fn imported_base_default_uncertainty_propagates_through_subscripted_bases() {
-        let source = "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\nfrom base import Parent\n\nT = TypeVar('T')\n\n@dataclass\nclass Middle(Parent, Generic[T]):\n    middle: int = 2\n\n@dataclass\nclass Child(Middle[T]):\n    child: int = 3\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -15006,5 +16669,2400 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(settings[0].private_only, Some(true));
         assert_eq!(settings[1].private_only, Some(false));
         Ok(())
+    }
+
+    #[test]
+    fn a_global_declaration_reaches_the_module_binding() -> Result<(), String> {
+        // `global target` names the module's binding, not the import an
+        // enclosing function made under the same name. `nonlocal` does name
+        // that enclosing one.
+        for (body, expected) in [
+            (
+                "from api import target\n\ndef outer():\n    from other import target\n    def inner():\n        global target\n        target()\n    return inner\n",
+                "target(alpha=1)",
+            ),
+            (
+                "def outer():\n    from other import target\n    def inner():\n        nonlocal target\n        target()\n    return inner\n",
+                "target(beta=2)",
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let other = directory.path().join("other.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(alpha=1): pass\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&other, "def target(beta=2): pass\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, body).map_err(|error| error.to_string())?;
+            fix_all(&[api, other, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(updated.contains(expected), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_subscripted_base_carries_its_metaclass() {
+        // `Child(Parent[int])` builds on `Parent` and inherits the metaclass
+        // intercepting attribute access, exactly as `Child(Parent)` does.
+        for base in ["Parent", "Parent[int]"] {
+            let source = format!(
+                "from dataclasses import dataclass\n\nclass Meta(type):\n    def __getattribute__(self, name): pass\n\n@dataclass\nclass Parent(metaclass=Meta):\n    a: int = 1\n\n@dataclass\nclass Child({base}):\n    b: int = 2\n"
+            );
+            let checked = check_source(
+                Path::new("fixture.py"),
+                &source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert!(
+                checked.diagnostics.iter().all(|d| d.fix.is_none()),
+                "{base}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rewrap_is_not_an_overwrite_but_what_follows_one_is() {
+        // `target = staticmethod(target)` keeps the same function behind the
+        // name, so the default is still what a call needs. Anything else
+        // assigned to the name replaces it, including after a rewrap.
+        for (source, fixable) in [
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = staticmethod(target)\n",
+                true,
+            ),
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = staticmethod(target)\n    target = lambda self: 9\n",
+                false,
+            ),
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = lambda self: 9\n",
+                false,
+            ),
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert_eq!(checked.diagnostics[0].fix.is_some(), fixable, "{source}");
+        }
+    }
+
+    #[test]
+    fn only_a_descriptor_wrapper_counts_as_a_rewrap() {
+        // `staticmethod` leaves the function's own parameters behind the name.
+        // An unknown call may return anything, so the default stays put.
+        for (source, fixable) in [
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = staticmethod(target)\n",
+                true,
+            ),
+            (
+                "class C:\n    def target(self, value=1): pass\n    target = memoize(target)\n",
+                false,
+            ),
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert_eq!(checked.diagnostics[0].fix.is_some(), fixable, "{source}");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_loop_else_import_does_not_take_over() -> Result<(), String> {
+        // The `else` runs only where the loop was not broken out of, so an
+        // import in there must not replace what the function was written
+        // against.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def run():\n    from api import target\n    for _ in [1]:\n        break\n    else:\n        from other import target\n    target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("target(beta=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_built_in_a_function_sees_a_later_base() {
+        // `build()` runs after the module is executed, so `Parent` exists by
+        // then and its metaclass may replace what a call reads.
+        for source in [
+            "class Meta(type):\n    def __getattribute__(self, name): pass\n\nclass Parent(metaclass=Meta):\n    pass\n\ndef build():\n    class Child(Parent):\n        def run(self, value=1): pass\n    return Child\n",
+            "def build():\n    class Child(Parent):\n        def run(self, value=1): pass\n    return Child\n\nclass Meta(type):\n    def __getattribute__(self, name): pass\n\nclass Parent(metaclass=Meta):\n    pass\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_guard_does_not_bind_for_later_cases() -> Result<(), String> {
+        // The second case runs only where the first guard failed, so the
+        // import in that guarded body is not one it can be assumed to see.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(alpha=1): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(&other, "def target(beta=2): pass\n").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from api import target\n\nmatch 1:\n    case 1 if unknown():\n        from other import target\n    case 2:\n        target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("target(beta=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_alias_only_drops_what_it_really_rebinds() -> Result<(), String> {
+        // `import pkg as pkg` names the same package, so the dotted imports
+        // under it still stand. A different module taking the name does
+        // replace them, and an import resolving to nothing rebinds nothing.
+        for (caller, rewritten) in [
+            ("import pkg.api\n\npkg.api.target()\n", true),
+            (
+                "import pkg.api\nimport pkg as pkg\n\npkg.api.target()\n",
+                true,
+            ),
+            (
+                "import pkg.api\nimport external as pkg\n\npkg.api.target()\n",
+                false,
+            ),
+            (
+                "import pkg.api\nimport external as pkg, pkg.missing\n\npkg.api.target()\n",
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let package = directory.path().join("pkg");
+            std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+            std::fs::write(package.join("__init__.py"), "").map_err(|error| error.to_string())?;
+            std::fs::write(package.join("api.py"), "def target(value=1): pass\n")
+                .map_err(|error| error.to_string())?;
+            let external = directory.path().join("external.py");
+            std::fs::write(&external, "").map_err(|error| error.to_string())?;
+            let user = directory.path().join("user.py");
+            std::fs::write(&user, caller).map_err(|error| error.to_string())?;
+            fix_all(&[
+                package.join("__init__.py"),
+                package.join("api.py"),
+                external,
+                user.clone(),
+            ])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert_eq!(updated.contains("target(value=1)"), rewritten, "{caller}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotation_without_a_value_keeps_a_dataclass_alias_shape() -> Result<(), String> {
+        // `Alias: object` declares a type and binds nothing, so `Child` still
+        // inherits `Base`'s field and its call needs that argument.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\nAlias: object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        assert_eq!(
+            fixed(source)?,
+            "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int\n\nAlias = Base\nAlias: object\n\n@dataclass\nclass Child(Alias):\n    value: int\n\nChild(inherited=1, value=2)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_scope_walrus_replaces_an_earlier_import() -> Result<(), String> {
+        // The class namespace resolves a name to an import bound in the same
+        // body ahead of everything else, so a walrus that took the name over
+        // has to drop it. Rewriting past one wrote `target(value=1)` against
+        // a lambda that takes nothing.
+        for body in [
+            "class C:\n    from api import target\n\n    (target := staticmethod(lambda: 9))\n    result = target()\n",
+            "class C:\n    from api import target\n\n    holder = [(target := staticmethod(lambda: 9))]\n    result = target()\n",
+            "class C:\n    from api import target\n\n    flag = True\n    if flag:\n        (target := staticmethod(lambda: 9))\n    result = target()\n",
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(value=1):\n    return value\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, body).map_err(|error| error.to_string())?;
+            fix_all(&[api, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(!updated.contains("target(value=1)"), "{updated}");
+        }
+        // The same class body without the walrus is rewritten, so the calls
+        // above are left alone by the rebinding rather than by nothing.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(&api, "def target(value=1):\n    return value\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "class C:\n    from api import target\n\n    result = target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.contains("target(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotated_assignment_drops_a_dataclass_alias_shape() -> Result<(), String> {
+        // `Alias: object = object` does rebind, so nothing is known about what
+        // `Child` inherits and its call is left alone.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\nAlias: object = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        let updated = fixed(source)?;
+        assert!(updated.ends_with("\nChild()\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebound_base_name_loses_its_dataclass_shape() -> Result<(), String> {
+        // A loop, context-manager, walrus, or match target replaces the class
+        // the name stood for just as an assignment does. Keeping the shape
+        // wrote the old base's fields into a subclass's constructor.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n";
+        let tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in [
+            "for Alias in [object]:\n    pass\n",
+            "class Ctx:\n    def __enter__(self):\n        return object\n\n    def __exit__(self, *args):\n        return False\n\nwith Ctx() as Alias:\n    pass\n",
+            "print(Alias := object)\n",
+            "match object:\n    case Alias:\n        pass\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        // Without a rebinding the alias still carries the fields through.
+        let updated = fixed(&format!("{head}{tail}"))?;
+        assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebound_flag_is_no_longer_known_to_be_true() -> Result<(), String> {
+        // The same rebindings decide a branch the recorded truthiness would
+        // otherwise settle, so a stale value picked the wrong base entirely.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nFLAG = True\n";
+        let tail = "\nif FLAG:\n    Alias = Base\nelse:\n    Alias = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in ["for FLAG in [False]:\n    pass\n", "print(FLAG := False)\n"] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        let updated = fixed(&format!("{head}{tail}"))?;
+        assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_rebinding_leaves_module_truthiness_alone() -> Result<(), String> {
+        // A loop or walrus target in a function or class body binds that
+        // scope's own name, leaving the module-level flag it happens to share
+        // a name with untouched. Dropping the recorded truth made the branch
+        // below uncertain, so the base was unknown and `Child()` kept its
+        // arguments while the fields it needed lost their defaults.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nFLAG = True\n";
+        let tail = "\nif FLAG:\n    Alias = Base\nelse:\n    Alias = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for nested in [
+            "def helper():\n    for FLAG in [False]:\n        pass\n",
+            "def helper():\n    print(FLAG := False)\n",
+            "class Holder:\n    for FLAG in [False]:\n        pass\n",
+        ] {
+            let updated = fixed(&format!("{head}{nested}{tail}"))?;
+            assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        }
+        // `global` sends the body's binding to the module namespace, so the
+        // flag there does stop being known, as it does when the rebinding is
+        // written at module level.
+        for rebind in [
+            "def helper():\n    global FLAG\n    for FLAG in [False]:\n        pass\n\nhelper()\n",
+            "def helper():\n    global FLAG\n    FLAG = False\n\nhelper()\n",
+            "for FLAG in [False]:\n    pass\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_match_capture_shadows_an_import_before_a_case_is_chosen() -> Result<(), String> {
+        // A pattern that cannot be selected statically still binds its
+        // captures for its own body, so a capture named after an earlier class
+        // import takes that name over there. Only a case capturing some other
+        // name leaves the import standing.
+        for (case, rewritten) in [
+            ("case [other]:", true),
+            ("case [target]:", false),
+            ("case [_] as target:", false),
+            ("case Wrapper(inner=target):", false),
+            ("case target if flag():", false),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(value=1): return value\n")
+                .map_err(|error| error.to_string())?;
+            let caller = format!(
+                "class C:\n    from api import target\n    match subject:\n        {case}\n            result = target()\n"
+            );
+            std::fs::write(&user, &caller).map_err(|error| error.to_string())?;
+            fix_all(&[api, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert_eq!(updated.contains("target(value=1)"), rewritten, "{caller}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_match_capture_ends_with_its_own_case() -> Result<(), String> {
+        // A case after one whose pattern cannot be selected statically runs
+        // only where that pattern did not match, so a capture that one made is
+        // not in force there and the class import it displaced still stands.
+        // The class body after the whole match is reached whichever case ran,
+        // so there a captured name does stay uncertain.
+        for (cases, rewritten) in [
+            (
+                "        case [target]:\n            result = target()\n",
+                false,
+            ),
+            (
+                "        case [target]:\n            pass\n        case [other]:\n            result = target()\n",
+                true,
+            ),
+            (
+                "        case [other]:\n            pass\n        case [another]:\n            result = target()\n",
+                true,
+            ),
+            (
+                "        case [target]:\n            pass\n    result = target()\n",
+                false,
+            ),
+            (
+                "        case [other]:\n            pass\n    result = target()\n",
+                true,
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(value=1): return value\n")
+                .map_err(|error| error.to_string())?;
+            let caller =
+                format!("class C:\n    from api import target\n    match subject:\n{cases}");
+            std::fs::write(&user, &caller).map_err(|error| error.to_string())?;
+            fix_all(&[api, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert_eq!(
+                updated.contains("result = target(value=1)"),
+                rewritten,
+                "{caller}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_match_capture_undoes_a_reimport_in_its_case() -> Result<(), String> {
+        // Undoing a capture has to undo an import the case body wrote for that
+        // same name, because a later case runs only where the pattern did not
+        // match and so reaches neither the capture nor the import. The name
+        // there is whatever the case found, an earlier class import or a
+        // module-level one, and never the re-import. An import of a name the
+        // pattern did not capture is left alone.
+        for (caller, expected) in [
+            (
+                "class C:\n    from api import target\n    match subject:\n        case [target]:\n            from other import target\n        case [x]:\n            result = target()\n",
+                "result = target(value=1)",
+            ),
+            (
+                "from api import target\nclass C:\n    match subject:\n        case [target]:\n            from other import target\n        case [x]:\n            result = target()\n",
+                "result = target(value=1)",
+            ),
+            (
+                "class C:\n    from api import target\n    match subject:\n        case [x]:\n            from other import target\n        case [y]:\n            result = target()\n",
+                "result = target(value=2)",
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let other = directory.path().join("other.py");
+            let user = directory.path().join("user.py");
+            std::fs::write(&api, "def target(value=1): return value\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&other, "def target(value=2): return value\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, caller).map_err(|error| error.to_string())?;
+            fix_all(&[api, other, user.clone()])?;
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(updated.contains(expected), "{caller}\n{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stub_annotations_are_not_rewritten_as_calls() -> Result<(), String> {
+        // A stub postpones its annotations without the future import, so a
+        // call in one is a type expression rather than a call site. The two
+        // `.py` cases pin the surrounding behaviour: without the import the
+        // annotation runs and must be rewritten, with it it must not.
+        for (name, caller, expected) in [
+            (
+                "stub.pyi",
+                "from api import helper\n\ndef f(x: helper()) -> None: ...\n",
+                "def f(x: helper()) -> None: ...\n",
+            ),
+            (
+                "plain.py",
+                "from api import helper\n\ndef f(x: helper()) -> None: pass\n",
+                "def f(x: helper(value=1)) -> None: pass\n",
+            ),
+            (
+                "postponed.py",
+                "from __future__ import annotations\n\nfrom api import helper\n\ndef f(x: helper()) -> None: pass\n",
+                "def f(x: helper()) -> None: pass\n",
+            ),
+        ] {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let api = directory.path().join("api.py");
+            let user = directory.path().join(name);
+            std::fs::write(&api, "def helper(value=1): return value\n")
+                .map_err(|error| error.to_string())?;
+            std::fs::write(&user, caller).map_err(|error| error.to_string())?;
+            fix_all(&[api.clone(), user.clone()])?;
+            assert_eq!(
+                std::fs::read_to_string(&api).map_err(|error| error.to_string())?,
+                "def helper(value): return value\n"
+            );
+            let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+            assert!(updated.ends_with(expected), "{name}\n{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_global_rebinding_drops_module_truthiness() -> Result<(), String> {
+        // A class body runs when its statement does, so a `global` binding
+        // there lands in the module namespace straight away and the flag a
+        // later module-level test reads is the one the body wrote. Keeping the
+        // recorded truth took the branch the class body had already ruled out,
+        // writing the wrong base's fields into `Child()`.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nFLAG = True\n";
+        let tail = "\nif FLAG:\n    Alias = Base\nelse:\n    Alias = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in [
+            "class Holder:\n    global FLAG\n    FLAG = False\n",
+            "class Holder:\n    global FLAG\n    for FLAG in [False]:\n        pass\n",
+            "class Holder:\n    global FLAG\n    print(FLAG := False)\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        // Without `global` the body binds a class attribute and the module
+        // flag stands, so the calls above are left alone by the rebinding
+        // rather than by the class body alone.
+        let updated = fixed(&format!("{head}class Holder:\n    FLAG = False\n{tail}"))?;
+        assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_global_rebinding_drops_the_module_dataclass_shape() -> Result<(), String> {
+        // `global` sends a body's binding to the module namespace, so the
+        // class the module name stood for is gone by the time a later
+        // subclass names it. Shapes are keyed by the enclosing scope, which
+        // left the module entry standing, and `Child()` was rewritten with an
+        // `inherited` argument the rebound base no longer accepts.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n";
+        let tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in [
+            "class Holder:\n    global Alias\n    Alias = object\n",
+            "class Holder:\n    global Alias\n    for Alias in [object]:\n        pass\n",
+            "def helper():\n    global Alias\n    Alias = object\n\nhelper()\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        // Without `global` the body binds its own name, the module alias still
+        // stands for the dataclass, and the fields come through as they do
+        // when no body intervenes at all.
+        for kept in [
+            "class Holder:\n    Alias = object\n",
+            "def helper():\n    Alias = object\n\nhelper()\n",
+            "",
+        ] {
+            let updated = fixed(&format!("{head}{kept}{tail}"))?;
+            assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_global_rebinding_drops_a_structural_base_alias() -> Result<(), String> {
+        // A structural base declares no fields, so a dataclass built on one
+        // has exactly the fields its own body writes and its constructor is
+        // known from the file that defines it. `global` sends a body's binding
+        // to the module namespace, so the imported name stands for the
+        // rebinding by the time a later subclass names it, and `Child()` was
+        // rewritten without the fields that binding brought with it.
+        for (imported, base) in [
+            ("from typing import Protocol", "Protocol"),
+            ("from abc import ABC", "ABC"),
+        ] {
+            let head = format!(
+                "from dataclasses import dataclass\n{imported}\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\n"
+            );
+            let tail =
+                format!("\n@dataclass\nclass Child({base}):\n    value: int = 2\n\nChild()\n");
+            for rebind in [
+                format!("class Holder:\n    global {base}\n    {base} = Base\n"),
+                format!("def helper():\n    global {base}\n    {base} = Base\n\nhelper()\n"),
+            ] {
+                let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+                assert!(!updated.contains("Child(value=2)"), "{updated}");
+            }
+            // Without `global` the body binds a name only it can see, the
+            // import still stands, and the structural base contributes nothing
+            // beyond what the subclass writes itself.
+            for kept in [format!("class Holder:\n    {base} = Base\n"), String::new()] {
+                let updated = fixed(&format!("{head}{kept}{tail}"))?;
+                assert!(updated.contains("Child(value=2)"), "{updated}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_twice_nested_global_rebinding_drops_a_structural_base_alias() -> Result<(), String> {
+        // `global` sends a binding to the module namespace from however deep
+        // in the file it is written, so the import the name arrived under is
+        // gone once the body runs. A body one scope down is reached after its
+        // enclosing body has saved the alias table it puts back on the way
+        // out, so the import used to reappear and `Child()` was rewritten as a
+        // subclass of a structural base, without the fields the rebinding
+        // brought with it.
+        for (imported, base) in [
+            ("from typing import Protocol", "Protocol"),
+            ("from abc import ABC", "ABC"),
+        ] {
+            let head = format!(
+                "from dataclasses import dataclass\n{imported}\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\n"
+            );
+            let tail =
+                format!("\n@dataclass\nclass Child({base}):\n    value: int = 2\n\nChild()\n");
+            for rebind in [
+                format!(
+                    "def outer():\n    class Holder:\n        global {base}\n        {base} = Base\n\nouter()\n"
+                ),
+                format!(
+                    "def outer():\n    def inner():\n        global {base}\n        {base} = Base\n\n    inner()\n\nouter()\n"
+                ),
+                format!(
+                    "class Holder:\n    def inner():\n        global {base}\n        {base} = Base\n\nHolder.inner()\n"
+                ),
+                format!(
+                    "class Holder:\n    class Inner:\n        global {base}\n        {base} = Base\n"
+                ),
+            ] {
+                let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+                assert!(!updated.contains("Child(value=2)"), "{updated}");
+            }
+            // The same nesting without `global` binds a name only the inner
+            // body can see, so the import stands and the structural base still
+            // contributes nothing of its own.
+            for kept in [
+                format!("def outer():\n    class Holder:\n        {base} = Base\n\nouter()\n"),
+                String::new(),
+            ] {
+                let updated = fixed(&format!("{head}{kept}{tail}"))?;
+                assert!(updated.contains("Child(value=2)"), "{updated}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotation_does_not_lose_a_live_shape_alias() -> Result<(), String> {
+        // A bare annotation binds nothing, and an annotated assignment names
+        // its value just as a plain one does, so both leave `Alias` describing
+        // `Base` and its field reaches the subclass constructor. Only a real
+        // rebinding takes those fields away.
+        for (middle, inherits) in [
+            ("", true),
+            ("Alias: object\n", true),
+            ("Alias: object = Base\n", true),
+            ("Alias = object\n", false),
+            ("Alias: object = object\n", false),
+        ] {
+            let source = format!(
+                "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n{middle}\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n"
+            );
+            let updated = fixed(&source)?;
+            assert_eq!(
+                updated.contains("Child(inherited=1, value=2)"),
+                inherits,
+                "{middle}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotation_only_global_leaves_the_module_name_standing() -> Result<(), String> {
+        // `global Alias` followed by `Alias: int` declares a type and assigns
+        // nothing, so the module name still holds what it was imported or
+        // assigned as. Reading the declaration as a rebinding dropped the
+        // alias, the shape and the flag, leaving the subclass below with a
+        // base the file could no longer describe.
+        let structural_head = "from dataclasses import dataclass\nfrom typing import Protocol\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\n";
+        let structural_tail =
+            "\n@dataclass\nclass Child(Protocol):\n    value: int = 2\n\nChild()\n";
+        let shape_head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n";
+        let shape_tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        let flag_head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nFLAG = True\n";
+        let flag_tail = "\nif FLAG:\n    Alias = Base\nelse:\n    Alias = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for declaration in [
+            "def helper():\n    global Protocol\n    Protocol: int\n",
+            "class Holder:\n    global Protocol\n    Protocol: int\n",
+        ] {
+            let updated = fixed(&format!("{structural_head}{declaration}{structural_tail}"))?;
+            assert!(updated.contains("Child(value=2)"), "{updated}");
+        }
+        for declaration in [
+            "def helper():\n    global Alias\n    Alias: int\n",
+            "class Holder:\n    global Alias\n    Alias: int\n",
+        ] {
+            let updated = fixed(&format!("{shape_head}{declaration}{shape_tail}"))?;
+            assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        }
+        for declaration in [
+            "def helper():\n    global FLAG\n    FLAG: int\n",
+            "class Holder:\n    global FLAG\n    FLAG: int\n",
+        ] {
+            let updated = fixed(&format!("{flag_head}{declaration}{flag_tail}"))?;
+            assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        }
+        // An annotated assignment in the same place does put something behind
+        // the name, so the calls above are left standing by the missing value
+        // rather than by the declaration being nested or `global` doing
+        // nothing at all.
+        for rebind in [
+            "def helper():\n    global Protocol\n    Protocol: object = Base\n\nhelper()\n",
+            "class Holder:\n    global Protocol\n    Protocol: object = Base\n",
+        ] {
+            let updated = fixed(&format!("{structural_head}{rebind}{structural_tail}"))?;
+            assert!(!updated.contains("Child(value=2)"), "{updated}");
+        }
+        for rebind in [
+            "def helper():\n    global Alias\n    Alias: object = object\n\nhelper()\n",
+            "class Holder:\n    global Alias\n    Alias: object = object\n",
+        ] {
+            let updated = fixed(&format!("{shape_head}{rebind}{shape_tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_lambda_walrus_leaves_the_enclosing_name_standing() -> Result<(), String> {
+        // A walrus in a lambda body binds in the lambda's own scope, which
+        // nothing outside the lambda reads. Treating it as a module rebinding
+        // threw away the shape and the flag the module name really holds, and
+        // the subclass below lost the base it was written against.
+        let shape_head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n";
+        let shape_tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        let flag_head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nFLAG = True\n";
+        let flag_tail = "\nif FLAG:\n    Alias = Base\nelse:\n    Alias = object\n\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        let updated = fixed(&format!(
+            "{shape_head}handler = lambda: (Alias := object)\n{shape_tail}"
+        ))?;
+        assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        let updated = fixed(&format!(
+            "{flag_head}handler = lambda: (FLAG := False)\n{flag_tail}"
+        ))?;
+        assert!(updated.contains("Child(inherited=1, value=2)"), "{updated}");
+        // A lambda's parameter defaults are evaluated where the lambda is
+        // written, not in its scope, so a walrus among them does rebind. The
+        // same walrus written as a statement does too, so the lambda body is
+        // what spares the name above.
+        for rebind in [
+            "handler = lambda value=(Alias := object): value\n",
+            "print(Alias := object)\n",
+        ] {
+            let updated = fixed(&format!("{shape_head}{rebind}{shape_tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{updated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_definition_header_walrus_rebinds_the_enclosing_name() -> Result<(), String> {
+        // Decorators, parameter defaults, annotations and bases are evaluated
+        // where the `def` or `class` is written, before the scope it opens
+        // exists. Recording a walrus among them against that scope left the
+        // module shape standing, and the subclass below was constructed with
+        // fields the rebound base no longer has.
+        let shape_head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n\ndef deco(value):\n    return lambda target: target\n";
+        let shape_tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for header in [
+            "def helper(value=(Alias := object)):\n    pass\n",
+            "def helper(value: (Alias := object) = 1):\n    pass\n",
+            "def helper() -> (Alias := object):\n    pass\n",
+            "@deco(Alias := object)\ndef helper():\n    pass\n",
+            "@deco(Alias := object)\nclass Holder:\n    pass\n",
+            "class Holder((Alias := object)):\n    pass\n",
+        ] {
+            let updated = fixed(&format!("{shape_head}{header}{shape_tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{header}\n{updated}");
+        }
+        // The same walrus in the body binds a name only that body can see, so
+        // the module alias still stands and the fields come through.
+        for body in [
+            "def helper():\n    print(Alias := object)\n",
+            "class Holder:\n    print(Alias := object)\n",
+            "",
+        ] {
+            let updated = fixed(&format!("{shape_head}{body}{shape_tail}"))?;
+            assert!(
+                updated.contains("Child(inherited=1, value=2)"),
+                "{body}\n{updated}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_header_lambda_default_walrus_rebinds_the_enclosing_name() -> Result<(), String> {
+        // A lambda written in a `def` or `class` header keeps its body to
+        // itself, but the defaults of its parameters are evaluated where the
+        // lambda is, which is the enclosing namespace. Stopping at the lambda
+        // while collecting what a header rebinds left the alias table saved on
+        // the way into the definition holding the old name, and the table put
+        // back on the way out brought it with it, so the subclass below was
+        // built on a base the rebinding had taken away.
+        let shape_head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n\ndef deco(value):\n    return lambda target: target\n\ndef pick(value):\n    return object\n";
+        let shape_tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for header in [
+            "def helper(value=(lambda inner=(Alias := object): inner)):\n    pass\n",
+            "def helper() -> (lambda inner=(Alias := object): inner):\n    pass\n",
+            "@deco(lambda inner=(Alias := object): inner)\ndef helper():\n    pass\n",
+            "@deco(lambda inner=(Alias := object): inner)\nclass Holder:\n    pass\n",
+            "class Holder(pick(lambda inner=(Alias := object): inner)):\n    pass\n",
+        ] {
+            let updated = fixed(&format!("{shape_head}{header}{shape_tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{header}\n{updated}");
+        }
+        // A structural base is imported rather than assigned, so what the
+        // header takes away is the import itself.
+        let structural_head = "from dataclasses import dataclass\nfrom typing import Protocol\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\ndef deco(value):\n    return lambda target: target\n";
+        let structural_tail =
+            "\n@dataclass\nclass Child(Protocol):\n    value: int = 2\n\nChild()\n";
+        for header in [
+            "def helper(value=(lambda inner=(Protocol := Base): inner)):\n    pass\n",
+            "@deco(lambda inner=(Protocol := Base): inner)\ndef helper():\n    pass\n",
+            "@deco(lambda inner=(Protocol := Base): inner)\nclass Holder:\n    pass\n",
+        ] {
+            let updated = fixed(&format!("{structural_head}{header}{structural_tail}"))?;
+            assert!(!updated.contains("Child(value=2)"), "{header}\n{updated}");
+        }
+        // The lambda's body is another scope, so a walrus there leaves the
+        // enclosing name standing, as does a header with nothing rebound in
+        // it at all.
+        for header in [
+            "@deco(lambda: (Alias := object))\ndef helper():\n    pass\n",
+            "def helper(value=(lambda: (Alias := object))):\n    pass\n",
+            "",
+        ] {
+            let updated = fixed(&format!("{shape_head}{header}{shape_tail}"))?;
+            assert!(
+                updated.contains("Child(inherited=1, value=2)"),
+                "{header}\n{updated}"
+            );
+        }
+        let updated = fixed(&format!("{structural_head}{structural_tail}"))?;
+        assert!(updated.contains("Child(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn constructor_aliases_shadow_the_inherited_constructor() -> Result<(), String> {
+        // ``__init__ = setup`` makes ``setup`` the constructor, so ``Child()``
+        // takes that method's parameters rather than the ones the base's
+        // ``__init__`` was left with. Rewriting it against the base would call
+        // ``setup`` with a keyword it does not accept.
+        let aliased = "class Base:\n    def __init__(self, parent=1):\n        self.value = parent\n\nclass Child(Base):\n    def setup(self):\n        self.value = 2\n    __init__ = setup\n\nassert Child().value == 2\n";
+        assert_eq!(
+            fixed(aliased)?,
+            "class Base:\n    def __init__(self, parent):\n        self.value = parent\n\nclass Child(Base):\n    def setup(self):\n        self.value = 2\n    __init__ = setup\n\nassert Child().value == 2\n"
+        );
+        // A subclass that binds no constructor of its own still inherits the
+        // base's, so its calls are rewritten against it.
+        let inherited = "class Base:\n    def __init__(self, parent=1):\n        self.value = parent\n\nclass Child(Base):\n    pass\n\nassert Child().value == 1\n";
+        assert_eq!(
+            fixed(inherited)?,
+            "class Base:\n    def __init__(self, parent):\n        self.value = parent\n\nclass Child(Base):\n    pass\n\nassert Child(parent=1).value == 1\n"
+        );
+        Ok(())
+    }
+
+    /// Fix `source` the way `--fix` does, without insisting that nothing is
+    /// left to report afterwards.
+    ///
+    /// A constructor alias keeps the defaults its implementation declares, so
+    /// the diagnostic for them outlives the fix that `fixed` requires to be
+    /// cleared.
+    fn fixed_with_retained_defaults(source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.py");
+        std::fs::write(&path, source).map_err(|error| error.to_string())?;
+        let files = [path.clone()];
+        let checked = check_file(
+            &path,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        let mut edits = call_site_edits(&files, checked.signatures)?.edits;
+        for diagnostic in &checked.diagnostics {
+            if let Some(range) = diagnostic.fix {
+                edits
+                    .entry(diagnostic.path.clone())
+                    .or_default()
+                    .push(Edit::deletion(range));
+            }
+        }
+        let mut updated = 0;
+        let mut unfixed = BTreeSet::new();
+        write_fixes_atomically(fixed_sources(edits, &mut updated, &mut unfixed)?)?;
+        std::fs::read_to_string(&path).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_retained_alias_default_leaves_the_constructor_call_alone() -> Result<(), String> {
+        // The implementation behind `__init__ = setup` keeps its default,
+        // which records no signature for the call site to be rewritten
+        // against. The base's `__init__` must not stand in for the one that
+        // is missing: `setup` never takes `parent`.
+        let source = "class Base:\n    def __init__(self, parent=1):\n        self.value = parent\n\nclass Child(Base):\n    def setup(self, own=2):\n        self.value = own\n    __init__ = setup\n\nassert Child().value == 2\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("def __init__(self, parent=1)", "def __init__(self, parent)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_module_annotation_leaves_super_the_builtin() -> Result<(), String> {
+        // Nothing stands behind ``super`` here, so the call in ``run`` still
+        // reaches the builtin and the inherited default has to travel with it.
+        // Removing ``value`` while leaving the call alone would have left a
+        // live call short of an argument.
+        let annotated = "super: object\n\nclass Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(annotated)?,
+            "super: object\n\nclass Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self): return super().target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        // An assignment does put something else behind the name, and then the
+        // call reaches that instead of the inherited method.
+        let assigned = "class Other:\n    def target(self): return 9\n\nclass Base:\n    def target(self, value=1): return value\n\nsuper = Other\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 9\n";
+        assert_eq!(
+            fixed(assigned)?,
+            "class Other:\n    def target(self): return 9\n\nclass Base:\n    def target(self, value): return value\n\nsuper = Other\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_aliased_post_init_keeps_its_defaults() {
+        // `@dataclass` finds the hook under the name it is bound to, so
+        // aliasing an ordinary method to `__post_init__` makes the generated
+        // `__init__` call that method with no arguments. There is no call site
+        // to carry the default to, so it has to stay.
+        let aliased = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int\n\n    def setup(self, extra=1):\n        self.extra = extra\n\n    __post_init__ = setup\n\nC(5)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            aliased,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+        // Without the alias nothing calls the method implicitly, so the same
+        // default is removed as usual.
+        let unaliased = "from dataclasses import dataclass\n\n@dataclass\nclass C:\n    value: int\n\n    def setup(self, extra=1):\n        self.extra = extra\n\nC(5)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            unaliased,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_class_nested_in_a_method_does_not_claim_its_receiver() -> Result<(), String> {
+        // A class defined in a method body is pushed onto the class stack
+        // while the method's `self` or `cls` is still in view, so a receiver
+        // used from inside that class stands for the outer class rather than
+        // the one being defined.
+        for receiver in ["type(self)()", "self.__class__()"] {
+            let source = format!(
+                "class Outer:\n    def target(self, value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, other=2):\n                return other\n\n            result = {receiver}.target()\n        return Inner.result\n\nassert Outer().run() == 1\n"
+            );
+            assert_eq!(
+                fixed(&source)?,
+                format!(
+                    "class Outer:\n    def target(self, value):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, other):\n                return other\n\n            result = {receiver}.target(value=1)\n        return Inner.result\n\nassert Outer().run() == 1\n"
+                )
+            );
+        }
+        let classmethod = "class Outer:\n    def target(self, value=1):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            def target(self, other=2):\n                return other\n\n            result = cls().target()\n        return Inner.result\n\nassert Outer.run() == 1\n";
+        assert_eq!(
+            fixed(classmethod)?,
+            "class Outer:\n    def target(self, value):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            def target(self, other):\n                return other\n\n            result = cls().target(value=1)\n        return Inner.result\n\nassert Outer.run() == 1\n"
+        );
+        // A method of the nested class brings its own receiver, which does
+        // stand for the nested class.
+        let own_receiver = "class Outer:\n    def target(self, value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, other=2):\n                return other\n\n            @classmethod\n            def build(cls):\n                return cls().target()\n        return Inner.build()\n\nassert Outer().run() == 2\n";
+        assert_eq!(
+            fixed(own_receiver)?,
+            "class Outer:\n    def target(self, value):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, other):\n                return other\n\n            @classmethod\n            def build(cls):\n                return cls().target(other=2)\n        return Inner.build()\n\nassert Outer().run() == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_shadows_only_with_what_it_leaves_behind() -> Result<(), String> {
+        // A `TYPE_CHECKING` block does not run, so `Child` has no `method` of
+        // its own and the call still reaches the base's. Treating the block as
+        // a shadow left the call as written while the default it needs was
+        // removed from under it.
+        let guarded = "from typing import TYPE_CHECKING\n\nclass Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    if TYPE_CHECKING:\n        def method(self): ...\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed(guarded)?,
+            "from typing import TYPE_CHECKING\n\nclass Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    if TYPE_CHECKING:\n        def method(self): ...\n\nassert Child().method(value=1) == 1\n"
+        );
+        // An `except ... as` target is deleted when its handler ends, so it
+        // is never on the class either.
+        let caught = "class Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    try:\n        pass\n    except Exception as method:\n        pass\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed(caught)?,
+            "class Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    try:\n        pass\n    except Exception as method:\n        pass\n\nassert Child().method(value=1) == 1\n"
+        );
+        // An assignment under `global` is made outside the class, and a `del`
+        // takes back what the body put there.
+        let elsewhere = "class Base:\n    def method(self, value=1): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    global method\n    method = other\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed(elsewhere)?,
+            "class Base:\n    def method(self, value): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    global method\n    method = other\n\nassert Child().method(value=1) == 1\n"
+        );
+        let deleted = "class Base:\n    def method(self, value=1): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n    del method\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed(deleted)?,
+            "class Base:\n    def method(self, value): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n    del method\n\nassert Child().method(value=1) == 1\n"
+        );
+        // A binding the body does leave behind still shadows, so the call is
+        // left alone.
+        let bound = "class Base:\n    def method(self, value=1): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n\nassert Child().method() == 9\n";
+        assert_eq!(
+            fixed(bound)?,
+            "class Base:\n    def method(self, value): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n\nassert Child().method() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_lambda_owns_the_class_cell_of_the_body_it_is_written_in() -> Result<(), String> {
+        // Python hands a lambda written straight in a class body that class's
+        // own `__class__` cell, exactly as it does a `def` there, so the
+        // nested class the lambda sits in is the one `__class__` names.
+        let nested = "class Outer:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value=2): return value\n            make = lambda: __class__.target()\n        return Inner.make()\n\nassert Outer().run() == 2\n";
+        assert_eq!(
+            fixed(nested)?,
+            "class Outer:\n    @staticmethod\n    def target(value): return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value): return value\n            make = lambda: __class__.target(value=2)\n        return Inner.make()\n\nassert Outer().run() == 2\n"
+        );
+        let module_level = "class Top:\n    @staticmethod\n    def target(value=3): return value\n    make = lambda: __class__.target()\n\nassert Top.make() == 3\n";
+        assert_eq!(
+            fixed(module_level)?,
+            "class Top:\n    @staticmethod\n    def target(value): return value\n    make = lambda: __class__.target(value=3)\n\nassert Top.make() == 3\n"
+        );
+        // A lambda in a method body owns no class of its own, so it still sees
+        // the cell of the method holding it.
+        let in_method = "class Outer:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self):\n        make = lambda: __class__.target()\n        return make()\n\nassert Outer().run() == 1\n";
+        assert_eq!(
+            fixed(in_method)?,
+            "class Outer:\n    @staticmethod\n    def target(value): return value\n\n    def run(self):\n        make = lambda: __class__.target(value=1)\n        return make()\n\nassert Outer().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unaliased_imported_super_is_still_the_builtin() -> Result<(), String> {
+        // `from builtins import super` binds `super` to the very builtin the
+        // bare name reaches, so the call it stands in front of resolves as it
+        // would without the import.
+        let source = "from builtins import super\n\nclass Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "from builtins import super\n\nclass Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method(value=1)\n\nassert Child().run() == 1\n"
+        );
+        // A name the file binds to something of its own is a real shadow, and
+        // the call through it names nothing this pass can follow.
+        let shadowed = "def super(): raise SystemExit\n\nclass Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n";
+        assert_eq!(
+            fixed(shadowed)?,
+            "def super(): raise SystemExit\n\nclass Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parameterized_local_bases_carry_default_uncertainty() {
+        // `Middle` is built on an import, so whether its fields end in a
+        // default is unknown, and a subclass must keep its own defaults to
+        // stay constructible. Writing the base as `Middle[int]` names the same
+        // class, so it must reach the same conclusion as a bare `Middle`.
+        for base in ["Middle[int]", "Middle"] {
+            let source = format!(
+                "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\nfrom mixins import Mixin\n\nT = TypeVar(\"T\")\n\n@dataclass\nclass Middle(Mixin, Generic[T]):\n    first: int = 1\n\n@dataclass\nclass Child({base}):\n    second: int = 2\n"
+            );
+            let checked = check_source(
+                Path::new("fixture.py"),
+                &source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 2, "{base}");
+            assert!(
+                checked.diagnostics.iter().all(|item| item.fix.is_none()),
+                "{base}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_same_scope_import_names_a_nested_class_base() -> Result<(), String> {
+        // The import and the subclass sit in one function body, where a scope
+        // of its own holds the name. The same pair at module level resolves,
+        // and so must this one.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Base:\n    def method(self, value=1): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def outer():\n    from other import Base\n\n    class Child(Base):\n        def run(self): return self.method()\n\n    return Child().run()\n\n\nassert outer() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert_eq!(
+            updated,
+            "def outer():\n    from other import Base\n\n    class Child(Base):\n        def run(self): return self.method(value=1)\n\n    return Child().run()\n\n\nassert outer() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameter_shadowing_an_imported_base_keeps_child_defaults() {
+        // The parameter hides the import rather than revealing what it named,
+        // so the base is still one whose fields this file cannot see and may
+        // end in a positional default. Removing the child's would leave a
+        // field without one behind it, which `dataclasses` rejects outright,
+        // and no call could be rewritten to make up for it because the
+        // inherited fields are unknown. Field order spares a keyword-only
+        // field, which `dataclasses` moves past the `*`, but a metaclass the
+        // base brings does not: one that builds the class without arguments
+        // reaches `__init__` with none to give, and the default is what stood
+        // in for them. That hazard is the same behind the shadow as before it.
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\n\ndef build(Parent):\n    @dataclass\n    class Child(Parent):\n        positional: int = 2\n        keyword: int = field(default=3, kw_only=True)\n\n    return Child()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics.iter().all(|item| item.fix.is_none()));
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_nested_class_body_calls_through_the_enclosing_receiver() -> Result<(), String> {
+        // A class suite is not a closure scope for the names it binds, but a
+        // name it only reads still comes from the function around it, so
+        // `self` and `cls` written straight in a nested class body are the
+        // enclosing method's receiver rather than anything the nested class
+        // holds. Indexing nested classes puts a same-named method of the
+        // nested class within reach, and taking that one would supply the
+        // wrong default.
+        let instance = "class Outer:\n    def target(self, value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, value=2):\n                return value\n\n            probe = self.target()\n\n        return Inner.probe\n\nassert Outer().run() == 1\n";
+        assert_eq!(
+            fixed(instance)?,
+            "class Outer:\n    def target(self, value):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, value):\n                return value\n\n            probe = self.target(value=1)\n\n        return Inner.probe\n\nassert Outer().run() == 1\n"
+        );
+        // The class a receiver stands for reaches the nested body the same way
+        // however the call spells it out.
+        for receiver in ["type(self)", "self.__class__"] {
+            let source = format!(
+                "class Outer:\n    @staticmethod\n    def target(value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value=2):\n                return value\n\n            probe = {receiver}.target()\n\n        return Inner.probe\n\nassert Outer().run() == 1\n"
+            );
+            assert_eq!(
+                fixed(&source)?,
+                format!(
+                    "class Outer:\n    @staticmethod\n    def target(value):\n        return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value):\n                return value\n\n            probe = {receiver}.target(value=1)\n\n        return Inner.probe\n\nassert Outer().run() == 1\n"
+                ),
+                "{receiver}"
+            );
+        }
+        let class_method = "class Outer:\n    @staticmethod\n    def target(value=1):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            @staticmethod\n            def target(value=2):\n                return value\n\n            probe = cls.target()\n\n        return Inner.probe\n\nassert Outer.run() == 1\n";
+        assert_eq!(
+            fixed(class_method)?,
+            "class Outer:\n    @staticmethod\n    def target(value):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            @staticmethod\n            def target(value):\n                return value\n\n            probe = cls.target(value=1)\n\n        return Inner.probe\n\nassert Outer.run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_function_local_class_holds_a_base_name_against_an_import() -> Result<(), String> {
+        // The class written in the function body takes `Helper` over from the
+        // import for the rest of that body, so `Child` is built on the local
+        // class and `super().target()` reaches the parameter it declares. The
+        // imported class of the same name is never the base here, and passing
+        // the parameter it declares would raise `TypeError`.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Helper:\n    def target(self, imported=1): return imported\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "from other import Helper\n\n\ndef outer():\n    class Helper:\n        def target(self, local=2): return local\n\n    class Child(Helper):\n        def run(self):\n            return super().target()\n\n    return Child().run()\n\n\nassert outer() == 2\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert!(updated.contains("super().target(local=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameter_shadowing_an_import_leaves_a_nested_class_base_unknown() -> Result<(), String> {
+        // The parameter holds the name for the whole call, so the class the
+        // subclass is built on is whatever the caller passed rather than the
+        // import above. Reading the import as the base would rewrite the
+        // inherited call with a default the runtime base never had, silently
+        // changing what the program returns.
+        // `a_same_scope_import_names_a_nested_class_base` covers the same
+        // shape without the parameter, where the import is the base and the
+        // call is rewritten.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let runtime = directory.path().join("runtime.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Base:\n    def method(self, value=1): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &runtime,
+            "class Runtime:\n    def method(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let source = "from other import Base\nfrom runtime import Runtime\n\n\ndef outer(Base):\n    class Child(Base):\n        def run(self): return self.method()\n\n    return Child().run()\n\n\nassert outer(Runtime) == 2\n";
+        std::fs::write(&user, source).map_err(|error| error.to_string())?;
+        fix_all(&[other, runtime, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert_eq!(updated, source);
+        Ok(())
+    }
+
+    /// Fix a function body written against a `Runtime` class in another file,
+    /// and report what the body became.
+    fn fixed_against_runtime_class(user_source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let runtime = directory.path().join("runtime.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &runtime,
+            "class Runtime:\n    def method(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(&user, user_source).map_err(|error| error.to_string())?;
+        fix_all(&[runtime, user.clone()])?;
+        std::fs::read_to_string(&user).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_parameter_holds_its_name_against_a_later_class_of_the_same_spelling() -> Result<(), String>
+    {
+        // The class comes after the subclass, so the name the subclass was
+        // built on was still the parameter's. Dropping the parameter's name
+        // rather than holding it would leave the later class free to answer
+        // to it, and the inherited call would be rewritten with a default
+        // that belongs to a class the subclass never had.
+        let source = "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Child(Helper):\n        def run(self): return self.method()\n\n    class Helper:\n        def method(self, value=3): return value\n\n    return Child().run()\n\n\nassert outer(Runtime) == 2\n";
+        assert_eq!(
+            fixed_against_runtime_class(source)?,
+            "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Child(Helper):\n        def run(self): return self.method()\n\n    class Helper:\n        def method(self, value): return value\n\n    return Child().run()\n\n\nassert outer(Runtime) == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_written_before_a_subclass_takes_the_name_from_a_parameter() -> Result<(), String> {
+        // The other order, where the class has replaced the parameter by the
+        // time the subclass is written and is what it inherits from. Holding
+        // the parameter's name must not reach this far, or the base would go
+        // unresolved and the call would be left alone.
+        let source = "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Helper:\n        def method(self, value=3): return value\n\n    class Child(Helper):\n        def run(self): return self.method()\n\n    return Child().run()\n\n\nassert outer(Runtime) == 3\n";
+        assert_eq!(
+            fixed_against_runtime_class(source)?,
+            "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Helper:\n        def method(self, value): return value\n\n    class Child(Helper):\n        def run(self): return self.method(value=3)\n\n    return Child().run()\n\n\nassert outer(Runtime) == 3\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_in_a_function_leaves_a_module_level_namesake_its_bases() -> Result<(), String> {
+        // Nothing that names a class puts the function holding it in the name,
+        // so a class written in a function body is spelled exactly as one
+        // written outside one. Recording the inner class's bases under that
+        // name would replace the outer class's ancestry with an empty one, and
+        // the inherited call in its body would then be left as written while
+        // the default behind it was removed.
+        let source = "class Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self): return self.target()\n\ndef outer():\n    class Child:\n        def target(self): return 0\n    return Child().target()\n\nassert Child().run() == 1\nassert outer() == 0\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self): return self.target(value=1)\n\ndef outer():\n    class Child:\n        def target(self): return 0\n    return Child().target()\n\nassert Child().run() == 1\nassert outer() == 0\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_module_level_rebinding_takes_an_imported_super_back() -> Result<(), String> {
+        // The module body runs in full before any method it defines is called,
+        // so a `def`, a `class`, or an assignment that takes the name over
+        // leaves the import behind. A call through the name reaches whatever
+        // replaced it, and the class the file is written in says nothing about
+        // what it returns.
+        for rebinding in [
+            "def super():\n    return Other()\n",
+            "class super:\n    def __new__(cls, *args):\n        return Other()\n",
+        ] {
+            let source = format!(
+                "from builtins import super\n\nclass Base:\n    def target(self, value=1): return value\n\nclass Other:\n    def target(self): return 2\n\n{rebinding}\nclass Child(Base):\n    def run(self):\n        return super().target()\n\nassert Child().run() == 2\n"
+            );
+            let expected = format!(
+                "from builtins import super\n\nclass Base:\n    def target(self, value): return value\n\nclass Other:\n    def target(self): return 2\n\n{rebinding}\nclass Child(Base):\n    def run(self):\n        return super().target()\n\nassert Child().run() == 2\n"
+            );
+            assert_eq!(fixed(&source)?, expected, "{rebinding}");
+        }
+        // The import alone still names the builtin, so a zero-argument call
+        // through it resolves as one written as `super`.
+        let untouched = "from builtins import super\n\nclass Base:\n    def target(self, value=1): return value\n\nclass Child(Base):\n    def run(self):\n        return super().target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(untouched)?,
+            "from builtins import super\n\nclass Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        return super().target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_in_a_control_flow_suite_holds_no_name_it_is_not_indexed_under() -> Result<(), String>
+    {
+        // The walk over a file descends into class bodies and function bodies
+        // alone, so a class written in an `if`, `try`, `for`, or `with` suite
+        // is never recorded. Holding its name against a class in a function
+        // body would leave both of them unindexed, and the inherited call in
+        // the one that is written would be left as written while the default
+        // behind it was removed.
+        let body = "def outer():\n    class Base:\n        def target(self, value=2): return value\n\n    class Helper(Base):\n        def run(self): return self.target()\n\n    return Helper().run()\n\n\nassert outer() == 2\n";
+        let fixed_body = "def outer():\n    class Base:\n        def target(self, value): return value\n\n    class Helper(Base):\n        def run(self): return self.target(value=2)\n\n    return Helper().run()\n\n\nassert outer() == 2\n";
+        for suite in [
+            "if True:\n    class Helper:\n        def unrelated(self): return 0\n",
+            "try:\n    class Helper:\n        def unrelated(self): return 0\nexcept Exception:\n    pass\n",
+            "for _ in range(1):\n    class Helper:\n        def unrelated(self): return 0\n",
+        ] {
+            assert_eq!(
+                fixed(&format!("{suite}\n\n{body}"))?,
+                format!("{suite}\n\n{fixed_body}"),
+                "{suite}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_aliases_reach_a_class_named_in_the_scope_around_them() -> Result<(), String> {
+        // `alias = Base.target` names the class beside the one being
+        // collected, which a function body identifies by the scopes holding
+        // it. Naming it as though it sat at module level finds nothing, so the
+        // default comes off `target` with the alias call left as written, or
+        // finds a namesake of another scope and passes that one's default.
+        let local = "def outer():\n    class Base:\n        def target(self, value=1): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias()\n\n    return Child().run()\n\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(local)?,
+            "def outer():\n    class Base:\n        def target(self, value): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias(value=1)\n\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        // The module-level namesake is a different class, and taking its
+        // default would return `2` where Python returns `1`.
+        let shadowed = "class Base:\n    def target(self, value=2): return value\n\ndef outer():\n    class Base:\n        def target(self, value=1): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias()\n\n    return Child().run()\n\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(shadowed)?,
+            "class Base:\n    def target(self, value): return value\n\ndef outer():\n    class Base:\n        def target(self, value): return value\n\n    class Child(Base):\n        alias = Base.target\n\n        def run(self): return self.alias(value=1)\n\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        // A method body is such a scope too, and the class it holds is told
+        // apart from one written straight in the class around it.
+        let in_method = "class Outer:\n    class Base:\n        def target(self, value=2): return value\n\n    def build(self):\n        class Base:\n            def target(self, value=1): return value\n\n        class Child(Base):\n            alias = Base.target\n\n            def run(self): return self.alias()\n\n        return Child().run()\n\nassert Outer().build() == 1\n";
+        assert_eq!(
+            fixed(in_method)?,
+            "class Outer:\n    class Base:\n        def target(self, value): return value\n\n    def build(self):\n        class Base:\n            def target(self, value): return value\n\n        class Child(Base):\n            alias = Base.target\n\n            def run(self): return self.alias(value=1)\n\n        return Child().run()\n\nassert Outer().build() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_scope_local_bases_shadow_imported_classes() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Base\n\ndef outer():\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert outer() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
+            "from api import Base\n\ndef outer():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn imported_base_default_uncertainty_propagates_through_subscripted_bases() {
+        let source = "from dataclasses import dataclass\nfrom typing import Generic, TypeVar\nfrom base import Parent\n\nT = TypeVar('T')\n\n@dataclass\nclass Middle(Parent, Generic[T]):\n    middle: int = 2\n\n@dataclass\nclass Child(Middle[T]):\n    child: int = 3\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics.iter().all(|item| item.fix.is_none()));
+    }
+
+    #[test]
+    fn an_import_stays_the_base_of_a_subclass_written_above_a_local_class() -> Result<(), String> {
+        // `Child` is written while `Helper` still names the import, so that is
+        // the class it inherits from however thoroughly a class further down
+        // takes the name over. Reading the whole suite for local classes
+        // without regard for where each is written would rewrite the
+        // inherited call with a default the base never had.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Helper:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Helper\n\n\nclass Child(Helper):\n    def run(self): return self.target()\n\n\nclass Helper:\n    def target(self, value=2): return value\n\n\nassert Child().run() == 9\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
+            "from api import Helper\n\n\nclass Child(Helper):\n    def run(self): return self.target(value=9)\n\n\nclass Helper:\n    def target(self, value): return value\n\n\nassert Child().run() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_flow_classes_preserve_inherited_method_calls() -> Result<(), String> {
+        let source = "if True:\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "if True:\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_attribute_bases_preserve_inherited_method_calls() -> Result<(), String> {
+        let source = "def outer():\n    class Namespace:\n        class Base:\n            def target(self, value=1): return value\n    class Child(Namespace.Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert outer() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer():\n    class Namespace:\n        class Base:\n            def target(self, value): return value\n    class Child(Namespace.Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_does_not_shadow_its_own_imported_base() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Base\n\nclass Base(Base):\n    def run(self): return self.target()\n\nassert Base().run() == 9\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
+            "from api import Base\n\nclass Base(Base):\n    def run(self): return self.target(value=9)\n\nassert Base().run() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aliased_namespace_attribute_bases_preserve_inherited_method_calls() -> Result<(), String> {
+        // The dotted spelling of a nested class is not the only way to reach
+        // it: a name bound to the class around it names the same member, and
+        // the spelling `NS.Base` matches no class this file writes.
+        for source in [
+            "class Namespace:\n    class Base:\n        def target(self, value=1): return value\n\nNS = Namespace\n\nclass Child(NS.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+            "class Namespace:\n    class Inner:\n        class Base:\n            def target(self, value=1): return value\n\nNS = Namespace.Inner\n\nclass Child(NS.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+        ] {
+            assert_eq!(
+                fixed(source)?,
+                source
+                    .replace("value=1): return value", "value): return value")
+                    .replace("self.target()", "self.target(value=1)")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_unseen_imported_ancestor_protects_a_local_subclass() {
+        // The metaclass an imported base may carry builds every class beneath
+        // it, not only the one that names it, so a local class standing
+        // between the two hides nothing. Removing the subclass's default would
+        // leave that metaclass reaching `__init__` with no argument to stand
+        // in for it, and no call could be rewritten to make up for it because
+        // the inherited fields are unknown.
+        for source in [
+            "from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    pass\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n",
+            "from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    pass\n\nclass Inner(Middle):\n    pass\n\n@dataclass\nclass Child(Inner):\n    keyword: int = field(default=3, kw_only=True)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_class_body_does_not_rewrite_its_own_header_bases() {
+        // Whether a base is an unseen import is settled where the header is
+        // written, not where the body ends. A member binding the base's name
+        // rebinds it for readers of the class, never for the header above it,
+        // and a base spelled with the class's own name still reaches whatever
+        // that name held before the class did. Reading either after the body
+        // would drop the mark that protects a later subclass, or invent one
+        // over a base that carries no fields at all.
+        for (source, removable) in [
+            ("from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    Base = 1\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n", false),
+            ("from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    class Base:\n        pass\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n", false),
+            ("from dataclasses import dataclass, field\nfrom typing import Protocol\n\nclass Protocol(Protocol):\n    pass\n\n@dataclass\nclass Child(Protocol):\n    keyword: int = field(default=3, kw_only=True)\n", true),
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert_eq!(checked.diagnostics[0].fix.is_some(), removable, "{source}");
+            assert_eq!(checked.signatures.is_empty(), !removable, "{source}");
+        }
+    }
+    #[test]
+    fn control_flow_classes_see_enclosing_suite_bases() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn suites_that_disagree_on_a_class_leave_its_inherited_calls_alone() -> Result<(), String> {
+        // Both suites define `Child`, and only one of them runs. Rewriting the
+        // call against either suite's base would hand the class the module
+        // actually built the other one's default.
+        let source = "import os\n\nclass BaseA:\n    def target(self, value=1): return value\n\nclass BaseB:\n    def target(self, value=2): return value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        def run(self): return self.target()\nelse:\n    class Child(BaseB):\n        def run(self): return self.target()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("self.target(value="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_suite_that_cannot_run_leaves_the_base_of_the_one_that_can() -> Result<(), String> {
+        let source = "class BaseA:\n    def target(self, value=1): return value\n\nclass BaseB:\n    def target(self, value=2): return value\n\nif True:\n    class Child(BaseA):\n        def run(self): return self.target()\nelse:\n    class Child(BaseB):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("self.target(value=1)"), "{updated}");
+        assert!(!updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn suites_that_hold_both_a_class_and_its_base_still_disagree() -> Result<(), String> {
+        let source = "import os\n\nif os.environ.get('PICK'):\n    class BaseA:\n        def target(self, value=1): return value\n    class Child(BaseA):\n        def run(self): return self.target()\nelse:\n    class BaseB:\n        def target(self, value=2): return value\n    class Child(BaseB):\n        def run(self): return self.target()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("self.target(value="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn match_cases_that_disagree_on_a_class_leave_its_inherited_calls_alone() -> Result<(), String>
+    {
+        let source = "import os\n\nclass BaseA:\n    def target(self, value=1): return value\n\nclass BaseB:\n    def target(self, value=2): return value\n\nmatch os.environ.get('PICK'):\n    case 'a':\n        class Child(BaseA):\n            def run(self): return self.target()\n    case _:\n        class Child(BaseB):\n            def run(self): return self.target()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("self.target(value="), "{updated}");
+        Ok(())
+    }
+    #[test]
+    fn suites_that_disagree_on_a_class_report_its_construction() -> Result<(), String> {
+        // `Child()` is spelled with the class's name, not the `__init__` it
+        // inherits, so the gate that reports an unresolved call never saw it
+        // and the default behind the constructor was dropped with nothing
+        // written into the call to stand in for it. A subclass of the
+        // contested class is no better placed than the class itself.
+        for source in [
+            "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n\nprint(Child().value)\n",
+            "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n\nclass Grandchild(Child):\n    pass\n\nprint(Grandchild().value)\n",
+        ] {
+            assert_eq!(
+                skipped_reasons(source)?,
+                ["this call cannot be tied to the definition that was fixed"],
+                "{source}"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn suites_that_disagree_on_a_class_report_a_qualified_construction() -> Result<(), String> {
+        // `api.Child()` is spelled exactly as a method call, but the callee
+        // names a class of the module rather than a method of a receiver. It
+        // resolves and is rewritten when the ancestry is settled, so it has to
+        // be held back when it is not.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        let api_source = "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n";
+        let user_source = "import api\n\nprint(api.Child().value)\n";
+        std::fs::write(&api, api_source).map_err(|error| error.to_string())?;
+        std::fs::write(&user, user_source).map_err(|error| error.to_string())?;
+        let reasons: Vec<String> = fix_all(&[api, user])?
+            .into_iter()
+            .map(|skip| skip.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            ["this call cannot be tied to the definition that was fixed"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn branches_that_disagree_on_a_base_leave_its_inherited_calls_alone() -> Result<(), String> {
+        // The bases are settled at module level and only the subclass is
+        // written twice, so the disagreement is over `Child` alone. Which
+        // `target` it inherits depends on a test the tool cannot read, so the
+        // calls that would have named it are reported rather than rewritten.
+        // That the defaults behind them survive the fix is decided further on,
+        // where `retained` is honoured, so it is covered end to end by
+        // `branches_that_disagree_on_a_base_keep_the_inherited_default` in
+        // `tests/cli.rs` rather than here.
+        let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif os.environ.get('PICK'):\n    class Child(First):\n        def run(self): return self.target()\nelse:\n    class Child(Second):\n        def run(self): return self.target()\n\nChild().run()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("self.target(value="), "{updated}");
+        assert_eq!(
+            skipped_reasons(source)?,
+            [
+                "this call cannot be tied to the definition that was fixed",
+                "this call cannot be tied to the definition that was fixed",
+                "this call cannot be tied to the definition that was fixed"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_shape_alias_uses_the_nearest_enclosing_scope() -> Result<(), String> {
+        // The alias is written in a class body, and the name it reads is a
+        // free one there, so Python answers it from the enclosing function
+        // before the module. Reading the module first would build `Child` on
+        // the outermost `Base` and give it a field the class never has.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    module: int = 1\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    class Container:\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n    return Container.Child()\n\nouter()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        let child = checked
+            .signatures
+            .iter()
+            .find(|signature| signature.positional.iter().any(|field| field == "child"))
+            .ok_or("expected the nested child signature")?;
+        assert_eq!(child.positional, ["local", "child"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_class_shape_alias_skips_outer_class_scopes() -> Result<(), String> {
+        // `Nested` is written inside `Container`, but a class namespace is not
+        // a closure scope: the alias reads straight past the `Base` of the
+        // outer class body to the one the enclosing function holds.
+        let source = "from dataclasses import dataclass\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 1\n\n    class Container:\n        @dataclass\n        class Base:\n            class_body: int = 2\n\n        class Nested:\n            Alias = Base\n\n            @dataclass\n            class Child(Alias):\n                child: int = 3\n\n    return Container.Nested.Child\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        let child = checked
+            .signatures
+            .iter()
+            .find(|signature| signature.positional.iter().any(|field| field == "child"))
+            .ok_or("expected the nested child signature")?;
+        assert_eq!(child.positional, ["local", "child"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameter_hides_the_enclosing_class_of_the_same_name() -> Result<(), String> {
+        // `inner` takes its base as a parameter, so the `Base` the alias reads
+        // is that argument and not the class `outer` holds. Walking on to the
+        // enclosing class would give `Child` a `local` field the class it is
+        // really built on has no room for.
+        let source = "from dataclasses import dataclass\n\nclass Fallback:\n    pass\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    def inner(Base):\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n        return Child()\n\n    return inner(Fallback)\n\nouter()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("Child(local="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebinding_hides_the_enclosing_class_of_the_same_name() -> Result<(), String> {
+        // The rebinding is a call, so what it produces is unknown, but that it
+        // happened is not: `Base` in `inner` is whatever the call returned and
+        // the enclosing class is out of reach behind it.
+        let source = "from dataclasses import dataclass\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    def inner():\n        Base = type('Base', (), {})\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n        return Child()\n\n    return inner()\n\nouter()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("Child(local="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_target_hides_the_enclosing_class_of_the_same_name() -> Result<(), String> {
+        // A loop target binds its name for the rest of the body, so the same
+        // reasoning holds for it as for a plain assignment.
+        let source = "from dataclasses import dataclass\n\nclass Fallback:\n    pass\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    def inner():\n        for Base in [Fallback]:\n            pass\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n        return Child()\n\n    return inner()\n\nouter()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("Child(local="), "{updated}");
+        Ok(())
+    }
+
+    fn fixed_keeping_unreachable_defaults(source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = directory.path().join("example.py");
+        std::fs::write(&path, source).map_err(|error| error.to_string())?;
+        let checked = check_file(
+            &path,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        let files = [path.clone()];
+        let mut call_sites = call_site_edits(&files, checked.signatures)?;
+        for diagnostic in &checked.diagnostics {
+            let Some(range) = diagnostic.fix else {
+                continue;
+            };
+            if call_sites
+                .retained
+                .contains(&fix_key(&diagnostic.path, range))
+            {
+                continue;
+            }
+            call_sites
+                .edits
+                .entry(diagnostic.path.clone())
+                .or_default()
+                .push(Edit::deletion(range));
+        }
+        let mut updated = 0;
+        let mut unfixed = BTreeSet::new();
+        write_fixes_atomically(fixed_sources(call_sites.edits, &mut updated, &mut unfixed)?)?;
+        std::fs::read_to_string(&path).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn competing_conditional_class_bases_retain_inherited_defaults() -> Result<(), String> {
+        // Leaving the call alone is only half of it: the defaults behind it
+        // have to stay too, or the call it could not rewrite reaches a method
+        // that no longer has one.
+        let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif os.environ.get(\"PICK\"):\n    class Child(First):\n        def run(self): return self.target()\nelse:\n    class Child(Second):\n        def run(self): return self.target()\n\nChild().run()\n";
+        assert_eq!(fixed_keeping_unreachable_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_ambiguous_ancestor_leaves_a_subclass_method_resolvable() -> Result<(), String> {
+        // The subclass's own method does not depend on which base the competing
+        // suites gave `Amb`, so its default is removed and the call to it
+        // rewritten. Leaving the call bare would have raised `TypeError`.
+        let source = "import sys\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif sys.argv:\n    class Amb(First):\n        pass\nelse:\n    class Amb(Second):\n        pass\n\nclass Sub(Amb):\n    def own(self, value=5): return value\n    def run(self): return self.own()\n\nassert Sub().run() == 5\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(source)?,
+            source
+                .replace("def own(self, value=5)", "def own(self, value)")
+                .replace("self.own()", "self.own(value=5)")
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("def target(self, value=2)", "def target(self, value)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_default_an_ambiguous_ancestry_hides_is_kept() -> Result<(), String> {
+        // `Leaf` has two bases, so which of `Sub`'s ancestors come before the
+        // other is not known once `Amb` is in doubt, and `self.own()` is left
+        // alone. The default behind it has to stay for that call to keep
+        // working.
+        let source = "import sys\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nclass Mixin:\n    pass\n\nif sys.argv:\n    class Amb(First):\n        pass\nelse:\n    class Amb(Second):\n        pass\n\nclass Sub(Amb):\n    def own(self, value=5): return value\n\nclass Leaf(Sub, Mixin):\n    def run(self): return self.own()\n\nassert Leaf().run() == 5\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("def target(self, value=2)", "def target(self, value)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn competing_aliases_leave_a_subclass_ancestry_unsettled() -> Result<(), String> {
+        // Which suite ran decides which class `Alias` stands for, so `Child`
+        // has an ancestry for each and the file settles neither. Resolving the
+        // inherited call against either candidate strips the other's default
+        // too: with `Second` live, a rewritten `self.target(value=1)` raises
+        // `TypeError: Second.target() got an unexpected keyword argument`.
+        for source in [
+            "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, other=2): return other\n\nif os.environ.get(\"PICK\"):\n    Alias = Second\nelse:\n    Alias = First\n\nclass Child(Alias):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+            "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, other=2): return other\n\nif os.environ.get(\"PICK\"):\n    Alias = Second\nelse:\n    Alias = First\n\nif os.environ.get(\"OTHER\"):\n    class Child(Alias):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n",
+        ] {
+            assert_eq!(fixed_keeping_unreachable_defaults(source)?, source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_alias_a_later_assignment_settles_resolves_a_subclass_ancestry() -> Result<(), String> {
+        // The assignment after the suites runs whichever way they went, so the
+        // name stands for one class again and the ancestry is known.
+        let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif os.environ.get(\"PICK\"):\n    Alias = Second\nelse:\n    Alias = First\n\nAlias = First\n\nclass Child(Alias):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("def target(self, value=2)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_later_unguarded_class_definition_settles_a_contested_ancestry() -> Result<(), String> {
+        // The definition after the suites is the one standing when the module
+        // is done, whichever suite ran, so its bases are the class's and the
+        // inherited call resolves against them.
+        let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, value=2): return value\n\nif os.environ.get(\"PICK\"):\n    class Child(First):\n        pass\nelse:\n    class Child(Second):\n        pass\n\nclass Child(First):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("def target(self, value=2)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_subscripted_settled_alias_resolves_its_inherited_call() -> Result<(), String> {
+        // The parameter on the base changes nothing about which class it
+        // names, so a settled alias still resolves through it. That the
+        // contested spelling of the same shape keeps its defaults is decided
+        // where `retained` is honoured, so it is covered end to end by
+        // `a_subscripted_contested_base_keeps_the_inherited_default` in
+        // `tests/cli.rs` rather than here.
+        let source = "from typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n\nclass First(Generic[T]):\n    def target(self, value=1): return value\n\nAlias = First\n\nclass Child(Alias[int]):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_suite_that_certainly_runs_settles_the_name_it_binds() -> Result<(), String> {
+        // The body of `if True:` runs, so `Alias` names `First` afterwards
+        // however it was bound above. Reading the earlier binding instead
+        // rewrote the call with `Second`'s parameter, which `First` does not
+        // take.
+        let source = "class First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, other=2): return other\n\nAlias = Second\nif True:\n    Alias = First\n\nclass Child(Alias):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("def target(self, other=2)", "def target(self, other)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_shape_alias_does_not_reach_an_enclosing_class_scope() -> Result<(), String> {
+        // A class body is not a closure scope, so `Base` beside `Inner` is the
+        // module's, not the `Base` written in `Outer` around it.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    module: int = 1\n\nclass Outer:\n    @dataclass\n    class Base:\n        outer: int = 2\n\n    class Inner:\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\nOuter.Inner.Child()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        let child = checked
+            .signatures
+            .iter()
+            .find(|signature| signature.positional.iter().any(|field| field == "child"))
+            .ok_or("expected the nested child signature")?;
+        assert_eq!(child.positional, ["module", "child"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_copy_of_a_settled_name_resolves_its_inherited_call() -> Result<(), String> {
+        // Nothing is in doubt here, so reading one name from another resolves
+        // straight through. That the same shape keeps its defaults once the
+        // source is contested is decided where `retained` is honoured, so it
+        // is covered end to end by
+        // `a_copy_of_a_contested_name_keeps_the_inherited_default` in
+        // `tests/cli.rs` rather than here.
+        let source = "class First:\n    def target(self, value=1): return value\n\nAlias = First\n\nOther = Alias\n\nclass Child(Other):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_certain_suite_settles_a_name_by_rebinding_what_the_scope_held() -> Result<(), String> {
+        // The `if True:` body runs, so `Alias` names `First` afterwards
+        // whichever way the branch above it went. Binding what the scope
+        // already held is still a binding: passing over it left the earlier
+        // branch's candidate standing and the call declined for nothing.
+        let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, other=2): return other\n\nAlias = First\nif os.environ.get(\"PICK\"):\n    Alias = Second\n\nif True:\n    Alias = First\n\nclass Child(Alias):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            source
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("def target(self, other=2)", "def target(self, other)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn imported_metaclass_uncertainty_propagates_through_local_bases() {
+        // A metaclass an imported base carries builds every class under it, so
+        // the local class between the import and the dataclass hides nothing.
+        // A keyword-only default is no safer to remove than a positional one
+        // here: the metaclass reaches `__init__` either way, and the inherited
+        // fields are unknown, so no call could be rewritten to make up for it.
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Middle(Parent):\n    pass\n\n@dataclass\nclass Child(Middle):\n    value: int = field(default=1, kw_only=True)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn dotted_submodules_win_over_package_nested_classes() -> Result<(), String> {
+        // `import package.module` sets the submodule on the package, so the
+        // initializer's namesake class is not what the dotted base reaches.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &initializer,
+            "class module:\n    class Base:\n        def target(self, value=1): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 2\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_package_namesake_holds_a_dotted_base() -> Result<(), String> {
+        // A class written above the subclass takes the package's name over, so
+        // the dotted base is that class's nested one and not the submodule the
+        // import bound. Preferring the submodule regardless would write the
+        // wrong module's field into the inherited call.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import package.module\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=7): return value\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 7\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=7)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_namesake_holds_a_single_component_dotted_base() -> Result<(), String> {
+        // The prefix is one name rather than a dotted path, so the walk over
+        // its components has only that name to test. A class written above the
+        // subclass takes it over just the same, and the base is the nested
+        // class here rather than the package the import bound.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &initializer,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import pkg\n\nclass pkg:\n    class Base:\n        def target(self, value=1): return value\n\nclass Child(pkg.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_class_hides_the_enclosing_dataclass_of_the_same_name() -> Result<(), String> {
+        // The `Base` the alias reads is the class `outer` writes, which has no
+        // fields at all. Walking past it to the module dataclass would name a
+        // keyword the class `Child` really inherits from has no field for.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    module: int = 1\n\ndef outer():\n    class Base:\n        pass\n\n    Alias = Base\n\n    @dataclass\n    class Child(Alias):\n        child: int = 3\n\n    return Child()\n\nouter()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("Child(module="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_safe_redefinition_clears_imported_metaclass_uncertainty() {
+        // The second `Base` is the one standing when `Child` is written, and
+        // it inherits from nothing this file cannot see, so the uncertainty
+        // the first one carried must not outlive it.
+        let source = "from dataclasses import dataclass\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base:\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+        assert!(checked
+            .signatures
+            .iter()
+            .any(|signature| signature.positional == ["value"]));
+    }
+
+    #[test]
+    fn nested_assignments_do_not_clear_module_truthiness() -> Result<(), String> {
+        let source = "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value=1): return value\n    target()\n";
+        assert_eq!(
+            fixed(source)?,
+            "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value): return value\n    target(value=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_rebinding_itself_keeps_imported_metaclass_uncertainty() {
+        // `Base` is rebound to a subclass of its own earlier binding, which
+        // still reaches the unseen import, so the metaclass that import may
+        // carry still builds `Child` and no fix may be offered.
+        let source = "from dataclasses import dataclass\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base(Base):\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = 1\n\nChild()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_class_body_name_is_out_of_scope_for_the_bodies_written_in_it() {
+        // A class body is not a closure scope. `Outer.Safe` stands for nothing
+        // inside `method`, inside `Mid`, or inside a class deeper still, so
+        // every `Child` here is built on the module-level `Safe` that inherits
+        // the unseen import. Under a metaclass on that import CPython answers
+        // `Child()` and `Child(value=1)` differently, so none may be rewritten.
+        let bodies = [
+            "    def method(self):\n        @dataclass\n        class Child(Safe):\n            value: int = 1\n        return Child()\n",
+            "    class Mid:\n        @dataclass\n        class Child(Safe):\n            value: int = 1\n",
+            "    class Mid:\n        class Deeper:\n            @dataclass\n            class Child(Safe):\n                value: int = 1\n",
+        ];
+        for body in bodies {
+            let source = format!("from dataclasses import dataclass\nfrom base import Parent\n\nclass Safe(Parent):\n    pass\n\nclass Outer:\n    class Safe:\n        pass\n\n{body}");
+            let checked = check_source(
+                Path::new("fixture.py"),
+                &source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_class_body_name_still_reaches_the_classes_that_body_writes() {
+        // The bases of a class statement are read in the body that holds it,
+        // where the name written above is bound, and nothing there is unseen,
+        // so the fix is offered.
+        let source = "from dataclasses import dataclass\n\nclass Safe:\n    pass\n\nclass Outer:\n    class Safe:\n        pass\n\n    def method(self):\n        @dataclass\n        class Child(Safe):\n            value: int = 1\n        return Child()\n\nOuter().method()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn qualified_pydantic_private_attributes_are_not_model_fields() {
+        // `pydantic` may be reached under its own name or an alias, and either
+        // spelling is the same `PrivateAttr` call: per-instance state rather
+        // than a field the constructor takes. A model base answers that on its
+        // own, since an underscore name is no field there whatever it holds,
+        // so the class here is a plain dataclass and the call is all there is
+        // to read.
+        for source in [
+            "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pydantic.PrivateAttr(default=1)\n",
+            "import pydantic as pd\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pd.PrivateAttr(default=1)\n",
+        ] {
+            assert!(messages(source, false).is_empty(), "{source}");
+        }
+        // An ordinary default in the same class is still reported, so the
+        // silence above is the call being read rather than the shape being
+        // passed over.
+        assert_eq!(
+            messages(
+                "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = 1\n",
+                false,
+            ),
+            ["dataclass field `_value` has a default"]
+        );
+    }
+
+    #[test]
+    fn a_comprehension_walrus_rebinds_the_enclosing_name() -> Result<(), String> {
+        // A walrus in a comprehension binds in the scope the comprehension is
+        // written in, unlike one in a lambda body, which binds in the lambda's
+        // own. A list comprehension runs where it is written, and a generator
+        // expression runs as soon as anything draws from it, so the rebinding
+        // reaches the module name before the class below is built. Skipping
+        // the invalidation because the element is only visited and not yet run
+        // kept a shape the name no longer holds, and the subclass was called
+        // with fields the rebound base never had.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n";
+        let tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in [
+            "list((Alias := object) for _ in seed)\n",
+            "total = sum(1 for _ in seed if (Alias := object))\n",
+            "values = ((Alias := object) for _ in seed)\nlist(values)\n",
+            "values = [(Alias := object) for _ in seed]\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{rebind}\n{updated}");
+        }
+        // A comprehension with no walrus rebinds nothing, so the alias still
+        // stands and the inherited field comes through.
+        for kept in ["values = (item for item in seed)\n", ""] {
+            let updated = fixed(&format!("{head}{kept}{tail}"))?;
+            assert!(
+                updated.contains("Child(inherited=1, value=2)"),
+                "{kept}\n{updated}"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn enum_member_initializer_defaults_are_retained() {
+        // Creating a member calls the initializer the body holds with the
+        // member's value alone, from inside the class statement, so a stripped
+        // default leaves a module that cannot even be imported.
+        for source in [
+            "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum as Base\n\nclass E(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "import enum\n\nclass E(enum.Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "import enum as enums\n\nclass E(enums.Enum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn enum_missing_hook_defaults_are_retained() {
+        let source = "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn inherited_enum_member_initializer_defaults_are_retained() {
+        // Enumeration membership is inherited, so a subclass of a same-file
+        // enumeration builds its own members the same implicit way, however
+        // many classes and class bodies separate it from the imported base.
+        for source in [
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Mid(Base):\n    pass\n\nclass Child(Mid):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_redefinition_that_is_no_enum_frees_its_subclasses() {
+        // The name, not the class the enumeration was, is what a later base
+        // resolves to, and nothing implicit calls this initializer.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Base:\n    pass\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn enum_bodies_keep_only_their_implicitly_called_hooks() {
+        // Retention is for the two hooks member creation reaches on its own.
+        // Every other method in the body is called explicitly, so its default
+        // is as removable as any other.
+        let source = "from enum import Enum\n\nclass E(Enum):\n    A = 1\n    def describe(self, prefix='p'): return prefix\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
     }
 }

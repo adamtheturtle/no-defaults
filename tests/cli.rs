@@ -6262,3 +6262,71 @@ fn a_method_named_near_get_source_is_still_fixed() -> Result<(), Box<dyn std::er
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_sqlite_conform_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Binding a parameter sends the object through `sqlite3`'s adapter, which
+    // calls `__conform__(sqlite3.PrepareProtocol)` from C with the protocol
+    // alone, so `extra` only ever arrives as its default. That call is made by
+    // the extension rather than by any line in the file, so dropping the
+    // default leaves it raising
+    // `TypeError: Value.__conform__() missing 1 required positional argument:
+    // 'extra'`; `_sqlite3` swallows that and the bind fails outright with
+    // `sqlite3.ProgrammingError: Error binding parameter 1`, with no written
+    // call site to carry the value.
+    let source =
+        "class Value:\n    def __conform__(self, protocol, extra=1):\n        return str(extra)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_helper_beside_sqlite_conform_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // sibling with the same signature shape is rewritten as usual, carrying
+    // its own default to the call.
+    let source = "class Value:\n    def __conform__(self, protocol, extra=1):\n        return self.helper()\n\n    def helper(self, value=2):\n        return value\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Value:\n    def __conform__(self, protocol, extra=1):\n        return self.helper(value=2)\n\n    def helper(self, value):\n        return value\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_method_named_near_sqlite_conform_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The adapter looks the hook up under its exact name, so a near miss is an
+    // ordinary method whose default the fixer removes.
+    let source =
+        "class Value:\n    def conform(self, protocol, extra=1):\n        return str(extra)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Value:\n    def conform(self, protocol, extra):\n        return str(extra)\n",
+    );
+    // Nothing is left unfixed once the near miss is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

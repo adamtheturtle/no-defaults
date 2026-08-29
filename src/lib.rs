@@ -394,6 +394,9 @@ struct Definitions {
     bindings: BTreeMap<(PathBuf, String), Binding>,
     /// Direct statically resolved base classes for method lookup.
     bases: BTreeMap<(PathBuf, String), Vec<(PathBuf, String)>>,
+    /// Classes two suites of one statement gave different bases, so which
+    /// ancestry the file ends up with is not known.
+    uncertain_bases: BTreeSet<(PathBuf, String)>,
     /// Every name a fixed callable goes by, so a call that cannot be resolved
     /// to one can still be reported rather than silently left behind.
     names: BTreeSet<String>,
@@ -403,6 +406,30 @@ struct Definitions {
 }
 
 impl Definitions {
+    /// Record the bases a class definition names.
+    ///
+    /// Two suites of the same statement are alternatives: only one of them
+    /// runs, and a class each writes under the same name is one class at
+    /// runtime rather than two. Where they disagree on its bases, nothing here
+    /// says which set the file ends up with, so the ancestry is held unknown
+    /// and the inherited calls it would have answered are left alone. A
+    /// definition that certainly runs settles the question again, since it is
+    /// the one standing when the module is done.
+    fn record_bases(
+        &mut self,
+        class: (PathBuf, String),
+        bases: Vec<(PathBuf, String)>,
+        alternative: bool,
+    ) {
+        if !alternative {
+            self.uncertain_bases.remove(&class);
+        } else if self.bases.get(&class).is_some_and(|held| *held != bases) {
+            self.uncertain_bases.insert(class);
+            return;
+        }
+        self.bases.insert(class, bases);
+    }
+
     fn symbol(&self, file: &Path, name: &str) -> Option<&Signature> {
         let mut file = file.to_path_buf();
         let mut name = name.to_owned();
@@ -459,6 +486,13 @@ impl Definitions {
         self.method_in_mro(file, class, name, true)
     }
 
+    /// Whether this class, or a class it inherits from, has an ancestry the
+    /// file does not settle. Nothing a lookup through it answers is reliable,
+    /// so a default behind such a call has to stay where it is.
+    fn ancestry_is_uncertain(&self, class: &(PathBuf, String)) -> bool {
+        self.linearized_mro(class, &mut BTreeSet::new()).is_none()
+    }
+
     fn method_in_mro(
         &self,
         file: &Path,
@@ -487,6 +521,12 @@ impl Definitions {
         class: &(PathBuf, String),
         visiting: &mut BTreeSet<(PathBuf, String)>,
     ) -> Option<Vec<(PathBuf, String)>> {
+        // A class whose bases are not known has no resolution order to walk:
+        // answering with one set of them would rewrite calls against ancestors
+        // the class may never have had.
+        if self.uncertain_bases.contains(class) {
+            return None;
+        }
         if !visiting.insert(class.clone()) {
             return None;
         }
@@ -971,13 +1011,13 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
 
 /// The classes `index_method_bases` records without entering a function.
 ///
-/// The walk descends into a class body and a function body and nothing else,
-/// so a class written in an `if` or a `try` suite is never reached. Its name
-/// must not be held against a class in a function body: holding a name for a
-/// class that is never recorded would leave both of them unindexed, and an
-/// inherited call in the one that is written would be left alone after the
-/// default behind it was removed. This mirrors the statements the walk itself
-/// matches on, and has to keep mirroring them.
+/// The walk descends into a class body, a function body and the suites of a
+/// control-flow statement, and nothing else. A name it reaches must not be
+/// held against a class in a function body: holding a name for a class that is
+/// never recorded would leave both of them unindexed, and an inherited call in
+/// the one that is written would be left alone after the default behind it was
+/// removed. This mirrors the statements the walk itself matches on, and has to
+/// keep mirroring them.
 fn collect_indexed_class_names(
     statements: &[Stmt],
     parent_class: Option<&str>,
@@ -988,6 +1028,10 @@ fn collect_indexed_class_names(
             let identity = qualified_name(parent_class, class.name.as_str());
             collect_indexed_class_names(&class.body, Some(&identity), found);
             found.insert(identity);
+            continue;
+        }
+        for suite in control_flow_suites(statement) {
+            collect_indexed_class_names(suite, parent_class, found);
         }
     }
 }
@@ -1026,7 +1070,8 @@ impl<'a> LexicalClasses<'a> {
     }
 }
 
-/// Where the walk stands, for naming the classes it finds.
+/// Where the walk stands, for naming the classes it finds and for judging
+/// whether each one is the class the file ends up with.
 ///
 /// A class body is a namespace a name reaches from outside it, so a class
 /// written in one is named under the class holding it. A function body is not:
@@ -1040,6 +1085,10 @@ struct ClassNamespace<'a> {
     parent: Option<&'a str>,
     /// The enclosing class and function names, outermost first.
     lexical_scope: &'a [String],
+    /// Whether the statements sit in one of several suites of a control-flow
+    /// statement of which only one runs, so a class written here stands beside
+    /// whatever a sibling suite writes under the same name.
+    alternative: bool,
 }
 
 impl ClassNamespace<'_> {
@@ -1047,6 +1096,7 @@ impl ClassNamespace<'_> {
         Self {
             parent: None,
             lexical_scope: &[],
+            alternative: false,
         }
     }
 
@@ -1097,30 +1147,79 @@ fn index_method_bases(
     lexical_classes: LexicalClasses<'_>,
     definitions: &mut Definitions,
 ) {
-    let local_classes = local_class_identities(statements, namespace);
-    let mut aliases = BTreeMap::new();
+    let classes = local_class_identities(statements, namespace);
+    let mut scope = BaseScope {
+        namespace,
+        lexical_classes,
+        classes: &classes,
+        aliases: BTreeMap::new(),
+    };
+    index_scope_method_bases(
+        statements,
+        importer,
+        known,
+        bindings,
+        definitions,
+        &mut scope,
+    );
+}
+
+/// What a scope has bound where a class written in it is read.
+///
+/// A control-flow suite opens no scope of its own: a class written in one is
+/// spelled as a class beside it, and it reaches the classes the scope around it
+/// defines and the aliases that scope had already bound. Carrying this into the
+/// suite is what keeps a base written outside it in reach.
+struct BaseScope<'a> {
+    namespace: ClassNamespace<'a>,
+    lexical_classes: LexicalClasses<'a>,
+    /// Every class the scope defines, under the spelling a base expression
+    /// uses for it, beside where it is written.
+    classes: &'a BTreeMap<String, (String, TextSize)>,
+    /// The classes the scope's assignments have named so far.
+    aliases: BTreeMap<String, (PathBuf, String)>,
+}
+
+impl BaseScope<'_> {
+    /// The same scope as one of a statement's suites sees it. An alternative
+    /// suite is one of several of which only one runs, so a class it defines
+    /// may not be the class the file ends up with.
+    fn in_suite(&self, alternative: bool) -> BaseScope<'_> {
+        BaseScope {
+            namespace: ClassNamespace {
+                alternative: self.namespace.alternative || alternative,
+                ..self.namespace
+            },
+            lexical_classes: self.lexical_classes,
+            classes: self.classes,
+            aliases: self.aliases.clone(),
+        }
+    }
+}
+
+fn index_scope_method_bases(
+    statements: &[Stmt],
+    importer: &Path,
+    known: &BTreeSet<&Path>,
+    bindings: &BTreeMap<String, Binding>,
+    definitions: &mut Definitions,
+    scope: &mut BaseScope<'_>,
+) {
+    let namespace = scope.namespace;
+    let lexical_classes = scope.lexical_classes;
     for statement in statements {
         let defined_at = statement.start();
         match statement {
             Stmt::ClassDef(class) => {
                 let identity = namespace.identity(class.name.as_str());
-                // A class written in a function body leaves the name to a
-                // namesake written outside one: recording this one under it
-                // would replace that class's bases with these and leave its
-                // calls resolved against the wrong ancestry. A class nested in
-                // here can still hold a name of its own, so the walk goes on
-                // either way.
-                if lexical_classes.holds(&identity) {
-                    record_class_bases_and_attributes(
-                        class,
-                        &identity,
-                        importer,
-                        bindings,
-                        &local_classes,
-                        &aliases,
-                        definitions,
-                    );
-                }
+                record_class_bases_and_attributes(
+                    class,
+                    &identity,
+                    importer,
+                    bindings,
+                    definitions,
+                    scope,
+                );
                 let mut inner = namespace.lexical_scope.to_vec();
                 inner.push(class.name.to_string());
                 index_method_bases(
@@ -1131,6 +1230,7 @@ fn index_method_bases(
                     ClassNamespace {
                         parent: Some(&identity),
                         lexical_scope: &inner,
+                        alternative: namespace.alternative,
                     },
                     lexical_classes,
                     definitions,
@@ -1153,6 +1253,7 @@ fn index_method_bases(
                     ClassNamespace {
                         parent: None,
                         lexical_scope: &inner,
+                        alternative: namespace.alternative,
                     },
                     lexical_classes.entering_function(),
                     definitions,
@@ -1166,16 +1267,16 @@ fn index_method_bases(
                     value,
                     importer,
                     bindings,
-                    &local_classes,
+                    scope.classes,
                     defined_at,
-                    &aliases,
+                    &scope.aliases,
                     &definitions.methods,
                 ) else {
                     continue;
                 };
                 for target in targets {
                     if let Expr::Name(alias) = target {
-                        aliases.insert(alias.id.to_string(), identity.clone());
+                        scope.aliases.insert(alias.id.to_string(), identity.clone());
                     }
                 }
             }
@@ -1184,9 +1285,8 @@ fn index_method_bases(
                 importer,
                 known,
                 bindings,
-                namespace,
-                lexical_classes,
                 definitions,
+                scope,
             ),
         }
     }
@@ -1198,10 +1298,17 @@ fn record_class_bases_and_attributes(
     identity: &str,
     importer: &Path,
     bindings: &BTreeMap<String, Binding>,
-    local_classes: &BTreeMap<String, (String, TextSize)>,
-    aliases: &BTreeMap<String, (PathBuf, String)>,
     definitions: &mut Definitions,
+    scope: &BaseScope<'_>,
 ) {
+    // A class written in a function body leaves the name to a namesake written
+    // outside one: recording this one under it would replace that class's bases
+    // with these and leave its calls resolved against the wrong ancestry. A
+    // class nested in here can still hold a name of its own, so the walk goes on
+    // either way.
+    if !scope.lexical_classes.holds(identity) {
+        return;
+    }
     let bases = class
         .arguments
         .iter()
@@ -1211,9 +1318,9 @@ fn record_class_bases_and_attributes(
                 base,
                 importer,
                 bindings,
-                local_classes,
+                scope.classes,
                 class.start(),
-                aliases,
+                &scope.aliases,
                 &definitions.methods,
             )
         })
@@ -1233,9 +1340,11 @@ fn record_class_bases_and_attributes(
     for name in BoundNames::of_class_attributes(&class.body) {
         methods.entry(name).or_insert(None);
     }
-    definitions
-        .bases
-        .insert((importer.to_path_buf(), identity.to_owned()), bases);
+    definitions.record_bases(
+        (importer.to_path_buf(), identity.to_owned()),
+        bases,
+        scope.namespace.alternative,
+    );
 }
 
 /// Record the bases of every class a control-flow suite holds.
@@ -1244,27 +1353,54 @@ fn record_class_bases_and_attributes(
 /// exactly as a class beside it is, and a subclass written after it in the
 /// same suite inherits from it. Leaving these bodies unwalked would record no
 /// bases for either, and an inherited call would keep its arguments while the
-/// default behind it was stripped.
+/// default behind it was stripped. The suite is read with the scope around it
+/// rather than afresh, so a base written above the statement is still in reach.
 fn index_control_flow_method_bases(
     statement: &Stmt,
     importer: &Path,
     known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
-    namespace: ClassNamespace<'_>,
-    lexical_classes: LexicalClasses<'_>,
     definitions: &mut Definitions,
+    scope: &BaseScope<'_>,
 ) {
-    for suite in control_flow_suites(statement) {
-        index_method_bases(
-            suite,
-            importer,
-            known,
-            bindings,
-            namespace,
-            lexical_classes,
-            definitions,
-        );
+    let suites = runnable_suites(statement);
+    let alternative = suites.len() > 1;
+    for suite in suites {
+        let mut inner = scope.in_suite(alternative);
+        index_scope_method_bases(suite, importer, known, bindings, definitions, &mut inner);
     }
+}
+
+/// The suites of a statement whose classes the file can end up with.
+///
+/// A test the tool can already read leaves only one suite of an `if` chain
+/// standing, and a suite behind a test that is never true defines nothing the
+/// file keeps. Dropping those here is what lets a class guarded by `if True`
+/// still be resolved against the base it names.
+fn runnable_suites(statement: &Stmt) -> Vec<&[Stmt]> {
+    let Stmt::If(branch) = statement else {
+        return control_flow_suites(statement);
+    };
+    let clauses = std::iter::once((Some(branch.test.as_ref()), branch.body.as_slice())).chain(
+        branch
+            .elif_else_clauses
+            .iter()
+            .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
+    );
+    let mut suites = Vec::new();
+    for (test, body) in clauses {
+        match test.map_or(Truthiness::True, |test| {
+            Truthiness::from_expr(test, |_| false)
+        }) {
+            Truthiness::False | Truthiness::Falsey | Truthiness::None => {}
+            Truthiness::True | Truthiness::Truthy => {
+                suites.push(body);
+                return suites;
+            }
+            Truthiness::Unknown => suites.push(body),
+        }
+    }
+    suites
 }
 
 /// The statement bodies a control-flow statement holds, in the order they are
@@ -1356,39 +1492,11 @@ fn collect_local_class_offsets(
                 found.entry(qualified.clone()).or_insert(statement.start());
                 collect_local_class_offsets(&class.body, Some(&qualified), found);
             }
-            // A suite does not open a namespace, so a class written inside one
-            // is spelled the same as a class beside it. A function body does
-            // open one, and a class in there is out of reach of these names.
-            Stmt::If(branch) => {
-                collect_local_class_offsets(&branch.body, prefix, found);
-                for clause in &branch.elif_else_clauses {
-                    collect_local_class_offsets(&clause.body, prefix, found);
+            _ => {
+                for suite in control_flow_suites(statement) {
+                    collect_local_class_offsets(suite, prefix, found);
                 }
             }
-            Stmt::For(loop_) => {
-                collect_local_class_offsets(&loop_.body, prefix, found);
-                collect_local_class_offsets(&loop_.orelse, prefix, found);
-            }
-            Stmt::While(loop_) => {
-                collect_local_class_offsets(&loop_.body, prefix, found);
-                collect_local_class_offsets(&loop_.orelse, prefix, found);
-            }
-            Stmt::With(block) => collect_local_class_offsets(&block.body, prefix, found),
-            Stmt::Try(block) => {
-                collect_local_class_offsets(&block.body, prefix, found);
-                collect_local_class_offsets(&block.orelse, prefix, found);
-                collect_local_class_offsets(&block.finalbody, prefix, found);
-                for handler in &block.handlers {
-                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                    collect_local_class_offsets(&handler.body, prefix, found);
-                }
-            }
-            Stmt::Match(block) => {
-                for case in &block.cases {
-                    collect_local_class_offsets(&case.body, prefix, found);
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -8329,6 +8437,37 @@ impl Rewriter<'_> {
         }
     }
 
+    /// Whether the call is made on a class whose ancestry two suites of one
+    /// statement disagree on. The method it reaches is one of two, and the
+    /// default behind whichever it is has to survive a call left unrewritten.
+    fn receiver_ancestry_is_uncertain(&self, expression: &Expr) -> bool {
+        let Expr::Attribute(attribute) = expression else {
+            return false;
+        };
+        self.class_ancestry_is_uncertain(&attribute.value)
+    }
+
+    /// Whether the call builds such a class. `Child()` and `api.Child()` name
+    /// the class rather than the `__init__` it inherits, so there is no single
+    /// constructor to give them and the class is left without one. That leaves
+    /// the call bare of the argument the removed default stood in for, which is
+    /// why the deletion has to be held back.
+    ///
+    /// A construction through a module is spelled exactly as a method call is,
+    /// so what tells them apart is whether the callee itself names a class:
+    /// `api.Child` does, and `receiver.method` does not.
+    fn constructs_uncertain_ancestry(&self, expression: &Expr) -> bool {
+        matches!(expression, Expr::Name(_) | Expr::Attribute(_))
+            && self.class_ancestry_is_uncertain(expression)
+    }
+
+    fn class_ancestry_is_uncertain(&self, receiver: &Expr) -> bool {
+        self.receiving_class(receiver)
+            .is_some_and(|(file, class, _, _)| {
+                self.definitions.ancestry_is_uncertain(&(file, class))
+            })
+    }
+
     fn skip(&mut self, offset: TextSize, callable: &str, reason: String) {
         let (line, column) = self.lines.locate(self.source, offset);
         self.skipped.push(Skipped {
@@ -8715,6 +8854,56 @@ impl Rewriter<'_> {
         }
     }
 
+    /// Report a call that names a fixed callable but reaches something else:
+    /// an unrelated `connect`, a method on a receiver whose type is not known,
+    /// or a call through an unresolved import. Rewriting it would break
+    /// working code, so it is reported instead — and where the name it stands
+    /// for is one of two, the default behind it is held back as well, since
+    /// nothing was written into the call to stand in for it.
+    fn report_unresolved_call(&mut self, call: &ast::ExprCall, name: &str) {
+        // The gate is keyed on the name the fixed callable goes by, which a
+        // construction does not carry: it is spelled with the class's name,
+        // not the inherited `__init__`'s.
+        let constructs_uncertain = self.constructs_uncertain_ancestry(&call.func);
+        if !self.definitions.names.contains(name) && !constructs_uncertain {
+            return;
+        }
+        let replaced_import =
+            dotted_name(&call.func).is_some_and(|binding| self.binding_is_replaced(&binding));
+        let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
+        let ambiguous_import = self.has_unknown_receiver_binding(&call.func);
+        let uncertain_ancestry =
+            constructs_uncertain || self.receiver_ancestry_is_uncertain(&call.func);
+        let conditional_definition = matches!(call.func.as_ref(), Expr::Name(name) if self.in_class_scope()
+            && self
+                .conditional_class_definitions
+                .last()
+                .is_some_and(|names| names.contains(name.id.as_str())));
+        if replaced_import
+            || local_shadow
+            || ambiguous_import
+            || conditional_definition
+            || uncertain_ancestry
+        {
+            if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
+                self.retained.extend(fixes.iter().cloned());
+            }
+            // Asking for the call's own name finds nothing for a construction,
+            // so the inherited constructor is asked for under the name it goes
+            // by.
+            if constructs_uncertain {
+                if let Some(fixes) = self.definitions.fixes_by_name.get("__init__") {
+                    self.retained.extend(fixes.iter().cloned());
+                }
+            }
+        }
+        self.skip(
+            call.start(),
+            name,
+            "this call cannot be tied to the definition that was fixed".to_owned(),
+        );
+    }
+
     fn check_call(&mut self, call: &ast::ExprCall) {
         let name = match &*call.func {
             Expr::Name(name) => name.id.as_str(),
@@ -8722,31 +8911,7 @@ impl Rewriter<'_> {
             _ => return,
         };
         let Some((signature, bound)) = self.resolve(&call.func) else {
-            // A name a fixed callable also goes by, reached some other way: an
-            // unrelated `connect`, a method on a receiver whose type is not
-            // known, or a call through an unresolved import. Rewriting it would
-            // break working code, so say so instead.
-            if self.definitions.names.contains(name) {
-                let replaced_import = dotted_name(&call.func)
-                    .is_some_and(|binding| self.binding_is_replaced(&binding));
-                let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
-                let ambiguous_import = self.has_unknown_receiver_binding(&call.func);
-                let conditional_definition = matches!(call.func.as_ref(), Expr::Name(name) if self.in_class_scope()
-                    && self
-                        .conditional_class_definitions
-                        .last()
-                        .is_some_and(|names| names.contains(name.id.as_str())));
-                if replaced_import || local_shadow || ambiguous_import || conditional_definition {
-                    if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
-                        self.retained.extend(fixes.iter().cloned());
-                    }
-                }
-                self.skip(
-                    call.start(),
-                    name,
-                    "this call cannot be tied to the definition that was fixed".to_owned(),
-                );
-            }
+            self.report_unresolved_call(call, name);
             return;
         };
         if !signature.complete {
@@ -17767,5 +17932,93 @@ def b(x=1): pass  # type: ignore  # noqa
             assert_eq!(checked.diagnostics[0].fix.is_some(), removable, "{source}");
             assert_eq!(checked.signatures.is_empty(), !removable, "{source}");
         }
+    }
+    #[test]
+    fn control_flow_classes_see_enclosing_suite_bases() -> Result<(), String> {
+        let source = "class Base:\n    def target(self, value=1): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Base:\n    def target(self, value): return value\n\nif True:\n    class Child(Base):\n        def run(self): return self.target(value=1)\n\nassert Child().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn suites_that_disagree_on_a_class_leave_its_inherited_calls_alone() -> Result<(), String> {
+        // Both suites define `Child`, and only one of them runs. Rewriting the
+        // call against either suite's base would hand the class the module
+        // actually built the other one's default.
+        let source = "import os\n\nclass BaseA:\n    def target(self, value=1): return value\n\nclass BaseB:\n    def target(self, value=2): return value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        def run(self): return self.target()\nelse:\n    class Child(BaseB):\n        def run(self): return self.target()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("self.target(value="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_suite_that_cannot_run_leaves_the_base_of_the_one_that_can() -> Result<(), String> {
+        let source = "class BaseA:\n    def target(self, value=1): return value\n\nclass BaseB:\n    def target(self, value=2): return value\n\nif True:\n    class Child(BaseA):\n        def run(self): return self.target()\nelse:\n    class Child(BaseB):\n        def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("self.target(value=1)"), "{updated}");
+        assert!(!updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn suites_that_hold_both_a_class_and_its_base_still_disagree() -> Result<(), String> {
+        let source = "import os\n\nif os.environ.get('PICK'):\n    class BaseA:\n        def target(self, value=1): return value\n    class Child(BaseA):\n        def run(self): return self.target()\nelse:\n    class BaseB:\n        def target(self, value=2): return value\n    class Child(BaseB):\n        def run(self): return self.target()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("self.target(value="), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn match_cases_that_disagree_on_a_class_leave_its_inherited_calls_alone() -> Result<(), String>
+    {
+        let source = "import os\n\nclass BaseA:\n    def target(self, value=1): return value\n\nclass BaseB:\n    def target(self, value=2): return value\n\nmatch os.environ.get('PICK'):\n    case 'a':\n        class Child(BaseA):\n            def run(self): return self.target()\n    case _:\n        class Child(BaseB):\n            def run(self): return self.target()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("self.target(value="), "{updated}");
+        Ok(())
+    }
+    #[test]
+    fn suites_that_disagree_on_a_class_report_its_construction() -> Result<(), String> {
+        // `Child()` is spelled with the class's name, not the `__init__` it
+        // inherits, so the gate that reports an unresolved call never saw it
+        // and the default behind the constructor was dropped with nothing
+        // written into the call to stand in for it. A subclass of the
+        // contested class is no better placed than the class itself.
+        for source in [
+            "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n\nprint(Child().value)\n",
+            "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n\nclass Grandchild(Child):\n    pass\n\nprint(Grandchild().value)\n",
+        ] {
+            assert_eq!(
+                skipped_reasons(source)?,
+                ["this call cannot be tied to the definition that was fixed"],
+                "{source}"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn suites_that_disagree_on_a_class_report_a_qualified_construction() -> Result<(), String> {
+        // `api.Child()` is spelled exactly as a method call, but the callee
+        // names a class of the module rather than a method of a receiver. It
+        // resolves and is rewritten when the ancestry is settled, so it has to
+        // be held back when it is not.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        let api_source = "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n";
+        let user_source = "import api\n\nprint(api.Child().value)\n";
+        std::fs::write(&api, api_source).map_err(|error| error.to_string())?;
+        std::fs::write(&user, user_source).map_err(|error| error.to_string())?;
+        let reasons: Vec<String> = fix_all(&[api, user])?
+            .into_iter()
+            .map(|skip| skip.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            ["this call cannot be tied to the definition that was fixed"]
+        );
+        Ok(())
     }
 }

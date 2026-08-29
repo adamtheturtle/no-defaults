@@ -3485,6 +3485,27 @@ impl Checker<'_> {
         }
     }
 
+    fn unknown_base_may_end_in_default(&self, class: &ast::StmtClassDef) -> bool {
+        class_bases(class).any(|base| {
+            // A parameter shadowing the import hides the base further rather
+            // than revealing it, so the name it took over counts too.
+            if base_root_name(base).is_some_and(|name| {
+                self.aliases.import_bindings.contains(name)
+                    || self.aliases.invalidated_import_bindings.contains(name)
+            }) {
+                return true;
+            }
+            let Expr::Name(name) = base else {
+                return false;
+            };
+            let qualified = qualified_class_name(&self.lexical_scope, name.id.as_str());
+            self.shapes
+                .get(&qualified)
+                .and_then(Option::as_ref)
+                .is_some_and(|shape| shape.kept_default)
+        })
+    }
+
     fn class_field_style(&self, class: &ast::StmtClassDef) -> Option<FieldStyle> {
         field_style(
             class,
@@ -4879,15 +4900,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                         // An unseen base may end in a positional default. A
                         // child field without one would then make dataclass
                         // construction fail before any call can be rewritten.
-                        // A parameter shadowing the import hides the base
-                        // further rather than revealing it, so the name it
-                        // took over counts too.
-                        Inherited::Unknown => class_bases(class).any(|base| {
-                            base_root_name(base).is_some_and(|name| {
-                                self.aliases.import_bindings.contains(name)
-                                    || self.aliases.invalidated_import_bindings.contains(name)
-                            })
-                        }),
+                        Inherited::Unknown => self.unknown_base_may_end_in_default(class),
                         Inherited::Nothing => false,
                     };
                     let qualified = self.qualified_class(class.name.as_str());
@@ -14932,6 +14945,22 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 2);
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn imported_base_default_uncertainty_propagates_through_local_subclasses() {
+        let source = "from dataclasses import dataclass\nfrom base import Parent\n\n@dataclass\nclass Middle(Parent):\n    middle: int = 2\n\n@dataclass\nclass Child(Middle):\n    child: int = 3\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics.iter().all(|item| item.fix.is_none()));
     }
 
     #[test]

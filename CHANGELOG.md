@@ -61,6 +61,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A metaclass whose base is written `builtins.type`, or under a name `import builtins as ...` or `from builtins import type as ...` bound, is recognised as one, so the defaults class creation relies on are retained rather than removed with no call site to rewrite.
+- A `def` or a `class` that replaces an imported name takes that name over for the function bodies inside it, which run after the definition is bound. Calls in there were resolved against the replaced import, so a recursive call could be rewritten with an argument the definition does not accept. A class body still reads the import, because it runs before the name is bound.
+- A base imported through a package that re-exports it — `from pkg import Base`, where `pkg/__init__.py` binds the name to a submodule — is followed to the module that defines it, so the inherited calls behind it are rewritten instead of being left alone once their default is gone.
 - Class-body aliases created with `staticmethod()` and `classmethod()` carry the wrapper's receiver convention; `property()` aliases retain defaults consumed by descriptor access.
 - Class-body control-flow suites are scanned conservatively for method aliases, while nested definition scopes remain excluded.
 - Annotated assignments, statically paired destructuring, and named expressions in class bodies record method aliases for call rewriting.

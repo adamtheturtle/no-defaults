@@ -5864,3 +5864,69 @@ fn a_pickler_helper_beside_reducer_override_is_still_fixed(
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn an_unpickler_persistent_load_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `_pickle`'s unpickling loop calls `persistent_load(pid)` with the
+    // persistent id alone, so `extra` only ever arrives as its default. That
+    // call is made by the interpreter rather than by any line in the file, so
+    // dropping the default leaves the next `load` raising
+    // `TypeError: U.persistent_load() missing 1 required positional argument:
+    // 'extra'` with no written call site to carry the value.
+    let source =
+        "class U:\n    def persistent_load(self, pid, extra=1):\n        return (pid, extra)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_unpickler_helper_beside_persistent_load_is_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // sibling with the same signature shape is rewritten as usual, carrying
+    // its own default to the call.
+    let source = "class U:\n    def persistent_load(self, pid, extra=1):\n        return self.helper(pid)\n\n    def helper(self, pid, value=2):\n        return (pid, value)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class U:\n    def persistent_load(self, pid, extra=1):\n        return self.helper(pid, value=2)\n\n    def helper(self, pid, value):\n        return (pid, value)\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_method_named_near_persistent_load_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The unpickler looks the hook up under its exact name, so a near miss is
+    // an ordinary method whose default the fixer removes.
+    let source =
+        "class U:\n    def persistent_loads(self, pid, extra=1):\n        return (pid, extra)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class U:\n    def persistent_loads(self, pid, extra):\n        return (pid, extra)\n",
+    );
+    // Nothing is left unfixed once the near miss is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

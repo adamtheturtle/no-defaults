@@ -1213,6 +1213,24 @@ fn import_rebindings(statements: &[Stmt]) -> BTreeMap<String, TextSize> {
     rebindings
 }
 
+/// Where the last class statement binding each name in this scope is written.
+///
+/// A scope that writes the name again below an import has taken it back from
+/// that import, and the offsets a single spelling carries cannot say so. The
+/// spelling is left to the import instead of being handed an answer the class
+/// written last contradicts.
+fn last_class_offsets(statements: &[Stmt], found: &mut BTreeMap<String, TextSize>) {
+    for statement in statements {
+        if let Stmt::ClassDef(class) = statement {
+            found.insert(class.name.to_string(), statement.start());
+            continue;
+        }
+        for suite in control_flow_suites(statement) {
+            last_class_offsets(suite, found);
+        }
+    }
+}
+
 /// The classes a scope defines, under the spelling a base expression uses for
 /// each one there.
 ///
@@ -1227,6 +1245,8 @@ fn local_class_identities(
     let mut spellings = BTreeMap::new();
     collect_local_class_offsets(statements, None, &mut spellings);
     let rebindings = import_rebindings(statements);
+    let mut last_written = BTreeMap::new();
+    last_class_offsets(statements, &mut last_written);
     spellings
         .into_iter()
         .map(|(spelling, defined_at)| {
@@ -1239,7 +1259,12 @@ fn local_class_identities(
             let superseded_at = rebindings
                 .get(root)
                 .copied()
-                .filter(|offset| defined_at < *offset);
+                .filter(|offset| defined_at < *offset)
+                .filter(|offset| {
+                    last_written
+                        .get(root)
+                        .is_none_or(|written| *written < *offset)
+                });
             (
                 spelling,
                 LocalClass {
@@ -19494,6 +19519,57 @@ def b(x=1): pass  # type: ignore  # noqa
         fix_all(&[initializer, module, case.clone()])?;
         let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
         assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn later_imports_reclaim_plain_class_names() -> Result<(), String> {
+        // The plain-name half of the same rule: `from api import Base` binds
+        // `Base` again, so the subclass below is built on the imported class,
+        // whose default CPython gives the call as 9.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Base:\n    def target(self, value=1): return value\n\nfrom api import Base\n\nclass Child(Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=9)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_written_again_below_an_import_keeps_the_name_from_it() -> Result<(), String> {
+        // The scope writes `Base` again below the import, so the import never
+        // ends up holding the name and the subclass is built on the second
+        // local class, which CPython gives the call as 4. The two same-named
+        // classes leave the file with no signature to rewrite against, which
+        // is #1102 and is unchanged here; what matters is that the import's
+        // default is not handed over in its place.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Base:\n    def target(self, value=1): return value\n\nfrom api import Base\n\nclass Base:\n    def target(self, value=4): return value\n\nclass Child(Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(!updated.contains("self.target(value=9)"), "{updated}");
         Ok(())
     }
 }

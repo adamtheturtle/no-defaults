@@ -5608,6 +5608,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "persistent_id"
             | "reducer_override"
             | "persistent_load"
+            | "find_class"
             | "get_source"
             | "__call__"
             | "__enter__"
@@ -20225,6 +20226,66 @@ def b(x=1): pass  # type: ignore  # noqa
         // Only an unpickler's attribute is consulted for the hook, so a plain
         // function of that name at module level carries no such obligation.
         let source = "def persistent_load(pid, extra=1):\n    return (pid, extra)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn unpickler_find_class_defaults_are_retained() {
+        // The unpickler looks a global up by calling `find_class` itself, from
+        // `_pickle` or from `pickle.load_stack_global`, handing it the module
+        // and the name and nothing more, so a parameter beside them survives
+        // only through its default.
+        let source =
+            "class U:\n    def find_class(self, module, name, extra=1):\n        return extra\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn an_unpickler_method_beside_find_class_stays_fixable() {
+        // Retention is keyed to the hook name, so a sibling sharing the
+        // unpickler and the signature shape keeps its ordinary treatment.
+        let source = "class U:\n    def find_class(self, module, name, extra=1):\n        return self.helper(module, name)\n    def helper(self, module, name, value=2):\n        return value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_name_near_find_class_stays_fixable() {
+        // The catalogue holds the hook's exact name, so a namesake such as
+        // `find_classes` is nothing the unpickler ever reaches for.
+        let source =
+            "class U:\n    def find_classes(self, module, name, extra=1):\n        return extra\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

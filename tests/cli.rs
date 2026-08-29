@@ -5097,3 +5097,361 @@ fn match_captures_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn 
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
+
+// A rebinding nested in class-body control flow may or may not run, so unlike
+// a nested `del` — which at worst leaves the earlier binding standing — it can
+// leave the name pointing at something else entirely. Module and function
+// scopes both decline to rewrite such a call, and a class body matches them.
+#[test]
+fn conditional_class_rebindings_leave_prior_import_calls_alone(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for body in [
+        "    condition = False\n    if condition:\n        target = lambda: 9",
+        "    try:\n        pass\n    except Exception:\n        target = lambda: 9",
+        "    values = []\n    for _ in values:\n        target = lambda: 9",
+        "    values = []\n    if values:\n        for target in values:\n            pass",
+        "    subject = 0\n    match subject:\n        case 1:\n            target = lambda: 9",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        let api_source = "def target(value=1):\n    return value\n";
+        let caller_source =
+            format!("class C:\n    from api import target\n{body}\n    result = target()\n");
+        std::fs::write(&api, api_source)?;
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(1), "{body}");
+        assert_eq!(std::fs::read_to_string(api)?, api_source, "{body}");
+        assert_eq!(std::fs::read_to_string(caller)?, caller_source, "{body}");
+    }
+    Ok(())
+}
+
+// `target: int` in a class body annotates without binding, so the import above
+// it is still what the call below it reaches.
+#[test]
+fn class_annotations_without_values_keep_import_bindings() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    std::fs::write(&api, "def target(value=1):\n    return value\n")?;
+    std::fs::write(
+        &caller,
+        "class C:\n    from api import target\n    target: int\n    result = target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value):\n    return value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        "class C:\n    from api import target\n    target: int\n    result = target(value=1)\n"
+    );
+    Ok(())
+}
+
+// A `def` or a `class` takes the name over in the class namespace just as an
+// assignment does, so a call below it reaches the definition rather than the
+// import above it and cannot be given the imported function's default. The
+// definition runs unconditionally here, so nothing in the file reaches the
+// import any more and its default goes.
+#[test]
+fn class_definitions_replace_earlier_class_body_imports() -> Result<(), Box<dyn std::error::Error>>
+{
+    for body in [
+        "    def target():\n        return 5",
+        "    class target:\n        pass",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        let caller_source =
+            format!("class C:\n    from api import target\n{body}\n\n    result = target()\n");
+        std::fs::write(&api, "def target(value=1):\n    return value\n")?;
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(api)?,
+            "def target(value):\n    return value\n",
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(caller)?, caller_source, "{body}");
+    }
+    Ok(())
+}
+
+// The same class bodies with a definition under a different name leave the
+// import standing, so the call below it is still the imported function's.
+#[test]
+fn class_definitions_under_other_names_keep_import_bindings(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for body in [
+        "    def other():\n        return 5",
+        "    class other:\n        pass",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        std::fs::write(&api, "def target(value=1):\n    return value\n")?;
+        std::fs::write(
+            &caller,
+            format!("class C:\n    from api import target\n{body}\n\n    result = target()\n"),
+        )?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(0), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(api)?,
+            "def target(value):\n    return value\n",
+            "{body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(caller)?,
+            format!(
+                "class C:\n    from api import target\n{body}\n\n    result = target(value=1)\n"
+            ),
+            "{body}"
+        );
+    }
+    Ok(())
+}
+
+// A `def` or a `class` nested in class-body control flow may never run, so the
+// name below it holds either the definition or the import that was there
+// first. The call cannot be tied to either and is left alone, which means the
+// import's default has to stay: removing it while leaving a call that can
+// still reach it would leave that call an argument short. A conditional
+// assignment in the same position already keeps the default for this reason.
+#[test]
+fn conditional_class_definitions_keep_the_imported_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for body in [
+        "    condition = False\n    if condition:\n\n        def target():\n            return 5",
+        "    condition = False\n    if condition:\n\n        class target:\n            pass",
+        "    try:\n        pass\n    except Exception:\n\n        def target():\n            return 5",
+        "    values = []\n    for _ in values:\n\n        def target():\n            return 5",
+        "    subject = 0\n    match subject:\n        case 1:\n\n            class target:\n                pass",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let api = directory.path().join("api.py");
+        let caller = directory.path().join("caller.py");
+        let api_source = "def target(value=1):\n    return value\n";
+        let caller_source =
+            format!("class C:\n    from api import target\n{body}\n\n    result = target()\n");
+        std::fs::write(&api, api_source)?;
+        std::fs::write(&caller, &caller_source)?;
+
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(output.status.code(), Some(1), "{body}");
+        assert_eq!(std::fs::read_to_string(api)?, api_source, "{body}");
+        assert_eq!(std::fs::read_to_string(caller)?, caller_source, "{body}");
+    }
+    Ok(())
+}
+
+// Only the import the conditional definition could replace is held back. A
+// nested class body binds the name in its own namespace, so the enclosing
+// class's call still reaches the import above it.
+#[test]
+fn conditional_definitions_in_a_nested_class_leave_the_outer_import(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let caller = directory.path().join("caller.py");
+    let body = "    class Inner:\n        condition = False\n        if condition:\n\n            def target():\n                return 5";
+    std::fs::write(&api, "def target(value=1):\n    return value\n")?;
+    std::fs::write(
+        &caller,
+        format!("class C:\n    from api import target\n{body}\n\n    result = target()\n"),
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(api)?,
+        "def target(value):\n    return value\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(caller)?,
+        format!("class C:\n    from api import target\n{body}\n\n    result = target(value=1)\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_class_body_annotation_keeps_a_live_import() -> Result<(), Box<dyn std::error::Error>> {
+    // `target: int` declares a type and binds nothing, so the class-body
+    // import above it still names the imported function and the call under it
+    // is rewritten against that import.
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("api.py"),
+        "def target(value=1):\n    return value\n",
+    )?;
+    let user = directory.path().join("user.py");
+    std::fs::write(
+        &user,
+        "class C:\n    from api import target\n\n    target: int\n    result = target()\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let fixed = std::fs::read_to_string(user)?;
+    assert!(fixed.contains("result = target(value=1)"), "{fixed}");
+    Ok(())
+}
+
+#[test]
+fn a_conditionally_rebound_class_body_import_keeps_its_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The guarded assignment may leave `target` naming something that takes no
+    // arguments, so the call under it cannot be tied to the import. Dropping
+    // the default anyway would leave that call raising `TypeError` whenever
+    // the branch did run, so the whole fix is declined instead.
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let api_source = "def target(value=1):\n    return value\n";
+    std::fs::write(&api, api_source)?;
+    let user = directory.path().join("user.py");
+    let user_source = "def unknown():\n    return True\n\n\nclass C:\n    from api import target\n\n    if unknown():\n        target = staticmethod(lambda: 9)\n    result = target()\n";
+    std::fs::write(&user, user_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(api)?, api_source);
+    assert_eq!(std::fs::read_to_string(user)?, user_source);
+    Ok(())
+}
+
+#[test]
+fn suites_that_disagree_on_a_class_keep_the_defaults_behind_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Only one of the two suites runs, and nothing in the source says which,
+    // so the call under either of them cannot be tied to a base. Dropping the
+    // defaults anyway would leave whichever `Child` the module built calling
+    // `target` short an argument.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass BaseA:\n    def target(self, value=1):\n        return value\n\n\nclass BaseB:\n    def target(self, value=2):\n        return value\n\n\nif os.environ.get(\"PICK\"):\n\n    class Child(BaseA):\n        def run(self):\n            return self.target()\n\nelse:\n\n    class Child(BaseB):\n        def run(self):\n            return self.target()\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}
+
+#[test]
+fn suites_that_disagree_on_a_class_keep_the_default_behind_its_constructor(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The construction names the class, and which `__init__` the class ends
+    // up with is what the two suites disagree on. Removing the default of
+    // either would leave `Child()` short the argument it stood in for,
+    // whichever suite ran.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass BaseA:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass BaseB:\n    def __init__(self, value=2):\n        self.value = value\n\n\nif os.environ.get(\"PICK\"):\n\n    class Child(BaseA):\n        pass\n\nelse:\n\n    class Child(BaseB):\n        pass\n\n\nprint(Child().value)\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}
+
+#[test]
+fn suites_that_disagree_on_a_class_keep_the_default_behind_a_qualified_construction(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // `api.Child()` is rewritten like any other construction while the class
+    // has one ancestry, so the default behind it has to stay while the class
+    // has two.
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let user = directory.path().join("user.py");
+    let api_source = "import os\n\n\nclass BaseA:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass BaseB:\n    def __init__(self, value=2):\n        self.value = value\n\n\nif os.environ.get(\"PICK\"):\n\n    class Child(BaseA):\n        pass\n\nelse:\n\n    class Child(BaseB):\n        pass\n";
+    let user_source = "import api\n\nprint(api.Child().value)\n";
+    std::fs::write(&api, api_source)?;
+    std::fs::write(&user, user_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(api)?, api_source);
+    assert_eq!(std::fs::read_to_string(user)?, user_source);
+    Ok(())
+}
+
+#[test]
+fn branches_that_disagree_on_a_base_keep_the_inherited_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The bases are settled at module level and only the subclass is written
+    // twice, so the disagreement is over `Child` alone. Which `target` it
+    // inherits depends on a test the tool cannot read, so both defaults have
+    // to survive the fix: stripping either would leave the `self.target()`
+    // that was left alone short of the argument it stood in for.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass First:\n    def target(self, value=1):\n        return value\n\n\nclass Second:\n    def target(self, value=2):\n        return value\n\n\nif os.environ.get(\"PICK\"):\n\n    class Child(First):\n        def run(self):\n            return self.target()\n\nelse:\n\n    class Child(Second):\n        def run(self):\n            return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_alias_reaches_the_enclosing_functions_class() -> Result<(), Box<dyn std::error::Error>> {
+    // `inner` binds no `Base` of its own, so the alias reads the one `outer`
+    // holds and not the module class of the same name. Naming the module
+    // class's field here would hand the constructor a keyword the class it
+    // really inherits from has no field for, and the fixed file would stop
+    // running.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "from dataclasses import dataclass\n\n\n@dataclass\nclass Base:\n    module: int = 1\n\n\ndef outer():\n    @dataclass\n    class Base:\n        local: int = 2\n\n    def inner():\n        Alias = Base\n\n        @dataclass\n        class Child(Alias):\n            child: int = 3\n\n        return Child()\n\n    return inner()\n\n\nprint(outer())\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    let updated = std::fs::read_to_string(path)?;
+    assert!(
+        updated.contains("        return Child(local=2, child=3)\n"),
+        "{updated}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

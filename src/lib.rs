@@ -339,8 +339,10 @@ enum Binding {
     Module(PathBuf),
     /// A symbol imported from a module, so `name(...)` resolves to it.
     Symbol(PathBuf, String),
-    /// A name definitely bound by an import whose checked definition is
-    /// ambiguous. It shadows earlier candidates but cannot be resolved.
+    /// A name definitely bound, by an import whose checked definition is
+    /// ambiguous or by a parameter of the scope being read, to something this
+    /// file cannot follow. It shadows earlier candidates but cannot be
+    /// resolved, and it is not free for a later definition to answer to.
     Unknown,
 }
 
@@ -912,16 +914,11 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
-        // A class the file defines itself takes the name over from an import
-        // of the same name, so a subclass written after it is built on the
-        // local class. One written before it still reaches the import.
-        let mut local_classes = BTreeMap::<String, TextSize>::new();
-        collect_local_class_offsets(parsed.suite(), None, &mut local_classes);
         index_method_bases(
             parsed.suite(),
             &importer,
+            &known,
             &bindings,
-            &local_classes,
             None,
             &mut definitions,
         );
@@ -972,28 +969,28 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
 fn index_method_bases(
     statements: &[Stmt],
     importer: &Path,
+    known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
-    local_classes: &BTreeMap<String, TextSize>,
     parent_class: Option<&str>,
     definitions: &mut Definitions,
 ) {
-    let scope_classes: BTreeMap<String, String> = statements
-        .iter()
-        .filter_map(|statement| match statement {
-            Stmt::ClassDef(class) => Some((
-                class.name.to_string(),
-                qualified_name(parent_class, class.name.as_str()),
-            )),
-            _ => None,
+    // A class this scope defines itself takes the name over from an import of
+    // the same name, so a subclass written after it is built on the local
+    // class. One written before it still reaches the import. The offsets are
+    // gathered under the spelling a base expression uses here, while the
+    // identity a spelling resolves to carries the enclosing class's name.
+    let mut spellings = BTreeMap::new();
+    collect_local_class_offsets(statements, None, &mut spellings);
+    let local_classes: BTreeMap<String, (String, TextSize)> = spellings
+        .into_iter()
+        .map(|(spelling, offset)| {
+            let identity = qualified_name(parent_class, &spelling);
+            (spelling, (identity, offset))
         })
         .collect();
     let mut aliases = BTreeMap::new();
     for statement in statements {
-        let local = LocalClasses {
-            offsets: local_classes,
-            scope: &scope_classes,
-            defined_at: statement.start(),
-        };
+        let defined_at = statement.start();
         match statement {
             Stmt::ClassDef(class) => {
                 let identity = qualified_name(parent_class, class.name.as_str());
@@ -1006,7 +1003,8 @@ fn index_method_bases(
                             base,
                             importer,
                             bindings,
-                            local,
+                            &local_classes,
+                            defined_at,
                             &aliases,
                             &definitions.methods,
                         )
@@ -1019,13 +1017,13 @@ fn index_method_bases(
                 // Every name the body still holds at the end of it is an
                 // attribute of the class, whether a `def` wrote it or an
                 // assignment such as `__init__ = setup` did. Recording the
-                // assigned ones too keeps them shadowing what the bases
-                // hold: a subclass that binds `__init__` has a constructor
-                // of its own, and rewriting its calls against an
-                // ancestor's `__init__` would pass parameters the binding
-                // does not take. A name the body never leaves behind is a
-                // shadow that does not exist, and recording it would stop
-                // the lookup that should have walked on to a base.
+                // assigned ones too keeps them shadowing what the bases hold:
+                // a subclass that binds `__init__` has a constructor of its
+                // own, and rewriting its calls against an ancestor's
+                // `__init__` would pass parameters the binding does not take.
+                // A name the body never leaves behind is a shadow that does
+                // not exist, and recording it would stop the lookup that
+                // should have walked on to a base.
                 for name in BoundNames::of_class_attributes(&class.body) {
                     methods.entry(name).or_insert(None);
                 }
@@ -1035,17 +1033,23 @@ fn index_method_bases(
                 index_method_bases(
                     &class.body,
                     importer,
-                    bindings,
-                    local_classes,
+                    known,
+                    &scoped_bindings(&class.body, None, importer, known, bindings),
                     Some(&identity),
                     definitions,
                 );
             }
-            Stmt::FunctionDef(function) => index_function_body_bases(
+            Stmt::FunctionDef(function) => index_method_bases(
                 &function.body,
                 importer,
-                bindings,
-                local_classes,
+                known,
+                &scoped_bindings(
+                    &function.body,
+                    Some(&function.parameters),
+                    importer,
+                    known,
+                    bindings,
+                ),
                 parent_class,
                 definitions,
             ),
@@ -1070,7 +1074,8 @@ fn index_method_bases(
                     value,
                     importer,
                     bindings,
-                    local,
+                    &local_classes,
+                    defined_at,
                     &aliases,
                     &definitions.methods,
                 ) else {
@@ -1087,51 +1092,34 @@ fn index_method_bases(
     }
 }
 
-/// Index the bases of the classes written in a function body.
-///
-/// The file-wide offsets stop at function bodies, because a class written in
-/// one is out of reach of the names the rest of the file spells. Inside the
-/// body it is in reach, and it takes the name over from whatever an enclosing
-/// scope bound it to, so the walk of the body carries the body's own classes
-/// ahead of the file's.
-fn index_function_body_bases(
+/// The bindings a nested scope sees: the ones the scopes around it left
+/// standing, less the names the scope's own parameters claim, plus the imports
+/// the scope makes for itself. `collect_bindings` stops at every scope
+/// boundary, so a body is read for its own imports as it is entered; without
+/// that, a `from module import Base` written beside the class that inherits
+/// from it would name nothing, though the same pair at module level resolves.
+/// A parameter pushes the other way: it takes its name over for the whole
+/// call, so a base spelled with it is whatever the caller handed in, and
+/// linking the subclass to the import of that spelling would rewrite inherited
+/// calls against a class the subclass never had.
+fn scoped_bindings(
     body: &[Stmt],
+    parameters: Option<&ast::Parameters>,
     importer: &Path,
+    known: &BTreeSet<&Path>,
     bindings: &BTreeMap<String, Binding>,
-    local_classes: &BTreeMap<String, TextSize>,
-    parent_class: Option<&str>,
-    definitions: &mut Definitions,
-) {
-    let mut body_classes = BTreeMap::new();
-    collect_local_class_offsets(body, parent_class, &mut body_classes);
-    let mut offsets = local_classes.clone();
-    offsets.extend(body_classes);
-    index_method_bases(
-        body,
-        importer,
-        bindings,
-        &offsets,
-        parent_class,
-        definitions,
-    );
+) -> BTreeMap<String, Binding> {
+    let mut scoped = bindings.clone();
+    for name in parameters.into_iter().flat_map(BoundNames::of_parameters) {
+        // Claimed, not vacated. Merely dropping the name would leave it free
+        // for a class written later in the same body to answer to, and that
+        // class does not exist yet where the subclass is written.
+        scoped.insert(name, Binding::Unknown);
+    }
+    collect_bindings(body, importer, known, &mut scoped);
+    scoped
 }
 
-/// The classes a file defines, as a base expression written at one point in
-/// the file can reach them.
-#[derive(Clone, Copy)]
-struct LocalClasses<'a> {
-    /// Where each class is written, under the qualified name a base
-    /// expression spells it with.
-    offsets: &'a BTreeMap<String, TextSize>,
-    /// The qualified name of each class of the suite holding the base, under
-    /// the simple name written there.
-    scope: &'a BTreeMap<String, String>,
-    /// Where the base itself is written, so that only classes above it hold
-    /// the names they bind.
-    defined_at: TextSize,
-}
-
-/// Resolve the class identity denoted by a base expression for method lookup.
 /// Where each class this file defines is written, under the name a base
 /// expression would spell it with — nested classes included, so `Outer.Inner`
 /// is found as readily as a class at the top level.
@@ -1184,11 +1172,13 @@ fn collect_local_class_offsets(
     }
 }
 
+/// Resolve the class identity denoted by a base expression for method lookup.
 fn method_base_identity(
     expression: &Expr,
     importer: &Path,
     bindings: &BTreeMap<String, Binding>,
-    local: LocalClasses<'_>,
+    local_classes: &BTreeMap<String, (String, TextSize)>,
+    defined_at: TextSize,
     aliases: &BTreeMap<String, (PathBuf, String)>,
     methods: &BTreeMap<(PathBuf, String), BTreeMap<String, Option<Signature>>>,
 ) -> Option<(PathBuf, String)> {
@@ -1197,45 +1187,43 @@ fn method_base_identity(
             &subscript.value,
             importer,
             bindings,
-            local,
+            local_classes,
+            defined_at,
             aliases,
             methods,
         ),
         Expr::Name(name) => aliases.get(name.id.as_str()).cloned().or_else(|| {
-            let bound = match bindings.get(name.id.as_str()) {
-                Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
-                _ => None,
-            };
-            // A class of the suite holding this base is spelled by its simple
-            // name but identified by the qualified one a nested class needs.
-            let Some(identity) = local.scope.get(name.id.as_str()) else {
-                return bound;
-            };
+            let local = local_classes.get(name.id.as_str());
             // A class already defined here holds the name, whatever an import
             // of the same name bound earlier.
-            if local
-                .offsets
-                .get(identity.as_str())
-                .is_some_and(|written| *written < local.defined_at)
-            {
+            if let Some((identity, _)) = local.filter(|(_, offset)| *offset < defined_at) {
                 return Some((importer.to_path_buf(), identity.clone()));
             }
-            bound.or_else(|| Some((importer.to_path_buf(), identity.clone())))
+            match bindings.get(name.id.as_str()) {
+                Some(Binding::Symbol(file, class)) => Some((file.clone(), class.clone())),
+                // Something holds the name here that cannot be followed, so
+                // the class it stands for is unknown. Reading on to a class
+                // of the same spelling written further down the scope would
+                // answer with one the subclass was never built on.
+                Some(Binding::Unknown) => None,
+                _ => local.map(|(identity, _)| (importer.to_path_buf(), identity.clone())),
+            }
         }),
         Expr::Attribute(attribute) => {
             let qualified = dotted_name(expression)?;
             // A nested class holds the dotted name only once it is written,
             // the same rule a simple name follows above. Before that the
             // prefix still names whatever an import bound.
-            if local
-                .offsets
+            if let Some((identity, _)) = local_classes
                 .get(&qualified)
-                .is_some_and(|written| *written < local.defined_at)
-                && methods
-                    .keys()
-                    .any(|(file, class)| file == importer && class == &qualified)
+                .filter(|(_, offset)| *offset < defined_at)
+                .filter(|(identity, _)| {
+                    methods
+                        .keys()
+                        .any(|(file, class)| file == importer && class == identity)
+                })
             {
-                return Some((importer.to_path_buf(), qualified));
+                return Some((importer.to_path_buf(), identity.clone()));
             }
             let module = dotted_name(&attribute.value)?;
             let Binding::Module(file) = bindings.get(&module)? else {
@@ -7531,6 +7519,13 @@ impl BoundNames {
         collector.finish()
     }
 
+    /// The names a signature claims, without reading the body behind it.
+    fn of_parameters(parameters: &ast::Parameters) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        collector.parameters(parameters);
+        collector.names
+    }
+
     fn of_body(body: &[Stmt]) -> Self {
         let mut collector = Self::default();
         for statement in body {
@@ -8162,14 +8157,18 @@ impl Rewriter<'_> {
 
     fn is_builtin_super_call(&self, call: &ast::ExprCall) -> bool {
         match call.func.as_ref() {
+            // An import of the builtin is checked before the bare name, since
+            // `from builtins import super` binds `super` to the very builtin
+            // the name would have reached anyway. Reading that binding as a
+            // shadow would leave the call pointing at nothing.
+            Expr::Name(name) if self.aliases.supers.contains(name.id.as_str()) => {
+                self.nested_binding(name.id.as_str()).is_none()
+                    && !self.binding_is_replaced(name.id.as_str())
+            }
             Expr::Name(name) if name.id.as_str() == "super" => {
                 self.nested_binding("super").is_none()
                     && self.binding("super").is_none()
                     && !self.module_bindings.contains("super")
-            }
-            Expr::Name(name) if self.aliases.supers.contains(name.id.as_str()) => {
-                self.nested_binding(name.id.as_str()).is_none()
-                    && !self.binding_is_replaced(name.id.as_str())
             }
             _ => false,
         }
@@ -16866,6 +16865,26 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn an_unaliased_imported_super_is_still_the_builtin() -> Result<(), String> {
+        // `from builtins import super` binds `super` to the very builtin the
+        // bare name reaches, so the call it stands in front of resolves as it
+        // would without the import.
+        let source = "from builtins import super\n\nclass Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "from builtins import super\n\nclass Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method(value=1)\n\nassert Child().run() == 1\n"
+        );
+        // A name the file binds to something of its own is a real shadow, and
+        // the call through it names nothing this pass can follow.
+        let shadowed = "def super(): raise SystemExit\n\nclass Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n";
+        assert_eq!(
+            fixed(shadowed)?,
+            "def super(): raise SystemExit\n\nclass Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        __class__\n        return super().method()\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn parameterized_local_bases_carry_default_uncertainty() {
         // `Middle` is built on an import, so whether its fields end in a
         // default is unknown, and a subclass must keep its own defaults to
@@ -16890,6 +16909,33 @@ def b(x=1): pass  # type: ignore  # noqa
                 "{base}"
             );
         }
+    }
+
+    #[test]
+    fn a_same_scope_import_names_a_nested_class_base() -> Result<(), String> {
+        // The import and the subclass sit in one function body, where a scope
+        // of its own holds the name. The same pair at module level resolves,
+        // and so must this one.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Base:\n    def method(self, value=1): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &user,
+            "def outer():\n    from other import Base\n\n    class Child(Base):\n        def run(self): return self.method()\n\n    return Child().run()\n\n\nassert outer() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[other, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert_eq!(
+            updated,
+            "def outer():\n    from other import Base\n\n    class Child(Base):\n        def run(self): return self.method(value=1)\n\n    return Child().run()\n\n\nassert outer() == 1\n"
+        );
+        Ok(())
     }
 
     #[test]
@@ -16940,6 +16986,84 @@ def b(x=1): pass  # type: ignore  # noqa
         fix_all(&[other, user.clone()])?;
         let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
         assert!(updated.contains("super().target(local=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameter_shadowing_an_import_leaves_a_nested_class_base_unknown() -> Result<(), String> {
+        // The parameter holds the name for the whole call, so the class the
+        // subclass is built on is whatever the caller passed rather than the
+        // import above. Reading the import as the base would rewrite the
+        // inherited call with a default the runtime base never had, silently
+        // changing what the program returns.
+        // `a_same_scope_import_names_a_nested_class_base` covers the same
+        // shape without the parameter, where the import is the base and the
+        // call is rewritten.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let other = directory.path().join("other.py");
+        let runtime = directory.path().join("runtime.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &other,
+            "class Base:\n    def method(self, value=1): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &runtime,
+            "class Runtime:\n    def method(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let source = "from other import Base\nfrom runtime import Runtime\n\n\ndef outer(Base):\n    class Child(Base):\n        def run(self): return self.method()\n\n    return Child().run()\n\n\nassert outer(Runtime) == 2\n";
+        std::fs::write(&user, source).map_err(|error| error.to_string())?;
+        fix_all(&[other, runtime, user.clone()])?;
+        let updated = std::fs::read_to_string(&user).map_err(|error| error.to_string())?;
+        assert_eq!(updated, source);
+        Ok(())
+    }
+
+    /// Fix a function body written against a `Runtime` class in another file,
+    /// and report what the body became.
+    fn fixed_against_runtime_class(user_source: &str) -> Result<String, String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let runtime = directory.path().join("runtime.py");
+        let user = directory.path().join("user.py");
+        std::fs::write(
+            &runtime,
+            "class Runtime:\n    def method(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(&user, user_source).map_err(|error| error.to_string())?;
+        fix_all(&[runtime, user.clone()])?;
+        std::fs::read_to_string(&user).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_parameter_holds_its_name_against_a_later_class_of_the_same_spelling() -> Result<(), String>
+    {
+        // The class comes after the subclass, so the name the subclass was
+        // built on was still the parameter's. Dropping the parameter's name
+        // rather than holding it would leave the later class free to answer
+        // to it, and the inherited call would be rewritten with a default
+        // that belongs to a class the subclass never had.
+        let source = "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Child(Helper):\n        def run(self): return self.method()\n\n    class Helper:\n        def method(self, value=3): return value\n\n    return Child().run()\n\n\nassert outer(Runtime) == 2\n";
+        assert_eq!(
+            fixed_against_runtime_class(source)?,
+            "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Child(Helper):\n        def run(self): return self.method()\n\n    class Helper:\n        def method(self, value): return value\n\n    return Child().run()\n\n\nassert outer(Runtime) == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_written_before_a_subclass_takes_the_name_from_a_parameter() -> Result<(), String> {
+        // The other order, where the class has replaced the parameter by the
+        // time the subclass is written and is what it inherits from. Holding
+        // the parameter's name must not reach this far, or the base would go
+        // unresolved and the call would be left alone.
+        let source = "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Helper:\n        def method(self, value=3): return value\n\n    class Child(Helper):\n        def run(self): return self.method()\n\n    return Child().run()\n\n\nassert outer(Runtime) == 3\n";
+        assert_eq!(
+            fixed_against_runtime_class(source)?,
+            "from runtime import Runtime\n\n\ndef outer(Helper):\n    class Helper:\n        def method(self, value): return value\n\n    class Child(Helper):\n        def run(self): return self.method(value=3)\n\n    return Child().run()\n\n\nassert outer(Runtime) == 3\n"
+        );
         Ok(())
     }
 }

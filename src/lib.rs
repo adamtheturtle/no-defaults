@@ -7981,6 +7981,12 @@ impl Rewriter<'_> {
             {
                 return None;
             }
+            // Python supplies a `__class__` closure cell to class-owned
+            // functions that reference it. It denotes the enclosing class,
+            // including in static methods and nested closures.
+            if name.id.as_str() == "__class__" && !self.implicit_receivers.is_empty() {
+                return self.enclosing_class_cell();
+            }
             if self.rebound_classes.contains(name.id.as_str()) {
                 return None;
             }
@@ -8018,6 +8024,15 @@ impl Rewriter<'_> {
             Binding::Module(file) => Some((file.clone(), attribute.attr.to_string(), false, false)),
             Binding::Symbol(..) | Binding::Unknown => None,
         }
+    }
+
+    fn enclosing_class_cell(&self) -> Option<(PathBuf, String, bool, bool)> {
+        Some((
+            self.physical.to_path_buf(),
+            self.classes.last()?.clone(),
+            false,
+            false,
+        ))
     }
 
     fn self_class_receiver(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
@@ -13293,6 +13308,16 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(source)?,
             "class C:\n    @staticmethod\n    def target(value): return value\n\n    def run(self): return self.__class__.target(value=1)\n\nassert C().run() == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bare_class_cell_calls_resolve_to_the_enclosing_class() -> Result<(), String> {
+        let source = "class C:\n    @staticmethod\n    def target(value=1): return value\n\n    def run(self): return __class__.target()\n\nassert C().run() == 1\n";
+        assert_eq!(
+            fixed(source)?,
+            "class C:\n    @staticmethod\n    def target(value): return value\n\n    def run(self): return __class__.target(value=1)\n\nassert C().run() == 1\n"
         );
         Ok(())
     }

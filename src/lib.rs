@@ -914,9 +914,8 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         let importer = physical_path(path);
         let mut bindings = BTreeMap::new();
         collect_bindings(parsed.suite(), &importer, &known, &mut bindings);
-        let mut outside_functions = BTreeMap::new();
-        collect_local_class_offsets(parsed.suite(), None, &mut outside_functions);
-        let outside_functions: BTreeSet<String> = outside_functions.into_keys().collect();
+        let mut outside_functions = BTreeSet::new();
+        collect_indexed_class_names(parsed.suite(), None, &mut outside_functions);
         index_method_bases(
             parsed.suite(),
             &importer,
@@ -968,6 +967,29 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
         (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
     });
     Ok(call_sites)
+}
+
+/// The classes `index_method_bases` records without entering a function.
+///
+/// The walk descends into a class body and a function body and nothing else,
+/// so a class written in an `if` or a `try` suite is never reached. Its name
+/// must not be held against a class in a function body: holding a name for a
+/// class that is never recorded would leave both of them unindexed, and an
+/// inherited call in the one that is written would be left alone after the
+/// default behind it was removed. This mirrors the statements the walk itself
+/// matches on, and has to keep mirroring them.
+fn collect_indexed_class_names(
+    statements: &[Stmt],
+    parent_class: Option<&str>,
+    found: &mut BTreeSet<String>,
+) {
+    for statement in statements {
+        if let Stmt::ClassDef(class) = statement {
+            let identity = qualified_name(parent_class, class.name.as_str());
+            collect_indexed_class_names(&class.body, Some(&identity), found);
+            found.insert(identity);
+        }
+    }
 }
 
 /// The class names a file reaches without entering a function, and whether the
@@ -17222,6 +17244,31 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(untouched)?,
             "from builtins import super\n\nclass Base:\n    def target(self, value): return value\n\nclass Child(Base):\n    def run(self):\n        return super().target(value=1)\n\nassert Child().run() == 1\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_in_a_control_flow_suite_holds_no_name_it_is_not_indexed_under() -> Result<(), String>
+    {
+        // The walk over a file descends into class bodies and function bodies
+        // alone, so a class written in an `if`, `try`, `for`, or `with` suite
+        // is never recorded. Holding its name against a class in a function
+        // body would leave both of them unindexed, and the inherited call in
+        // the one that is written would be left as written while the default
+        // behind it was removed.
+        let body = "def outer():\n    class Base:\n        def target(self, value=2): return value\n\n    class Helper(Base):\n        def run(self): return self.target()\n\n    return Helper().run()\n\n\nassert outer() == 2\n";
+        let fixed_body = "def outer():\n    class Base:\n        def target(self, value): return value\n\n    class Helper(Base):\n        def run(self): return self.target(value=2)\n\n    return Helper().run()\n\n\nassert outer() == 2\n";
+        for suite in [
+            "if True:\n    class Helper:\n        def unrelated(self): return 0\n",
+            "try:\n    class Helper:\n        def unrelated(self): return 0\nexcept Exception:\n    pass\n",
+            "for _ in range(1):\n    class Helper:\n        def unrelated(self): return 0\n",
+        ] {
+            assert_eq!(
+                fixed(&format!("{suite}\n\n{body}"))?,
+                format!("{suite}\n\n{fixed_body}"),
+                "{suite}"
+            );
+        }
         Ok(())
     }
 }

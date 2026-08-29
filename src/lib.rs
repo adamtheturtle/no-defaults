@@ -18518,4 +18518,26 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         Ok(())
     }
+
+    #[test]
+    fn imported_metaclass_uncertainty_propagates_through_local_bases() {
+        // A metaclass an imported base carries builds every class under it, so
+        // the local class between the import and the dataclass hides nothing.
+        // A keyword-only default is no safer to remove than a positional one
+        // here: the metaclass reaches `__init__` either way, and the inherited
+        // fields are unknown, so no call could be rewritten to make up for it.
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Middle(Parent):\n    pass\n\n@dataclass\nclass Child(Middle):\n    value: int = field(default=1, kw_only=True)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
 }

@@ -8444,7 +8444,20 @@ impl Rewriter<'_> {
         let Expr::Attribute(attribute) = expression else {
             return false;
         };
-        self.receiving_class(&attribute.value)
+        self.class_ancestry_is_uncertain(&attribute.value)
+    }
+
+    /// Whether the call builds such a class. `Child()` names the class rather
+    /// than the `__init__` it inherits, so there is no single constructor to
+    /// give it and the class is left without one. That leaves the call bare of
+    /// the argument the removed default stood in for, which is why the
+    /// deletion has to be held back.
+    fn constructs_uncertain_ancestry(&self, expression: &Expr) -> bool {
+        matches!(expression, Expr::Name(_)) && self.class_ancestry_is_uncertain(expression)
+    }
+
+    fn class_ancestry_is_uncertain(&self, receiver: &Expr) -> bool {
+        self.receiving_class(receiver)
             .is_some_and(|(file, class, _, _)| {
                 self.definitions.ancestry_is_uncertain(&(file, class))
             })
@@ -8836,6 +8849,56 @@ impl Rewriter<'_> {
         }
     }
 
+    /// Report a call that names a fixed callable but reaches something else:
+    /// an unrelated `connect`, a method on a receiver whose type is not known,
+    /// or a call through an unresolved import. Rewriting it would break
+    /// working code, so it is reported instead — and where the name it stands
+    /// for is one of two, the default behind it is held back as well, since
+    /// nothing was written into the call to stand in for it.
+    fn report_unresolved_call(&mut self, call: &ast::ExprCall, name: &str) {
+        // The gate is keyed on the name the fixed callable goes by, which a
+        // construction does not carry: it is spelled with the class's name,
+        // not the inherited `__init__`'s.
+        let constructs_uncertain = self.constructs_uncertain_ancestry(&call.func);
+        if !self.definitions.names.contains(name) && !constructs_uncertain {
+            return;
+        }
+        let replaced_import =
+            dotted_name(&call.func).is_some_and(|binding| self.binding_is_replaced(&binding));
+        let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
+        let ambiguous_import = self.has_unknown_receiver_binding(&call.func);
+        let uncertain_ancestry =
+            constructs_uncertain || self.receiver_ancestry_is_uncertain(&call.func);
+        let conditional_definition = matches!(call.func.as_ref(), Expr::Name(name) if self.in_class_scope()
+            && self
+                .conditional_class_definitions
+                .last()
+                .is_some_and(|names| names.contains(name.id.as_str())));
+        if replaced_import
+            || local_shadow
+            || ambiguous_import
+            || conditional_definition
+            || uncertain_ancestry
+        {
+            if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
+                self.retained.extend(fixes.iter().cloned());
+            }
+            // Asking for the call's own name finds nothing for a construction,
+            // so the inherited constructor is asked for under the name it goes
+            // by.
+            if constructs_uncertain {
+                if let Some(fixes) = self.definitions.fixes_by_name.get("__init__") {
+                    self.retained.extend(fixes.iter().cloned());
+                }
+            }
+        }
+        self.skip(
+            call.start(),
+            name,
+            "this call cannot be tied to the definition that was fixed".to_owned(),
+        );
+    }
+
     fn check_call(&mut self, call: &ast::ExprCall) {
         let name = match &*call.func {
             Expr::Name(name) => name.id.as_str(),
@@ -8843,37 +8906,7 @@ impl Rewriter<'_> {
             _ => return,
         };
         let Some((signature, bound)) = self.resolve(&call.func) else {
-            // A name a fixed callable also goes by, reached some other way: an
-            // unrelated `connect`, a method on a receiver whose type is not
-            // known, or a call through an unresolved import. Rewriting it would
-            // break working code, so say so instead.
-            if self.definitions.names.contains(name) {
-                let replaced_import = dotted_name(&call.func)
-                    .is_some_and(|binding| self.binding_is_replaced(&binding));
-                let local_shadow = matches!(call.func.as_ref(), Expr::Name(name) if self.nested_callable(name.id.as_str()) == Some(false));
-                let ambiguous_import = self.has_unknown_receiver_binding(&call.func);
-                let uncertain_ancestry = self.receiver_ancestry_is_uncertain(&call.func);
-                let conditional_definition = matches!(call.func.as_ref(), Expr::Name(name) if self.in_class_scope()
-                    && self
-                        .conditional_class_definitions
-                        .last()
-                        .is_some_and(|names| names.contains(name.id.as_str())));
-                if replaced_import
-                    || local_shadow
-                    || ambiguous_import
-                    || conditional_definition
-                    || uncertain_ancestry
-                {
-                    if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
-                        self.retained.extend(fixes.iter().cloned());
-                    }
-                }
-                self.skip(
-                    call.start(),
-                    name,
-                    "this call cannot be tied to the definition that was fixed".to_owned(),
-                );
-            }
+            self.report_unresolved_call(call, name);
             return;
         };
         if !signature.complete {
@@ -17939,6 +17972,25 @@ def b(x=1): pass  # type: ignore  # noqa
         let source = "import os\n\nclass BaseA:\n    def target(self, value=1): return value\n\nclass BaseB:\n    def target(self, value=2): return value\n\nmatch os.environ.get('PICK'):\n    case 'a':\n        class Child(BaseA):\n            def run(self): return self.target()\n    case _:\n        class Child(BaseB):\n            def run(self): return self.target()\n";
         let updated = fixed(source)?;
         assert!(!updated.contains("self.target(value="), "{updated}");
+        Ok(())
+    }
+    #[test]
+    fn suites_that_disagree_on_a_class_report_its_construction() -> Result<(), String> {
+        // `Child()` is spelled with the class's name, not the `__init__` it
+        // inherits, so the gate that reports an unresolved call never saw it
+        // and the default behind the constructor was dropped with nothing
+        // written into the call to stand in for it. A subclass of the
+        // contested class is no better placed than the class itself.
+        for source in [
+            "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n\nprint(Child().value)\n",
+            "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n\nclass Grandchild(Child):\n    pass\n\nprint(Grandchild().value)\n",
+        ] {
+            assert_eq!(
+                skipped_reasons(source)?,
+                ["this call cannot be tied to the definition that was fixed"],
+                "{source}"
+            );
+        }
         Ok(())
     }
 }

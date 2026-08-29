@@ -5372,3 +5372,21 @@ fn suites_that_disagree_on_a_class_keep_the_defaults_behind_it(
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
+
+#[test]
+fn suites_that_disagree_on_a_class_keep_the_default_behind_its_constructor(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The construction names the class, and which `__init__` the class ends
+    // up with is what the two suites disagree on. Removing the default of
+    // either would leave `Child()` short the argument it stood in for,
+    // whichever suite ran.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass BaseA:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass BaseB:\n    def __init__(self, value=2):\n        self.value = value\n\n\nif os.environ.get(\"PICK\"):\n\n    class Child(BaseA):\n        pass\n\nelse:\n\n    class Child(BaseB):\n        pass\n\n\nprint(Child().value)\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(path)?, source);
+    Ok(())
+}

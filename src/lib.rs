@@ -5621,6 +5621,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "get_code"
             | "get_source"
             | "__conform__"
+            | "is_package"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -20693,6 +20694,88 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(updated.contains("self[0].target()\n"), "{updated}");
         assert!(updated.contains("C()[0].target()\n"), "{updated}");
         Ok(())
+    }
+
+    #[test]
+    fn import_loader_is_package_defaults_are_retained() {
+        // Building a specification asks the loader whether the name is a
+        // package, and `importlib._bootstrap.spec_from_loader` makes that call
+        // with the module name alone, so a parameter beside it only ever
+        // arrives as its default. Dropping the default leaves the next import
+        // raising `TypeError: Loader.is_package() missing 1 required
+        // positional argument` from inside the import machinery, where there
+        // is no written line for the fixer to keep in step.
+        let source =
+            "class Loader:\n    def is_package(self, fullname, extra=1):\n        return False\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_loader_method_beside_is_package_stays_fixable() {
+        // Retention is keyed to the hook name rather than to the shape of the
+        // parameter list, so a sibling declared the very same way keeps its
+        // ordinary treatment.
+        let source = "class Loader:\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, extra=1):\n        return False\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_is_package_stays_fixable() {
+        // The import machinery reaches for the hook under its exact name, so a
+        // near miss is an ordinary method and its default is the fixer's.
+        let source =
+            "class Loader:\n    def is_packages(self, fullname, extra=1):\n        return False\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_module_level_is_package_stays_fixable() {
+        // Only a loader's attribute is consulted for the hook, so a plain
+        // function of that name at module level carries no such obligation.
+        let source = "def is_package(fullname, extra=1):\n    return False\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
     }
 
     #[test]

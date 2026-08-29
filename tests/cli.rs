@@ -5600,3 +5600,40 @@ fn enum_missing_hook_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn inherited_enum_initializer_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Creating `Child.A` calls this initializer from inside the class
+    // statement, so removing the default leaves a module that raises before
+    // anything can import it, and there is no call site to rewrite.
+    let source = "from enum import Enum\n\n\nclass Base(Enum):\n    pass\n\n\nclass Child(Base):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_enum_hidden_by_a_nested_namesake_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `Base` in the header below is the module-level enumeration: a class body
+    // is not a closure scope, so `Outer.Base` is no name to the function
+    // written there. Creating `Child.A` calls this initializer from inside the
+    // class statement, and removing the default makes `Outer.build()` raise.
+    let source = "from enum import Enum\n\n\nclass Base(Enum):\n    pass\n\n\nclass Outer:\n    class Base:\n        pass\n\n    def build():\n        class Child(Base):\n            A = 1\n\n            def __init__(self, value, label='x'):\n                self.label = label\n\n        return Child\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

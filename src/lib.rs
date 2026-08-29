@@ -3483,6 +3483,8 @@ fn check_source(
         metaclass_classes: BTreeSet::new(),
         entered_class_metaclass_classes: Vec::new(),
         metaclass_definitions: BTreeSet::new(),
+        local_enum_classes: BTreeSet::new(),
+        entered_class_enum_classes: Vec::new(),
         metaclass_intercepted_classes,
         repeated_functions,
         property_aliased_methods,
@@ -3787,6 +3789,15 @@ struct Checker<'a> {
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
+    /// The enumerations the file defines, whether they name an imported `Enum`
+    /// or another of these. Being an enumeration is inherited, so a subclass
+    /// of one creates its members the same implicit way.
+    local_enum_classes: BTreeSet<String>,
+    /// What `local_enum_classes` held as each enclosing class body was
+    /// entered, for the same reason `entered_class_metaclass_classes` keeps
+    /// its own: a class body binds names only for itself, so a function or a
+    /// class written in one reads the names the class statement began with.
+    entered_class_enum_classes: Vec<BTreeSet<String>>,
     /// Same-file classes whose metaclass can replace class attributes.
     metaclass_intercepted_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
@@ -4193,6 +4204,7 @@ impl Checker<'_> {
             }
             self.shapes
                 .remove(&qualified_class_name(&self.lexical_scope, name));
+            self.local_enum_classes.remove(name);
             if let Some(bindings) = self.lexical_bindings.last_mut() {
                 bindings.insert(name.to_owned());
             }
@@ -4431,6 +4443,25 @@ impl Checker<'_> {
         generates_init(class, &self.aliases, &self.metaclass_classes)
     }
 
+    /// Whether the class statement itself creates the class's members, which
+    /// it does for an enumeration: each member assignment calls the body's
+    /// initializer with the value assigned, through no call site the fixer can
+    /// rewrite. A base written in this file that is already an enumeration
+    /// makes this class one too, because that is inherited like any other
+    /// class behaviour.
+    fn is_enum_class(&self, class: &ast::StmtClassDef) -> bool {
+        class_bases(class).any(|base| match base {
+            Expr::Name(name) => {
+                self.aliases.enum_classes.contains(name.id.as_str())
+                    || self.local_enum_classes.contains(name.id.as_str())
+            }
+            Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
+                matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
+            }
+            _ => false,
+        })
+    }
+
     /// Note that a metaclass builds this class, so a later subclass of it is
     /// built by that metaclass too. An unseen imported base counts as one: the
     /// metaclass it may carry reaches every class beneath it alike, and a
@@ -4536,6 +4567,7 @@ impl Checker<'_> {
         let outer_local_classes = self.local_classes.clone();
         let outer_metaclass_classes = self.metaclass_classes.clone();
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
+        let outer_enum_classes = self.local_enum_classes.clone();
         // Written straight in a class body, this function sees none of the
         // names that body binds: a class written above it there is not in
         // scope here, and reading a base through it would answer with a class
@@ -4545,6 +4577,9 @@ impl Checker<'_> {
             if let Some(entered) = self.entered_class_metaclass_classes.last() {
                 self.metaclass_classes.clone_from(entered);
             }
+            if let Some(entered) = self.entered_class_enum_classes.last() {
+                self.local_enum_classes.clone_from(entered);
+            }
         }
         let mut parameters = BoundNames::default();
         parameters.parameters(&function.parameters);
@@ -4553,6 +4588,7 @@ impl Checker<'_> {
         let parameter_names = parameters.names.clone();
         for name in parameters.names {
             self.aliases.invalidate_parameter(&name);
+            self.local_enum_classes.remove(&name);
         }
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
@@ -4578,6 +4614,7 @@ impl Checker<'_> {
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
         self.metaclass_definitions = outer_metaclass_definitions;
+        self.local_enum_classes = outer_enum_classes;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
     }
@@ -5482,6 +5519,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer_local_classes = self.local_classes.clone();
                 let outer_metaclass_classes = self.metaclass_classes.clone();
                 let outer_metaclass_definitions = self.metaclass_definitions.clone();
+                let outer_enum_classes = self.local_enum_classes.clone();
+                let enum_class = self.is_enum_class(class);
                 let outer_repeated_functions = self.repeated_functions.clone();
                 let mut method_names = BTreeSet::new();
                 let mut repeated_methods = BTreeSet::new();
@@ -5498,15 +5537,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     } else {
                         ClassScope::Ordinary
                     },
-                    enum_class: class_bases(class).any(|base| match base {
-                        Expr::Name(name) => {
-                            self.aliases.enum_classes.contains(name.id.as_str())
-                        }
-                        Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
-                            matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
-                        }
-                        _ => false,
-                    }),
+                    enum_class,
                     // Each class body starts fresh; a base's fields are not
                     // written here.
                     kept_default: false,
@@ -5590,13 +5621,24 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 } else {
                     outer_metaclass_classes.clone()
                 };
+                let body_enum_classes = if self.lexical_is_class.last() == Some(&true) {
+                    self.entered_class_enum_classes
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| outer_enum_classes.clone())
+                } else {
+                    outer_enum_classes.clone()
+                };
                 self.lexical_scope.push(class.name.to_string());
                 self.lexical_is_class.push(true);
                 self.lexical_bindings.push(BTreeSet::new());
                 self.metaclass_classes.clone_from(&body_metaclass_classes);
                 self.entered_class_metaclass_classes
                     .push(body_metaclass_classes);
+                self.local_enum_classes.clone_from(&body_enum_classes);
+                self.entered_class_enum_classes.push(body_enum_classes);
                 walk_stmt(self, statement);
+                self.entered_class_enum_classes.pop();
                 self.entered_class_metaclass_classes.pop();
                 self.lexical_bindings.pop();
                 self.lexical_is_class.pop();
@@ -5618,6 +5660,15 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.metaclass_classes = outer_metaclass_classes;
                 self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
+                self.local_enum_classes = outer_enum_classes;
+                // A later class of the same name that is no enumeration takes
+                // the name back, so a subclass written on it below is built
+                // the ordinary way.
+                if enum_class {
+                    self.local_enum_classes.insert(class.name.to_string());
+                } else {
+                    self.local_enum_classes.remove(class.name.as_str());
+                }
                 self.repeated_functions = outer_repeated_functions;
                 if defines_metaclass(class, &self.metaclass_definitions) {
                     self.metaclass_definitions.insert(class.name.to_string());
@@ -19088,5 +19139,185 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
         assert_eq!(checked.signatures.len(), 1);
+    }
+    #[test]
+    fn inherited_enum_member_initializer_defaults_are_retained() {
+        // Being an enumeration is inherited, so a subclass of one written in
+        // this file creates its own members the same implicit way, and reaches
+        // `_missing_` the same way too, however many classes and class bodies
+        // stand between it and the import.
+        for source in [
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Mid(Base):\n    pass\n\nclass Child(Mid):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "import enum\n\nclass Base(enum.Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_redefinition_that_is_no_enum_frees_its_subclasses() {
+        // A base resolves to the class the name holds where the subclass is
+        // written, not to the enumeration that name once stood for, and
+        // nothing creates members of an ordinary class.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Base:\n    pass\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn an_inherited_enum_body_keeps_only_its_implicit_initializer() {
+        // Reaching subclasses widens which bodies are enumerations, not which
+        // of their methods are called implicitly. Every other method is called
+        // through a call site the fixer can rewrite.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Child(Base):\n    A = 1\n    def describe(self, prefix='p'): return prefix\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+    #[test]
+    fn an_enum_hidden_by_a_nested_namesake_still_reaches_deeper_bodies() {
+        // A class body binds names for itself alone. A function written in one
+        // reads past it, so `Base` there is the module-level enumeration and
+        // not the plain class the body wrote, and a class written in a further
+        // class body reads past it the same way.
+        for source in [
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Outer:\n    class Base:\n        pass\n\n    def build():\n        class Child(Base):\n            A = 1\n            def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Outer:\n    class Base:\n        pass\n\n    class Holder:\n        class Child(Base):\n            A = 1\n            def __init__(self, value, label='x'): self.label = label\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn an_enum_in_a_class_body_does_not_reach_the_bodies_written_in_it() {
+        // The same rule the other way round: the enumeration this class body
+        // writes is no name at all to a function written below it there, which
+        // reaches the module-level plain class instead, so nothing creates
+        // members and the default is as removable as any other.
+        let source = "from enum import Enum\n\nclass Base:\n    pass\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    def build():\n        class Child(Base):\n            def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn an_enum_in_a_class_body_still_reaches_the_classes_beside_it() {
+        // Only the bodies written in it are out of reach. A class statement
+        // later in the same body reads the name the way anything else there
+        // does, so this subclass is an enumeration.
+        let source = "from enum import Enum\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+    #[test]
+    fn a_rebinding_takes_the_name_off_a_local_enum() {
+        // Whatever now stands under the name is what the base below spells, so
+        // this class is ordinary and nothing creates members of it.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nBase = object\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_parameter_takes_the_name_off_a_local_enum() {
+        // The parameter holds the name for the whole body, so the class
+        // written there is built on what the caller passed.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\ndef build(Base):\n    class Child(Base):\n        def __init__(self, value, label='x'): self.label = label\n    return Child\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_loop_target_takes_the_name_off_a_local_enum() {
+        // Every rebinding form goes through the same invalidation, so a loop
+        // target hides the enumeration exactly as an assignment does.
+        let source = "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nfor Base in bases:\n    pass\n\nclass Child(Base):\n    def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
     }
 }

@@ -4033,6 +4033,7 @@ fn check_source(
         class_deletions: Vec::new(),
         class_assignments: Vec::new(),
         class_rewraps: Vec::new(),
+        class_opaque_rebindings: Vec::new(),
         method_aliases: Vec::new(),
         signatures: Vec::new(),
         own_constructors: Vec::new(),
@@ -4396,6 +4397,10 @@ struct Checker<'a> {
     /// Class-body assignments that put the same function back under its own
     /// name, which replace nothing.
     class_rewraps: Vec<BTreeMap<String, Vec<TextSize>>>,
+    /// Methods each enclosing class body names in an assignment whose value
+    /// this file cannot describe, so what stands behind the assigned name, and
+    /// how a call through it is spelled, are both unknown.
+    class_opaque_rebindings: Vec<BTreeSet<String>>,
     /// Direct `alias = method` bindings for each enclosing class, keyed by the
     /// original method name.
     method_aliases: Vec<BTreeMap<String, Vec<MethodAlias>>>,
@@ -5230,6 +5235,7 @@ impl Checker<'_> {
         self.class_deletions.pop();
         self.class_assignments.pop();
         self.class_rewraps.pop();
+        self.class_opaque_rebindings.pop();
         self.method_aliases.pop();
     }
 
@@ -5504,6 +5510,7 @@ impl Checker<'_> {
                     .class_implicit_callbacks
                     .contains(function.name.as_str()))
             || self.method_is_intercepted(function.name.as_str())
+            || self.method_is_opaquely_rebound(function.name.as_str())
             || self.method_is_rebound_later(function)
             || self.is_delegation_protocol_method(function.name.as_str())
             || (self.scope.class == ClassScope::Metaclass
@@ -5621,6 +5628,25 @@ impl Checker<'_> {
     /// the generated call finds it by the name it is bound to.
     fn generated_code_calls(&self, name: &str) -> bool {
         self.scope.fields == Some(FieldStyle::Dataclass) && name == "__post_init__"
+    }
+
+    /// Whether a class-body assignment this file cannot describe names the
+    /// method.
+    ///
+    /// `alias = wrap(target)`, where `wrap` is not one of the descriptor
+    /// wrappers, puts something unknown behind `alias`: it may be `target`
+    /// itself, it may take anything at all, and no signature can be recorded
+    /// for it. A call written through the assigned name is therefore never
+    /// rewritten, and it is not even reported, because the name is not one any
+    /// fixed callable goes by. Removing the default and saying nothing is the
+    /// one pairing that turns a working file into a `TypeError`, so the
+    /// default stays.
+    fn method_is_opaquely_rebound(&self, name: &str) -> bool {
+        self.scope.class != ClassScope::None
+            && self
+                .class_opaque_rebindings
+                .last()
+                .is_some_and(|names| names.contains(name))
     }
 
     fn method_is_rebound_later(&self, function: &ast::StmtFunctionDef) -> bool {
@@ -6361,6 +6387,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     aliases: &self.aliases,
                     module_bindings: &self.module_bindings,
                 };
+                self.class_opaque_rebindings
+                    .push(class_opaque_rebindings(&class.body, context));
                 self.method_aliases
                     .push(class_method_aliases(class, context));
                 if self.collect_signatures {
@@ -9184,6 +9212,107 @@ fn class_rewraps(
         found: BTreeMap::new(),
         aliases,
         module_bindings,
+    };
+    collector.visit_body(body);
+    collector.found
+}
+
+/// Every method a class body names in an assignment whose value this file
+/// cannot describe.
+///
+/// A value the alias machinery recognises — a bare name, a `Class.method`, or a
+/// descriptor wrapper around one of those — records an alias, and a call through
+/// the assigned name is rewritten against it. Anything else records nothing at
+/// all, which left the assigned name unknown to the fixer: the call through it
+/// was neither rewritten nor reported, while the default behind the method it
+/// mentions was removed. Naming the methods such a value mentions is what lets
+/// those defaults be held back instead.
+///
+/// The names are read from the whole value, so `_identity(target)`,
+/// `[target][0]` and `(target if flag else other)` are all caught. A name the
+/// class defines no method under matches nothing and costs nothing.
+fn class_opaque_rebindings(body: &[Stmt], context: AliasContext<'_>) -> BTreeSet<String> {
+    /// Every name an expression reads, however deeply it is written into it.
+    fn collect_read_names(expression: &Expr, found: &mut BTreeSet<String>) {
+        struct Reader<'a>(&'a mut BTreeSet<String>);
+
+        impl<'a> Visitor<'a> for Reader<'_> {
+            fn visit_expr(&mut self, expression: &'a Expr) {
+                if let Expr::Name(name) = expression {
+                    self.0.insert(name.id.to_string());
+                }
+                walk_expr(self, expression);
+            }
+        }
+
+        Reader(found).visit_expr(expression);
+    }
+
+    struct Collector<'a> {
+        found: BTreeSet<String>,
+        context: AliasContext<'a>,
+    }
+
+    impl Collector<'_> {
+        /// Record what an assignment of `value` to `target` puts out of reach.
+        ///
+        /// The pairing of matched tuples and lists is walked element by
+        /// element, exactly as the alias collector walks it, so
+        /// `first, second = one, two` is read as the two assignments it is
+        /// rather than as one opaque value.
+        fn record(&mut self, target: &Expr, value: &Expr) {
+            let paired = match (target, value) {
+                (Expr::Tuple(targets), Expr::Tuple(values)) => {
+                    Some((targets.elts.as_slice(), values.elts.as_slice()))
+                }
+                (Expr::List(targets), Expr::List(values)) => {
+                    Some((targets.elts.as_slice(), values.elts.as_slice()))
+                }
+                _ => None,
+            };
+            if let Some((targets, values)) =
+                paired.filter(|(targets, values)| targets.len() == values.len())
+            {
+                for (target, value) in targets.iter().zip(values) {
+                    self.record(target, value);
+                }
+                return;
+            }
+            // A value the alias machinery describes records an alias of its
+            // own, and the call through the assigned name is rewritten against
+            // it.
+            if method_alias_origin(value, self.context, &BTreeMap::new()).is_some() {
+                return;
+            }
+            collect_read_names(value, &mut self.found);
+        }
+    }
+
+    impl<'a> Visitor<'a> for Collector<'_> {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            match statement {
+                Stmt::Assign(assign) => {
+                    for target in &assign.targets {
+                        self.record(target, &assign.value);
+                    }
+                }
+                Stmt::AnnAssign(assign) => {
+                    if let Some(value) = &assign.value {
+                        self.record(&assign.target, value);
+                    }
+                }
+                // A method written in a body of its own is a definition rather
+                // than a rebinding, and a nested class keeps its own body to
+                // itself.
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                _ => walk_stmt(self, statement),
+            }
+        }
+    }
+
+    let mut collector = Collector {
+        found: BTreeSet::new(),
+        context,
     };
     collector.visit_body(body);
     collector.found
@@ -23054,6 +23183,93 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed_with_retained_defaults(source)?,
             "class Handler:\n    def _do(self, record, extra): return extra\n\n    emit = _do\n\n\nassert Handler._do(Handler(), \"r\", extra=1) == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unrecognised_wrapper_around_a_class_body_alias_holds_the_default_back(
+    ) -> Result<(), String> {
+        // `_identity` may return anything at all, so no signature can be
+        // recorded for `alias` and the call written through it is never
+        // rewritten. It is not even reported, because `alias` is not a name
+        // any fixed callable goes by, so removing the default here was the one
+        // pairing that turns a working file into a `TypeError`.
+        let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = _identity(target)\n\n\nassert C().alias(2) == (2, 1)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_subscript_of_a_method_holds_the_default_back() -> Result<(), String> {
+        // The same silence for any value this file cannot describe that still
+        // mentions the method.
+        let source = "class C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = [target][0]\n\n\nassert C().alias(2) == (2, 1)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_conditional_expression_holds_the_default_back() -> Result<(), String> {
+        // Which of the two the name ends up holding is a runtime fact, so the
+        // call through it cannot be rewritten against either.
+        let source = "import os\n\n\ndef other(self, x):\n    return x\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = target if os.environ.get(\"ND_TYPING\") else other\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_tuple_unpacking_holds_the_default_back() -> Result<(), String> {
+        // The shape `fractions.Fraction` is written in: a helper defined in the
+        // class body is called there and its results unpacked. Removing the
+        // default leaves the call beside it short of an argument, and the
+        // module raises before anything can import it.
+        let source = "import operator\n\n\nclass C:\n    def _fallbacks(forward, reverse, handle_complex=True):\n        return forward, reverse\n\n    def _add(self, other):\n        return other\n\n    __add__, __radd__ = _fallbacks(_add, operator.add)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_recognised_wrapper_around_a_class_body_alias_is_still_fixed() -> Result<(), String> {
+        // The counterpart guard. A descriptor wrapper leaves the function's own
+        // parameters behind the name, so the alias carries a signature and the
+        // call through it takes the value the removed default held.
+        let source = "class C:\n    def target(x, y=1):\n        return (x, y)\n\n    alias = staticmethod(target)\n\n\nassert C.alias(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("y=1):", "y):")
+                .replace("C.alias(2)", "C.alias(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_value_naming_no_method_is_still_fixed() -> Result<(), String> {
+        // Holding back every method of a class that writes anything opaque in
+        // its body would retain a default for most classes. Only a value that
+        // names the method counts.
+        let source = "class C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    table = {\"a\": 1}\n    label = \"x\".upper()\n\n\nassert C().target(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("y=1):", "y):")
+                .replace("C().target(2)", "C().target(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_module_level_opaque_binding_still_fixes_the_function() -> Result<(), String> {
+        // A module namespace is not a class body: a name bound there is one the
+        // fixer already tracks, and the call through it is reported by the
+        // paths that own module bindings.
+        let source = "def _identity(function):\n    return function\n\n\ndef target(x, y=1):\n    return (x, y)\n\n\nassert target(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("y=1):", "y):")
+                .replace("assert target(2)", "assert target(2, y=1)")
         );
         Ok(())
     }

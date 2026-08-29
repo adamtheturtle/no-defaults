@@ -21155,4 +21155,18 @@ def b(x=1): pass  # type: ignore  # noqa
         let live = shadowed.replace("as field:", "as error:");
         assert!(messages(&live, false).is_empty());
     }
+
+    #[test]
+    fn indexed_instance_method_calls_are_not_treated_as_generic_classes() -> Result<(), String> {
+        // The method the index yields need not take the parameter the enclosing
+        // class gives a default at all, so borrowing that default would write a
+        // call the interpreter rejects outright rather than merely one carrying
+        // the wrong value.
+        let source = "class Other:\n    def target(self):\n        pass\n\nclass C:\n    def target(self, value=1):\n        pass\n    def __getitem__(self, index):\n        return Other()\n    def run(self):\n        self[0].target()\n        C()[0].target()\n";
+        let updated = fixed(source)?;
+        assert!(updated.contains("def target(self, value):"), "{updated}");
+        assert!(updated.contains("self[0].target()\n"), "{updated}");
+        assert!(updated.contains("C()[0].target()\n"), "{updated}");
+        Ok(())
+    }
 }

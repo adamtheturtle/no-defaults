@@ -5738,3 +5738,45 @@ fn a_loader_helper_beside_create_module_is_still_fixed() -> Result<(), Box<dyn s
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn a_loader_execution_hook_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `_bootstrap._load` runs `exec_module(module)` with the module alone, so
+    // `extra` only ever arrives as its default. That call sits inside the
+    // interpreter's import machinery rather than in any file the fixer can
+    // see, so dropping the default leaves the next import raising
+    // `TypeError: Loader.exec_module() missing 1 required positional
+    // argument` with no written call site to carry the value.
+    let source = "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_loader_helper_beside_exec_module_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // sibling with the same signature shape is rewritten as usual, carrying
+    // its own default to the call.
+    let source = "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(module)\n\n    def helper(self, module, value=2):\n        return value\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(module, value=2)\n\n    def helper(self, module, value):\n        return value\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

@@ -6593,3 +6593,38 @@ fn a_method_named_near_source_to_code_is_still_fixed() -> Result<(), Box<dyn std
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_closed_stderr_pipe_is_a_normal_termination() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    // Every lambda earns a warning that `--fix` writes to stderr, so the run has
+    // far more to say than a pipe buffer holds. The reader is dropped before the
+    // child can have written anything, which makes the failing write certain
+    // rather than a race a buffer might absorb.
+    let lambdas = "f = lambda value=1: value\n".repeat(10_000);
+    std::fs::write(&path, lambdas)?;
+    let mut child = Command::new(binary())
+        .arg("--fix")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    drop(child.stderr.take());
+    assert_eq!(child.wait()?.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_failure_announced_on_stderr_still_sets_the_exit_status(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // Operational failures are announced on the stream the closed-pipe handling
+    // forgives, so one read to the end has to keep reporting itself.
+    let missing = directory.path().join("missing.py");
+    let output = Command::new(binary()).arg(&missing).output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("path does not exist"), "{stderr}");
+    Ok(())
+}

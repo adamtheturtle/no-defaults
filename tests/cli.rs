@@ -5697,3 +5697,44 @@ fn an_import_finder_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn an_import_loader_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `module_from_spec` hands a loader the spec and nothing else, so `extra`
+    // is only ever filled by its default. That call lives in
+    // `importlib._bootstrap` rather than in any file the fixer can see, so
+    // removing the default leaves the next import raising `TypeError` with no
+    // written call site to carry the argument.
+    let source =
+        "class Loader:\n    def create_module(self, spec, extra=1):\n        return None\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_loader_helper_beside_create_module_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // plain helper on the same loader is rewritten as usual.
+    let source = "class Loader:\n    def create_module(self, spec, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value=2):\n        return value\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Loader:\n    def create_module(self, spec, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value):\n        return value\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

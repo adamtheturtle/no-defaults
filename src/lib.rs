@@ -5603,6 +5603,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__init_subclass__"
             | "__annotate__"
             | "find_spec"
+            | "create_module"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -19985,6 +19986,43 @@ def b(x=1): pass  # type: ignore  # noqa
         // every method a finder happens to carry, so an ordinary helper on the
         // same class is still the fixer's to rewrite.
         let source = "class Finder:\n    def find_spec(self, fullname, path, target, extra=1):\n        return self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn import_loader_create_module_defaults_are_retained() {
+        let source =
+            "class Loader:\n    def create_module(self, spec, extra=1):\n        return None\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_loader_method_beside_create_module_stays_fixable() {
+        // Retention is keyed to the hook `importlib` reaches for, so an
+        // ordinary helper sharing the loader keeps its ordinary treatment.
+        let source = "class Loader:\n    def create_module(self, spec, extra=1):\n        return self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,

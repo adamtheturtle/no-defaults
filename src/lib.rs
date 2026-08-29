@@ -18855,4 +18855,37 @@ def b(x=1): pass  # type: ignore  # noqa
             ["dataclass field `_value` has a default"]
         );
     }
+
+    #[test]
+    fn a_comprehension_walrus_rebinds_the_enclosing_name() -> Result<(), String> {
+        // A walrus in a comprehension binds in the scope the comprehension is
+        // written in, unlike one in a lambda body, which binds in the lambda's
+        // own. A list comprehension runs where it is written, and a generator
+        // expression runs as soon as anything draws from it, so the rebinding
+        // reaches the module name before the class below is built. Skipping
+        // the invalidation because the element is only visited and not yet run
+        // kept a shape the name no longer holds, and the subclass was called
+        // with fields the rebound base never had.
+        let head = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    inherited: int = 1\n\nAlias = Base\n";
+        let tail = "\n@dataclass\nclass Child(Alias):\n    value: int = 2\n\nChild()\n";
+        for rebind in [
+            "list((Alias := object) for _ in seed)\n",
+            "total = sum(1 for _ in seed if (Alias := object))\n",
+            "values = ((Alias := object) for _ in seed)\nlist(values)\n",
+            "values = [(Alias := object) for _ in seed]\n",
+        ] {
+            let updated = fixed(&format!("{head}{rebind}{tail}"))?;
+            assert!(!updated.contains("Child(inherited="), "{rebind}\n{updated}");
+        }
+        // A comprehension with no walrus rebinds nothing, so the alias still
+        // stands and the inherited field comes through.
+        for kept in ["values = (item for item in seed)\n", ""] {
+            let updated = fixed(&format!("{head}{kept}{tail}"))?;
+            assert!(
+                updated.contains("Child(inherited=1, value=2)"),
+                "{kept}\n{updated}"
+            );
+        }
+        Ok(())
+    }
 }

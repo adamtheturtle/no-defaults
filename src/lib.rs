@@ -7425,8 +7425,11 @@ fn record_method_alias(
             // An assignment that puts a method back under its own name, be it
             // written directly, through a wrapper or by way of a temporary,
             // replaces nothing: the definition above is still what a call by
-            // that name reaches.
-            if original == alias.id.as_str() {
+            // that name reaches. A method copied from another class is a
+            // replacement even where it goes by the same name, since what
+            // stands behind the name afterwards is that class's function and
+            // its parameters, so the name it shares settles nothing.
+            if original == alias.id.as_str() && original_class.is_none() {
                 collected
                     .rewraps
                     .entry(original.clone())

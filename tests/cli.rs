@@ -6420,6 +6420,216 @@ fn a_module_level_is_package_is_still_fixed() -> Result<(), Box<dyn std::error::
 }
 
 #[test]
+fn an_execution_loader_get_filename_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `importlib` compiles a module's source against the path its loader
+    // reports, calling `get_filename(fullname)` with the module name alone, so
+    // `extra` only ever arrives as its default. That call is made from
+    // `importlib.abc` under `<frozen importlib._bootstrap_external>` rather
+    // than by any line in the file, so dropping the default leaves the next
+    // import raising `TypeError: L.get_filename() missing 1 required
+    // positional argument: 'extra'` with no written call site to carry the
+    // value.
+    let source =
+        "class L:\n    def get_filename(self, fullname, extra=1):\n        return '/virtual/probe.py'\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_loader_helper_beside_get_filename_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // sibling with the same signature shape is rewritten as usual, carrying
+    // its own default to the call.
+    let source = "class L:\n    def get_filename(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class L:\n    def get_filename(self, fullname, extra=1):\n        return self.helper(fullname, value=2)\n\n    def helper(self, fullname, value):\n        return (fullname, value)\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_method_named_near_get_filename_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The import machinery looks the hook up under its exact name, so a near
+    // miss is an ordinary method whose default the fixer removes.
+    let source =
+        "class L:\n    def get_filenames(self, fullname, extra=1):\n        return (fullname, extra)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class L:\n    def get_filenames(self, fullname, extra):\n        return (fullname, extra)\n",
+    );
+    // Nothing is left unfixed once the near miss is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_function_named_get_filename_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The hook is looked up on the loader, so a module-level namesake is an
+    // ordinary function and its written call is kept in step with the default
+    // the fixer removes.
+    let source =
+        "def get_filename(fullname, extra=1):\n    return (fullname, extra)\n\n\nget_filename('probe')\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "def get_filename(fullname, extra):\n    return (fullname, extra)\n\n\nget_filename('probe', extra=1)\n",
+    );
+    // Nothing is left unfixed once the namesake is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_source_loader_source_to_code_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The import machinery compiles a module's source by asking its loader to
+    // do it, calling `source_to_code(data, path)` with those two alone, so
+    // `extra` only ever arrives as its default. That call is made from
+    // `<frozen importlib._bootstrap_external>` rather than by any line in the
+    // file, so dropping the default leaves the next import raising
+    // `TypeError: L.source_to_code() missing 1 required positional argument:
+    // 'extra'` with no written call site to carry the value.
+    let source =
+        "class L:\n    def source_to_code(self, data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_static_source_to_code_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `importlib.abc.InspectLoader` spells the hook as a `staticmethod`, so a
+    // loader written against the documented shape is retained the same way.
+    let source =
+        "class L:\n    @staticmethod\n    def source_to_code(data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_loader_helper_beside_source_to_code_is_still_fixed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // sibling with the same signature shape is rewritten as usual, carrying
+    // its own default to the call.
+    let source = "class L:\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path)\n\n    def helper(self, data, path, value=2):\n        return (data, path, value)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class L:\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path, value=2)\n\n    def helper(self, data, path, value):\n        return (data, path, value)\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_method_named_near_source_to_code_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The import machinery looks the hook up under its exact name, so a near
+    // miss is an ordinary method whose default the fixer removes.
+    let source =
+        "class L:\n    def source_to_codes(self, data, path, extra=1):\n        return (data, path, extra)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class L:\n    def source_to_codes(self, data, path, extra):\n        return (data, path, extra)\n",
+    );
+    // Nothing is left unfixed once the near miss is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_closed_stderr_pipe_is_a_normal_termination() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    // Every lambda earns a warning that `--fix` writes to stderr, so the run has
+    // far more to say than a pipe buffer holds. The reader is dropped before the
+    // child can have written anything, which makes the failing write certain
+    // rather than a race a buffer might absorb.
+    let lambdas = "f = lambda value=1: value\n".repeat(10_000);
+    std::fs::write(&path, lambdas)?;
+    let mut child = Command::new(binary())
+        .arg("--fix")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    drop(child.stderr.take());
+    assert_eq!(child.wait()?.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_failure_announced_on_stderr_still_sets_the_exit_status(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // Operational failures are announced on the stream the closed-pipe handling
+    // forgives, so one read to the end has to keep reporting itself.
+    let missing = directory.path().join("missing.py");
+    let output = Command::new(binary()).arg(&missing).output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("path does not exist"), "{stderr}");
+    Ok(())
+}
+
+#[test]
 fn a_parameter_shadowing_a_configured_base_keeps_its_class_defaults(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

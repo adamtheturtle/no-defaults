@@ -5154,7 +5154,10 @@ impl Checker<'_> {
                     ))
                 || (self.scope.class == ClassScope::None
                     && self.lexical_scope.is_empty()
-                    && matches!(function.name.as_str(), "__getattr__" | "__dir__"))
+                    && matches!(
+                        function.name.as_str(),
+                        "__getattr__" | "__dir__" | "__annotate__"
+                    ))
                 || self.repeated_functions.contains(function.name.as_str())
                 || (positional && kept)
             {
@@ -5598,6 +5601,7 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__mro_entries__"
             | "__prepare__"
             | "__init_subclass__"
+            | "__annotate__"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -19880,6 +19884,68 @@ def b(x=1): pass  # type: ignore  # noqa
         let checked = check_source(
             Path::new("fixture.py"),
             control,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn annotate_hook_defaults_are_retained() {
+        // Python 3.14 reaches a class's annotations by calling the
+        // `__annotate__` it holds with the format alone, so a parameter beside
+        // that one is only ever filled by its default. Stripping it leaves
+        // annotation access raising `TypeError`, and there is no call written
+        // anywhere for the fixer to put the argument back into.
+        let source = "class C:\n    @staticmethod\n    def __annotate__(format, extra=1):\n        return {'x': extra}\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn module_annotate_hook_defaults_are_retained() {
+        // A module carries the same hook, and reading its annotations calls it
+        // the same one-argument way. It is written as a plain function rather
+        // than in a class body, so it is the module-level protocol hooks it
+        // belongs with, beside `__getattr__` and `__dir__`.
+        let source = "def __annotate__(format, extra=1):\n    return {'x': extra}\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_nested_annotate_hook_keeps_its_defaults_to_itself() {
+        // The module-level reading only covers the module's own hook. One
+        // written inside a function is an ordinary local function that nothing
+        // calls implicitly, so its default is the fixer's to remove.
+        let source = "def build():\n    def __annotate__(format, extra=1):\n        return {'x': extra}\n    return __annotate__(1)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
             false,
             Path::new(""),
             &Reexports::default(),

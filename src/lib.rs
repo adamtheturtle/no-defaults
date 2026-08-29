@@ -4000,8 +4000,6 @@ fn check_source(
         metaclass_classes: BTreeSet::new(),
         entered_class_metaclass_classes: Vec::new(),
         metaclass_definitions: BTreeSet::new(),
-        local_enum_classes: BTreeSet::new(),
-        entered_class_enum_classes: Vec::new(),
         local_implicit_callback_classes: BTreeMap::new(),
         entered_class_implicit_callback_classes: Vec::new(),
         class_implicit_callbacks: BTreeSet::new(),
@@ -4310,21 +4308,14 @@ struct Checker<'a> {
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
-    /// The enumerations the file defines, whether they name an imported `Enum`
-    /// or another of these. Being an enumeration is inherited, so a subclass
-    /// of one creates its members the same implicit way.
-    local_enum_classes: BTreeSet<String>,
-    /// What `local_enum_classes` held as each enclosing class body was
-    /// entered, for the same reason `entered_class_metaclass_classes` keeps
-    /// its own: a class body binds names only for itself, so a function or a
-    /// class written in one reads the names the class statement began with.
-    entered_class_enum_classes: Vec<BTreeSet<String>>,
     /// The classes this file defines that derive from a base
     /// [`IMPLICIT_CALLBACK_BASES`] names, with the callbacks reached on them.
     /// Deriving is inherited, so a subclass of one is called the same way.
     local_implicit_callback_classes: BTreeMap<String, BTreeSet<&'static str>>,
     /// What `local_implicit_callback_classes` held as each enclosing class body
-    /// was entered, for the reason `entered_class_enum_classes` keeps its own.
+    /// was entered, for the same reason `entered_class_metaclass_classes` keeps
+    /// its own: a class body binds names only for itself, so a function or a
+    /// class written in one reads the names the class statement began with.
     entered_class_implicit_callback_classes: Vec<BTreeMap<String, BTreeSet<&'static str>>>,
     /// The callbacks the standard library reaches on the class body being
     /// visited, empty outside one and for a class that derives from nothing
@@ -4417,9 +4408,6 @@ struct Scope {
     fields: Option<FieldStyle>,
     /// What kind of class body definitions here sit directly in, if any.
     class: ClassScope,
-    /// Whether this is an `enum.Enum` body whose members are initialized
-    /// implicitly while the class is created.
-    enum_class: bool,
     /// Whether a field of this class has kept its default, which forces every
     /// field after it to keep its own: `dataclasses` rejects a field without a
     /// default following one with it.
@@ -4739,7 +4727,6 @@ impl Checker<'_> {
             }
             self.shapes
                 .remove(&qualified_class_name(&self.lexical_scope, name));
-            self.local_enum_classes.remove(name);
             self.local_implicit_callback_classes.remove(name);
             if let Some(bindings) = self.lexical_bindings.last_mut() {
                 bindings.insert(name.to_owned());
@@ -4970,25 +4957,6 @@ impl Checker<'_> {
         generates_init(class, &self.aliases, &self.metaclass_classes)
     }
 
-    /// Whether the class statement itself creates the class's members, which
-    /// it does for an enumeration: each member assignment calls the body's
-    /// initializer with the value assigned, through no call site the fixer can
-    /// rewrite. A base written in this file that is already an enumeration
-    /// makes this class one too, because that is inherited like any other
-    /// class behaviour.
-    fn is_enum_class(&self, class: &ast::StmtClassDef) -> bool {
-        class_bases(class).any(|base| match base {
-            Expr::Name(name) => {
-                self.aliases.enum_classes.contains(name.id.as_str())
-                    || self.local_enum_classes.contains(name.id.as_str())
-            }
-            Expr::Attribute(attribute) if attribute.attr.as_str() == "Enum" => {
-                matches!(attribute.value.as_ref(), Expr::Name(module) if self.aliases.enum_modules.contains(module.id.as_str()))
-            }
-            _ => false,
-        })
-    }
-
     /// The callbacks the standard library itself calls on instances of `class`,
     /// through machinery its bases own and no call site in this file. A base
     /// written here that already derives from such a class contributes its
@@ -5140,7 +5108,6 @@ impl Checker<'_> {
         let outer_local_classes = self.local_classes.clone();
         let outer_metaclass_classes = self.metaclass_classes.clone();
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
-        let outer_enum_classes = self.local_enum_classes.clone();
         let outer_implicit_callback_classes = self.local_implicit_callback_classes.clone();
         // Written straight in a class body, this function sees none of the
         // names that body binds: a class written above it there is not in
@@ -5150,9 +5117,6 @@ impl Checker<'_> {
         if self.lexical_is_class.last() == Some(&true) {
             if let Some(entered) = self.entered_class_metaclass_classes.last() {
                 self.metaclass_classes.clone_from(entered);
-            }
-            if let Some(entered) = self.entered_class_enum_classes.last() {
-                self.local_enum_classes.clone_from(entered);
             }
             if let Some(entered) = self.entered_class_implicit_callback_classes.last() {
                 self.local_implicit_callback_classes.clone_from(entered);
@@ -5165,14 +5129,12 @@ impl Checker<'_> {
         let parameter_names = parameters.names.clone();
         for name in parameters.names {
             self.aliases.invalidate_parameter(&name);
-            self.local_enum_classes.remove(&name);
             self.local_implicit_callback_classes.remove(&name);
         }
         self.scope = Scope {
             private: self.encloses_private(function.name.as_str(), outer),
             fields: None,
             class: ClassScope::None,
-            enum_class: false,
             kept_default: false,
         };
         let outer_repeated_functions = self.repeated_functions.clone();
@@ -5192,7 +5154,6 @@ impl Checker<'_> {
         self.local_classes = outer_local_classes;
         self.metaclass_classes = outer_metaclass_classes;
         self.metaclass_definitions = outer_metaclass_definitions;
-        self.local_enum_classes = outer_enum_classes;
         self.local_implicit_callback_classes = outer_implicit_callback_classes;
         self.aliases.invalidate(function.name.as_str());
         self.scope = outer;
@@ -5499,11 +5460,6 @@ impl Checker<'_> {
             || self.is_delegation_protocol_method(function.name.as_str())
             || (self.scope.class == ClassScope::Metaclass
                 && matches!(function.name.as_str(), "__init__" | "mro"))
-            || (self.scope.enum_class
-                && matches!(
-                    function.name.as_str(),
-                    "__init__" | "_missing_" | "_generate_next_value_"
-                ))
             || (!in_class
                 && self.lexical_scope.is_empty()
                 && matches!(
@@ -6109,6 +6065,16 @@ fn implicitly_called_method(name: &str) -> bool {
     )
 }
 
+/// The methods the enumeration machinery reaches on an enumeration, whichever
+/// of the module's bases the subclass was written on.
+///
+/// The class statement itself creates the members: each assignment in the body
+/// calls the class's own initializer with the value assigned, and `auto()`
+/// reaches `_generate_next_value_` on the way. A lookup that finds no member
+/// calls `_missing_` with the value alone. None of the three has a call site in
+/// the file to carry a deleted default to.
+const ENUM_CALLBACKS: &[&str] = &["__init__", "_generate_next_value_", "_missing_"];
+
 /// The methods `logging` reaches on a handler it owns, whichever handler base
 /// the subclass was written on.
 const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
@@ -6138,6 +6104,12 @@ const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
 const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
+    ("enum", "Enum", ENUM_CALLBACKS),
+    ("enum", "Flag", ENUM_CALLBACKS),
+    ("enum", "IntEnum", ENUM_CALLBACKS),
+    ("enum", "IntFlag", ENUM_CALLBACKS),
+    ("enum", "ReprEnum", ENUM_CALLBACKS),
+    ("enum", "StrEnum", ENUM_CALLBACKS),
     (
         "logging",
         "BufferingFormatter",
@@ -6293,9 +6265,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 let outer_local_classes = self.local_classes.clone();
                 let outer_metaclass_classes = self.metaclass_classes.clone();
                 let outer_metaclass_definitions = self.metaclass_definitions.clone();
-                let outer_enum_classes = self.local_enum_classes.clone();
                 let outer_implicit_callback_classes = self.local_implicit_callback_classes.clone();
-                let enum_class = self.is_enum_class(class);
                 // Read the bases with the tables the class statement itself
                 // saw, before its body binds anything over them.
                 let implicit_callbacks = self.implicit_callbacks(class);
@@ -6315,7 +6285,6 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     } else {
                         ClassScope::Ordinary
                     },
-                    enum_class,
                     // Each class body starts fresh; a base's fields are not
                     // written here.
                     kept_default: false,
@@ -6395,14 +6364,6 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 } else {
                     outer_metaclass_classes.clone()
                 };
-                let body_enum_classes = if self.lexical_is_class.last() == Some(&true) {
-                    self.entered_class_enum_classes
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| outer_enum_classes.clone())
-                } else {
-                    outer_enum_classes.clone()
-                };
                 let body_implicit_callback_classes = if self.lexical_is_class.last() == Some(&true)
                 {
                     self.entered_class_implicit_callback_classes
@@ -6420,15 +6381,12 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.metaclass_classes.clone_from(&body_metaclass_classes);
                 self.entered_class_metaclass_classes
                     .push(body_metaclass_classes);
-                self.local_enum_classes.clone_from(&body_enum_classes);
-                self.entered_class_enum_classes.push(body_enum_classes);
                 self.local_implicit_callback_classes
                     .clone_from(&body_implicit_callback_classes);
                 self.entered_class_implicit_callback_classes
                     .push(body_implicit_callback_classes);
                 walk_stmt(self, statement);
                 self.entered_class_implicit_callback_classes.pop();
-                self.entered_class_enum_classes.pop();
                 self.entered_class_metaclass_classes.pop();
                 self.lexical_bindings.pop();
                 self.lexical_is_class.pop();
@@ -6450,18 +6408,6 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.metaclass_classes = outer_metaclass_classes;
                 self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
-                self.local_enum_classes = outer_enum_classes;
-                // A later class of the same name that is no enumeration takes
-                // the name back, so a subclass written on it below is built
-                // the ordinary way. A namesake in a branch that may not run
-                // takes nothing back: where it is skipped the enumeration is
-                // still what the name stands for, and dropping it here would
-                // strip a default the class statement of a subclass needs.
-                if enum_class {
-                    self.local_enum_classes.insert(class.name.to_string());
-                } else if self.conditional_depth == 0 {
-                    self.local_enum_classes.remove(class.name.as_str());
-                }
                 let implicit_callbacks = std::mem::replace(
                     &mut self.class_implicit_callbacks,
                     outer_class_implicit_callbacks,
@@ -6797,8 +6743,6 @@ struct Aliases {
     pydantic_private_attrs: BTreeSet<String>,
     dataclasses_modules: BTreeSet<String>,
     pydantic_modules: BTreeSet<String>,
-    enum_classes: BTreeSet<String>,
-    enum_modules: BTreeSet<String>,
     /// Names bound to a base [`IMPLICIT_CALLBACK_BASES`] names, mapped to the
     /// callbacks that base's machinery calls.
     implicit_callback_bases: BTreeMap<String, &'static [&'static str]>,
@@ -6839,8 +6783,6 @@ impl Aliases {
         self.pydantic_private_attrs.remove(name);
         self.dataclasses_modules.remove(name);
         self.pydantic_modules.remove(name);
-        self.enum_classes.remove(name);
-        self.enum_modules.remove(name);
         self.implicit_callback_bases.remove(name);
         self.implicit_callback_modules.remove(name);
         self.staticmethods.remove(name);
@@ -6907,8 +6849,6 @@ impl Aliases {
             ),
             (&mut self.dataclasses_modules, &before.dataclasses_modules),
             (&mut self.pydantic_modules, &before.pydantic_modules),
-            (&mut self.enum_classes, &before.enum_classes),
-            (&mut self.enum_modules, &before.enum_modules),
             (&mut self.staticmethods, &before.staticmethods),
             (&mut self.classmethods, &before.classmethods),
             (&mut self.supers, &before.supers),
@@ -7025,22 +6965,6 @@ impl Aliases {
         }
     }
 
-    fn collect_enum_members(&mut self, import: &ast::StmtImportFrom) {
-        if import
-            .module
-            .as_ref()
-            .is_none_or(|module| module.as_str() != "enum")
-        {
-            return;
-        }
-        for alias in &import.names {
-            if alias.name.as_str() == "Enum" {
-                self.enum_classes
-                    .insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
-            }
-        }
-    }
-
     /// The names `from <module> import <Base>` binds for a base whose own
     /// machinery calls the methods a subclass writes.
     fn collect_implicit_callback_bases(&mut self, import: &ast::StmtImportFrom) {
@@ -7106,13 +7030,6 @@ impl Aliases {
                         .as_ref()
                         .map_or_else(|| "pydantic".to_owned(), ToString::to_string),
                 );
-            } else if alias.name.as_str() == "enum" {
-                self.enum_modules.insert(
-                    alias
-                        .asname
-                        .as_ref()
-                        .map_or_else(|| "enum".to_owned(), ToString::to_string),
-                );
             } else if alias.name.as_str() == "builtins" {
                 self.builtins_modules.insert(
                     alias
@@ -7163,7 +7080,6 @@ impl Aliases {
         self.collect_typing_members(import);
         self.collect_builtin_members(import);
         self.collect_abc_members(import);
-        self.collect_enum_members(import);
         self.collect_implicit_callback_bases(import);
         let carries_fields = import.module.as_ref().is_some_and(|module| {
             matches!(module.split('.').next(), Some("dataclasses" | "pydantic"))
@@ -23219,6 +23135,51 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(
             updated.contains("assert C().later(5) == (\"second\", 5)\n"),
             "{updated}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_enumeration_base_keeps_its_hook_defaults() -> Result<(), String> {
+        // The whole `enum` module creates members the same way, so every base
+        // it ships reaches the class's own initializer, `_missing_` and
+        // `_generate_next_value_` through machinery no call site here can be
+        // rewritten into. Only a base spelled `Enum` was recognized before, so
+        // `class E(IntEnum)` had its default removed and nothing to carry it
+        // to, which CPython answers with a `TypeError` while the class
+        // statement itself runs.
+        for source in [
+            "from enum import IntEnum\n\nclass E(IntEnum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import StrEnum\n\nclass E(StrEnum):\n    A = 'a'\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Flag\n\nclass E(Flag):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import ReprEnum\n\nclass E(ReprEnum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "import enum\n\nclass E(enum.IntFlag):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "import enum as enums\n\nclass E(enums.IntEnum):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import IntEnum as IE\n\nclass E(IE):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import IntEnum\n\nclass Base(IntEnum):\n    pass\n\nclass E(Base):\n    A = 1\n    def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import IntEnum\n\nclass E(IntEnum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n",
+            "from enum import StrEnum\n\nclass E(StrEnum):\n    def _generate_next_value_(name, start, count, last_values, extra='x'): return name\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+        // The retention is the base, not the method name: a class of the same
+        // shape whose base only happens to be spelled after an enumeration is
+        // reached from the file alone, so its default goes and the call it is
+        // written for carries the value.
+        let control = "class IntEnum:\n    pass\n\nclass E(IntEnum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback='x'): return cls.A\n\nE._missing_(1)\n";
+        assert_eq!(
+            fixed(control)?,
+            "class IntEnum:\n    pass\n\nclass E(IntEnum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback): return cls.A\n\nE._missing_(1, fallback='x')\n"
         );
         Ok(())
     }

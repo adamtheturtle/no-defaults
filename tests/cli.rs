@@ -7003,3 +7003,61 @@ fn callback_names_off_the_logging_hierarchy_are_still_fixed(
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn argparse_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `argparse` reaches every one of these itself — `error` and `exit` from a
+    // failing `parse_args`, `convert_arg_line_to_args` from an `@file`, and the
+    // formatter's hooks from `format_help` on a formatter the parser built — so
+    // there is no call site here to carry the value once the default is gone.
+    let source = "import argparse\nfrom argparse import RawTextHelpFormatter\n\n\nclass P(argparse.ArgumentParser):\n    def error(self, message, extra=1): raise RuntimeError(message)\n\n    def exit(self, status=0, message=None, extra=2): raise SystemExit(status)\n\n    def convert_arg_line_to_args(self, arg_line, extra=3): return arg_line.split()\n\n\nclass Child(P):\n    def error(self, message, extra=4): raise RuntimeError(message)\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=5): pass\n\n    def format_help(self, extra=6): return ''\n\n    def start_section(self, heading, extra=7): pass\n\n\nclass R(RawTextHelpFormatter):\n    def add_text(self, text, extra=8): pass\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The defaults are still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn email_policy_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The `email` package calls these on the policy a message or parser was
+    // handed, from the feed parser, from header assignment and access, and from
+    // the generator that serialises a message.
+    let source = "import email.policy\nfrom email.policy import Compat32\n\n\nclass P(email.policy.EmailPolicy):\n    def fold(self, name, value, extra=1): return ''\n\n    def header_source_parse(self, sourcelines, extra=2): return '', ''\n\n    def register_defect(self, obj, defect, extra=3): pass\n\n\nclass Child(P):\n    def header_max_count(self, name, extra=4): return None\n\n\nclass C(Compat32):\n    def header_fetch_parse(self, name, value, extra=5): return value\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn callback_names_off_the_argparse_hierarchy_are_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `add_argument` is the method every argparse user calls by hand, and
+    // `error` and `exit` are as ordinary as method names get. Only the
+    // formatter's `add_argument` is retained; the class beside it is fixed and
+    // its calls carry the values they held.
+    let source = "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n\nclass Recorder:\n    def add_argument(self, action, extra=2): return extra\n\n    def error(self, message, extra=3): return extra\n\n    def exit(self, status=4): return status\n\n\nr = Recorder()\nassert Recorder.add_argument(r, 'a') == 2\nassert Recorder.error(r, 'm') == 3\nassert Recorder.exit(r) == 4\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n\nclass Recorder:\n    def add_argument(self, action, extra): return extra\n\n    def error(self, message, extra): return extra\n\n    def exit(self, status): return status\n\n\nr = Recorder()\nassert Recorder.add_argument(r, 'a', extra=2) == 2\nassert Recorder.error(r, 'm', extra=3) == 3\nassert Recorder.exit(r, status=4) == 4\n");
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

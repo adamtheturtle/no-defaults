@@ -6118,6 +6118,42 @@ fn implicitly_called_method(name: &str) -> bool {
     )
 }
 
+/// The methods `argparse` reaches on the formatter a parser builds, whichever
+/// formatter base the subclass was written on.
+///
+/// A parser makes the formatter itself, from the `formatter_class` it was given,
+/// and drives it through `format_help`, `format_usage` and `print_help`; none of
+/// those calls is written in the file that supplies the subclass.
+const ARGPARSE_FORMATTER_CALLBACKS: &[&str] = &[
+    "add_argument",
+    "add_arguments",
+    "add_text",
+    "add_usage",
+    "end_section",
+    "format_help",
+    "start_section",
+];
+
+/// The methods the `email` package reaches on the policy a message or parser was
+/// handed, whichever policy base the subclass was written on.
+///
+/// `email.policy` re-exports `Policy` and `Compat32` from `email._policybase`,
+/// so both spellings name the same classes and both get rows. The callbacks
+/// themselves are split across the hierarchy — `register_defect` and
+/// `handle_defect` are `Policy`'s, the rest `EmailPolicy` overrides — but a
+/// subclass inherits whichever it does not write, and the package calls it
+/// either way.
+const EMAIL_POLICY_CALLBACKS: &[&str] = &[
+    "fold",
+    "fold_binary",
+    "handle_defect",
+    "header_fetch_parse",
+    "header_max_count",
+    "header_source_parse",
+    "header_store_parse",
+    "register_defect",
+];
+
 /// The methods `logging` reaches on a handler it owns, whichever handler base
 /// the subclass was written on.
 const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
@@ -6147,6 +6183,37 @@ const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
 const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
+    (
+        "argparse",
+        "ArgumentDefaultsHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    (
+        "argparse",
+        "ArgumentParser",
+        &["convert_arg_line_to_args", "error", "exit"],
+    ),
+    ("argparse", "HelpFormatter", ARGPARSE_FORMATTER_CALLBACKS),
+    (
+        "argparse",
+        "MetavarTypeHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    (
+        "argparse",
+        "RawDescriptionHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    (
+        "argparse",
+        "RawTextHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    ("email._policybase", "Compat32", EMAIL_POLICY_CALLBACKS),
+    ("email._policybase", "Policy", EMAIL_POLICY_CALLBACKS),
+    ("email.policy", "Compat32", EMAIL_POLICY_CALLBACKS),
+    ("email.policy", "EmailPolicy", EMAIL_POLICY_CALLBACKS),
+    ("email.policy", "Policy", EMAIL_POLICY_CALLBACKS),
     (
         "logging",
         "BufferingFormatter",
@@ -23054,6 +23121,162 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed_with_retained_defaults(source)?,
             "class Handler:\n    def _do(self, record, extra): return extra\n\n    emit = _do\n\n\nassert Handler._do(Handler(), \"r\", extra=1) == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn argparse_parser_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `argparse` calls each of these from inside a parse: `error` from
+        // `parse_args` on a bad argument, `exit` from `error`, and
+        // `convert_arg_line_to_args` for every line of an `@file`. None of
+        // those calls is written here.
+        let source = "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def convert_arg_line_to_args(self, arg_line, extra=1): return arg_line.split()\n\n    def error(self, message, extra=2): raise RuntimeError(message)\n\n    def exit(self, status=0, message=None, extra=3): raise SystemExit(status)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn argparse_formatter_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A parser builds the formatter itself from the `formatter_class` it was
+        // given and drives all seven of these from `format_help`, so the file
+        // that supplies the subclass holds no call to carry the values.
+        let source = "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n    def add_arguments(self, actions, extra=2): pass\n\n    def add_text(self, text, extra=3): pass\n\n    def add_usage(self, usage, actions, groups, prefix=None, extra=4): pass\n\n    def end_section(self, extra=5): pass\n\n    def format_help(self, extra=6): return \"\"\n\n    def start_section(self, heading, extra=7): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_argument_defaults_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        // The four formatters `argparse` ships are bases in their own right, and
+        // a parser drives whichever of them it was handed the same way.
+        let source = "import argparse\n\n\nclass F(argparse.ArgumentDefaultsHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_metavar_type_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import argparse\n\n\nclass F(argparse.MetavarTypeHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_raw_description_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import argparse\n\n\nclass F(argparse.RawDescriptionHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_raw_text_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import argparse\n\n\nclass F(argparse.RawTextHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn email_policy_callbacks_keep_their_defaults() -> Result<(), String> {
+        // The `email` package reaches these on whatever policy a message or
+        // parser was handed: `header_source_parse` and `register_defect` from
+        // the feed parser, `header_store_parse` and `header_max_count` from
+        // header assignment, `header_fetch_parse` from header access, and
+        // `fold` and `fold_binary` from the generator that serialises it.
+        // `EmailPolicy` overrides most of them and inherits the two defect
+        // hooks, so a subclass of it is reached through both halves.
+        let source = "import email.policy\n\n\nclass P(email.policy.EmailPolicy):\n    def fold(self, name, value, extra=1): return \"\"\n\n    def fold_binary(self, name, value, extra=2): return b\"\"\n\n    def handle_defect(self, obj, defect, extra=3): pass\n\n    def header_fetch_parse(self, name, value, extra=4): return value\n\n    def header_max_count(self, name, extra=5): return None\n\n    def header_source_parse(self, sourcelines, extra=6): return \"\", \"\"\n\n    def header_store_parse(self, name, value, extra=7): return name, value\n\n    def register_defect(self, obj, defect, extra=8): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_email_policy_compat32_keeps_its_callback_defaults() -> Result<(), String> {
+        // `email.policy` re-exports `Compat32`, and the package calls a subclass
+        // of it exactly as it calls an `EmailPolicy` one.
+        let source = "from email.policy import Compat32\n\n\nclass C(Compat32):\n    def fold(self, name, value, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_email_policy_policy_keeps_its_callback_defaults() -> Result<(), String> {
+        // `Policy` is the abstract base the whole hierarchy is written on, and
+        // the defect hooks are its own.
+        let source = "from email.policy import Policy\n\n\nclass P(Policy):\n    def register_defect(self, obj, defect, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_policybase_compat32_keeps_its_callback_defaults() -> Result<(), String> {
+        // `email.policy` re-exports `Compat32` from `email._policybase`, which
+        // is where it is written, so the private spelling names the same class
+        // and has to be recognised as well.
+        let source = "from email._policybase import Compat32\n\n\nclass C(Compat32):\n    def header_fetch_parse(self, name, value, extra=1): return value\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_policybase_policy_keeps_its_callback_defaults() -> Result<(), String> {
+        // The same for `Policy`, whose defect hooks a subclass inherits whether
+        // it is reached through the public module or the private one.
+        let source = "from email._policybase import Policy\n\n\nclass P(Policy):\n    def handle_defect(self, obj, defect, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_argparse_parser_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being reached by the subsystem is inherited, so a parser written on a
+        // parser defined here fails the same way.
+        let source = "import argparse\n\n\nclass Base(argparse.ArgumentParser):\n    pass\n\n\nclass Child(Base):\n    def error(self, message, extra=1): raise RuntimeError(message)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_email_policy_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import email.policy\n\n\nclass Base(email.policy.EmailPolicy):\n    pass\n\n\nclass Child(Base):\n    def fold(self, name, value, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_argparse_and_email_are_still_fixed() -> Result<(), String> {
+        // `error`, `exit`, `add_argument` and `format_help` are among the most
+        // ordinary method names there are. Nothing reaches this class but the
+        // calls written below, so the defaults go and those calls carry them.
+        let source = "class Recorder:\n    def add_argument(self, action, extra=1): return extra\n\n    def error(self, message, extra=2): return extra\n\n    def exit(self, status=3): return status\n\n    def fold(self, name, value, extra=4): return extra\n\n    def format_help(self, extra=5): return extra\n\n    def register_defect(self, obj, defect, extra=6): return extra\n\n\nr = Recorder()\nassert Recorder.add_argument(r, \"a\") == 1\nassert Recorder.error(r, \"m\") == 2\nassert Recorder.exit(r) == 3\nassert Recorder.fold(r, \"n\", \"v\") == 4\nassert Recorder.format_help(r) == 5\nassert Recorder.register_defect(r, \"o\", \"d\") == 6\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "class Recorder:\n    def add_argument(self, action, extra): return extra\n\n    def error(self, message, extra): return extra\n\n    def exit(self, status): return status\n\n    def fold(self, name, value, extra): return extra\n\n    def format_help(self, extra): return extra\n\n    def register_defect(self, obj, defect, extra): return extra\n\n\nr = Recorder()\nassert Recorder.add_argument(r, \"a\", extra=1) == 1\nassert Recorder.error(r, \"m\", extra=2) == 2\nassert Recorder.exit(r, status=3) == 3\nassert Recorder.fold(r, \"n\", \"v\", extra=4) == 4\nassert Recorder.format_help(r, extra=5) == 5\nassert Recorder.register_defect(r, \"o\", \"d\", extra=6) == 6\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_add_argument_call_off_the_formatter_hierarchy_is_still_rewritten() -> Result<(), String> {
+        // `add_argument` is a formatter callback and the method every argparse
+        // user calls by hand. Only the formatter's keeps its default; the
+        // ordinary class of the same name is fixed and its call rewritten.
+        let source = "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n\nclass Recorder:\n    def add_argument(self, action, extra=2): return extra\n\n\nassert Recorder.add_argument(Recorder(), \"a\") == 2\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n\nclass Recorder:\n    def add_argument(self, action, extra): return extra\n\n\nassert Recorder.add_argument(Recorder(), \"a\", extra=2) == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_callback_of_the_other_argparse_base_is_still_fixed() -> Result<(), String> {
+        // The two `argparse` rows name different callbacks, and nothing calls a
+        // formatter's hooks on a parser or a parser's on a formatter.
+        let source = "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def start_section(self, heading, extra=1): return extra\n\n\nclass F(argparse.HelpFormatter):\n    def error(self, message, extra=2): return extra\n\n\nassert P.start_section(P(add_help=False), \"h\") == 1\nassert F.error(F(\"p\"), \"m\") == 2\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def start_section(self, heading, extra): return extra\n\n\nclass F(argparse.HelpFormatter):\n    def error(self, message, extra): return extra\n\n\nassert P.start_section(P(add_help=False), \"h\", extra=1) == 1\nassert F.error(F(\"p\"), \"m\", extra=2) == 2\n"
         );
         Ok(())
     }

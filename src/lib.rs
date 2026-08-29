@@ -1152,13 +1152,18 @@ struct LocalClass {
 }
 
 impl LocalClass {
+    /// Whether an import has taken the spelling back by the time a base
+    /// written at `defined_at` reads it. The class is out of reach under that
+    /// name from there on, however the name would otherwise be resolved.
+    fn superseded_before(&self, defined_at: TextSize) -> bool {
+        self.superseded_at
+            .is_some_and(|superseded| superseded <= defined_at)
+    }
+
     /// Whether the spelling stands for this class where a base written at
     /// `defined_at` reads it.
     fn holds_at(&self, defined_at: TextSize) -> bool {
-        self.defined_at < defined_at
-            && self
-                .superseded_at
-                .is_none_or(|superseded| defined_at < superseded)
+        self.defined_at < defined_at && !self.superseded_before(defined_at)
     }
 }
 
@@ -1223,6 +1228,7 @@ fn index_method_bases(
         classes: &classes,
         aliases: BTreeMap::new(),
         contested: BTreeSet::new(),
+        reclaimed: BTreeSet::new(),
     };
     index_scope_method_bases(
         statements,
@@ -1251,6 +1257,11 @@ struct BaseScope<'a> {
     /// Names alternative suites bind to different classes, which therefore
     /// stand for no one class in the scope holding them.
     contested: BTreeSet<String>,
+    /// Names an import in this scope has taken back off whatever the scope had
+    /// put behind them. A class carries the offset that settles the same
+    /// question; an alias carries none, so the reclaim is recorded here for
+    /// the scope around a suite to read.
+    reclaimed: BTreeSet<String>,
 }
 
 impl<'a> BaseScope<'a> {
@@ -1267,6 +1278,9 @@ impl<'a> BaseScope<'a> {
             classes: self.classes,
             aliases: self.aliases.clone(),
             contested: self.contested.clone(),
+            // The suite records what its own imports take back; what the scope
+            // around it already reclaimed is spent.
+            reclaimed: BTreeSet::new(),
         }
     }
 }
@@ -1375,6 +1389,7 @@ fn index_scope_method_bases(
             Stmt::Import(_) | Stmt::ImportFrom(_) => {
                 for bound in imported_names(statement) {
                     scope.aliases.remove(bound);
+                    scope.reclaimed.insert(bound.to_string());
                 }
             }
             _ => index_control_flow_method_bases(
@@ -1533,6 +1548,16 @@ fn carry_suite_aliases(scope: &mut BaseScope<'_>, suite: &BaseScope<'_>, settles
             scope.aliases.insert(spelling.clone(), identity.clone());
         } else if scope.aliases.get(spelling) != Some(identity) {
             scope.contested.insert(spelling.clone());
+        }
+    }
+    // An import in a suite that certainly runs takes the name back for the
+    // code after it, exactly as one written beside that code would. A suite
+    // that may not run is left alone: marking the name unsettled would only
+    // decline the base while the defaults behind it were still stripped, and
+    // the class the file may well end up with is the one already recorded.
+    if settles {
+        for spelling in &suite.reclaimed {
+            scope.aliases.remove(spelling);
         }
     }
     scope.contested.extend(suite.contested.iter().cloned());
@@ -1717,8 +1742,16 @@ fn collect_import_rebindings(statements: &[Stmt], found: &mut BTreeMap<String, V
                 }
             }
             _ => {
-                for suite in control_flow_suites(statement) {
-                    collect_import_rebindings(suite, found);
+                // A suite that may not run cannot be counted on to take the
+                // name back, and where several stand against each other only
+                // one of them runs. Only a suite the statement is certain to
+                // enter binds for the code written after it, which is the same
+                // rule `carry_suite_aliases` settles a name by.
+                let suites = runnable_suites(statement);
+                if suites.len() == 1 && a_suite_certainly_runs(statement) {
+                    for suite in suites {
+                        collect_import_rebindings(suite, found);
+                    }
                 }
             }
         }
@@ -1789,7 +1822,13 @@ fn method_base_identity(
                 // of the same spelling written further down the scope would
                 // answer with one the subclass was never built on.
                 Some(Binding::Unknown) => None,
-                _ => local.map(|class| (importer.to_path_buf(), class.identity.clone())),
+                // A class written further down the scope still answers where
+                // nothing else holds the name — but not once an import below
+                // it has taken the name back, whether or not this run can see
+                // what that import bound.
+                _ => local
+                    .filter(|class| !class.superseded_before(defined_at))
+                    .map(|class| (importer.to_path_buf(), class.identity.clone())),
             }
         }),
         Expr::Attribute(attribute) => {
@@ -19358,5 +19397,81 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
+    fn an_untracked_import_takes_a_local_base_name_back() -> Result<(), String> {
+        // The import binds nothing this run can follow, so what it put behind
+        // the name is unknown. Reading on to the class of that spelling
+        // written above it would answer with one the subclass is not built on,
+        // and the inherited call would be rewritten with its default.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Base:\n    def target(self, value=3): return value\n\nfrom unresolvable import Base\n\nclass Child(Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("return self.target()\n"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_import_in_a_suite_that_certainly_runs_reclaims_an_alias() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "class Local:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\npackage = Local\n\nif True:\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=2)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_conditional_import_does_not_reclaim_a_dotted_owner() -> Result<(), String> {
+        // The suite may not run, so the class written above it is still the
+        // one the file may end up with. Handing the name to the module here
+        // would resolve the subclass against a base it never had.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import os\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nif os.environ.get(\"USE_REAL\"):\n    import package.module\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=3)"), "{updated}");
+        Ok(())
     }
 }

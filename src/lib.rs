@@ -4670,7 +4670,16 @@ impl Checker<'_> {
             Stmt::AugAssign(assign) => bound.bind(&assign.target),
             _ => return,
         }
-        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
+        // An assignment in a suite that may not run is the same shape as a
+        // class statement written there, and leaves the name's import records
+        // standing for the same reason. Only a plain assignment is held back:
+        // a `for` target and a `match` capture are bound where the traversal
+        // has already entered the suite, and a capture pattern is irrefutable,
+        // so holding those back would keep a record a binding really did take.
+        self.rebind_names(
+            bound.names.iter().map(String::as_str),
+            self.conditional_depth == 0,
+        );
         // An annotated assignment binds its target every bit as much as a plain
         // one does, so an annotation is no reason to forget what the name was
         // just given. Reading only plain assignments left `Alias: object = Base`
@@ -4730,6 +4739,21 @@ impl Checker<'_> {
     /// fields into a subclass's constructor, and stale truthiness would take
     /// a branch the rebinding decided against.
     fn invalidate_bound_names<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+        self.rebind_names(names, true);
+    }
+
+    /// Forget what `names` stood for, where `supersedes` says whether the
+    /// binding really takes the name over.
+    ///
+    /// A binding written in a suite that may not run does not: where the suite
+    /// is skipped the import is still what the name stands for, and forgetting
+    /// it hands a class written below a base the file no longer recognises as
+    /// an enumeration or as something the standard library calls back. The
+    /// shape goes either way, because an unknown base only stops a rewrite,
+    /// while a forgotten import record is what strips a default the program
+    /// needs. So does the binding stop, which records that a name was written
+    /// here at all rather than what it was written as.
+    fn rebind_names<'n>(&mut self, names: impl IntoIterator<Item = &'n str>, supersedes: bool) {
         // Truthiness is recorded for module-level names and consulted only
         // where a module-level test can see them. A binding in a function or
         // class body names something else that leaves the module name alone,
@@ -4738,14 +4762,16 @@ impl Checker<'_> {
         let rebinds_module_name =
             self.scope.class == ClassScope::None && self.lexical_scope.is_empty();
         for name in names {
-            self.aliases.invalidate(name);
+            if supersedes {
+                self.aliases.invalidate(name);
+                self.local_enum_classes.remove(name);
+                self.local_implicit_callback_classes.remove(name);
+            }
             if rebinds_module_name {
                 self.known_truthiness.remove(name);
             }
             self.shapes
                 .remove(&qualified_class_name(&self.lexical_scope, name));
-            self.local_enum_classes.remove(name);
-            self.local_implicit_callback_classes.remove(name);
             if let Some(bindings) = self.lexical_bindings.last_mut() {
                 bindings.insert(name.to_owned());
             }
@@ -6588,7 +6614,17 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 }
                 self.header = old_header;
                 self.restore_aliases(outer_aliases);
-                self.aliases.invalidate(class.name.as_str());
+                // The class takes the name over for everything below it, so
+                // whatever an import made the name stands there no longer.
+                // A namesake in a suite that may not run takes nothing over:
+                // where it is skipped the import is still what the name means,
+                // and forgetting it hands a subclass written below a base the
+                // file no longer recognises. That is the rule the class tables
+                // beside this already follow, applied to every record `Aliases`
+                // keeps rather than to one table at a time.
+                if self.conditional_depth == 0 {
+                    self.aliases.invalidate(class.name.as_str());
+                }
                 self.scope = outer;
             }
             _ => {
@@ -23486,6 +23522,96 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed_with_retained_defaults(source)?,
             "from io import RawIOBase\n\nRawIOBase = object\n\n\nclass R(RawIOBase):\n    def close(self, extra): return extra\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_in_an_untaken_branch_leaves_an_imported_enumeration_standing(
+    ) -> Result<(), String> {
+        // The branch may not run, so `Enum` is still the import and `C` is
+        // still built by the enum machinery, which calls the initializer from
+        // inside the class statement. Removing the default leaves a module
+        // that raises before anything can import it, and there is no written
+        // call for a rewrite to make up for it.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class Enum:\n        pass\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_in_an_untaken_branch_leaves_an_imported_callback_base_standing(
+    ) -> Result<(), String> {
+        // The same hole reaches every record `Aliases` keeps, not the
+        // enumerations alone: where the branch is skipped `Handler` is still
+        // the imported base, `logging` still emits through `H`, and the
+        // default has nowhere else to come from.
+        let source = "import os\nfrom logging import Handler\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class Handler:\n        pass\n\n\nclass H(Handler):\n    def emit(self, record, prefix='p'): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_in_an_untaken_branch_leaves_an_imported_class_var_standing() -> Result<(), String>
+    {
+        // A category with no class table of its own: forgetting the import
+        // left `kind` looking like an ordinary field, so its default went and
+        // the constructor was called with a keyword it never accepted.
+        let source = "import os\nfrom dataclasses import dataclass\nfrom typing import ClassVar\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class ClassVar:\n        pass\n\n\n@dataclass\nclass C:\n    kind: ClassVar[int] = 5\n    x: int = 1\n\n\nassert C().x == 1\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import os\nfrom dataclasses import dataclass\nfrom typing import ClassVar\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n\n    class ClassVar:\n        pass\n\n\n@dataclass\nclass C:\n    kind: ClassVar[int] = 5\n    x: int\n\n\nassert C(x=1).x == 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_namesake_class_written_where_it_runs_still_takes_an_import_back() -> Result<(), String> {
+        // The counterpart guard: the second `Enum` is written where the file
+        // is certain to reach it, so it really does take the name off the
+        // import and `C` is an ordinary class whose initializer nothing calls
+        // on its own. Holding every namesake back would retain this default.
+        let source = "from enum import Enum\n\n\nclass Enum:\n    pass\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_assignment_in_an_untaken_branch_leaves_an_imported_enumeration_standing(
+    ) -> Result<(), String> {
+        // An assignment written in a suite that may not run shadows the import
+        // exactly as a class statement there does, and #1110 covered neither.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    Enum = object\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_assignment_written_where_it_runs_still_takes_an_import_back() -> Result<(), String> {
+        // The counterpart guard for the assignment: nothing guards this
+        // rebinding, so `Enum` really is `object` by the time `C` is written
+        // and the initializer is an ordinary one.
+        let source = "from enum import Enum\n\nEnum = object\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_match_capture_still_takes_an_import_back() -> Result<(), String> {
+        // A capture pattern is irrefutable, so it binds whenever the match
+        // statement runs at all. It sits inside the traversal's conditional
+        // depth all the same, which is why only a plain assignment is held
+        // back there.
+        let source = "from enum import Enum\n\nmatch object:\n    case Enum:\n        pass\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
         );
         Ok(())
     }

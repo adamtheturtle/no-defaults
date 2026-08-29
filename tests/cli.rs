@@ -6961,3 +6961,45 @@ fn a_definition_body_does_not_resolve_the_import_it_replaces(
     assert!(String::from_utf8(output.stderr)?.contains("cannot be tied to the definition"));
     Ok(())
 }
+
+#[test]
+fn logging_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Every one of these is called by `logging` itself — from `Handler.handle`,
+    // from `Logger._log`, from `Formatter.format`, from `logging.shutdown` — so
+    // there is no call site here to carry the value once the default is gone.
+    // The subclass of a handler written in this file inherits that reach.
+    let source = "import logging\nimport logging.handlers\nfrom logging import Formatter\n\n\nclass H(logging.Handler):\n    def emit(self, record, extra=1): pass\n\n    def close(self, extra=2): pass\n\n\nclass Child(H):\n    def flush(self, extra=3): pass\n\n\nclass Q(logging.handlers.QueueHandler):\n    def format(self, record, extra=4): return ''\n\n\nclass F(Formatter):\n    def formatException(self, ei, extra=5): return ''\n\n\nclass L(logging.Logger):\n    def isEnabledFor(self, level, extra=6): return True\n\n\nclass R(logging.LogRecord):\n    def getMessage(self, extra=7): return ''\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The defaults are still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn callback_names_off_the_logging_hierarchy_are_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `emit`, `close` and `format` are ordinary method names. Nothing but the
+    // calls written below reaches this class, so the defaults go and those
+    // calls carry the values they held.
+    let source = "class Handler:\n    def emit(self, record, extra=1): return extra\n\n    def close(self, extra=2): return extra\n\n    def format(self, record, extra=3): return extra\n\n\nh = Handler()\nassert Handler.emit(h, 'r') == 1\nassert Handler.close(h) == 2\nassert Handler.format(h, 'r') == 3\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Handler:\n    def emit(self, record, extra): return extra\n\n    def close(self, extra): return extra\n\n    def format(self, record, extra): return extra\n\n\nh = Handler()\nassert Handler.emit(h, 'r', extra=1) == 1\nassert Handler.close(h, extra=2) == 2\nassert Handler.format(h, 'r', extra=3) == 3\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

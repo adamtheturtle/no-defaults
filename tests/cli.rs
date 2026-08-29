@@ -5932,6 +5932,73 @@ fn a_method_named_near_persistent_load_is_still_fixed() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn an_unpickler_class_lookup_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // An unpickler reaches a global by calling `find_class(module, name)`
+    // itself, so `extra` only ever arrives as its default. That call is made
+    // from the `_pickle` accelerator, or from `pickle.load_stack_global` in
+    // the pure-Python fallback, rather than from any file the fixer can see,
+    // so dropping the default leaves the next `load()` raising
+    // `TypeError: U.find_class() missing 1 required positional argument` with
+    // no written call site to carry the value.
+    let source =
+        "class U:\n    def find_class(self, module, name, extra=1):\n        return extra\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_unpickler_helper_beside_find_class_is_still_fixed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the class holding it, so a
+    // sibling with the same signature shape is rewritten as usual, carrying
+    // its own default to the call.
+    let source = "class U:\n    def find_class(self, module, name, extra=1):\n        return self.helper(module, name)\n\n    def helper(self, module, name, value=2):\n        return value\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class U:\n    def find_class(self, module, name, extra=1):\n        return self.helper(module, name, value=2)\n\n    def helper(self, module, name, value):\n        return value\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_name_near_find_class_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The catalogue holds the hook's exact name, so a namesake the unpickler
+    // never reaches for keeps its ordinary treatment.
+    let source =
+        "class U:\n    def find_classes(self, module, name, extra=1):\n        return extra\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class U:\n    def find_classes(self, module, name, extra):\n        return extra\n",
+    );
+    // Nothing is retained here, so the run ends with no diagnostic remaining.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn an_import_finder_invalidate_caches_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

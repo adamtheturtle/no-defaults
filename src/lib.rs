@@ -151,7 +151,14 @@ impl FieldBases {
 
     fn matches(&self, base: &Expr, aliases: &Aliases) -> bool {
         match base {
-            Expr::Name(name) => self.names.contains(aliases.resolve(name.id.as_str())),
+            // A configured base is matched by its bare spelling, so a
+            // parameter named after one would otherwise keep matching inside
+            // the function it is bound in, where the name stands for whatever
+            // the caller passed rather than for the library's class.
+            Expr::Name(name) => {
+                !aliases.parameter_bindings.contains(name.id.as_str())
+                    && self.names.contains(aliases.resolve(name.id.as_str()))
+            }
             Expr::Attribute(attribute) => self.names.contains(attribute.attr.as_str()),
             // `class Job(BaseModel, Generic[T])` names its base through a
             // subscript, as a generic model does.
@@ -5615,6 +5622,8 @@ fn implicitly_called_method(name: &str) -> bool {
             | "get_source"
             | "__conform__"
             | "is_package"
+            | "get_filename"
+            | "source_to_code"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -6210,6 +6219,7 @@ struct Aliases {
     invalidated_import_bindings: BTreeSet<String>,
     type_checking: BTreeSet<String>,
     kw_only_markers: BTreeSet<String>,
+    parameter_bindings: BTreeSet<String>,
 }
 
 impl Aliases {
@@ -6239,6 +6249,7 @@ impl Aliases {
         self.structural_bases.remove(name);
         self.type_checking.remove(name);
         self.kw_only_markers.remove(name);
+        self.parameter_bindings.remove(name);
     }
 
     /// Give `name` back every record it held in `before`, undoing an
@@ -6305,6 +6316,7 @@ impl Aliases {
             self.invalidated_import_bindings.insert(name.to_owned());
         }
         self.invalidate(name);
+        self.parameter_bindings.insert(name.to_owned());
     }
 
     /// The `dataclasses` or `pydantic` member `name` was imported as, or `name`
@@ -6458,11 +6470,24 @@ impl Aliases {
         }
     }
 
+    /// A parameter holds its name for the whole call, but an import written
+    /// under it rebinds that name for everything below, so a base spelled with
+    /// that name after the import is the imported class again.
+    fn reclaim_parameter_imports(&mut self, import: &ast::StmtImportFrom) {
+        for alias in &import.names {
+            if alias.name.as_str() != "*" {
+                self.parameter_bindings
+                    .remove(alias.asname.as_ref().unwrap_or(&alias.name).as_str());
+            }
+        }
+    }
+
     fn collect(&mut self, statements: &[Stmt]) {
         for statement in statements {
             match statement {
                 Stmt::Import(import) => self.collect_module_aliases(import),
                 Stmt::ImportFrom(import) => {
+                    self.reclaim_parameter_imports(import);
                     self.import_bindings.extend(
                         import
                             .names
@@ -20852,6 +20877,269 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn execution_loader_get_filename_defaults_are_retained() {
+        // `importlib` compiles a module's source against the path its loader
+        // reports, calling `get_filename(fullname)` with the module name
+        // alone, so a parameter beside it only ever arrives as its default.
+        // That call is made from `importlib.abc` under
+        // `<frozen importlib._bootstrap_external>` rather than by any written
+        // line, so dropping the default leaves the next import raising
+        // `TypeError: L.get_filename() missing 1 required positional
+        // argument` with nothing for the fixer to update.
+        let source =
+            "class L:\n    def get_filename(self, fullname, extra=1):\n        return '/virtual/probe.py'\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_loader_method_beside_get_filename_stays_fixable() {
+        // Retention is keyed to the hook name, so a sibling sharing the loader
+        // and the signature shape keeps its ordinary treatment.
+        let source = "class L:\n    def get_filename(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_get_filename_stays_fixable() {
+        // The import machinery looks the hook up under its exact name, so a
+        // near miss is an ordinary method and its default is the fixer's.
+        let source = "class L:\n    def get_filenames(self, fullname, extra=1):\n        return (fullname, extra)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_function_named_get_filename_stays_fixable() {
+        // The hook is looked up on the loader, so a module-level namesake is
+        // an ordinary function whose written calls the fixer can keep in step.
+        let source =
+            "def get_filename(fullname, extra=1):\n    return (fullname, extra)\n\n\nget_filename('probe')\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn inspect_loader_source_to_code_defaults_are_retained() {
+        // The import machinery compiles a module's source by asking its loader
+        // to do it, calling `source_to_code(data, path)` with those two alone,
+        // so a parameter beside them only ever arrives as its default. That
+        // call is made from `<frozen importlib._bootstrap_external>` rather
+        // than by any written line, so dropping the default leaves the next
+        // import raising `TypeError: L.source_to_code() missing 1 required
+        // positional argument` with nothing for the fixer to update.
+        let source =
+            "class L:\n    def source_to_code(self, data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_loader_method_beside_source_to_code_stays_fixable() {
+        // Retention is keyed to the hook name, so a sibling sharing the loader
+        // and the signature shape keeps its ordinary treatment.
+        let source = "class L:\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path)\n    def helper(self, data, path, value=2):\n        return (data, path, value)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
+    }
+
+    #[test]
+    fn a_method_named_near_source_to_code_stays_fixable() {
+        // The import machinery looks the hook up under its exact name, so a
+        // near miss is an ordinary method and its default is the fixer's.
+        let source =
+            "class L:\n    def source_to_codes(self, data, path, extra=1):\n        return (data, path, extra)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn a_decorated_source_to_code_keeps_its_defaults_too() {
+        // Real loaders spell the hook as a `staticmethod`, and the import
+        // machinery reaches it through the instance either way, so the
+        // decorated form is retained on the same grounds.
+        let source =
+            "class L:\n    @staticmethod\n    def source_to_code(data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
+    fn function_parameters_shadow_configured_field_bases() -> Result<(), String> {
+        // A configured base is recognised by the bare name it is written
+        // with, so a parameter spelled the same way would go on matching
+        // inside the function even though the class it heads is built from
+        // whatever the caller handed over.
+        let source = "from pydantic import BaseModel\n\nclass Plain:\n    pass\n\ndef outer(BaseModel):\n    class C(BaseModel):\n        x: int = 1\n    return C\n\nassert outer(Plain).x == 1\n";
+        assert_eq!(fixed(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameter_shadowing_a_configured_base_leaves_its_calls_alone() -> Result<(), String> {
+        // Rewriting the call would be the worse half of the same mistake: the
+        // default moves into a constructor the caller's class never accepts.
+        let source = "from pydantic import BaseModel\n\nclass Plain:\n    pass\n\ndef outer(BaseModel):\n    class C(BaseModel):\n        x: int = 1\n    return C()\n\nassert outer(Plain).x == 1\n";
+        assert_eq!(fixed(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn imports_reclaim_parameter_shadowed_field_bases() -> Result<(), String> {
+        // A parameter holds its name for the whole call, but an import written
+        // under it rebinds that name for everything below, so a class written
+        // after the import is built on the imported model whatever the caller
+        // handed in. Reading the base as the caller's would leave the field
+        // where it is and the call unchanged.
+        let source = "def outer(BaseModel):\n    from pydantic import BaseModel\n    class C(BaseModel):\n        x: int = 1\n    return C()\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer(BaseModel):\n    from pydantic import BaseModel\n    class C(BaseModel):\n        x: int\n    return C(x=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_import_reclaims_a_parameter_shadowed_field_base() -> Result<(), String> {
+        // The same reclaim through the module a plain `import` binds, where the
+        // base is spelled out with the module rather than with a name the file
+        // imported on its own.
+        let source = "def outer(pydantic):\n    import pydantic\n    class C(pydantic.BaseModel):\n        x: int = 1\n    return C()\n";
+        assert_eq!(
+            fixed(source)?,
+            "def outer(pydantic):\n    import pydantic\n    class C(pydantic.BaseModel):\n        x: int\n    return C(x=1)\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn function_parameters_shadow_pydantic_field_imports() {
+        // `Field` names the parameter inside `outer`, so what the annotation
+        // calls is whatever the caller passed and not `pydantic.Field`. Its
+        // keywords therefore carry none of the meaning the fixer relies on to
+        // move a default onto the constructor, and the default has to stay.
+        let source = "from pydantic import BaseModel, Field\n\ndef helper(*, default, description): return default\ndef outer(Field):\n    class C(BaseModel):\n        x: int = Field(default=1, description='x')\n    return C\n\nassert outer(helper)().x == 1\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+    }
+
+    #[test]
+    fn function_parameters_shadow_pydantic_private_attr_imports() {
+        // A parameter named `PrivateAttr` is some unknown callable, not the
+        // import, so the call it makes is an ordinary default rather than
+        // per-instance private state. The field here carries no leading
+        // underscore, which a model base would answer on its own, so the
+        // rebinding is the only reason this is reported.
+        let source = "from pydantic import BaseModel, PrivateAttr\n\ndef helper(*, default): return default\ndef outer(PrivateAttr):\n    class C(BaseModel):\n        value: int = PrivateAttr(default=1)\n    return C\n\nassert outer(helper)(value=2).value == 2\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].message.contains("field `value`"));
+        // Under the import the same call is still read as private state, in a
+        // plain dataclass so that no underscore rule can answer first. The
+        // report above is therefore the parameter binding rather than the
+        // call shape going unrecognised.
+        assert!(messages(
+            "from dataclasses import dataclass\nfrom pydantic import PrivateAttr\n\n@dataclass\nclass C:\n    _value: int = PrivateAttr(default=1)\n",
+            false,
+        )
+        .is_empty());
     }
 
     #[test]

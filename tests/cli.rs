@@ -6064,3 +6064,70 @@ fn a_method_named_near_invalidate_caches_is_still_fixed() -> Result<(), Box<dyn 
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_legacy_loader_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // A loader that offers no `exec_module` is still driven through the legacy
+    // fallback, where `_bootstrap._load_backward_compatible` calls
+    // `load_module(fullname)` with the module name alone, so `extra` only ever
+    // arrives as its default. That call sits inside the import machinery
+    // rather than in any file the fixer can see, so dropping the default
+    // leaves the next import raising
+    // `TypeError: Loader.load_module() missing 1 required positional argument`
+    // with no written call site to carry the value.
+    let source =
+        "class Loader:\n    def load_module(self, fullname, extra=1):\n        return fullname\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_loader_helper_beside_load_module_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the shape of the parameter
+    // list, so a sibling declared with the very same signature is stripped and
+    // its call site given the default that used to reach it.
+    let source = "class Loader:\n    def load_module(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, extra=1):\n        return fullname\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Loader:\n    def load_module(self, fullname, extra=1):\n        return self.helper(fullname, extra=1)\n\n    def helper(self, fullname, extra):\n        return fullname\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_method_named_near_load_module_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The fallback looks the hook up under its exact name, so a near miss is
+    // an ordinary method whose default the fixer removes.
+    let source =
+        "class Loader:\n    def load_modules(self, fullname, extra=1):\n        return fullname\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Loader:\n    def load_modules(self, fullname, extra):\n        return fullname\n",
+    );
+    // Nothing is left unfixed once the near miss is rewritten.
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

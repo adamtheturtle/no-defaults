@@ -61,6 +61,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- A metaclass whose base is written `builtins.type`, or under a name `import builtins as ...` or `from builtins import type as ...` bound, is recognised as one, so the defaults class creation relies on are retained rather than removed with no call site to rewrite.
+- A `def` or a `class` that replaces an imported name takes that name over for the function bodies inside it, which run after the definition is bound. Calls in there were resolved against the replaced import, so a recursive call could be rewritten with an argument the definition does not accept. A class body still reads the import, because it runs before the name is bound.
+- A base imported through a package that re-exports it — `from pkg import Base`, where `pkg/__init__.py` binds the name to a submodule — is followed to the module that defines it, so the inherited calls behind it are rewritten instead of being left alone once their default is gone.
 - A construction of a class that inherits its constructor is reported, and the inherited default retained, when the pass cannot say which class the name holds. Previously only the base's default went and the call was left bare, with nothing said about it.
 - A dataclass whose constructor is not known from the file that defines it keeps its field defaults. Removing them while leaving the constructions unrewritten made the file raise `TypeError`.
 - A class bound to a second name by an assignment keeps the defaults behind it, and a construction spelled with that name is reported. `Alias = Child` followed by `Alias()`, `api.Alias()`, `from api import Alias`, or `H.Child()` after `H = Holder` was passed over in silence while the default it relied on was deleted. A class nothing was taken from is not reported, since no call to it was threatened.

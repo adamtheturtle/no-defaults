@@ -7005,6 +7005,63 @@ fn callback_names_off_the_logging_hierarchy_are_still_fixed(
 }
 
 #[test]
+fn a_redefined_temporary_does_not_put_a_method_back() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `tmp` was another name for `target` only until the definition below it
+    // took the name over, so the last assignment puts the second function
+    // behind `target` rather than restoring the first. `target`'s own default
+    // therefore has no call site to be carried to and has to stay where it is,
+    // while the call goes to `tmp`'s parameters instead.
+    let source = "class C:\n    def target(self, x, y=1):\n        return (\"target\", x, y)\n\n    tmp = target\n\n    def tmp(self, x, w=2):\n        return (\"tmp\", x, w)\n\n    target = tmp\n\n\nassert C().target(5) == (\"tmp\", 5, 2)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class C:\n    def target(self, x, y=1):\n        return (\"target\", x, y)\n\n    tmp = target\n\n    def tmp(self, x, w):\n        return (\"tmp\", x, w)\n\n    target = tmp\n\n\nassert C().target(5, w=2) == (\"tmp\", 5, 2)\n"
+    );
+    // `target`'s default is still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_same_named_method_from_another_class_is_a_replacement(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // `C.target` is `Other.target` once the body has run, and that function
+    // takes `w`, not `y`. Sharing a name with the method defined above says
+    // nothing about the parameters behind it, so this is a replacement rather
+    // than a rewrap: `C`'s own default has no call site left to be carried to,
+    // and the call reaches `Other`'s parameters instead.
+    for copy in [
+        "    target = Other.target\n",
+        "    tmp = Other.target\n    target = tmp\n",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let case = directory.path().join("case.py");
+        let source = format!("class Other:\n    def target(self, x, w=2):\n        return (\"other\", x, w)\n\n\nclass C:\n    def target(self, x, y=1):\n        return (\"mine\", x, y)\n\n{copy}\n\nassert C().target(5) == (\"other\", 5, 2)\n");
+        std::fs::write(&case, &source)?;
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(
+            std::fs::read_to_string(&case)?,
+            source
+                .replace("def target(self, x, w=2)", "def target(self, x, w)")
+                .replace("C().target(5) ==", "C().target(5, w=2) =="),
+            "{copy}"
+        );
+        // `C.target`'s own default is still reported, only without a fix.
+        assert_eq!(output.status.code(), Some(1), "{copy}");
+    }
+    Ok(())
+}
+
+#[test]
 fn argparse_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

@@ -17421,4 +17421,27 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         Ok(())
     }
+
+    #[test]
+    fn same_scope_local_bases_shadow_imported_classes() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Base\n\ndef outer():\n    class Base:\n        def target(self, value=1): return value\n    class Child(Base):\n        def run(self): return self.target()\n    return Child().run()\n\nassert outer() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
+            "from api import Base\n\ndef outer():\n    class Base:\n        def target(self, value): return value\n    class Child(Base):\n        def run(self): return self.target(value=1)\n    return Child().run()\n\nassert outer() == 1\n"
+        );
+        Ok(())
+    }
 }

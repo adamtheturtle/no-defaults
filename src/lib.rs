@@ -4072,16 +4072,27 @@ impl Checker<'_> {
 
     fn class_constructs_safely(&self, class: &ast::StmtClassDef) -> bool {
         class_constructs_safely(class, &self.aliases, &self.metaclass_classes)
-            && !class_bases(class).any(|base| {
-                base_root_name(base).is_some_and(|name| self.aliases.import_bindings.contains(name))
-                    && !self.field_bases.matches(base, &self.aliases)
-                    && !carries_no_fields(
-                        base,
-                        &self.aliases,
-                        &self.local_classes,
-                        &self.module_bindings,
-                    )
-            })
+            && !self.inherits_unseen_import(class)
+    }
+
+    /// Whether a base of this class is an import whose fields, and whatever
+    /// metaclass builds it, this file cannot see.
+    ///
+    /// A parameter shadowing the import hides the base further rather than
+    /// revealing it, so the name it took over counts too.
+    fn inherits_unseen_import(&self, class: &ast::StmtClassDef) -> bool {
+        class_bases(class).any(|base| {
+            base_root_name(base).is_some_and(|name| {
+                self.aliases.import_bindings.contains(name)
+                    || self.aliases.invalidated_import_bindings.contains(name)
+            }) && !self.field_bases.matches(base, &self.aliases)
+                && !carries_no_fields(
+                    base,
+                    &self.aliases,
+                    &self.local_classes,
+                    &self.module_bindings,
+                )
+        })
     }
 
     fn generates_init(&self, class: &ast::StmtClassDef) -> bool {
@@ -4089,11 +4100,20 @@ impl Checker<'_> {
     }
 
     /// Note that a metaclass builds this class, so a later subclass of it is
-    /// built by that metaclass too. A later redefinition without a metaclass
-    /// clears the name so a sibling that inherits the new class is not treated
-    /// as metaclass-built.
-    fn record_metaclass_construction(&mut self, class: &ast::StmtClassDef) {
-        if declares_metaclass(class) || inherits_metaclass(class, &self.metaclass_classes) {
+    /// built by that metaclass too. An unseen imported base counts as one: the
+    /// metaclass it may carry reaches every class beneath it alike, and a
+    /// subclass written here sees no more of it than this class does. A later
+    /// redefinition without either clears the name so a sibling that inherits
+    /// the new class is not treated as metaclass-built.
+    fn record_metaclass_construction(
+        &mut self,
+        class: &ast::StmtClassDef,
+        unseen_import_base: bool,
+    ) {
+        if declares_metaclass(class)
+            || inherits_metaclass(class, &self.metaclass_classes)
+            || unseen_import_base
+        {
             self.metaclass_classes.insert(class.name.to_string());
         } else {
             self.metaclass_classes.remove(class.name.as_str());
@@ -5130,6 +5150,11 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     // written here.
                     kept_default: false,
                 };
+                // Read where the header is: the tables the predicate consults
+                // are the enclosing scope's until the body has been walked,
+                // and a name the body binds says nothing about the base the
+                // header already resolved.
+                let unseen_import_base = self.inherits_unseen_import(class);
                 self.class_constructs
                     .push(self.class_constructs_safely(class));
                 let defines_iterator_method = |expected: &str| {
@@ -5200,7 +5225,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
                 self.metaclass_classes = outer_metaclass_classes;
-                self.record_metaclass_construction(class);
+                self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
                 self.repeated_functions = outer_repeated_functions;
                 if defines_metaclass(class, &self.metaclass_definitions) {
@@ -17300,9 +17325,11 @@ def b(x=1): pass  # type: ignore  # noqa
         // end in a positional default. Removing the child's would leave a
         // field without one behind it, which `dataclasses` rejects outright,
         // and no call could be rewritten to make up for it because the
-        // inherited fields are unknown. A keyword-only field is exempt as it
-        // is without the shadow: `dataclasses` moves it past the `*`, where
-        // nothing the base contributes constrains its order.
+        // inherited fields are unknown. Field order spares a keyword-only
+        // field, which `dataclasses` moves past the `*`, but a metaclass the
+        // base brings does not: one that builds the class without arguments
+        // reaches `__init__` with none to give, and the default is what stood
+        // in for them. That hazard is the same behind the shadow as before it.
         let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\n\ndef build(Parent):\n    @dataclass\n    class Child(Parent):\n        positional: int = 2\n        keyword: int = field(default=3, kw_only=True)\n\n    return Child()\n";
         let checked = check_source(
             Path::new("fixture.py"),
@@ -17314,8 +17341,8 @@ def b(x=1): pass  # type: ignore  # noqa
             true,
         );
         assert_eq!(checked.diagnostics.len(), 2);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.diagnostics[1].fix.is_some());
+        assert!(checked.diagnostics.iter().all(|item| item.fix.is_none()));
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]
@@ -17645,6 +17672,29 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn a_class_does_not_shadow_its_own_imported_base() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &api,
+            "class Base:\n    def target(self, value=9): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "from api import Base\n\nclass Base(Base):\n    def run(self): return self.target()\n\nassert Base().run() == 9\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[api, case.clone()])?;
+        assert_eq!(
+            std::fs::read_to_string(case).map_err(|error| error.to_string())?,
+            "from api import Base\n\nclass Base(Base):\n    def run(self): return self.target(value=9)\n\nassert Base().run() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn aliased_namespace_attribute_bases_preserve_inherited_method_calls() -> Result<(), String> {
         // The dotted spelling of a nested class is not the only way to reach
         // it: a name bound to the class around it names the same member, and
@@ -17661,5 +17711,61 @@ def b(x=1): pass  # type: ignore  # noqa
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn an_unseen_imported_ancestor_protects_a_local_subclass() {
+        // The metaclass an imported base may carry builds every class beneath
+        // it, not only the one that names it, so a local class standing
+        // between the two hides nothing. Removing the subclass's default would
+        // leave that metaclass reaching `__init__` with no argument to stand
+        // in for it, and no call could be rewritten to make up for it because
+        // the inherited fields are unknown.
+        for source in [
+            "from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    pass\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n",
+            "from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    pass\n\nclass Inner(Middle):\n    pass\n\n@dataclass\nclass Child(Inner):\n    keyword: int = field(default=3, kw_only=True)\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1);
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_class_body_does_not_rewrite_its_own_header_bases() {
+        // Whether a base is an unseen import is settled where the header is
+        // written, not where the body ends. A member binding the base's name
+        // rebinds it for readers of the class, never for the header above it,
+        // and a base spelled with the class's own name still reaches whatever
+        // that name held before the class did. Reading either after the body
+        // would drop the mark that protects a later subclass, or invent one
+        // over a base that carries no fields at all.
+        for (source, removable) in [
+            ("from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    Base = 1\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n", false),
+            ("from dataclasses import dataclass, field\nfrom other import Base\n\nclass Middle(Base):\n    class Base:\n        pass\n\n@dataclass\nclass Child(Middle):\n    keyword: int = field(default=3, kw_only=True)\n", false),
+            ("from dataclasses import dataclass, field\nfrom typing import Protocol\n\nclass Protocol(Protocol):\n    pass\n\n@dataclass\nclass Child(Protocol):\n    keyword: int = field(default=3, kw_only=True)\n", true),
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert_eq!(checked.diagnostics[0].fix.is_some(), removable, "{source}");
+            assert_eq!(checked.signatures.is_empty(), !removable, "{source}");
+        }
     }
 }

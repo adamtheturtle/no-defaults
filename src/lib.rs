@@ -8447,13 +8447,18 @@ impl Rewriter<'_> {
         self.class_ancestry_is_uncertain(&attribute.value)
     }
 
-    /// Whether the call builds such a class. `Child()` names the class rather
-    /// than the `__init__` it inherits, so there is no single constructor to
-    /// give it and the class is left without one. That leaves the call bare of
-    /// the argument the removed default stood in for, which is why the
-    /// deletion has to be held back.
+    /// Whether the call builds such a class. `Child()` and `api.Child()` name
+    /// the class rather than the `__init__` it inherits, so there is no single
+    /// constructor to give them and the class is left without one. That leaves
+    /// the call bare of the argument the removed default stood in for, which is
+    /// why the deletion has to be held back.
+    ///
+    /// A construction through a module is spelled exactly as a method call is,
+    /// so what tells them apart is whether the callee itself names a class:
+    /// `api.Child` does, and `receiver.method` does not.
     fn constructs_uncertain_ancestry(&self, expression: &Expr) -> bool {
-        matches!(expression, Expr::Name(_)) && self.class_ancestry_is_uncertain(expression)
+        matches!(expression, Expr::Name(_) | Expr::Attribute(_))
+            && self.class_ancestry_is_uncertain(expression)
     }
 
     fn class_ancestry_is_uncertain(&self, receiver: &Expr) -> bool {
@@ -17991,6 +17996,29 @@ def b(x=1): pass  # type: ignore  # noqa
                 "{source}"
             );
         }
+        Ok(())
+    }
+    #[test]
+    fn suites_that_disagree_on_a_class_report_a_qualified_construction() -> Result<(), String> {
+        // `api.Child()` is spelled exactly as a method call, but the callee
+        // names a class of the module rather than a method of a receiver. It
+        // resolves and is rewritten when the ancestry is settled, so it has to
+        // be held back when it is not.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let api = directory.path().join("api.py");
+        let user = directory.path().join("user.py");
+        let api_source = "import os\n\nclass BaseA:\n    def __init__(self, value=1): self.value = value\n\nclass BaseB:\n    def __init__(self, value=2): self.value = value\n\nif os.environ.get('PICK'):\n    class Child(BaseA):\n        pass\nelse:\n    class Child(BaseB):\n        pass\n";
+        let user_source = "import api\n\nprint(api.Child().value)\n";
+        std::fs::write(&api, api_source).map_err(|error| error.to_string())?;
+        std::fs::write(&user, user_source).map_err(|error| error.to_string())?;
+        let reasons: Vec<String> = fix_all(&[api, user])?
+            .into_iter()
+            .map(|skip| skip.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            ["this call cannot be tied to the definition that was fixed"]
+        );
         Ok(())
     }
 }

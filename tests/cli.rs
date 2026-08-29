@@ -5390,3 +5390,27 @@ fn suites_that_disagree_on_a_class_keep_the_default_behind_its_constructor(
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
+
+#[test]
+fn suites_that_disagree_on_a_class_keep_the_default_behind_a_qualified_construction(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // `api.Child()` is rewritten like any other construction while the class
+    // has one ancestry, so the default behind it has to stay while the class
+    // has two.
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let user = directory.path().join("user.py");
+    let api_source = "import os\n\n\nclass BaseA:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass BaseB:\n    def __init__(self, value=2):\n        self.value = value\n\n\nif os.environ.get(\"PICK\"):\n\n    class Child(BaseA):\n        pass\n\nelse:\n\n    class Child(BaseB):\n        pass\n";
+    let user_source = "import api\n\nprint(api.Child().value)\n";
+    std::fs::write(&api, api_source)?;
+    std::fs::write(&user, user_source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(api)?, api_source);
+    assert_eq!(std::fs::read_to_string(user)?, user_source);
+    Ok(())
+}

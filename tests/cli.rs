@@ -5416,6 +5416,31 @@ fn suites_that_disagree_on_a_class_keep_the_default_behind_a_qualified_construct
 }
 
 #[test]
+fn a_descendant_of_disagreeing_suites_keeps_its_own_calls_in_step(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // `own` is declared on `Descendant` itself, so which of the two ancestries
+    // `Middle` ends up with does not change which `own` the call reaches. The
+    // default may therefore go — but only together with the argument standing
+    // in for it. Removing it while leaving `Descendant().own()` as written is
+    // the one outcome that breaks a file that ran before.
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    let source = "import os\n\n\nclass BaseA:\n    pass\n\n\nclass BaseB:\n    pass\n\n\nif os.environ.get(\"PICK\"):\n\n    class Middle(BaseA):\n        pass\n\nelse:\n\n    class Middle(BaseB):\n        pass\n\n\nclass Descendant(Middle):\n    def own(self, value=3):\n        return value\n\n\nassert Descendant().own() == 3\n";
+    std::fs::write(&path, source)?;
+
+    let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
+    let updated = std::fs::read_to_string(&path)?;
+    if updated.contains("def own(self, value=3):") {
+        assert_eq!(updated, source);
+        assert_eq!(output.status.code(), Some(1));
+    } else {
+        assert!(updated.contains("Descendant().own(value=3)"), "{updated}");
+        assert_eq!(output.status.code(), Some(0));
+    }
+    Ok(())
+}
+
+#[test]
 fn branches_that_disagree_on_a_base_keep_the_inherited_default(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The bases are settled at module level and only the subclass is written

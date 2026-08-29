@@ -1618,6 +1618,30 @@ fn collect_local_class_offsets(
     }
 }
 
+/// Whether a class written in this file above `defined_at` holds the spelling
+/// a base expression's prefix uses, so the prefix is that class rather than
+/// whatever a module of the same dotted name would be.
+fn prefix_names_a_local_class(
+    prefix: &Expr,
+    local_classes: &BTreeMap<String, (String, TextSize)>,
+    defined_at: TextSize,
+) -> bool {
+    let mut expression = prefix;
+    loop {
+        if dotted_name(expression).is_some_and(|spelling| {
+            local_classes
+                .get(&spelling)
+                .is_some_and(|(_, offset)| *offset < defined_at)
+        }) {
+            return true;
+        }
+        match expression {
+            Expr::Attribute(attribute) => expression = attribute.value.as_ref(),
+            _ => return false,
+        }
+    }
+}
+
 /// Resolve the class identity denoted by a base expression for method lookup.
 fn method_base_identity(
     expression: &Expr,
@@ -1656,6 +1680,22 @@ fn method_base_identity(
             }
         }),
         Expr::Attribute(attribute) => {
+            // A dotted submodule binding names the module its components spell
+            // out, which is more specific than reading those same components
+            // as classes nested in the package initializer — the reading the
+            // prefix would otherwise be given, since the initializer's own
+            // namesake answers before the module lookup below is reached.
+            //
+            // A class written here still holds the spelling first: the checks
+            // that follow settle that, so the shortcut only fires where no
+            // local class of that name is written above.
+            if !prefix_names_a_local_class(&attribute.value, local_classes, defined_at) {
+                if let Some(module) = dotted_name(&attribute.value) {
+                    if let Some(Binding::Module(file)) = bindings.get(&module) {
+                        return Some((file.clone(), attribute.attr.to_string()));
+                    }
+                }
+            }
             // The prefix may be a name this scope bound to a class rather than
             // a spelling written out in full, and an alias of an enclosing
             // class reaches the same nested class the dotted form does. The
@@ -1690,16 +1730,6 @@ fn method_base_identity(
                 })
             {
                 return Some((importer.to_path_buf(), identity.clone()));
-            }
-            // `import package.module` leaves the submodule behind the dotted
-            // name, over whatever the package initializer wrote there, so a
-            // spelling bound as a module is that module rather than a class of
-            // the same name nested in the initializer. Answering with the
-            // namesake class let a longer path read its base out of the
-            // initializer, and an inherited call was rewritten with the
-            // default that class held instead of the submodule's.
-            if matches!(bindings.get(&qualified), Some(Binding::Module(_))) {
-                return None;
             }
             let module = dotted_name(&attribute.value)?;
             let Binding::Module(file) = bindings.get(&module)? else {
@@ -3445,6 +3475,7 @@ fn check_source(
         module_bindings,
         local_classes: BTreeSet::new(),
         metaclass_classes: BTreeSet::new(),
+        entered_class_metaclass_classes: Vec::new(),
         metaclass_definitions: BTreeSet::new(),
         metaclass_intercepted_classes,
         repeated_functions,
@@ -3742,6 +3773,11 @@ struct Checker<'a> {
     /// through a base. A metaclass is inherited, so a subclass is built by it
     /// too even when it names no `metaclass=` of its own.
     metaclass_classes: BTreeSet<String>,
+    /// What `metaclass_classes` held as each enclosing class body was entered.
+    /// A class body is not a closure scope, so a class the body writes stands
+    /// for nothing inside a function or a class written there, which reads the
+    /// names the class statement began with instead.
+    entered_class_metaclass_classes: Vec<BTreeSet<String>>,
     /// Classes defined as subclasses of `type`, whose `__init__` and `mro`
     /// methods class creation invokes implicitly.
     metaclass_definitions: BTreeSet<String>,
@@ -4483,6 +4519,16 @@ impl Checker<'_> {
         let outer_local_classes = self.local_classes.clone();
         let outer_metaclass_classes = self.metaclass_classes.clone();
         let outer_metaclass_definitions = self.metaclass_definitions.clone();
+        // Written straight in a class body, this function sees none of the
+        // names that body binds: a class written above it there is not in
+        // scope here, and reading a base through it would answer with a class
+        // the method never builds on. What the class statement started with is
+        // what the body reaches instead.
+        if self.lexical_is_class.last() == Some(&true) {
+            if let Some(entered) = self.entered_class_metaclass_classes.last() {
+                self.metaclass_classes.clone_from(entered);
+            }
+        }
         let mut parameters = BoundNames::default();
         parameters.parameters(&function.parameters);
         // A parameter is bound the moment the body starts, so it hides an
@@ -5502,10 +5548,27 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     });
                     self.record_inherited_method_aliases(outer.class != ClassScope::None);
                 }
+                // A class written in another class body is built from the
+                // names that body holds, so its bases were read above with
+                // them in place. Its own body reaches past them, though:
+                // neither class scope is a closure, so what the enclosing
+                // class statement started with is what this body starts with.
+                let body_metaclass_classes = if self.lexical_is_class.last() == Some(&true) {
+                    self.entered_class_metaclass_classes
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| outer_metaclass_classes.clone())
+                } else {
+                    outer_metaclass_classes.clone()
+                };
                 self.lexical_scope.push(class.name.to_string());
                 self.lexical_is_class.push(true);
                 self.lexical_bindings.push(BTreeSet::new());
+                self.metaclass_classes.clone_from(&body_metaclass_classes);
+                self.entered_class_metaclass_classes
+                    .push(body_metaclass_classes);
                 walk_stmt(self, statement);
+                self.entered_class_metaclass_classes.pop();
                 self.lexical_bindings.pop();
                 self.lexical_is_class.pop();
                 self.lexical_scope.pop();
@@ -5514,6 +5577,15 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 // how this class's bases were resolved.
                 self.local_classes = outer_local_classes;
                 self.local_classes.insert(class.name.to_string());
+                // The statement binds the name in the scope around it whether
+                // or not the class it writes has a shape worth recording. A
+                // plain class stands between the name and an enclosing
+                // dataclass of the same spelling exactly as a parameter or a
+                // rebinding does, and reading past it would hand a subclass
+                // fields its base has never had.
+                if let Some(bindings) = self.lexical_bindings.last_mut() {
+                    bindings.insert(class.name.to_string());
+                }
                 self.metaclass_classes = outer_metaclass_classes;
                 self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
@@ -18530,27 +18602,31 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn qualified_pydantic_private_attributes_are_not_model_fields() {
-        for source in [
-            "import pydantic\n\nclass C(pydantic.BaseModel):\n    _value: int = pydantic.PrivateAttr(default=1)\n",
-            "import pydantic as pd\n\nclass C(pd.BaseModel):\n    _value: int = pd.PrivateAttr(default=1)\n",
-        ] {
-            assert!(messages(source, false).is_empty(), "{source}");
-        }
-    }
-
-    #[test]
-    fn nested_assignments_do_not_clear_module_truthiness() -> Result<(), String> {
-        let source = "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value=1): return value\n    target()\n";
-        assert_eq!(
-            fixed(source)?,
-            "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value): return value\n    target(value=1)\n"
+    fn imported_metaclass_uncertainty_propagates_through_local_bases() {
+        // A metaclass an imported base carries builds every class under it, so
+        // the local class between the import and the dataclass hides nothing.
+        // A keyword-only default is no safer to remove than a positional one
+        // here: the metaclass reaches `__init__` either way, and the inherited
+        // fields are unknown, so no call could be rewritten to make up for it.
+        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Middle(Parent):\n    pass\n\n@dataclass\nclass Child(Middle):\n    value: int = field(default=1, kw_only=True)\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
         );
-        Ok(())
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]
     fn dotted_submodules_win_over_package_nested_classes() -> Result<(), String> {
+        // `import package.module` sets the submodule on the package, so the
+        // initializer's namesake class is not what the dotted base reaches.
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let package = directory.path().join("package");
         std::fs::create_dir(&package).map_err(|error| error.to_string())?;
@@ -18579,29 +18655,77 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn imported_metaclass_uncertainty_propagates_through_local_bases() {
-        // A metaclass an imported base carries builds every class under it, so
-        // the local class between the import and the dataclass hides nothing.
-        // A keyword-only default is no safer to remove than a positional one
-        // here: the metaclass reaches `__init__` either way, and the inherited
-        // fields are unknown, so no call could be rewritten to make up for it.
-        let source = "from dataclasses import dataclass, field\nfrom base import Parent\n\nclass Middle(Parent):\n    pass\n\n@dataclass\nclass Child(Middle):\n    value: int = field(default=1, kw_only=True)\n";
-        let checked = check_source(
-            Path::new("fixture.py"),
-            source,
-            false,
-            Path::new(""),
-            &Reexports::default(),
-            &default_bases(),
-            true,
-        );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_none());
-        assert!(checked.signatures.is_empty());
+    fn a_local_package_namesake_holds_a_dotted_base() -> Result<(), String> {
+        // A class written above the subclass takes the package's name over, so
+        // the dotted base is that class's nested one and not the submodule the
+        // import bound. Preferring the submodule regardless would write the
+        // wrong module's field into the inherited call.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import package.module\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=7): return value\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 7\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=7)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_namesake_holds_a_single_component_dotted_base() -> Result<(), String> {
+        // The prefix is one name rather than a dotted path, so the walk over
+        // its components has only that name to test. A class written above the
+        // subclass takes it over just the same, and the base is the nested
+        // class here rather than the package the import bound.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("pkg");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(
+            &initializer,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import pkg\n\nclass pkg:\n    class Base:\n        def target(self, value=1): return value\n\nclass Child(pkg.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=1)"), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_class_hides_the_enclosing_dataclass_of_the_same_name() -> Result<(), String> {
+        // The `Base` the alias reads is the class `outer` writes, which has no
+        // fields at all. Walking past it to the module dataclass would name a
+        // keyword the class `Child` really inherits from has no field for.
+        let source = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    module: int = 1\n\ndef outer():\n    class Base:\n        pass\n\n    Alias = Base\n\n    @dataclass\n    class Child(Alias):\n        child: int = 3\n\n    return Child()\n\nouter()\n";
+        let updated = fixed(source)?;
+        assert!(!updated.contains("Child(module="), "{updated}");
+        Ok(())
     }
 
     #[test]
     fn a_safe_redefinition_clears_imported_metaclass_uncertainty() {
+        // The second `Base` is the one standing when `Child` is written, and
+        // it inherits from nothing this file cannot see, so the uncertainty
+        // the first one carried must not outlive it.
         let source = "from dataclasses import dataclass\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base:\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = 1\n";
         let checked = check_source(
             Path::new("fixture.py"),
@@ -18621,30 +18745,106 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn a_local_package_namesake_still_shadows_a_dotted_submodule() -> Result<(), String> {
-        // The submodule only wins where nothing in the importing file holds
-        // the name: a class written here takes the spelling over the import,
-        // and the base is read out of that class instead.
-        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let package = directory.path().join("package");
-        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
-        let initializer = package.join("__init__.py");
-        let module = package.join("module.py");
-        let case = directory.path().join("case.py");
-        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
-        std::fs::write(
-            &module,
-            "class Base:\n    def target(self, value=2): return value\n",
-        )
-        .map_err(|error| error.to_string())?;
-        std::fs::write(
-            &case,
-            "import package.module\n\nclass package:\n    class module:\n        class Base:\n            def target(self, value=3): return value\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 3\n",
-        )
-        .map_err(|error| error.to_string())?;
-        fix_all(&[initializer, module, case.clone()])?;
-        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
-        assert!(updated.contains("self.target(value=3)"), "{updated}");
+    fn nested_assignments_do_not_clear_module_truthiness() -> Result<(), String> {
+        let source = "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value=1): return value\n    target()\n";
+        assert_eq!(
+            fixed(source)?,
+            "enabled = True\n\ndef nested():\n    enabled = unknown\n\nif enabled:\n    def target(value): return value\n    target(value=1)\n"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn a_class_rebinding_itself_keeps_imported_metaclass_uncertainty() {
+        // `Base` is rebound to a subclass of its own earlier binding, which
+        // still reaches the unseen import, so the metaclass that import may
+        // carry still builds `Child` and no fix may be offered.
+        let source = "from dataclasses import dataclass\nfrom base import Parent\n\nclass Base(Parent):\n    pass\n\nclass Base(Base):\n    pass\n\n@dataclass\nclass Child(Base):\n    value: int = 1\n\nChild()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
+    }
+
+    #[test]
+    fn a_class_body_name_is_out_of_scope_for_the_bodies_written_in_it() {
+        // A class body is not a closure scope. `Outer.Safe` stands for nothing
+        // inside `method`, inside `Mid`, or inside a class deeper still, so
+        // every `Child` here is built on the module-level `Safe` that inherits
+        // the unseen import. Under a metaclass on that import CPython answers
+        // `Child()` and `Child(value=1)` differently, so none may be rewritten.
+        let bodies = [
+            "    def method(self):\n        @dataclass\n        class Child(Safe):\n            value: int = 1\n        return Child()\n",
+            "    class Mid:\n        @dataclass\n        class Child(Safe):\n            value: int = 1\n",
+            "    class Mid:\n        class Deeper:\n            @dataclass\n            class Child(Safe):\n                value: int = 1\n",
+        ];
+        for body in bodies {
+            let source = format!("from dataclasses import dataclass\nfrom base import Parent\n\nclass Safe(Parent):\n    pass\n\nclass Outer:\n    class Safe:\n        pass\n\n{body}");
+            let checked = check_source(
+                Path::new("fixture.py"),
+                &source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+            assert!(checked.signatures.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_class_body_name_still_reaches_the_classes_that_body_writes() {
+        // The bases of a class statement are read in the body that holds it,
+        // where the name written above is bound, and nothing there is unseen,
+        // so the fix is offered.
+        let source = "from dataclasses import dataclass\n\nclass Safe:\n    pass\n\nclass Outer:\n    class Safe:\n        pass\n\n    def method(self):\n        @dataclass\n        class Child(Safe):\n            value: int = 1\n        return Child()\n\nOuter().method()\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn qualified_pydantic_private_attributes_are_not_model_fields() {
+        // `pydantic` may be reached under its own name or an alias, and either
+        // spelling is the same `PrivateAttr` call: per-instance state rather
+        // than a field the constructor takes. A model base answers that on its
+        // own, since an underscore name is no field there whatever it holds,
+        // so the class here is a plain dataclass and the call is all there is
+        // to read.
+        for source in [
+            "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pydantic.PrivateAttr(default=1)\n",
+            "import pydantic as pd\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = pd.PrivateAttr(default=1)\n",
+        ] {
+            assert!(messages(source, false).is_empty(), "{source}");
+        }
+        // An ordinary default in the same class is still reported, so the
+        // silence above is the call being read rather than the shape being
+        // passed over.
+        assert_eq!(
+            messages(
+                "import pydantic\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    _value: int = 1\n",
+                false,
+            ),
+            ["dataclass field `_value` has a default"]
+        );
     }
 }

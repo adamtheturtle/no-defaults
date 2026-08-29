@@ -5605,7 +5605,8 @@ fn implicitly_called_method(name: &str) -> bool {
             | "find_spec"
             | "create_module"
             | "exec_module"
-            | "persistent_load"
+            | "persistent_id"
+            | "reducer_override"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -20078,16 +20079,10 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.diagnostics[1].fix.is_some());
     }
+
     #[test]
-    fn unpickler_persistent_load_defaults_are_retained() {
-        // `_pickle` invokes an unpickler's `persistent_load` with the
-        // persistent id alone, so a parameter beside it only ever arrives as
-        // its default. The call is made by the interpreter's own unpickling
-        // loop rather than by any written line, so dropping the default leaves
-        // the next `load` raising `TypeError: U.persistent_load() missing 1
-        // required positional argument` with nothing for the fixer to update.
-        let source =
-            "class U:\n    def persistent_load(self, pid, extra=1):\n        return (pid, extra)\n";
+    fn pickler_persistent_id_defaults_are_retained() {
+        let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return None\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -20103,10 +20098,10 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn an_unpickler_method_beside_persistent_load_stays_fixable() {
-        // Retention is keyed to the hook name, so a sibling sharing the
-        // unpickler and the signature shape keeps its ordinary treatment.
-        let source = "class U:\n    def persistent_load(self, pid, extra=1):\n        return self.helper(pid)\n    def helper(self, pid, value=2):\n        return (pid, value)\n";
+    fn a_pickler_method_beside_persistent_id_stays_fixable() {
+        // Retention is keyed to the hook `pickle` reaches for, so an ordinary
+        // helper sharing the pickler keeps its ordinary treatment.
+        let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -20122,10 +20117,13 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
-    fn a_method_named_near_persistent_load_stays_fixable() {
-        // The unpickling loop looks the hook up under its exact name, so a
-        // near miss is an ordinary method and its default is the fixer's.
-        let source = "class U:\n    def persistent_loads(self, pid, extra=1):\n        return (pid, extra)\n";
+    fn pickler_reducer_override_defaults_are_retained() {
+        // `dump` caches a pickler's `reducer_override` and calls it with the
+        // object being pickled and nothing else, so a parameter beside it is
+        // only ever filled by its default. Removing it leaves `dump` raising
+        // `TypeError` from inside `pickle`, where there is no written call
+        // the fixer could update.
+        let source = "class P:\n    def reducer_override(self, obj, extra=1):\n        return NotImplemented\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -20136,14 +20134,16 @@ def b(x=1): pass  # type: ignore  # noqa
             true,
         );
         assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_some());
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.signatures.is_empty());
     }
 
     #[test]
-    fn a_module_level_persistent_load_stays_fixable() {
-        // Only an unpickler's attribute is consulted for the hook, so a plain
-        // function of that name at module level carries no such obligation.
-        let source = "def persistent_load(pid, extra=1):\n    return (pid, extra)\n";
+    fn a_pickler_method_beside_reducer_override_stays_fixable() {
+        // A sibling carrying the very same signature is still stripped, which
+        // is what pins the retention to the hook name rather than to the
+        // shape of the parameter list.
+        let source = "class P:\n    def reducer_override(self, obj, extra=1):\n        return self.fallback(obj, extra)\n    def fallback(self, obj, extra=1):\n        return NotImplemented\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -20153,7 +20153,8 @@ def b(x=1): pass  # type: ignore  # noqa
             &default_bases(),
             true,
         );
-        assert_eq!(checked.diagnostics.len(), 1);
-        assert!(checked.diagnostics[0].fix.is_some());
+        assert_eq!(checked.diagnostics.len(), 2);
+        assert!(checked.diagnostics[0].fix.is_none());
+        assert!(checked.diagnostics[1].fix.is_some());
     }
 }

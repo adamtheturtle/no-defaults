@@ -5782,17 +5782,15 @@ fn a_loader_helper_beside_exec_module_is_still_fixed() -> Result<(), Box<dyn std
 }
 
 #[test]
-fn an_unpickler_persistent_load_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+fn a_pickler_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // `_pickle`'s unpickling loop calls `persistent_load(pid)` with the
-    // persistent id alone, so `extra` only ever arrives as its default. That
-    // call is made by the interpreter rather than by any line in the file, so
-    // dropping the default leaves the next `load` raising
-    // `TypeError: U.persistent_load() missing 1 required positional argument:
-    // 'extra'` with no written call site to carry the value.
-    let source =
-        "class U:\n    def persistent_load(self, pid, extra=1):\n        return (pid, extra)\n";
+    // `Pickler.dump` reaches for `persistent_id` itself, handing it the object
+    // and nothing else, so `extra` is only ever filled by its default. That
+    // call lives in `pickle` rather than in any file the fixer can see, so
+    // removing the default leaves the next dump raising `TypeError` with no
+    // written call site to carry the argument.
+    let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return None\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -5804,14 +5802,13 @@ fn an_unpickler_persistent_load_survives_a_fix() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn an_unpickler_helper_beside_persistent_load_is_still_fixed(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn a_pickler_helper_beside_persistent_id_is_still_fixed() -> Result<(), Box<dyn std::error::Error>>
+{
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
     // The retention follows the hook name, not the class holding it, so a
-    // sibling with the same signature shape is rewritten as usual, carrying
-    // its own default to the call.
-    let source = "class U:\n    def persistent_load(self, pid, extra=1):\n        return self.helper(pid)\n\n    def helper(self, pid, value=2):\n        return (pid, value)\n";
+    // plain helper on the same pickler is rewritten as usual.
+    let source = "class P:\n    def persistent_id(self, obj, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value=2):\n        return value\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -5819,20 +5816,42 @@ fn an_unpickler_helper_beside_persistent_load_is_still_fixed(
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class U:\n    def persistent_load(self, pid, extra=1):\n        return self.helper(pid, value=2)\n\n    def helper(self, pid, value):\n        return (pid, value)\n",
+        "class P:\n    def persistent_id(self, obj, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value):\n        return value\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
 
 #[test]
-fn a_method_named_near_persistent_load_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
+fn a_pickler_reducer_override_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The unpickler looks the hook up under its exact name, so a near miss is
-    // an ordinary method whose default the fixer removes.
+    // `dump` caches a pickler's `reducer_override` and calls it with the object
+    // being pickled and nothing else, so `extra` is only ever filled by its
+    // default. That call is made inside `pickle`, so removing the default
+    // leaves `dump` raising `TypeError` with no written call site to carry the
+    // argument.
     let source =
-        "class U:\n    def persistent_loads(self, pid, extra=1):\n        return (pid, extra)\n";
+        "class P:\n    def reducer_override(self, obj, extra=1):\n        return NotImplemented\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_pickler_helper_beside_reducer_override_is_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The retention follows the hook name, not the shape of the parameter
+    // list, so a sibling declared with the very same signature is stripped and
+    // its call site given the default that used to reach it.
+    let source = "class P:\n    def reducer_override(self, obj, extra=1):\n        return self.fallback(obj)\n\n    def fallback(self, obj, extra=1):\n        return NotImplemented\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -5840,9 +5859,8 @@ fn a_method_named_near_persistent_load_is_still_fixed() -> Result<(), Box<dyn st
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class U:\n    def persistent_loads(self, pid, extra):\n        return (pid, extra)\n",
+        "class P:\n    def reducer_override(self, obj, extra=1):\n        return self.fallback(obj, extra=1)\n\n    def fallback(self, obj, extra):\n        return NotImplemented\n",
     );
-    // Nothing is left unfixed once the near miss is rewritten.
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(1));
     Ok(())
 }

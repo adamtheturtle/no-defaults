@@ -909,18 +909,17 @@ fn call_site_edits(files: &[PathBuf], signatures: Vec<Signature>) -> Result<Call
                         .methods
                         .entry((importer.clone(), class.name.to_string()))
                         .or_default();
-                    // Every name the body binds is an attribute of the class,
-                    // whether a `def` wrote it or an assignment such as
-                    // `__init__ = setup` did. Recording the assigned ones too
-                    // keeps them shadowing what the bases hold: a subclass
-                    // that binds `__init__` has a constructor of its own, and
-                    // rewriting its calls against an ancestor's `__init__`
-                    // would pass parameters the binding does not take.
-                    let mut bound = BoundNames::default();
-                    for statement in &class.body {
-                        bound.visit_stmt(statement);
-                    }
-                    for name in bound.names {
+                    // Every name the body still holds at the end of it is an
+                    // attribute of the class, whether a `def` wrote it or an
+                    // assignment such as `__init__ = setup` did. Recording the
+                    // assigned ones too keeps them shadowing what the bases
+                    // hold: a subclass that binds `__init__` has a constructor
+                    // of its own, and rewriting its calls against an
+                    // ancestor's `__init__` would pass parameters the binding
+                    // does not take. A name the body never leaves behind is a
+                    // shadow that does not exist, and recording it would stop
+                    // the lookup that should have walked on to a base.
+                    for name in BoundNames::of_class_attributes(&class.body) {
                         methods.entry(name).or_insert(None);
                     }
                     let bases = class
@@ -7183,6 +7182,20 @@ fn deleted_names(body: &[Stmt]) -> BTreeSet<String> {
     collector.0
 }
 
+/// Whether an `if` test is the `TYPE_CHECKING` guard.
+///
+/// The name is read from the source rather than resolved back to `typing`,
+/// because this is asked of a class body long after the imports that reached
+/// it have been forgotten. A file that binds `TYPE_CHECKING` to something of
+/// its own is taken at its word.
+fn tests_type_checking(test: &Expr) -> bool {
+    match test {
+        Expr::Name(name) => name.id.as_str() == "TYPE_CHECKING",
+        Expr::Attribute(attribute) => attribute.attr.as_str() == "TYPE_CHECKING",
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 struct BoundNames {
     names: BTreeSet<String>,
@@ -7196,6 +7209,13 @@ struct BoundNames {
     nonlocals: BTreeSet<String>,
     functions: BTreeSet<String>,
     classes: BTreeSet<String>,
+    /// Whether to collect only the names still bound once the body has run.
+    /// An `except ... as` target is deleted when its handler ends, and a
+    /// `TYPE_CHECKING` block is read by type checkers and never run at all,
+    /// so neither leaves anything behind. A caller asking what a scope holds
+    /// wants them anyway, because they are the scope's own while the body is
+    /// running; a caller asking what a class ends up carrying does not.
+    surviving_only: bool,
 }
 
 impl BoundNames {
@@ -7296,6 +7316,42 @@ impl BoundNames {
         collector.finish().names
     }
 
+    /// The names a class body leaves on the class once it has run.
+    ///
+    /// A class body is executed and whatever is still bound at the end of it
+    /// becomes an attribute, so a name that does not survive the body cannot
+    /// shadow what the bases hold. `finish` is deliberately not called: as at
+    /// module level, a bare annotation puts nothing behind the name. A
+    /// `global` or `nonlocal` declaration is honoured for the opposite
+    /// reason: an assignment under one reaches past the class body entirely.
+    fn of_class_attributes(body: &[Stmt]) -> BTreeSet<String> {
+        let mut collector = Self {
+            surviving_only: true,
+            ..Self::default()
+        };
+        for statement in body {
+            collector.visit_stmt(statement);
+            // A `del` written straight in the body takes the name back off
+            // the class, and one written after a rebinding of it does not,
+            // so the statements are read in order. A `del` nested in a branch
+            // or a loop may never run, and is left to stand as written.
+            if let Stmt::Delete(delete) = statement {
+                let mut deleted = Self::default();
+                for target in &delete.targets {
+                    deleted.bind(target);
+                }
+                collector.names.retain(|name| !deleted.names.contains(name));
+            }
+        }
+        let declared: BTreeSet<String> = collector
+            .globals
+            .union(&collector.nonlocals)
+            .cloned()
+            .collect();
+        collector.names.retain(|name| !declared.contains(name));
+        collector.names
+    }
+
     fn of_lambda(lambda: &ast::ExprLambda) -> Self {
         let mut collector = Self::default();
         if let Some(parameters) = &lambda.parameters {
@@ -7362,13 +7418,33 @@ impl<'a> Visitor<'a> for BoundNames {
                     self.names.insert(bound);
                 }
             }
-            Stmt::Try(block) => {
+            Stmt::Try(block) if !self.surviving_only => {
                 for handler in &block.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
                     if let Some(name) = &handler.name {
                         self.names.insert(name.to_string());
                     }
                 }
+            }
+            // A `TYPE_CHECKING` block is read by type checkers and never run,
+            // so the names in it are bound at no point. The guard is
+            // recognised by the name it is written under, which is how it is
+            // always spelled; anything else is walked like an ordinary branch.
+            Stmt::If(branch) if self.surviving_only => {
+                self.visit_expr(&branch.test);
+                if !tests_type_checking(&branch.test) {
+                    self.visit_body(&branch.body);
+                }
+                for clause in &branch.elif_else_clauses {
+                    if let Some(test) = &clause.test {
+                        self.visit_expr(test);
+                    }
+                    if clause.test.as_ref().is_some_and(tests_type_checking) {
+                        continue;
+                    }
+                    self.visit_body(&clause.body);
+                }
+                return;
             }
             Stmt::Global(global) => {
                 self.globals
@@ -16072,6 +16148,46 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(assigned)?,
             "class Other:\n    def target(self): return 9\n\nclass Base:\n    def target(self, value): return value\n\nsuper = Other\n\nclass Child(Base):\n    def run(self): return super().target()\n\nassert Child().run() == 9\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_shadows_only_with_what_it_leaves_behind() -> Result<(), String> {
+        // A `TYPE_CHECKING` block does not run, so `Child` has no `method` of
+        // its own and the call still reaches the base's. Treating the block as
+        // a shadow left the call as written while the default it needs was
+        // removed from under it.
+        let guarded = "from typing import TYPE_CHECKING\n\nclass Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    if TYPE_CHECKING:\n        def method(self): ...\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed(guarded)?,
+            "from typing import TYPE_CHECKING\n\nclass Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    if TYPE_CHECKING:\n        def method(self): ...\n\nassert Child().method(value=1) == 1\n"
+        );
+        // An `except ... as` target is deleted when its handler ends, so it
+        // is never on the class either.
+        let caught = "class Base:\n    def method(self, value=1): return value\n\nclass Child(Base):\n    try:\n        pass\n    except Exception as method:\n        pass\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed(caught)?,
+            "class Base:\n    def method(self, value): return value\n\nclass Child(Base):\n    try:\n        pass\n    except Exception as method:\n        pass\n\nassert Child().method(value=1) == 1\n"
+        );
+        // An assignment under `global` is made outside the class, and a `del`
+        // takes back what the body put there.
+        let elsewhere = "class Base:\n    def method(self, value=1): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    global method\n    method = other\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed(elsewhere)?,
+            "class Base:\n    def method(self, value): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    global method\n    method = other\n\nassert Child().method(value=1) == 1\n"
+        );
+        let deleted = "class Base:\n    def method(self, value=1): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n    del method\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed(deleted)?,
+            "class Base:\n    def method(self, value): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n    del method\n\nassert Child().method(value=1) == 1\n"
+        );
+        // A binding the body does leave behind still shadows, so the call is
+        // left alone.
+        let bound = "class Base:\n    def method(self, value=1): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n\nassert Child().method() == 9\n";
+        assert_eq!(
+            fixed(bound)?,
+            "class Base:\n    def method(self, value): return value\n\ndef other(self): return 9\n\nclass Child(Base):\n    method = other\n\nassert Child().method() == 9\n"
         );
         Ok(())
     }

@@ -1618,13 +1618,17 @@ fn collect_local_class_offsets(
     }
 }
 
-/// Whether a class written in this file above `defined_at` holds the spelling
-/// a base expression's prefix uses, so the prefix is that class rather than
-/// whatever a module of the same dotted name would be.
+/// Whether a class written in this file above `defined_at`, or a name this
+/// scope has already bound to a class, holds the spelling a base expression's
+/// prefix uses, so the prefix is that class rather than whatever a module of
+/// the same dotted name would be. An assignment carries a class over to a name
+/// just as a class statement does, and the aliases collected so far are only
+/// those bound above, so no offset is needed to keep the order.
 fn prefix_names_a_local_class(
     prefix: &Expr,
     local_classes: &BTreeMap<String, (String, TextSize)>,
     defined_at: TextSize,
+    aliases: &BTreeMap<String, (PathBuf, String)>,
 ) -> bool {
     let mut expression = prefix;
     loop {
@@ -1632,6 +1636,7 @@ fn prefix_names_a_local_class(
             local_classes
                 .get(&spelling)
                 .is_some_and(|(_, offset)| *offset < defined_at)
+                || aliases.contains_key(&spelling)
         }) {
             return true;
         }
@@ -1686,10 +1691,11 @@ fn method_base_identity(
             // prefix would otherwise be given, since the initializer's own
             // namesake answers before the module lookup below is reached.
             //
-            // A class written here still holds the spelling first: the checks
-            // that follow settle that, so the shortcut only fires where no
-            // local class of that name is written above.
-            if !prefix_names_a_local_class(&attribute.value, local_classes, defined_at) {
+            // A class this scope has already put behind the spelling still
+            // holds it first, whether it was written out as a class statement
+            // or assigned to the name: the checks that follow settle that, so
+            // the shortcut only fires where nothing above claimed the name.
+            if !prefix_names_a_local_class(&attribute.value, local_classes, defined_at, aliases) {
                 if let Some(module) = dotted_name(&attribute.value) {
                     if let Some(Binding::Module(file)) = bindings.get(&module) {
                         return Some((file.clone(), attribute.attr.to_string()));
@@ -3478,6 +3484,7 @@ fn check_source(
         entered_class_metaclass_classes: Vec::new(),
         metaclass_definitions: BTreeSet::new(),
         local_enum_classes: BTreeSet::new(),
+        entered_class_enum_classes: Vec::new(),
         metaclass_intercepted_classes,
         repeated_functions,
         property_aliased_methods,
@@ -3786,6 +3793,11 @@ struct Checker<'a> {
     /// or another of these. Being an enumeration is inherited, so a subclass
     /// of one creates its members the same implicit way.
     local_enum_classes: BTreeSet<String>,
+    /// What `local_enum_classes` held as each enclosing class body was
+    /// entered, for the same reason `entered_class_metaclass_classes` keeps
+    /// its own: a class body binds names only for itself, so a function or a
+    /// class written in one reads the names the class statement began with.
+    entered_class_enum_classes: Vec<BTreeSet<String>>,
     /// Same-file classes whose metaclass can replace class attributes.
     metaclass_intercepted_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
@@ -4563,6 +4575,9 @@ impl Checker<'_> {
         if self.lexical_is_class.last() == Some(&true) {
             if let Some(entered) = self.entered_class_metaclass_classes.last() {
                 self.metaclass_classes.clone_from(entered);
+            }
+            if let Some(entered) = self.entered_class_enum_classes.last() {
+                self.local_enum_classes.clone_from(entered);
             }
         }
         let mut parameters = BoundNames::default();
@@ -5604,13 +5619,24 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 } else {
                     outer_metaclass_classes.clone()
                 };
+                let body_enum_classes = if self.lexical_is_class.last() == Some(&true) {
+                    self.entered_class_enum_classes
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| outer_enum_classes.clone())
+                } else {
+                    outer_enum_classes.clone()
+                };
                 self.lexical_scope.push(class.name.to_string());
                 self.lexical_is_class.push(true);
                 self.lexical_bindings.push(BTreeSet::new());
                 self.metaclass_classes.clone_from(&body_metaclass_classes);
                 self.entered_class_metaclass_classes
                     .push(body_metaclass_classes);
+                self.local_enum_classes.clone_from(&body_enum_classes);
+                self.entered_class_enum_classes.push(body_enum_classes);
                 walk_stmt(self, statement);
+                self.entered_class_enum_classes.pop();
                 self.entered_class_metaclass_classes.pop();
                 self.lexical_bindings.pop();
                 self.lexical_is_class.pop();
@@ -19018,6 +19044,34 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn an_aliased_class_holds_a_dotted_base_over_a_submodule() -> Result<(), String> {
+        // An assignment above the subclass puts a class behind the package's
+        // name, so the dotted base reaches that class's nested one rather than
+        // the submodule the import bound. Taking the submodule regardless
+        // writes the wrong module's default into the inherited call.
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let package = directory.path().join("package");
+        std::fs::create_dir(&package).map_err(|error| error.to_string())?;
+        let initializer = package.join("__init__.py");
+        let module = package.join("module.py");
+        let case = directory.path().join("case.py");
+        std::fs::write(&initializer, "").map_err(|error| error.to_string())?;
+        std::fs::write(
+            &module,
+            "class Base:\n    def target(self, value=2): return value\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &case,
+            "import package.module\n\nclass Local:\n    class module:\n        class Base:\n            def target(self, value=7): return value\n\npackage = Local\n\nclass Child(package.module.Base):\n    def run(self): return self.target()\n\nassert Child().run() == 7\n",
+        )
+        .map_err(|error| error.to_string())?;
+        fix_all(&[initializer, module, case.clone()])?;
+        let updated = std::fs::read_to_string(case).map_err(|error| error.to_string())?;
+        assert!(updated.contains("self.target(value=7)"), "{updated}");
+        Ok(())
+    }
+    #[test]
     fn inherited_enum_member_initializer_defaults_are_retained() {
         // Being an enumeration is inherited, so a subclass of one written in
         // this file creates its own members the same implicit way, and reaches
@@ -19081,5 +19135,67 @@ def b(x=1): pass  # type: ignore  # noqa
         );
         assert_eq!(checked.diagnostics.len(), 1);
         assert!(checked.diagnostics[0].fix.is_some());
+    }
+    #[test]
+    fn an_enum_hidden_by_a_nested_namesake_still_reaches_deeper_bodies() {
+        // A class body binds names for itself alone. A function written in one
+        // reads past it, so `Base` there is the module-level enumeration and
+        // not the plain class the body wrote, and a class written in a further
+        // class body reads past it the same way.
+        for source in [
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Outer:\n    class Base:\n        pass\n\n    def build():\n        class Child(Base):\n            A = 1\n            def __init__(self, value, label='x'): self.label = label\n",
+            "from enum import Enum\n\nclass Base(Enum):\n    pass\n\nclass Outer:\n    class Base:\n        pass\n\n    class Holder:\n        class Child(Base):\n            A = 1\n            def __init__(self, value, label='x'): self.label = label\n",
+        ] {
+            let checked = check_source(
+                Path::new("fixture.py"),
+                source,
+                false,
+                Path::new(""),
+                &Reexports::default(),
+                &default_bases(),
+                true,
+            );
+            assert_eq!(checked.diagnostics.len(), 1, "{source}");
+            assert!(checked.diagnostics[0].fix.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn an_enum_in_a_class_body_does_not_reach_the_bodies_written_in_it() {
+        // The same rule the other way round: the enumeration this class body
+        // writes is no name at all to a function written below it there, which
+        // reaches the module-level plain class instead, so nothing creates
+        // members and the default is as removable as any other.
+        let source = "from enum import Enum\n\nclass Base:\n    pass\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    def build():\n        class Child(Base):\n            def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_some());
+    }
+
+    #[test]
+    fn an_enum_in_a_class_body_still_reaches_the_classes_beside_it() {
+        // Only the bodies written in it are out of reach. A class statement
+        // later in the same body reads the name the way anything else there
+        // does, so this subclass is an enumeration.
+        let source = "from enum import Enum\n\nclass Outer:\n    class Base(Enum):\n        pass\n\n    class Child(Base):\n        A = 1\n        def __init__(self, value, label='x'): self.label = label\n";
+        let checked = check_source(
+            Path::new("fixture.py"),
+            source,
+            false,
+            Path::new(""),
+            &Reexports::default(),
+            &default_bases(),
+            true,
+        );
+        assert_eq!(checked.diagnostics.len(), 1);
+        assert!(checked.diagnostics[0].fix.is_none());
     }
 }

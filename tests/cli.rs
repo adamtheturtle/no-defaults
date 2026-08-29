@@ -6330,3 +6330,25 @@ fn a_method_named_near_sqlite_conform_is_still_fixed() -> Result<(), Box<dyn std
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_parameter_shadowing_pydantic_field_keeps_the_default() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Inside `outer` the name `Field` is the parameter, so the annotation
+    // calls whatever the caller passed. A helper returning its `default`
+    // argument makes `x` an ordinary `1`, where `pydantic.Field` would have
+    // carried the description instead. The file alone cannot say which
+    // arrives, so the default stays where it is.
+    let source = "from pydantic import BaseModel, Field\n\ndef helper(*, default, description): return default\ndef outer(Field):\n    class C(BaseModel):\n        x: int = Field(default=1, description='x')\n    return C\n\nassert outer(helper)().x == 1\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The field is still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

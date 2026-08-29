@@ -16837,4 +16837,40 @@ def b(x=1): pass  # type: ignore  # noqa
         assert!(checked.diagnostics[0].fix.is_none());
         assert!(checked.diagnostics[1].fix.is_some());
     }
+
+    #[test]
+    fn a_nested_class_body_calls_through_the_enclosing_receiver() -> Result<(), String> {
+        // A class suite is not a closure scope for the names it binds, but a
+        // name it only reads still comes from the function around it, so
+        // `self` and `cls` written straight in a nested class body are the
+        // enclosing method's receiver rather than anything the nested class
+        // holds. Indexing nested classes puts a same-named method of the
+        // nested class within reach, and taking that one would supply the
+        // wrong default.
+        let instance = "class Outer:\n    def target(self, value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, value=2):\n                return value\n\n            probe = self.target()\n\n        return Inner.probe\n\nassert Outer().run() == 1\n";
+        assert_eq!(
+            fixed(instance)?,
+            "class Outer:\n    def target(self, value):\n        return value\n\n    def run(self):\n        class Inner:\n            def target(self, value):\n                return value\n\n            probe = self.target(value=1)\n\n        return Inner.probe\n\nassert Outer().run() == 1\n"
+        );
+        // The class a receiver stands for reaches the nested body the same way
+        // however the call spells it out.
+        for receiver in ["type(self)", "self.__class__"] {
+            let source = format!(
+                "class Outer:\n    @staticmethod\n    def target(value=1):\n        return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value=2):\n                return value\n\n            probe = {receiver}.target()\n\n        return Inner.probe\n\nassert Outer().run() == 1\n"
+            );
+            assert_eq!(
+                fixed(&source)?,
+                format!(
+                    "class Outer:\n    @staticmethod\n    def target(value):\n        return value\n\n    def run(self):\n        class Inner:\n            @staticmethod\n            def target(value):\n                return value\n\n            probe = {receiver}.target(value=1)\n\n        return Inner.probe\n\nassert Outer().run() == 1\n"
+                ),
+                "{receiver}"
+            );
+        }
+        let class_method = "class Outer:\n    @staticmethod\n    def target(value=1):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            @staticmethod\n            def target(value=2):\n                return value\n\n            probe = cls.target()\n\n        return Inner.probe\n\nassert Outer.run() == 1\n";
+        assert_eq!(
+            fixed(class_method)?,
+            "class Outer:\n    @staticmethod\n    def target(value):\n        return value\n\n    @classmethod\n    def run(cls):\n        class Inner:\n            @staticmethod\n            def target(value):\n                return value\n\n            probe = cls.target(value=1)\n\n        return Inner.probe\n\nassert Outer.run() == 1\n"
+        );
+        Ok(())
+    }
 }

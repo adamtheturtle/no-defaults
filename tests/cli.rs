@@ -8152,3 +8152,52 @@ fn either_metaclass_two_suites_name_stands_construction_down(
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn dependency_callbacks_are_analyzed_through_reexports_without_editing_dependencies(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let dependencies = directory.path().join("dependencies");
+    let package = dependencies.join("dependency");
+    std::fs::create_dir_all(&package)?;
+    let initializer = package.join("__init__.py");
+    std::fs::write(
+        &initializer,
+        "from .engine import Engine\nfrom .hooks import HookBase\n",
+    )?;
+    let hooks = package.join("hooks.py");
+    let dependency_source = "class HookBase:\n    def callback(self, supplied, omitted=2):\n        return supplied + omitted\n";
+    std::fs::write(&hooks, dependency_source)?;
+    let engine = package.join("engine.py");
+    let engine_source = "from .hooks import HookBase\n\n\nclass Engine:\n    hook: HookBase\n\n    def run(self):\n        return self.hook.callback(10)\n";
+    std::fs::write(&engine, engine_source)?;
+
+    let application = directory.path().join("application.py");
+    std::fs::write(
+        &application,
+        "from dependency import Engine, HookBase\n\n\nclass Hook(HookBase):\n    def callback(self, supplied=1, omitted=2):\n        return supplied + omitted\n\n\nclass Unrelated:\n    def callback(self, value=3):\n        return value\n\n\nengine = Engine()\nengine.hook = Hook()\nassert engine.run() == 12\nassert Unrelated().callback() == 3\n",
+    )?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(&application)
+        .env("PYTHONPATH", &dependencies)
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(&initializer)?,
+        "from .engine import Engine\nfrom .hooks import HookBase\n"
+    );
+    assert_eq!(std::fs::read_to_string(&hooks)?, dependency_source);
+    assert_eq!(std::fs::read_to_string(&engine)?, engine_source);
+    assert_eq!(
+        std::fs::read_to_string(&application)?,
+        "from dependency import Engine, HookBase\n\n\nclass Hook(HookBase):\n    def callback(self, supplied, omitted=2):\n        return supplied + omitted\n\n\nclass Unrelated:\n    def callback(self, value):\n        return value\n\n\nengine = Engine()\nengine.hook = Hook()\nassert engine.run() == 12\nassert Unrelated().callback(value=3) == 3\n"
+    );
+    let status = Command::new("python3")
+        .arg(&application)
+        .env("PYTHONPATH", &dependencies)
+        .status()?;
+    assert!(status.success());
+    Ok(())
+}

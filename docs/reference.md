@@ -97,7 +97,7 @@ handlers = [lambda event, index=index: use(event, index) for index in range(3)] 
 
 ### What it cannot reach
 
-Two things `--fix` still cannot reach: **callers outside the files you checked** — for a function that is part of your public API, they are in other people's code — and **calls made dynamically**, through `getattr` or a variable holding the function. A warning after fixing says so, and **your test suite is what confirms the result**.
+Two things `--fix` still cannot reach in general: **callers outside the files you checked** — for a function that is part of your public API, they are in other people's code — and **calls made dynamically**, through `getattr` or a variable holding the function. There is one focused exception: imported Python packages are read from `PYTHONPATH` and the active virtual environment so statically visible calls made by a base class to an overridden method can retain the defaults those calls omit. Package files are parsed without importing the package and are never diagnosed, counted, or edited. Re-exports and inherited intermediate bases are followed; unresolved and dynamically dispatched calls stay conservative. A warning after fixing covers callers it still cannot see, and **your test suite is what confirms the result**.
 
 `--fix` is therefore safest under `private_only = true` with `respect_reexports = true`, where the symbols it touches have no callers outside the project, and it sees the most when you run it over the whole project at once. Under pre-commit, which passes only the changed files, a call in a file that did not change is not in the run and is not updated — run `no-defaults --fix .` by hand when you are removing a default that is called from elsewhere.
 

@@ -2,7 +2,7 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
@@ -19,6 +19,25 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use unicode_width::UnicodeWidthChar as _;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CallbackCall {
+    positional: usize,
+    keywords: BTreeSet<String>,
+    unpacked: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CallbackRequirements {
+    /// Runtime-owned protocols have no Python call expression to inspect.
+    unknown_calls: bool,
+    calls: Vec<CallbackCall>,
+}
+
+type CallbackMethods = BTreeMap<String, CallbackRequirements>;
+
+#[derive(Clone, Debug, Default)]
+struct ExternalCallbacks(BTreeMap<(String, String), CallbackMethods>);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Forbid defaults in Python functions and dataclasses")]
@@ -865,6 +884,7 @@ fn run() -> Result<bool, String> {
         return Ok(false);
     }
     let fixing = cli.fix || cli.diff;
+    let external_callbacks = discover_external_callbacks(&files);
     let results: Vec<Checked> = files
         .par_iter()
         .zip(settings.par_iter())
@@ -876,13 +896,14 @@ fn run() -> Result<bool, String> {
             setting
                 .private_only
                 .map_or_else(Checked::default, |private_only| {
-                    check_file(
+                    check_file_with_callbacks(
                         path,
                         private_only,
                         &setting.project_root,
                         &setting.reexports,
                         &setting.field_bases,
                         fixing,
+                        &external_callbacks,
                     )
                 })
         })
@@ -3873,6 +3894,7 @@ pub fn lint_source(source: &str, private_only: bool) -> Result<usize, String> {
     .len())
 }
 
+#[cfg(test)]
 fn check_file(
     path: &Path,
     private_only: bool,
@@ -3881,18 +3903,41 @@ fn check_file(
     field_bases: &FieldBases,
     signatures: bool,
 ) -> Checked {
+    check_file_with_callbacks(
+        path,
+        private_only,
+        project_root,
+        reexports,
+        field_bases,
+        signatures,
+        &ExternalCallbacks::default(),
+    )
+}
+
+fn check_file_with_callbacks(
+    path: &Path,
+    private_only: bool,
+    project_root: &Path,
+    reexports: &Reexports,
+    field_bases: &FieldBases,
+    signatures: bool,
+    external_callbacks: &ExternalCallbacks,
+) -> Checked {
     let source = match read_source(path) {
         Ok(source) => source,
         Err(error) => return source_error(path, error),
     };
-    check_source(
+    check_source_with_callbacks(
         path,
         &source,
         private_only,
         project_root,
         reexports,
         field_bases,
-        signatures,
+        CheckMode {
+            signatures,
+            external_callbacks,
+        },
     )
 }
 
@@ -4181,6 +4226,35 @@ fn check_source(
     field_bases: &FieldBases,
     signatures: bool,
 ) -> Checked {
+    check_source_with_callbacks(
+        path,
+        source,
+        private_only,
+        project_root,
+        reexports,
+        field_bases,
+        CheckMode {
+            signatures,
+            external_callbacks: &ExternalCallbacks::default(),
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CheckMode<'a> {
+    signatures: bool,
+    external_callbacks: &'a ExternalCallbacks,
+}
+
+fn check_source_with_callbacks(
+    path: &Path,
+    source: &str,
+    private_only: bool,
+    project_root: &Path,
+    reexports: &Reexports,
+    field_bases: &FieldBases,
+    mode: CheckMode<'_>,
+) -> Checked {
     // A file the parser rejects is reported like any other finding and the run
     // carries on. A tree often holds something unparseable — a Python 2 file
     // kept for reference, a template saved as `.py`, a file being edited — and
@@ -4219,6 +4293,7 @@ fn check_source(
         private_only,
         reexports,
         field_bases,
+        external_callbacks: mode.external_callbacks,
         aliases,
         module_bindings,
         local_classes: BTreeSet::new(),
@@ -4227,7 +4302,7 @@ fn check_source(
         metaclass_definitions: BTreeSet::new(),
         local_implicit_callback_classes: BTreeMap::new(),
         entered_class_implicit_callback_classes: Vec::new(),
-        class_implicit_callbacks: BTreeSet::new(),
+        class_implicit_callbacks: BTreeMap::new(),
         metaclass_intercepted_classes,
         repeated_functions,
         property_aliased_methods,
@@ -4246,7 +4321,7 @@ fn check_source(
             ..Scope::default()
         },
         header: None,
-        collect_signatures: signatures,
+        collect_signatures: mode.signatures,
         lines: LineIndex::new(source),
         classes: Vec::new(),
         class_constructs: Vec::new(),
@@ -4513,6 +4588,8 @@ struct Checker<'a> {
     reexports: &'a Reexports,
     /// The base classes whose subclasses carry fields, alongside `@dataclass`.
     field_bases: &'a FieldBases,
+    /// Callback protocols learned from imported Python dependency source.
+    external_callbacks: &'a ExternalCallbacks,
     /// What the file's renaming imports bound to `dataclasses` and `pydantic`
     /// members, so an aliased `@dataclass` is still recognised.
     aliases: Aliases,
@@ -4537,16 +4614,16 @@ struct Checker<'a> {
     /// The classes this file defines that derive from a base
     /// [`IMPLICIT_CALLBACK_BASES`] names, with the callbacks reached on them.
     /// Deriving is inherited, so a subclass of one is called the same way.
-    local_implicit_callback_classes: BTreeMap<String, BTreeSet<&'static str>>,
+    local_implicit_callback_classes: BTreeMap<String, CallbackMethods>,
     /// What `local_implicit_callback_classes` held as each enclosing class body
     /// was entered, for the same reason `entered_class_metaclass_classes` keeps
     /// its own: a class body binds names only for itself, so a function or a
     /// class written in one reads the names the class statement began with.
-    entered_class_implicit_callback_classes: Vec<BTreeMap<String, BTreeSet<&'static str>>>,
+    entered_class_implicit_callback_classes: Vec<BTreeMap<String, CallbackMethods>>,
     /// The callbacks the standard library reaches on the class body being
     /// visited, empty outside one and for a class that derives from nothing
     /// which calls back.
-    class_implicit_callbacks: BTreeSet<&'static str>,
+    class_implicit_callbacks: CallbackMethods,
     /// Same-file classes whose metaclass can replace class attributes.
     metaclass_intercepted_classes: BTreeSet<String>,
     /// Module-level functions defined more than once cannot share one safe
@@ -5264,18 +5341,34 @@ impl Checker<'_> {
     /// written here that already derives from such a class contributes its
     /// callbacks too, because that reach is inherited like any other class
     /// behaviour, and several bases contribute together.
-    fn implicit_callbacks(&self, class: &ast::StmtClassDef) -> BTreeSet<&'static str> {
-        let mut callbacks = BTreeSet::new();
+    fn implicit_callbacks(&self, class: &ast::StmtClassDef) -> CallbackMethods {
+        let mut callbacks = CallbackMethods::new();
         for base in class_bases(class) {
             match base {
                 Expr::Name(name) => {
                     if let Some(found) = self.aliases.implicit_callback_bases.get(name.id.as_str())
                     {
-                        callbacks.extend(found.iter().copied());
+                        for &callback in *found {
+                            callbacks.insert(
+                                callback.to_owned(),
+                                CallbackRequirements {
+                                    unknown_calls: true,
+                                    calls: Vec::new(),
+                                },
+                            );
+                        }
+                    }
+                    if let Some((module, base)) =
+                        self.aliases.imported_symbols.get(name.id.as_str())
+                    {
+                        merge_callback_methods(
+                            &mut callbacks,
+                            &callback_methods_for(self.external_callbacks, module, base),
+                        );
                     }
                     if let Some(found) = self.local_implicit_callback_classes.get(name.id.as_str())
                     {
-                        callbacks.extend(found.iter().copied());
+                        merge_callback_methods(&mut callbacks, found);
                     }
                 }
                 Expr::Attribute(_) => {
@@ -5285,7 +5378,12 @@ impl Checker<'_> {
                     let Some((root, rest)) = segments.split_first() else {
                         continue;
                     };
-                    let Some(module) = self.aliases.implicit_callback_modules.get(*root) else {
+                    let Some(module) = self
+                        .aliases
+                        .imported_modules
+                        .get(*root)
+                        .or_else(|| self.aliases.implicit_callback_modules.get(*root))
+                    else {
                         continue;
                     };
                     let mut dotted = module.clone();
@@ -5293,9 +5391,10 @@ impl Checker<'_> {
                         dotted.push('.');
                         dotted.push_str(segment);
                     }
-                    if let Some(found) = implicit_callbacks_for(&dotted, name) {
-                        callbacks.extend(found.iter().copied());
-                    }
+                    merge_callback_methods(
+                        &mut callbacks,
+                        &callback_methods_for(self.external_callbacks, &dotted, name),
+                    );
                 }
                 _ => {}
             }
@@ -5780,10 +5879,6 @@ impl Checker<'_> {
                 .any(|decorator| !known_descriptor(&decorator.expression))
             || self.is_stub()
             || (in_class && implicitly_called_method(function.name.as_str()))
-            || (in_class
-                && self
-                    .class_implicit_callbacks
-                    .contains(function.name.as_str()))
             || self.method_is_intercepted(function.name.as_str())
             || self.method_is_opaquely_rebound(function.name.as_str())
             || self.method_is_rebound_later(function)
@@ -5811,6 +5906,13 @@ impl Checker<'_> {
         // Nothing in this answer reads a parameter, so the whole signature is
         // judged once.
         let called_implicitly = self.defaults_are_decided_elsewhere(function);
+        let positional_names: Vec<&str> = function
+            .parameters
+            .posonlyargs
+            .iter()
+            .chain(&function.parameters.args)
+            .map(|parameter| parameter.parameter.name.as_str())
+            .collect();
         // A parameter without a default cannot follow one with a default, so
         // once a default has to stay, every positional default after it stays
         // too. Keyword-only parameters sit after the `*`, where order does not
@@ -5834,7 +5936,14 @@ impl Checker<'_> {
                 continue;
             };
             let range = self.default_fix_range(parameter.parameter.end(), default);
-            let fix = if called_implicitly || (positional && kept) {
+            let callback_needs_default = self.callback_needs_default(
+                function.name.as_str(),
+                parameter.parameter.name.as_str(),
+                positional_names
+                    .iter()
+                    .position(|name| *name == parameter.parameter.name.as_str()),
+            );
+            let fix = if called_implicitly || callback_needs_default || (positional && kept) {
                 None
             } else {
                 self.fixable(default, range)
@@ -5865,6 +5974,29 @@ impl Checker<'_> {
         self.record_signature(function, removed);
     }
 
+    fn callback_needs_default(
+        &self,
+        method: &str,
+        parameter: &str,
+        positional_index: Option<usize>,
+    ) -> bool {
+        let Some(requirements) = self.class_implicit_callbacks.get(method) else {
+            return false;
+        };
+        if requirements.unknown_calls {
+            return true;
+        }
+        requirements.calls.iter().any(|call| {
+            if call.unpacked {
+                return true;
+            }
+            let supplied_positionally = positional_index
+                .and_then(|index| index.checked_sub(1))
+                .is_some_and(|index| index < call.positional);
+            !supplied_positionally && !call.keywords.contains(parameter)
+        })
+    }
+
     fn method_is_intercepted(&self, name: &str) -> bool {
         self.scope.class != ClassScope::None
             && (self.attribute_interceptors.last() == Some(&true)
@@ -5882,7 +6014,9 @@ impl Checker<'_> {
                         implicitly_called_method(&alias.name)
                             || matches!(alias.name.as_str(), "__init__" | "__new__")
                             || self.generated_code_calls(&alias.name)
-                            || self.class_implicit_callbacks.contains(alias.name.as_str())
+                            || self
+                                .class_implicit_callbacks
+                                .contains_key(alias.name.as_str())
                     })
                 })
             })
@@ -6599,6 +6733,471 @@ const UNITTEST_RESULT_CALLBACKS: &[&str] = &[
     "stopTestRun",
 ];
 
+#[derive(Clone, Debug)]
+enum ExternalBinding {
+    Module(String),
+    Symbol(String, String),
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExternalClass {
+    bases: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExternalModule {
+    bindings: BTreeMap<String, ExternalBinding>,
+    classes: BTreeMap<String, ExternalClass>,
+}
+
+fn python_dependency_roots() -> Vec<PathBuf> {
+    let mut roots: BTreeSet<PathBuf> = std::env::var_os("PYTHONPATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    let configured_interpreter = std::env::var_os("VIRTUAL_ENV").map(|environment| {
+        let environment = PathBuf::from(environment);
+        if cfg!(windows) {
+            environment.join("Scripts").join("python.exe")
+        } else {
+            environment.join("bin").join("python")
+        }
+    });
+    let interpreters: Vec<PathBuf> = configured_interpreter.map_or_else(
+        || vec![PathBuf::from("python3"), PathBuf::from("python")],
+        |interpreter| vec![interpreter],
+    );
+    for interpreter in interpreters {
+        let Ok(output) = Command::new(interpreter)
+            .args([
+                "-c",
+                "import json,sys; print(json.dumps([p for p in sys.path if p]))",
+            ])
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            if let Ok(paths) = serde_json::from_slice::<Vec<PathBuf>>(&output.stdout) {
+                roots.extend(paths.into_iter().filter(|path| {
+                    path.components().any(|part| {
+                        matches!(
+                            part.as_os_str().to_str(),
+                            Some("site-packages" | "dist-packages")
+                        )
+                    })
+                }));
+                break;
+            }
+        }
+    }
+    roots
+        .into_iter()
+        .filter_map(|path| path.is_dir().then(|| path.canonicalize().unwrap_or(path)))
+        .collect()
+}
+
+fn dependency_module_path(module: &str, roots: &[PathBuf]) -> Option<(PathBuf, bool)> {
+    let parts: Vec<&str> = module.split('.').filter(|part| !part.is_empty()).collect();
+    for root in roots {
+        let base = parts
+            .iter()
+            .fold(root.clone(), |path, part| path.join(part));
+        let initializer = base.join("__init__.py");
+        if initializer.is_file() {
+            return Some((initializer, true));
+        }
+        let source = base.with_extension("py");
+        if source.is_file() {
+            return Some((source, false));
+        }
+    }
+    None
+}
+
+fn dependency_package_modules(imported: &str, roots: &[PathBuf]) -> BTreeSet<String> {
+    fn visit(directory: &Path, module: &str, found: &mut BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let initializer = path.join("__init__.py");
+                if initializer.is_file() {
+                    let child = format!("{module}.{}", entry.file_name().to_string_lossy());
+                    found.insert(child.clone());
+                    visit(&path, &child, found);
+                }
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("py")
+                && path.file_stem().and_then(|stem| stem.to_str()) != Some("__init__")
+            {
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    found.insert(format!("{module}.{stem}"));
+                }
+            }
+        }
+    }
+
+    let package = imported.split('.').next().unwrap_or(imported);
+    let mut found = BTreeSet::from([package.to_owned()]);
+    for root in roots {
+        let directory = root.join(package);
+        if directory.join("__init__.py").is_file() {
+            visit(&directory, package, &mut found);
+            break;
+        }
+    }
+    found
+}
+
+fn absolute_import_module(
+    current: &str,
+    current_is_package: bool,
+    module: &str,
+    level: u32,
+) -> Option<String> {
+    if level == 0 {
+        return (!module.is_empty()).then(|| module.to_owned());
+    }
+    let mut parts: Vec<&str> = current.split('.').collect();
+    if !current_is_package {
+        parts.pop();
+    }
+    for _ in 1..level {
+        parts.pop()?;
+    }
+    parts.extend(module.split('.').filter(|part| !part.is_empty()));
+    (!parts.is_empty()).then(|| parts.join("."))
+}
+
+fn external_imports(
+    suite: &[Stmt],
+    current: &str,
+    current_is_package: bool,
+) -> (BTreeMap<String, ExternalBinding>, BTreeSet<String>) {
+    let mut bindings = BTreeMap::new();
+    let mut modules = BTreeSet::new();
+    for statement in suite {
+        match statement {
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let module = alias.name.to_string();
+                    modules.insert(module.clone());
+                    let (bound, target) = alias.asname.as_ref().map_or_else(
+                        || {
+                            let top = module.split('.').next().unwrap_or_default().to_owned();
+                            (top.clone(), top)
+                        },
+                        |name| (name.to_string(), module.clone()),
+                    );
+                    bindings.insert(bound, ExternalBinding::Module(target));
+                }
+            }
+            Stmt::ImportFrom(import) => {
+                let written = import.module.as_ref().map_or("", ast::Identifier::as_str);
+                let Some(parent) =
+                    absolute_import_module(current, current_is_package, written, import.level)
+                else {
+                    continue;
+                };
+                modules.insert(parent.clone());
+                for alias in &import.names {
+                    if alias.name.as_str() == "*" {
+                        continue;
+                    }
+                    let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                    bindings.insert(
+                        local,
+                        ExternalBinding::Symbol(parent.clone(), alias.name.to_string()),
+                    );
+                    modules.insert(format!("{parent}.{}", alias.name));
+                }
+            }
+            _ => {}
+        }
+    }
+    (bindings, modules)
+}
+
+fn resolve_external_reference(
+    expression: &Expr,
+    module: &str,
+    bindings: &BTreeMap<String, ExternalBinding>,
+) -> Option<(String, String)> {
+    match expression {
+        Expr::Name(name) => match bindings.get(name.id.as_str()) {
+            Some(ExternalBinding::Symbol(module, symbol)) => Some((module.clone(), symbol.clone())),
+            _ => Some((module.to_owned(), name.id.to_string())),
+        },
+        Expr::Attribute(_) => {
+            let mut parts = Vec::new();
+            let mut current = expression;
+            while let Expr::Attribute(attribute) = current {
+                parts.push(attribute.attr.to_string());
+                current = &attribute.value;
+            }
+            let Expr::Name(root) = current else {
+                return None;
+            };
+            parts.reverse();
+            let class = parts.pop()?;
+            let imported = match bindings.get(root.id.as_str())? {
+                ExternalBinding::Module(module) => module.clone(),
+                ExternalBinding::Symbol(module, symbol) => format!("{module}.{symbol}"),
+            };
+            let owner = parts.into_iter().fold(imported, |mut owner, part| {
+                owner.push('.');
+                owner.push_str(&part);
+                owner
+            });
+            Some((owner, class))
+        }
+        Expr::Subscript(subscript) => {
+            resolve_external_reference(&subscript.value, module, bindings)
+        }
+        _ => None,
+    }
+}
+
+fn external_call_shape(call: &ast::ExprCall) -> CallbackCall {
+    CallbackCall {
+        positional: call
+            .arguments
+            .args
+            .iter()
+            .filter(|argument| !matches!(argument, Expr::Starred(_)))
+            .count(),
+        keywords: call
+            .arguments
+            .keywords
+            .iter()
+            .filter_map(|keyword| keyword.arg.as_ref().map(ToString::to_string))
+            .collect(),
+        unpacked: call
+            .arguments
+            .args
+            .iter()
+            .any(|argument| matches!(argument, Expr::Starred(_)))
+            || call
+                .arguments
+                .keywords
+                .iter()
+                .any(|keyword| keyword.arg.is_none()),
+    }
+}
+
+struct ExternalCallCollector<'a> {
+    class: (String, String),
+    receivers: BTreeSet<String>,
+    attributes: &'a BTreeMap<String, (String, String)>,
+    calls: &'a mut BTreeMap<(String, String), CallbackMethods>,
+}
+
+impl Visitor<'_> for ExternalCallCollector<'_> {
+    fn visit_expr(&mut self, expression: &Expr) {
+        if let Expr::Call(call) = expression {
+            if let Expr::Attribute(method) = call.func.as_ref() {
+                let target = match method.value.as_ref() {
+                    Expr::Name(receiver) if self.receivers.contains(receiver.id.as_str()) => {
+                        Some(self.class.clone())
+                    }
+                    Expr::Attribute(attribute) if matches!(attribute.value.as_ref(), Expr::Name(receiver) if self.receivers.contains(receiver.id.as_str())) => {
+                        self.attributes.get(attribute.attr.as_str()).cloned()
+                    }
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    self.calls
+                        .entry(target)
+                        .or_default()
+                        .entry(method.attr.to_string())
+                        .or_default()
+                        .calls
+                        .push(external_call_shape(call));
+                }
+            }
+        }
+        walk_expr(self, expression);
+    }
+}
+
+fn resolve_external_class(
+    mut class: (String, String),
+    modules: &BTreeMap<String, ExternalModule>,
+) -> Option<(String, String)> {
+    let mut seen = BTreeSet::new();
+    loop {
+        if !seen.insert(class.clone()) {
+            return None;
+        }
+        let module = modules.get(&class.0)?;
+        if module.classes.contains_key(&class.1) {
+            return Some(class);
+        }
+        let ExternalBinding::Symbol(next_module, next_name) = module.bindings.get(&class.1)? else {
+            return None;
+        };
+        class = (next_module.clone(), next_name.clone());
+    }
+}
+
+fn inherited_external_callbacks(
+    class: &(String, String),
+    modules: &BTreeMap<String, ExternalModule>,
+    direct: &BTreeMap<(String, String), CallbackMethods>,
+    visiting: &mut BTreeSet<(String, String)>,
+) -> CallbackMethods {
+    if !visiting.insert(class.clone()) {
+        return CallbackMethods::new();
+    }
+    let mut found = direct.get(class).cloned().unwrap_or_default();
+    if let Some(definition) = modules
+        .get(&class.0)
+        .and_then(|module| module.classes.get(&class.1))
+    {
+        for base in &definition.bases {
+            let base =
+                resolve_external_class(base.clone(), modules).unwrap_or_else(|| base.clone());
+            merge_callback_methods(
+                &mut found,
+                &inherited_external_callbacks(&base, modules, direct, visiting),
+            );
+        }
+    }
+    visiting.remove(class);
+    found
+}
+
+fn propagated_external_callbacks(
+    modules: &BTreeMap<String, ExternalModule>,
+    direct: &BTreeMap<(String, String), CallbackMethods>,
+) -> ExternalCallbacks {
+    let classes: Vec<(String, String)> = modules
+        .iter()
+        .flat_map(|(module, contents)| {
+            contents
+                .classes
+                .keys()
+                .map(|class| (module.clone(), class.clone()))
+        })
+        .collect();
+    let mut callbacks = BTreeMap::new();
+    for class in classes {
+        let found = inherited_external_callbacks(&class, modules, direct, &mut BTreeSet::new());
+        if !found.is_empty() {
+            callbacks.insert(class, found);
+        }
+    }
+    for (module_name, module) in modules {
+        for name in module.bindings.keys() {
+            let alias = (module_name.clone(), name.clone());
+            let Some(class) = resolve_external_class(alias.clone(), modules) else {
+                continue;
+            };
+            if let Some(found) = callbacks.get(&class).cloned() {
+                callbacks.insert(alias, found);
+            }
+        }
+    }
+    ExternalCallbacks(callbacks)
+}
+
+fn discover_external_callbacks(files: &[PathBuf]) -> ExternalCallbacks {
+    let roots = python_dependency_roots();
+    if roots.is_empty() {
+        return ExternalCallbacks::default();
+    }
+    let mut pending = BTreeSet::new();
+    for file in files {
+        let Ok(source) = read_source(file) else {
+            continue;
+        };
+        let Ok(parsed) = parse_module(&source) else {
+            continue;
+        };
+        let (_, imports) = external_imports(parsed.suite(), "", false);
+        for imported in imports {
+            pending.extend(dependency_package_modules(&imported, &roots));
+        }
+    }
+    let mut parsed_modules = BTreeMap::new();
+    while let Some(module) = pending.pop_first() {
+        if parsed_modules.contains_key(&module) {
+            continue;
+        }
+        let Some((path, is_package)) = dependency_module_path(&module, &roots) else {
+            continue;
+        };
+        let Ok(source) = read_source(&path) else {
+            continue;
+        };
+        let Ok(parsed) = parse_module(&source) else {
+            continue;
+        };
+        let (bindings, imports) = external_imports(parsed.suite(), &module, is_package);
+        pending.extend(imports);
+        parsed_modules.insert(module, (parsed, bindings));
+    }
+    let mut modules = BTreeMap::new();
+    let mut direct: BTreeMap<(String, String), CallbackMethods> = BTreeMap::new();
+    for (module_name, (parsed, bindings)) in &parsed_modules {
+        let mut classes = BTreeMap::new();
+        for statement in parsed.suite() {
+            let Stmt::ClassDef(class) = statement else {
+                continue;
+            };
+            let bases = class
+                .bases()
+                .iter()
+                .filter_map(|base| resolve_external_reference(base, module_name, bindings))
+                .collect();
+            let mut attributes = BTreeMap::new();
+            for body in &class.body {
+                if let Stmt::AnnAssign(assign) = body {
+                    if let Expr::Name(name) = assign.target.as_ref() {
+                        if let Some(identity) =
+                            resolve_external_reference(&assign.annotation, module_name, bindings)
+                        {
+                            attributes.insert(name.id.to_string(), identity);
+                        }
+                    }
+                }
+            }
+            for body in &class.body {
+                let Stmt::FunctionDef(function) = body else {
+                    continue;
+                };
+                let receivers = function
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(&function.parameters.args)
+                    .next()
+                    .map(|parameter| BTreeSet::from([parameter.parameter.name.to_string()]))
+                    .unwrap_or_default();
+                let mut collector = ExternalCallCollector {
+                    class: (module_name.clone(), class.name.to_string()),
+                    receivers,
+                    attributes: &attributes,
+                    calls: &mut direct,
+                };
+                for statement in &function.body {
+                    collector.visit_stmt(statement);
+                }
+            }
+            classes.insert(class.name.to_string(), ExternalClass { bases });
+        }
+        modules.insert(
+            module_name.clone(),
+            ExternalModule {
+                bindings: bindings.clone(),
+                classes,
+            },
+        );
+    }
+    propagated_external_callbacks(&modules, &direct)
+}
+
 /// Library base classes whose own machinery calls the methods a
 /// subclass writes, each with the callbacks that machinery reaches.
 ///
@@ -6645,8 +7244,6 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
         "RawTextHelpFormatter",
         ARGPARSE_FORMATTER_CALLBACKS,
     ),
-    ("bs4.builder", "HTMLTreeBuilder", &["prepare_markup"]),
-    ("bs4.builder", "TreeBuilder", &["prepare_markup"]),
     ("doctest", "DebugRunner", DOCTEST_RUNNER_CALLBACKS),
     ("doctest", "DocTestRunner", DOCTEST_RUNNER_CALLBACKS),
     (
@@ -6918,6 +7515,33 @@ fn implicit_callbacks_for(module: &str, base: &str) -> Option<&'static [&'static
         .iter()
         .find(|(base_module, base_name, _)| *base_module == module && *base_name == base)
         .map(|(_, _, callbacks)| *callbacks)
+}
+
+fn merge_callback_methods(target: &mut CallbackMethods, source: &CallbackMethods) {
+    for (method, requirements) in source {
+        let held = target.entry(method.clone()).or_default();
+        held.unknown_calls |= requirements.unknown_calls;
+        held.calls.extend(requirements.calls.iter().cloned());
+    }
+}
+
+fn callback_methods_for(external: &ExternalCallbacks, module: &str, base: &str) -> CallbackMethods {
+    let mut found = CallbackMethods::new();
+    if let Some(callbacks) = implicit_callbacks_for(module, base) {
+        for callback in callbacks {
+            found.insert(
+                (*callback).to_owned(),
+                CallbackRequirements {
+                    unknown_calls: true,
+                    calls: Vec::new(),
+                },
+            );
+        }
+    }
+    if let Some(callbacks) = external.0.get(&(module.to_owned(), base.to_owned())) {
+        merge_callback_methods(&mut found, callbacks);
+    }
+    found
 }
 
 /// Whether `module` is one [`IMPLICIT_CALLBACK_BASES`] names, or a package one
@@ -7490,6 +8114,10 @@ fn qualified_lexical_name(scope: &[String], name: &str) -> String {
 #[derive(Clone, Debug, Default)]
 struct Aliases {
     import_bindings: BTreeSet<String>,
+    /// Every imported module, not only modules in a built-in callback row.
+    imported_modules: BTreeMap<String, String>,
+    /// Every directly imported symbol, as `(module, original name)`.
+    imported_symbols: BTreeMap<String, (String, String)>,
     renamed: BTreeMap<String, Option<String>>,
     dataclasses_members: BTreeSet<String>,
     dataclass_fields: BTreeSet<String>,
@@ -7530,6 +8158,8 @@ struct Aliases {
 impl Aliases {
     fn invalidate(&mut self, name: &str) {
         self.import_bindings.remove(name);
+        self.imported_modules.remove(name);
+        self.imported_symbols.remove(name);
         self.renamed.remove(name);
         self.dataclasses_members.remove(name);
         if self.dataclass_fields.remove(name) {
@@ -7583,6 +8213,8 @@ impl Aliases {
         }
 
         copy_mapping(&mut self.renamed, &before.renamed, name);
+        copy_mapping(&mut self.imported_modules, &before.imported_modules, name);
+        copy_mapping(&mut self.imported_symbols, &before.imported_symbols, name);
         copy_mapping(
             &mut self.implicit_callback_bases,
             &before.implicit_callback_bases,
@@ -7774,6 +8406,7 @@ impl Aliases {
             } else {
                 bound.clone()
             };
+            self.imported_modules.insert(bound.clone(), module.clone());
             if names_implicit_callback_module(&module) {
                 self.implicit_callback_modules.insert(bound, module);
             }
@@ -7840,6 +8473,16 @@ impl Aliases {
                 .filter(|alias| alias.name.as_str() != "*")
                 .map(|alias| alias.asname.as_ref().unwrap_or(&alias.name).to_string()),
         );
+        if let Some(module) = &import.module {
+            for alias in &import.names {
+                if alias.name.as_str() != "*" {
+                    self.imported_symbols.insert(
+                        alias.asname.as_ref().unwrap_or(&alias.name).to_string(),
+                        (module.to_string(), alias.name.to_string()),
+                    );
+                }
+            }
+        }
         self.collect_typing_members(import);
         self.collect_builtin_members(import);
         self.collect_abc_members(import);
@@ -25548,20 +26191,6 @@ def b(x=1): pass  # type: ignore  # noqa
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         assert_eq!(keys, sorted);
-    }
-
-    #[test]
-    fn beautiful_soup_tree_builders_keep_prepare_markup_defaults() -> Result<(), String> {
-        let imported = "from bs4.builder import TreeBuilder\n\n\nclass Builder(TreeBuilder):\n    def prepare_markup(self, markup, user_specified_encoding=None, document_declared_encoding=None, exclude_encodings=None):\n        yield markup, None, None, False\n";
-        assert_eq!(fixed_with_retained_defaults(imported)?, imported);
-
-        let qualified = "import bs4.builder\n\n\nclass Builder(bs4.builder.TreeBuilder):\n    def prepare_markup(self, markup, user_specified_encoding=None, document_declared_encoding=None, exclude_encodings=None):\n        yield markup, None, None, False\n";
-        assert_eq!(fixed_with_retained_defaults(qualified)?, qualified);
-
-        let intermediate = "from bs4.builder import HTMLTreeBuilder\n\n\nclass Builder(HTMLTreeBuilder):\n    def prepare_markup(self, markup, user_specified_encoding=None, document_declared_encoding=None, exclude_encodings=None):\n        yield markup, None, None, False\n";
-        assert_eq!(fixed_with_retained_defaults(intermediate)?, intermediate);
-
-        Ok(())
     }
 
     #[test]

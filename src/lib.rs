@@ -6228,6 +6228,29 @@ const EMAIL_POLICY_CALLBACKS: &[&str] = &[
     "register_defect",
 ];
 
+/// The methods the `xml.sax` reader drives on the content handler a parser was
+/// given, whichever content-handler base the subclass was written on.
+///
+/// The four namespace callbacks are here because they are the same protocol,
+/// reached by the same driver once `feature_namespaces` is on; a handler that
+/// writes them is a content handler either way. `ignorableWhitespace` and
+/// `skippedEntity` are the two `ContentHandler` methods left out: the expat
+/// reader is the only one the standard library ships, and neither could be
+/// reached through it, so neither is claimed.
+const XML_SAX_CONTENT_HANDLER_CALLBACKS: &[&str] = &[
+    "characters",
+    "endDocument",
+    "endElement",
+    "endElementNS",
+    "endPrefixMapping",
+    "processingInstruction",
+    "setDocumentLocator",
+    "startDocument",
+    "startElement",
+    "startElementNS",
+    "startPrefixMapping",
+];
+
 /// Standard-library base classes whose own machinery calls the methods a
 /// subclass writes, each with the callbacks that machinery reaches.
 ///
@@ -6411,6 +6434,31 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
             "parse",
             "vformat",
         ],
+    ),
+    // `xml.sax` re-exports `ContentHandler` from `xml.sax.handler`, so both
+    // spellings name the same base and both have to be rows.
+    (
+        "xml.sax",
+        "ContentHandler",
+        XML_SAX_CONTENT_HANDLER_CALLBACKS,
+    ),
+    (
+        "xml.sax.handler",
+        "ContentHandler",
+        XML_SAX_CONTENT_HANDLER_CALLBACKS,
+    ),
+    // A filter is installed as the content handler of the parser beneath it, so
+    // the reader calls these on it even though it derives from `XMLReader`
+    // rather than from `ContentHandler`.
+    (
+        "xml.sax.saxutils",
+        "XMLFilterBase",
+        XML_SAX_CONTENT_HANDLER_CALLBACKS,
+    ),
+    (
+        "xml.sax.saxutils",
+        "XMLGenerator",
+        XML_SAX_CONTENT_HANDLER_CALLBACKS,
     ),
 ];
 
@@ -23920,6 +23968,102 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed_with_retained_defaults(source)?,
             "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def start_section(self, heading, extra): return extra\n\n\nclass F(argparse.HelpFormatter):\n    def error(self, message, extra): return extra\n\n\nassert P.start_section(P(add_help=False), \"h\", extra=1) == 1\nassert F.error(F(\"p\"), \"m\", extra=2) == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn xml_sax_content_handler_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A parser drives every one of these on the handler it was given:
+        // `setDocumentLocator` before the document, `startDocument` and
+        // `endDocument` around it, `startElement`, `endElement`, `characters`
+        // and `processingInstruction` from the expat callbacks, and the four
+        // namespace hooks once `feature_namespaces` is on. None of those calls
+        // is written here, so removing a default leaves a handler the reader
+        // can no longer call.
+        let source = "import xml.sax.handler\n\n\nclass H(xml.sax.handler.ContentHandler):\n    def setDocumentLocator(self, locator, extra=1): pass\n\n    def startDocument(self, extra=2): pass\n\n    def endDocument(self, extra=3): pass\n\n    def startElement(self, name, attrs, extra=4): pass\n\n    def endElement(self, name, extra=5): pass\n\n    def characters(self, content, extra=6): pass\n\n    def processingInstruction(self, target, data, extra=7): pass\n\n    def startPrefixMapping(self, prefix, uri, extra=8): pass\n\n    def endPrefixMapping(self, prefix, extra=9): pass\n\n    def startElementNS(self, name, qname, attrs, extra=10): pass\n\n    def endElementNS(self, name, qname, extra=11): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn the_xml_sax_re_export_of_a_content_handler_keeps_its_callback_defaults() -> Result<(), String>
+    {
+        // `xml.sax` re-exports the class `xml.sax.handler` defines, so the
+        // shorter spelling names the same base the reader calls.
+        let source = "from xml.sax import ContentHandler\n\n\nclass H(ContentHandler):\n    def characters(self, content, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_sax_handler_module_keeps_its_callback_defaults() -> Result<(), String> {
+        // A renaming import binds the submodule itself, so one attribute is all
+        // that stands between the name and the base.
+        let source = "import xml.sax.handler as sh\n\n\nclass H(sh.ContentHandler):\n    def startDocument(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sax_package_from_import_keeps_its_callback_defaults() -> Result<(), String> {
+        // `from xml import sax` binds the package, so the base is read through
+        // two attributes rather than one.
+        let source = "from xml import sax\n\n\nclass H(sax.handler.ContentHandler):\n    def endDocument(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sax_generator_keeps_its_callback_defaults() -> Result<(), String> {
+        // A generator is a content handler in its own right, and users write
+        // one to filter what a parse writes out, so the reader reaches the same
+        // callbacks on it.
+        let source = "import xml.sax.saxutils\n\n\nclass G(xml.sax.saxutils.XMLGenerator):\n    def characters(self, content, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sax_filter_keeps_its_callback_defaults() -> Result<(), String> {
+        // A filter derives from `XMLReader` rather than from `ContentHandler`,
+        // but it is installed as the content handler of the parser beneath it,
+        // so the reader calls these on it all the same.
+        let source = "from xml.sax.saxutils import XMLFilterBase\n\n\nclass F(XMLFilterBase):\n    def startElement(self, name, attrs, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_sax_handler_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being reached by the reader is inherited, so a subclass written on a
+        // handler defined here is parsed through in the same way.
+        let source = "import xml.sax.handler\n\n\nclass Base(xml.sax.handler.ContentHandler):\n    pass\n\n\nclass Child(Base):\n    def characters(self, content, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_xml_sax_hierarchy_are_still_fixed() -> Result<(), String> {
+        // `characters`, `startElement` and `endElement` are ordinary method
+        // names. Nothing calls them here but the calls written below, so the
+        // defaults go and those calls carry the values they held.
+        let source = "class Handler:\n    def characters(self, content, extra=1): return extra\n\n    def startElement(self, name, attrs, extra=2): return extra\n\n    def endElement(self, name, extra=3): return extra\n\n    def startDocument(self, extra=4): return extra\n\n    def endDocument(self, extra=5): return extra\n\n    def setDocumentLocator(self, locator, extra=6): return extra\n\n    def processingInstruction(self, target, data, extra=7): return extra\n\n    def startPrefixMapping(self, prefix, uri, extra=8): return extra\n\n    def endPrefixMapping(self, prefix, extra=9): return extra\n\n    def startElementNS(self, name, qname, attrs, extra=10): return extra\n\n    def endElementNS(self, name, qname, extra=11): return extra\n\n\nh = Handler()\nassert Handler.characters(h, \"c\") == 1\nassert Handler.startElement(h, \"n\", \"a\") == 2\nassert Handler.endElement(h, \"n\") == 3\nassert Handler.startDocument(h) == 4\nassert Handler.endDocument(h) == 5\nassert Handler.setDocumentLocator(h, \"l\") == 6\nassert Handler.processingInstruction(h, \"t\", \"d\") == 7\nassert Handler.startPrefixMapping(h, \"p\", \"u\") == 8\nassert Handler.endPrefixMapping(h, \"p\") == 9\nassert Handler.startElementNS(h, \"n\", \"q\", \"a\") == 10\nassert Handler.endElementNS(h, \"n\", \"q\") == 11\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Handler:\n    def characters(self, content, extra): return extra\n\n    def startElement(self, name, attrs, extra): return extra\n\n    def endElement(self, name, extra): return extra\n\n    def startDocument(self, extra): return extra\n\n    def endDocument(self, extra): return extra\n\n    def setDocumentLocator(self, locator, extra): return extra\n\n    def processingInstruction(self, target, data, extra): return extra\n\n    def startPrefixMapping(self, prefix, uri, extra): return extra\n\n    def endPrefixMapping(self, prefix, extra): return extra\n\n    def startElementNS(self, name, qname, attrs, extra): return extra\n\n    def endElementNS(self, name, qname, extra): return extra\n\n\nh = Handler()\nassert Handler.characters(h, \"c\", extra=1) == 1\nassert Handler.startElement(h, \"n\", \"a\", extra=2) == 2\nassert Handler.endElement(h, \"n\", extra=3) == 3\nassert Handler.startDocument(h, extra=4) == 4\nassert Handler.endDocument(h, extra=5) == 5\nassert Handler.setDocumentLocator(h, \"l\", extra=6) == 6\nassert Handler.processingInstruction(h, \"t\", \"d\", extra=7) == 7\nassert Handler.startPrefixMapping(h, \"p\", \"u\", extra=8) == 8\nassert Handler.endPrefixMapping(h, \"p\", extra=9) == 9\nassert Handler.startElementNS(h, \"n\", \"q\", \"a\", extra=10) == 10\nassert Handler.endElementNS(h, \"n\", \"q\", extra=11) == 11\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_redefined_without_a_sax_base_gives_up_its_callbacks() -> Result<(), String> {
+        // The second `Base` is what `Child` is built on, and no reader reaches
+        // it, so the default is removed.
+        let source = "import xml.sax.handler\n\n\nclass Base(xml.sax.handler.ContentHandler):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    def characters(self, content, extra=1): return extra\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import xml.sax.handler\n\n\nclass Base(xml.sax.handler.ContentHandler):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    def characters(self, content, extra): return extra\n"
         );
         Ok(())
     }

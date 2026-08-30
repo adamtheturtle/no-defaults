@@ -7232,12 +7232,7 @@ fn resolve_pending_external_calls(
     }
     let modules_by_path: BTreeMap<PathBuf, &str> = parsed_modules
         .iter()
-        .map(|(module, (_, _, path, _))| {
-            (
-                path.canonicalize().unwrap_or_else(|_| path.clone()),
-                module.as_str(),
-            )
-        })
+        .map(|(module, (_, _, path, _))| (comparable_external_path(path), module.as_str()))
         .collect();
     let mut ty = ty_resolver::TyResolver::start(project_root)?;
     let mut direct: BTreeMap<(String, String), CallbackMethods> = BTreeMap::new();
@@ -7248,7 +7243,7 @@ fn resolve_pending_external_calls(
         let locations = ty.definitions(path, source, call.offset)?;
         let mut targets = BTreeSet::new();
         for location in locations {
-            let path = location.path.canonicalize().unwrap_or(location.path);
+            let path = comparable_external_path(&location.path);
             let Some(module) = modules_by_path.get(&path) else {
                 continue;
             };
@@ -7273,6 +7268,15 @@ fn resolve_pending_external_calls(
         }
     }
     Ok(propagated_external_callbacks(modules, &direct))
+}
+
+fn comparable_external_path(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if cfg!(windows) {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path
+    }
 }
 
 fn discover_external_callbacks(

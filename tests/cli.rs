@@ -701,16 +701,22 @@ fn fix_leaves_calls_it_cannot_resolve_alone() -> Result<(), Box<dyn std::error::
          api.keep()\n\
          api.keep(**{})\n",
     )?;
+    let api = directory.path().join("api.py");
     let before = std::fs::read_to_string(&caller)?;
+    let defined = std::fs::read_to_string(&api)?;
     let output = Command::new(binary())
         .arg("--fix")
         .arg(directory.path())
         .output()?;
-    assert_eq!(output.status.code(), Some(0));
+    // Neither call can be completed, so the default behind them stays where
+    // it is: taking it out and leaving both calls as they stand is what
+    // turns a file that runs into one that raises.
+    assert_eq!(std::fs::read_to_string(&caller)?, before);
+    assert_eq!(std::fs::read_to_string(&api)?, defined);
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("is not a literal"), "{stderr:?}");
     assert!(stderr.contains("unpacks `*` or `**`"), "{stderr:?}");
-    assert_eq!(std::fs::read_to_string(&caller)?, before);
+    assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
 
@@ -3256,17 +3262,17 @@ fn skipped_calls_are_reported_even_with_nothing_removed() -> Result<(), Box<dyn 
 {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("example.py");
-    // The default is not a literal, so it is removed from the signature but
-    // the call cannot be completed. The warning about that call must not
-    // depend on how the removed-defaults count came out.
-    std::fs::write(
-        &path,
-        "SENTINEL = object()\n\n\ndef keep(value=SENTINEL): return value\n\n\nkeep()\n",
-    )?;
+    // The default is not a literal, so the call cannot be completed and the
+    // default is held back rather than removed. The warning about that call
+    // must not depend on how the removed-defaults count came out, and with
+    // nothing removed the count is zero.
+    let source = "SENTINEL = object()\n\n\ndef keep(value=SENTINEL): return value\n\n\nkeep()\n";
+    std::fs::write(&path, source)?;
     let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(&path)?, source);
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("is not a literal"), "{stderr}");
+    assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
 
@@ -7686,6 +7692,153 @@ fn a_local_the_body_owns_carries_its_class_past_a_call_out(
         std::fs::read_to_string(&case)?,
         "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\nmade = None\n\n\ndef swap():\n    global made\n    made = Other()\n\n\ndef go():\n    made = Child()\n    swap()\n    return made.own(extra=7)\n\n\nassert go() == 7, go()\n"
     );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_non_literal_default_behind_a_resolved_call_is_kept() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The call is tied to the definition, but `SENTINEL` is not a literal this
+    // run may repeat, so there is no way to write the deletion back into the
+    // call. Taking it out and leaving the call as it stands is what turns a
+    // file that runs into one that raises, so it is held back and reported
+    // instead.
+    let source = "SENTINEL = object()\n\n\nclass Child:\n    def own(self, extra=SENTINEL):\n        return extra\n\n\ndef outer():\n    return Child().own()\n\n\nassert outer() is SENTINEL, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_literal_default_behind_a_resolved_call_is_written_in() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The other direction: a default the run can repeat goes into the call and
+    // the deletion stands.
+    let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own()\n\n\nassert outer() == 7, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    return Child().own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn an_unpacked_call_keeps_the_default_it_cannot_be_given() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // A call that unpacks its arguments does not say what it passes, so
+    // nothing can be written into it and the deletion behind it stays.
+    let source = "class Child:\n    def own(self, first, extra=7):\n        return extra\n\n\ndef outer(args):\n    return Child().own(*args)\n\n\nassert outer([1]) == 7, outer([1])\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_call_that_unpacks_nothing_is_given_the_default() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The other direction: the same call written out is given the deleted
+    // default.
+    let source = "class Child:\n    def own(self, first, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own(1)\n\n\nassert outer() == 7, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, "class Child:\n    def own(self, first, extra):\n        return extra\n\n\ndef outer():\n    return Child().own(1, extra=7)\n\n\nassert outer() == 7, outer()\n");
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_bare_generator_argument_keeps_the_default_it_cannot_be_given(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Python allows an unparenthesized generator expression only as a call's
+    // one argument, so nothing may follow it and the deletion behind the call
+    // has to stay.
+    let source = "class Child:\n    def own(self, values, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own(x for x in range(1))\n\n\nassert outer() == 7, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_parenthesized_generator_argument_is_given_the_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The other direction: parenthesised, the generator is an ordinary
+    // argument and the default is written after it.
+    let source = "class Child:\n    def own(self, values, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own((x for x in range(1)))\n\n\nassert outer() == 7, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, "class Child:\n    def own(self, values, extra):\n        return extra\n\n\ndef outer():\n    return Child().own((x for x in range(1)), extra=7)\n\n\nassert outer() == 7, outer()\n");
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_bare_decorator_keeps_a_non_literal_default() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // A decorator applied bare is a call the run has to write an argument into
+    // as well, and the same non-literal default stops it, so the deletion is
+    // held back there too.
+    let source = "SENTINEL = object()\n\n\ndef decorate(function, flag=SENTINEL):\n    function.flag = flag\n    return function\n\n\n@decorate\ndef target():\n    pass\n\n\nassert target.flag is SENTINEL, target.flag\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_bare_decorator_with_a_literal_default_is_rewritten() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The other direction: a literal default turns the bare decorator into an
+    // explicit one-argument wrapper and the deletion stands.
+    let source = "def decorate(function, flag=1):\n    function.flag = flag\n    return function\n\n\n@decorate\ndef target():\n    pass\n\n\nassert target.flag == 1, target.flag\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, "def decorate(function, flag):\n    function.flag = flag\n    return function\n\n\n@lambda __no_defaults_decorated: decorate(__no_defaults_decorated, flag=1)\ndef target():\n    pass\n\n\nassert target.flag == 1, target.flag\n");
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }

@@ -426,6 +426,11 @@ struct Definitions {
     /// Classes whose decorator writes their constructor, so the `__init__`
     /// they inherit is not what a construction of them reaches.
     own_constructors: BTreeSet<(PathBuf, String)>,
+    /// The metaclass each class names in its header, under the identity this
+    /// index knows that metaclass by. A class inherits its metaclass, so the
+    /// entry is read along the resolution order rather than off the class
+    /// alone.
+    metaclasses: BTreeMap<(PathBuf, String), (PathBuf, String)>,
 }
 
 impl Definitions {
@@ -514,6 +519,52 @@ impl Definitions {
     /// so a default behind such a call has to stay where it is.
     fn ancestry_is_uncertain(&self, class: &(PathBuf, String)) -> bool {
         self.linearized_mro(class, &mut BTreeSet::new()).is_none()
+    }
+
+    /// Whether constructing this class runs something that may hand back an
+    /// object of some other class.
+    ///
+    /// `C()` is only an instance of `C` while nothing takes the decision
+    /// over. A `__new__` the class or an ancestor writes returns whatever it
+    /// likes — another class outright, or the subclass a factory picks — and
+    /// what it returns is what the attribute lookup then reads. Where one is
+    /// written, nothing here says which class the call reaches.
+    fn construction_is_hooked(&self, class: &(PathBuf, String)) -> bool {
+        if self.declares_in_mro(&class.0, &class.1, "__new__") {
+            return true;
+        }
+        // A metaclass `__call__` stands in front of construction entirely:
+        // `C()` is `type(C).__call__(C)`, and one written by hand answers
+        // with whatever it likes. The metaclass is inherited, so every class
+        // in the order is asked which one it names.
+        let mro = self
+            .linearized_mro(class, &mut BTreeSet::new())
+            .unwrap_or_else(|| self.settled_ancestry(class));
+        mro.iter().any(|identity| {
+            self.metaclasses.get(identity).is_some_and(|metaclass| {
+                self.declares_in_mro(&metaclass.0, &metaclass.1, "__call__")
+            })
+        })
+    }
+
+    /// Whether this class, or one it inherits from, writes a method of this
+    /// name at all.
+    ///
+    /// A method nothing was taken from is indexed without a signature, so
+    /// asking for the signature answers nothing where asking whether the
+    /// method was written at all answers yes. Construction hooks are asked
+    /// about this way: what matters is that the class took the decision
+    /// over, not what the fixer found to change in it.
+    fn declares_in_mro(&self, file: &Path, class: &str, name: &str) -> bool {
+        let identity = (file.to_path_buf(), class.to_owned());
+        let mro = self
+            .linearized_mro(&identity, &mut BTreeSet::new())
+            .unwrap_or_else(|| self.settled_ancestry(&identity));
+        mro.iter().any(|identity| {
+            self.methods
+                .get(identity)
+                .is_some_and(|methods| methods.contains_key(name))
+        })
     }
 
     fn method_in_mro(
@@ -1889,6 +1940,35 @@ fn record_class_bases_and_attributes(
     // it would stop the lookup that should have walked on to a base.
     for name in BoundNames::of_class_attributes(&class.body) {
         methods.entry(name).or_insert(None);
+    }
+    // The metaclass is named in the header the same way a base is, and is
+    // resolved the same way. Only a metaclass this index can name is
+    // recorded: one it cannot see answers nothing either way.
+    let metaclass = class
+        .arguments
+        .iter()
+        .flat_map(|arguments| arguments.keywords.iter())
+        .find(|keyword| {
+            keyword
+                .arg
+                .as_ref()
+                .is_some_and(|name| name.as_str() == "metaclass")
+        })
+        .and_then(|keyword| {
+            method_base_identity(
+                &keyword.value,
+                importer,
+                bindings,
+                scope.spelled(),
+                class.start(),
+                &scope.aliases,
+                &definitions.methods,
+            )
+        });
+    if let Some(metaclass) = metaclass {
+        definitions
+            .metaclasses
+            .insert((importer.to_path_buf(), identity.to_owned()), metaclass);
     }
     definitions.record_bases(
         (importer.to_path_buf(), identity.to_owned()),
@@ -10049,6 +10129,11 @@ struct BoundNames {
     /// The class each singly bound local was constructed from, recorded by
     /// the rewriter as it reaches the assignment.
     instances: BTreeMap<String, (PathBuf, String)>,
+    /// Locals built from a construction the class takes the decision over,
+    /// which stand for no class this run can name. The name is kept so that
+    /// a call through it is still known to be a construction, which is what
+    /// holds the deletions behind it back.
+    hooked_instances: BTreeSet<String>,
 }
 
 impl BoundNames {
@@ -10727,6 +10812,33 @@ impl Rewriter<'_> {
         self.class_ancestry_is_uncertain(&attribute.value)
     }
 
+    /// Whether the receiver of a call is a construction the class it names
+    /// takes the decision over, written out or bound to a local first.
+    fn receiver_construction_is_hooked(&self, expression: &Expr) -> bool {
+        let Expr::Attribute(attribute) = expression else {
+            return false;
+        };
+        match attribute.value.as_ref() {
+            Expr::Name(name) => self
+                .scopes
+                .last()
+                .is_some_and(|scope| scope.hooked_instances.contains(name.id.as_str())),
+            receiver => self.constructs_through_a_hook(receiver),
+        }
+    }
+
+    /// Whether an expression constructs a class that takes the decision over
+    /// what the construction hands back.
+    fn constructs_through_a_hook(&self, expression: &Expr) -> bool {
+        let Expr::Call(constructed) = expression else {
+            return false;
+        };
+        self.receiving_class(&constructed.func)
+            .is_some_and(|(file, class, through_instance, _)| {
+                !through_instance && self.definitions.construction_is_hooked(&(file, class))
+            })
+    }
+
     /// Whether the call builds such a class. `Child()` and `api.Child()` name
     /// the class rather than the `__init__` it inherits, so there is no single
     /// constructor to give them and the class is left without one. That leaves
@@ -10925,6 +11037,9 @@ impl Rewriter<'_> {
                     .definitions
                     .methods
                     .contains_key(&(file.clone(), class.clone()))
+                && !self
+                    .definitions
+                    .construction_is_hooked(&(file.clone(), class.clone()))
             {
                 return Some((file, class, true, false));
             }
@@ -11077,6 +11192,16 @@ impl Rewriter<'_> {
                 && !scope.attribute_targets.contains(target.id.as_str())
         });
         if !settled {
+            return;
+        }
+        // A construction the class takes the decision over names no class
+        // this run can read, but the local still holds whatever it built, so
+        // the name is kept for the deletions behind a call through it to be
+        // held against.
+        if self.constructs_through_a_hook(value) {
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.hooked_instances.insert(target.id.to_string());
+            }
             return;
         }
         // Only an instance is carried across: a class assigned to a local is
@@ -11443,6 +11568,12 @@ impl Rewriter<'_> {
         let ambiguous_import = self.has_unknown_receiver_binding(&call.func);
         let uncertain_ancestry =
             constructs_uncertain || self.receiver_ancestry_is_uncertain(&call.func);
+        // A construction whose class takes the decision over what it hands
+        // back resolves to nothing, so this is the only place the deletions
+        // behind the call can be held: the class named in the source is the
+        // one thing known about it, and every deletion that class carries is
+        // kept rather than guessed at.
+        let hooked_construction = self.receiver_construction_is_hooked(&call.func);
         let conditional_definition = matches!(call.func.as_ref(), Expr::Name(name) if self.in_class_scope()
             && self
                 .conditional_class_definitions
@@ -11453,6 +11584,7 @@ impl Rewriter<'_> {
             || ambiguous_import
             || conditional_definition
             || uncertain_ancestry
+            || hooked_construction
         {
             if let Some(fixes) = self.definitions.fixes_by_name.get(name) {
                 self.retained.extend(fixes.iter().cloned());

@@ -7689,3 +7689,192 @@ fn a_local_the_body_owns_carries_its_class_past_a_call_out(
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_class_that_writes_new_keeps_the_defaults_behind_its_constructions(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `C()` is an instance of `C` only while nothing takes the decision over.
+    // A `__new__` written by hand hands back whatever it likes, and the
+    // attribute lookup then reads that, so the class named in the source says
+    // nothing about which method the call reaches.
+    let source = "class Other:\n    def own(self):\n        return 9\n\n\nclass Child:\n    def __new__(cls):\n        return Other()\n\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own()\n\n\nassert outer() == 9, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_new_that_picks_a_subclass_keeps_the_default_the_subclass_overrides(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The dangerous shape: the construction hands back a subclass that
+    // overrides the method with a default of its own, so reading the class
+    // named in the source writes the wrong value in and the file goes on
+    // running with a different answer.
+    let source = "class Base:\n    def __new__(cls):\n        return object.__new__(Special)\n\n    def own(self, extra=7):\n        return extra\n\n\nclass Special(Base):\n    def __new__(cls):\n        return object.__new__(cls)\n\n    def own(self, extra=9):\n        return extra\n\n\ndef outer():\n    return Base().own()\n\n\nassert outer() == 9, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_inherited_new_keeps_the_defaults_behind_a_subclass_construction(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // A class inherits its `__new__`, so a subclass that writes none of its
+    // own is constructed through its ancestor's and is no more its own class
+    // than the ancestor was.
+    let source = "class Base:\n    def __new__(cls):\n        return object.__new__(Special)\n\n    def own(self, extra=7):\n        return extra\n\n\nclass Special(Base):\n    def __new__(cls):\n        return object.__new__(cls)\n\n    def own(self, extra=9):\n        return extra\n\n\nclass Heir(Base):\n    def own(self, extra=13):\n        return extra\n\n\ndef outer():\n    return Heir().own()\n\n\nassert outer() == 9, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_metaclass_call_keeps_the_defaults_behind_its_constructions(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `C()` is `type(C).__call__(C)`, so a metaclass that writes `__call__`
+    // stands in front of construction entirely and answers with whatever it
+    // likes.
+    let source = "class Other:\n    def own(self):\n        return 9\n\n\nclass Meta(type):\n    def __call__(cls, *arguments, **options):\n        return Other()\n\n\nclass Child(metaclass=Meta):\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own()\n\n\nassert outer() == 9, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_inherited_metaclass_call_keeps_them_too() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // A metaclass is inherited as well, so a subclass that names none is still
+    // constructed through the one its ancestor named.
+    let source = "class Other:\n    def own(self):\n        return 9\n\n\nclass Meta(type):\n    def __call__(cls, *arguments, **options):\n        return Other()\n\n\nclass Child(metaclass=Meta):\n    def own(self, extra=7):\n        return extra\n\n\nclass Sub(Child):\n    def own(self, extra=11):\n        return extra\n\n\ndef outer():\n    return Sub().own()\n\n\nassert outer() == 9, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_local_built_from_a_hooked_construction_keeps_them_too(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The construction bound to a local first is the same construction, so the
+    // local names no class either and the deletions behind a call through it
+    // are held back the same way.
+    let source = "class Base:\n    def __new__(cls):\n        return object.__new__(Special)\n\n    def own(self, extra=7):\n        return extra\n\n\nclass Special(Base):\n    def __new__(cls):\n        return object.__new__(cls)\n\n    def own(self, extra=9):\n        return extra\n\n\ndef outer():\n    made = Base()\n    return made.own()\n\n\nassert outer() == 9, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_new_that_hands_back_its_own_class_is_turned_down_as_well(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The cost of the rule, written down: a `__new__` that ends in
+    // `super().__new__(cls)` does give an instance of the class, but nothing
+    // here reads the body to find that out, so the deletions behind the call
+    // are held back rather than guessed at.
+    let source = "class Normal:\n    def __new__(cls, *arguments, **options):\n        return super().__new__(cls)\n\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    return Normal().own()\n\n\nassert outer() == 7, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_class_that_writes_no_construction_hook_is_still_resolved(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The other direction: an ordinary class builds an instance of itself, and
+    // the call through the construction carries the deleted default as it
+    // always did.
+    let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own()\n\n\nassert outer() == 7, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    return Child().own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_metaclass_that_writes_no_call_leaves_construction_alone(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The other direction for the metaclass: one that writes no `__call__` of
+    // its own leaves `type` to build the instance, so the class named in the
+    // source is what the call reaches.
+    let source = "class Meta(type):\n    def register(cls):\n        return cls\n\n\nclass Child(metaclass=Meta):\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own()\n\n\nassert outer() == 7, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, "class Meta(type):\n    def register(cls):\n        return cls\n\n\nclass Child(metaclass=Meta):\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    return Child().own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn an_init_is_no_construction_hook() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The other direction again: `__init__` is handed the instance the class
+    // already made, so writing one says nothing about which class that is.
+    let source = "class Child:\n    def __init__(self):\n        self.made = True\n\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own()\n\n\nassert outer() == 7, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, "class Child:\n    def __init__(self):\n        self.made = True\n\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    return Child().own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

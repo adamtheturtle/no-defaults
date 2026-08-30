@@ -6294,6 +6294,57 @@ const XML_SAX_CONTENT_HANDLER_CALLBACKS: &[&str] = &[
     "startPrefixMapping",
 ];
 
+/// The methods `doctest` reaches on the runner driving a `DocTest`, whichever
+/// runner base the subclass was written on.
+const DOCTEST_RUNNER_CALLBACKS: &[&str] = &[
+    "report_failure",
+    "report_start",
+    "report_success",
+    "report_unexpected_exception",
+];
+
+/// The methods `unittest` reaches on a test case as it runs it, whichever case
+/// base the subclass was written on.
+const UNITTEST_CASE_CALLBACKS: &[&str] = &[
+    "defaultTestResult",
+    "setUp",
+    "setUpClass",
+    "shortDescription",
+    "tearDown",
+    "tearDownClass",
+];
+
+/// What `unittest` reaches on an `IsolatedAsyncioTestCase`. It derives from
+/// `TestCase`, so the synchronous hooks are called on it too, and the two
+/// coroutine hooks are called as well; a shared slice cannot express that, so
+/// the list is written out.
+const UNITTEST_ASYNC_CASE_CALLBACKS: &[&str] = &[
+    "asyncSetUp",
+    "asyncTearDown",
+    "defaultTestResult",
+    "setUp",
+    "setUpClass",
+    "shortDescription",
+    "tearDown",
+    "tearDownClass",
+];
+
+/// The methods `unittest` reaches on the result object it is reporting into,
+/// whichever result base the subclass was written on.
+const UNITTEST_RESULT_CALLBACKS: &[&str] = &[
+    "addError",
+    "addExpectedFailure",
+    "addFailure",
+    "addSkip",
+    "addSubTest",
+    "addSuccess",
+    "addUnexpectedSuccess",
+    "startTest",
+    "startTestRun",
+    "stopTest",
+    "stopTestRun",
+];
+
 /// Standard-library base classes whose own machinery calls the methods a
 /// subclass writes, each with the callbacks that machinery reaches.
 ///
@@ -6353,6 +6404,13 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
         "argparse",
         "RawTextHelpFormatter",
         ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    ("doctest", "DebugRunner", DOCTEST_RUNNER_CALLBACKS),
+    ("doctest", "DocTestRunner", DOCTEST_RUNNER_CALLBACKS),
+    (
+        "doctest",
+        "OutputChecker",
+        &["check_output", "output_difference"],
     ),
     ("email._policybase", "Compat32", EMAIL_POLICY_CALLBACKS),
     ("email._policybase", "Policy", EMAIL_POLICY_CALLBACKS),
@@ -6477,6 +6535,28 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
             "parse",
             "vformat",
         ],
+    ),
+    ("unittest", "FunctionTestCase", UNITTEST_CASE_CALLBACKS),
+    (
+        "unittest",
+        "IsolatedAsyncioTestCase",
+        UNITTEST_ASYNC_CASE_CALLBACKS,
+    ),
+    ("unittest", "TestCase", UNITTEST_CASE_CALLBACKS),
+    ("unittest", "TestResult", UNITTEST_RESULT_CALLBACKS),
+    ("unittest", "TextTestResult", UNITTEST_RESULT_CALLBACKS),
+    (
+        "unittest.async_case",
+        "IsolatedAsyncioTestCase",
+        UNITTEST_ASYNC_CASE_CALLBACKS,
+    ),
+    ("unittest.case", "FunctionTestCase", UNITTEST_CASE_CALLBACKS),
+    ("unittest.case", "TestCase", UNITTEST_CASE_CALLBACKS),
+    ("unittest.result", "TestResult", UNITTEST_RESULT_CALLBACKS),
+    (
+        "unittest.runner",
+        "TextTestResult",
+        UNITTEST_RESULT_CALLBACKS,
     ),
     // `xml.sax` re-exports `ContentHandler` from `xml.sax.handler`, so both
     // spellings name the same base and both have to be rows.
@@ -24489,6 +24569,217 @@ def b(x=1): pass  # type: ignore  # noqa
                 .replace("x, y=1):", "x, y):")
                 .replace("C().alias(2)", "C().alias(2, y=1)")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn doctest_runner_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `DocTestRunner.__run` calls all four of these as it walks the
+        // examples of a test, and `run` is the only thing this file calls, so a
+        // removed default has no call site to be carried to.
+        let source = "import doctest\n\n\nclass R(doctest.DocTestRunner):\n    def report_start(self, out, test, example, extra=1): pass\n\n    def report_success(self, out, test, example, got, extra=2): pass\n\n    def report_failure(self, out, test, example, got, extra=3): pass\n\n    def report_unexpected_exception(self, out, test, example, exc_info, extra=4): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn doctest_output_checker_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A runner compares every example through the checker it was given, and
+        // reports a mismatch through the same object, so both hooks are reached
+        // from inside `doctest` alone.
+        let source = "import doctest\n\n\nclass C(doctest.OutputChecker):\n    def check_output(self, want, got, optionflags, extra=1): return True\n\n    def output_difference(self, example, got, optionflags, extra=2): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_doctest_debug_runner_keeps_its_callback_defaults() -> Result<(), String> {
+        // `DebugRunner` derives from `DocTestRunner` and inherits the loop that
+        // reaches the report hooks, so a subclass of it is called the same way.
+        let source = "from doctest import DebugRunner\n\n\nclass R(DebugRunner):\n    def report_start(self, out, test, example, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn unittest_test_case_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `unittest` drives a case itself: `setUp` and `tearDown` from
+        // `TestCase.run`, `setUpClass` and `tearDownClass` from `TestSuite.run`,
+        // `defaultTestResult` from `TestCase.run` when no result was passed, and
+        // `shortDescription` from the runner's own reporting.
+        let source = "import unittest\n\n\nclass C(unittest.TestCase):\n    def setUp(self, extra=1): pass\n\n    def tearDown(self, extra=2): pass\n\n    @classmethod\n    def setUpClass(cls, extra=3): pass\n\n    @classmethod\n    def tearDownClass(cls, extra=4): pass\n\n    def defaultTestResult(self, extra=5): return None\n\n    def shortDescription(self, extra=6): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_test_case_hook_keeps_its_default_without_the_classmethod_decorator() -> Result<(), String>
+    {
+        // `classmethod` is a descriptor whose effect on the signature is known,
+        // so it is not what holds the default. The row is keyed on the name, and
+        // the hook keeps its default written either way.
+        let source = "import unittest\n\n\nclass C(unittest.TestCase):\n    def setUpClass(cls, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn unittest_async_test_case_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `IsolatedAsyncioTestCase` derives from `TestCase`, so it is reached by
+        // the synchronous lifecycle as well, and `_callSetUp` and `_callTearDown`
+        // await the two coroutine hooks on top of that.
+        let source = "import unittest\n\n\nclass C(unittest.IsolatedAsyncioTestCase):\n    async def asyncSetUp(self, extra=1): pass\n\n    async def asyncTearDown(self, extra=2): pass\n\n    def setUp(self, extra=3): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_async_hook_on_a_plain_test_case_is_still_fixed() -> Result<(), String> {
+        // Only the asynchronous case awaits `asyncSetUp`. A plain `TestCase`
+        // never reaches it, so the default is removed there like any other.
+        let source = "import unittest\n\n\nclass C(unittest.TestCase):\n    async def asyncSetUp(self, extra=1): return extra\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, "import unittest\n\n\nclass C(unittest.TestCase):\n    async def asyncSetUp(self, extra): return extra\n");
+        Ok(())
+    }
+
+    #[test]
+    fn unittest_test_result_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A runner reports into the result object it built, and every one of
+        // these is called from inside `unittest` — the run boundaries from
+        // `TextTestRunner.run`, the per-test boundaries and the outcomes from
+        // `TestCase.run`, and `addSubTest` from `TestCase.subTest`.
+        let source = "import unittest\n\n\nclass R(unittest.TestResult):\n    def startTestRun(self, extra=1): pass\n\n    def stopTestRun(self, extra=2): pass\n\n    def startTest(self, test, extra=3): pass\n\n    def stopTest(self, test, extra=4): pass\n\n    def addSuccess(self, test, extra=5): pass\n\n    def addError(self, test, err, extra=6): pass\n\n    def addFailure(self, test, err, extra=7): pass\n\n    def addSkip(self, test, reason, extra=8): pass\n\n    def addExpectedFailure(self, test, err, extra=9): pass\n\n    def addUnexpectedSuccess(self, test, extra=10): pass\n\n    def addSubTest(self, test, subtest, err, extra=11): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_test_result_keeps_its_callback_defaults() -> Result<(), String> {
+        // `TextTestResult` is what `TextTestRunner` builds by default, and it
+        // derives from `TestResult`, so a subclass of it is reported into the
+        // same way.
+        let source = "import unittest\n\n\nclass R(unittest.TextTestResult):\n    def addSuccess(self, test, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_function_test_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // `FunctionTestCase` derives from `TestCase`, so a subclass of it is run
+        // through the same lifecycle.
+        let source = "import unittest\n\n\nclass C(unittest.FunctionTestCase):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_test_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being run by `unittest` is inherited, so a case written on a case
+        // defined here is set up the same way. This is the shape almost every
+        // test suite takes.
+        let source = "import unittest\n\n\nclass Base(unittest.TestCase):\n    pass\n\n\nclass Child(Base):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_imported_test_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // The base is the same class whether it is spelled through the module or
+        // bound under a name of the reader's choosing.
+        let source = "from unittest import TestCase as Base\n\n\nclass C(Base):\n    def tearDown(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_unittest_module_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import unittest as ut\n\n\nclass C(ut.TestCase):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_unittest_hierarchy_are_still_fixed() -> Result<(), String> {
+        // `setUp` and `tearDown` are among the commonest method names there are.
+        // Nothing but the calls written below reaches this class, so the defaults
+        // go and those calls carry the values they held.
+        let source = "class Fixture:\n    def setUp(self, extra=1): return extra\n\n    def tearDown(self, extra=2): return extra\n\n    def setUpClass(cls, extra=3): return extra\n\n    def tearDownClass(cls, extra=4): return extra\n\n    def defaultTestResult(self, extra=5): return extra\n\n    def shortDescription(self, extra=6): return extra\n\n\nf = Fixture()\nassert Fixture.setUp(f) == 1\nassert Fixture.tearDown(f) == 2\nassert Fixture.setUpClass(f) == 3\nassert Fixture.tearDownClass(f) == 4\nassert Fixture.defaultTestResult(f) == 5\nassert Fixture.shortDescription(f) == 6\n";
+        assert_eq!(fixed(source)?, "class Fixture:\n    def setUp(self, extra): return extra\n\n    def tearDown(self, extra): return extra\n\n    def setUpClass(cls, extra): return extra\n\n    def tearDownClass(cls, extra): return extra\n\n    def defaultTestResult(self, extra): return extra\n\n    def shortDescription(self, extra): return extra\n\n\nf = Fixture()\nassert Fixture.setUp(f, extra=1) == 1\nassert Fixture.tearDown(f, extra=2) == 2\nassert Fixture.setUpClass(f, extra=3) == 3\nassert Fixture.tearDownClass(f, extra=4) == 4\nassert Fixture.defaultTestResult(f, extra=5) == 5\nassert Fixture.shortDescription(f, extra=6) == 6\n");
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_result_and_doctest_hierarchies_are_still_fixed(
+    ) -> Result<(), String> {
+        // The same holds for the result and comparison hooks: nothing reaches
+        // this class but the calls written below.
+        let source = "class Sink:\n    def addSuccess(self, test, extra=1): return extra\n\n    def startTest(self, test, extra=2): return extra\n\n    def addSubTest(self, test, subtest, err, extra=3): return extra\n\n    def check_output(self, want, got, optionflags, extra=4): return extra\n\n    def report_start(self, out, test, example, extra=5): return extra\n\n\ns = Sink()\nassert Sink.addSuccess(s, None) == 1\nassert Sink.startTest(s, None) == 2\nassert Sink.addSubTest(s, None, None, None) == 3\nassert Sink.check_output(s, \"\", \"\", 0) == 4\nassert Sink.report_start(s, None, None, None) == 5\n";
+        assert_eq!(fixed(source)?, "class Sink:\n    def addSuccess(self, test, extra): return extra\n\n    def startTest(self, test, extra): return extra\n\n    def addSubTest(self, test, subtest, err, extra): return extra\n\n    def check_output(self, want, got, optionflags, extra): return extra\n\n    def report_start(self, out, test, example, extra): return extra\n\n\ns = Sink()\nassert Sink.addSuccess(s, None, extra=1) == 1\nassert Sink.startTest(s, None, extra=2) == 2\nassert Sink.addSubTest(s, None, None, None, extra=3) == 3\nassert Sink.check_output(s, \"\", \"\", 0, extra=4) == 4\nassert Sink.report_start(s, None, None, None, extra=5) == 5\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_class_in_a_test_case_body_is_no_test_case() -> Result<(), String> {
+        // Deriving is what the retention is gated on, not being written next to
+        // something that does, so the nested class is fixed while the case's own
+        // hook is left alone.
+        let source = "import unittest\n\n\nclass C(unittest.TestCase):\n    class Inner:\n        def setUp(self, extra=1): return extra\n\n    def setUp(self, extra=2): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, "import unittest\n\n\nclass C(unittest.TestCase):\n    class Inner:\n        def setUp(self, extra): return extra\n\n    def setUp(self, extra=2): pass\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_unittest_submodule_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // `unittest` re-exports `TestCase` from `unittest.case`, so both
+        // spellings name the same class and both have to be rows. The subsystem
+        // runs the case either way.
+        let source = "from unittest.case import TestCase\n\n\nclass C(TestCase):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_dotted_unittest_submodule_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // `import unittest.case` binds `unittest` alone, so the base is read
+        // through two attributes rather than one.
+        let source = "import unittest.case\n\n\nclass C(unittest.case.TestCase):\n    def tearDown(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_unittest_submodule_function_test_case_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "from unittest.case import FunctionTestCase\n\n\nclass C(FunctionTestCase):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_unittest_submodule_async_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // `IsolatedAsyncioTestCase` lives in `unittest.async_case`, a different
+        // submodule from the synchronous case, and carries the same superset.
+        let source = "from unittest.async_case import IsolatedAsyncioTestCase\n\n\nclass C(IsolatedAsyncioTestCase):\n    async def asyncSetUp(self, extra=1): pass\n\n    def setUp(self, extra=2): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn unittest_submodule_results_keep_their_callback_defaults() -> Result<(), String> {
+        // The two result classes come from two different submodules,
+        // `unittest.result` and `unittest.runner`, though `unittest` re-exports
+        // both.
+        let source = "from unittest.result import TestResult\nfrom unittest.runner import TextTestResult\n\n\nclass R(TestResult):\n    def addSuccess(self, test, extra=1): pass\n\n\nclass T(TextTestResult):\n    def startTest(self, test, extra=2): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_case_namespace_is_no_unittest_submodule() -> Result<(), String> {
+        // The row is the standard library's `unittest.case`, not any two names
+        // that happen to read that way, so a class written under a local
+        // namespace of the same spelling is fixed as usual.
+        let source = "class case:\n    class TestCase:\n        pass\n\n\nclass C(case.TestCase):\n    def setUp(self, extra=1): return extra\n\n\nassert C.setUp(C()) == 1\n";
+        assert_eq!(fixed(source)?, "class case:\n    class TestCase:\n        pass\n\n\nclass C(case.TestCase):\n    def setUp(self, extra): return extra\n\n\nassert C.setUp(C(), extra=1) == 1\n");
         Ok(())
     }
 }

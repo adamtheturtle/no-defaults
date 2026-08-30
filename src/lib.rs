@@ -4066,6 +4066,7 @@ fn check_source(
         class_deletions: Vec::new(),
         class_assignments: Vec::new(),
         class_rewraps: Vec::new(),
+        class_opaque_rebindings: Vec::new(),
         method_aliases: Vec::new(),
         signatures: Vec::new(),
         own_constructors: Vec::new(),
@@ -4422,6 +4423,10 @@ struct Checker<'a> {
     /// Class-body assignments that put the same function back under its own
     /// name, which replace nothing.
     class_rewraps: Vec<BTreeMap<String, Vec<TextSize>>>,
+    /// Methods each enclosing class body names in an assignment whose value
+    /// this file cannot describe, so what stands behind the assigned name, and
+    /// how a call through it is spelled, are both unknown.
+    class_opaque_rebindings: Vec<BTreeSet<String>>,
     /// Direct `alias = method` bindings for each enclosing class, keyed by the
     /// original method name.
     method_aliases: Vec<BTreeMap<String, Vec<MethodAlias>>>,
@@ -5266,6 +5271,7 @@ impl Checker<'_> {
         self.class_deletions.pop();
         self.class_assignments.pop();
         self.class_rewraps.pop();
+        self.class_opaque_rebindings.pop();
         self.method_aliases.pop();
     }
 
@@ -5540,6 +5546,7 @@ impl Checker<'_> {
                     .class_implicit_callbacks
                     .contains(function.name.as_str()))
             || self.method_is_intercepted(function.name.as_str())
+            || self.method_is_opaquely_rebound(function.name.as_str())
             || self.method_is_rebound_later(function)
             || self.is_delegation_protocol_method(function.name.as_str())
             || (self.scope.class == ClassScope::Metaclass
@@ -5652,6 +5659,42 @@ impl Checker<'_> {
     /// the generated call finds it by the name it is bound to.
     fn generated_code_calls(&self, name: &str) -> bool {
         self.scope.fields == Some(FieldStyle::Dataclass) && name == "__post_init__"
+    }
+
+    /// Whether a class-body assignment this file cannot describe names the
+    /// method.
+    ///
+    /// `alias = wrap(target)`, where `wrap` is not one of the descriptor
+    /// wrappers, puts something unknown behind `alias`: it may be `target`
+    /// itself, it may take anything at all, and no signature can be recorded
+    /// for it. A call written through the assigned name is therefore never
+    /// rewritten, and it is not even reported, because the name is not one any
+    /// fixed callable goes by. Removing the default and saying nothing is the
+    /// one pairing that turns a working file into a `TypeError`, so the
+    /// default stays.
+    fn method_is_opaquely_rebound(&self, name: &str) -> bool {
+        self.scope.class != ClassScope::None
+            && self.class_opaque_rebindings.last().is_some_and(|names| {
+                // An alias the file does understand is the method under
+                // another spelling, so a value that cannot be described naming
+                // the alias names the method just as surely as one naming the
+                // method itself. `wrapped = _identity(alias)` beside
+                // `alias = target` reaches `target`, and reading only the
+                // written spelling let its default go.
+                names.contains(name)
+                    || self.method_aliases.last().is_some_and(|aliases| {
+                        aliases.get(name).is_some_and(|aliases| {
+                            aliases.iter().any(|alias| {
+                                // A copy of another class's function is keyed
+                                // under the name it goes by there, which may
+                                // be the name of a method here too. It is not
+                                // this method under another spelling, so a
+                                // value naming it says nothing about this one.
+                                alias.original_class.is_none() && names.contains(&alias.name)
+                            })
+                        })
+                    })
+            })
     }
 
     fn method_is_rebound_later(&self, function: &ast::StmtFunctionDef) -> bool {
@@ -6186,6 +6229,13 @@ const IMPORTLIB_IMPORT_CALLBACKS: &[&str] = &[
 /// the file to carry a deleted default to.
 const ENUM_CALLBACKS: &[&str] = &["__init__", "_generate_next_value_", "_missing_"];
 
+/// The methods `json` reaches on an encoder it owns, whichever spelling of the
+/// base the subclass was written on.
+///
+/// `json` re-exports `JSONEncoder` from `json.encoder`, so the class has two
+/// equally ordinary spellings and each needs its own row.
+const JSON_ENCODER_CALLBACKS: &[&str] = &["default", "encode", "iterencode"];
+
 /// The methods `logging` reaches on a handler it owns, whichever handler base
 /// the subclass was written on.
 const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
@@ -6259,6 +6309,57 @@ const XML_SAX_CONTENT_HANDLER_CALLBACKS: &[&str] = &[
     "startPrefixMapping",
 ];
 
+/// The methods `doctest` reaches on the runner driving a `DocTest`, whichever
+/// runner base the subclass was written on.
+const DOCTEST_RUNNER_CALLBACKS: &[&str] = &[
+    "report_failure",
+    "report_start",
+    "report_success",
+    "report_unexpected_exception",
+];
+
+/// The methods `unittest` reaches on a test case as it runs it, whichever case
+/// base the subclass was written on.
+const UNITTEST_CASE_CALLBACKS: &[&str] = &[
+    "defaultTestResult",
+    "setUp",
+    "setUpClass",
+    "shortDescription",
+    "tearDown",
+    "tearDownClass",
+];
+
+/// What `unittest` reaches on an `IsolatedAsyncioTestCase`. It derives from
+/// `TestCase`, so the synchronous hooks are called on it too, and the two
+/// coroutine hooks are called as well; a shared slice cannot express that, so
+/// the list is written out.
+const UNITTEST_ASYNC_CASE_CALLBACKS: &[&str] = &[
+    "asyncSetUp",
+    "asyncTearDown",
+    "defaultTestResult",
+    "setUp",
+    "setUpClass",
+    "shortDescription",
+    "tearDown",
+    "tearDownClass",
+];
+
+/// The methods `unittest` reaches on the result object it is reporting into,
+/// whichever result base the subclass was written on.
+const UNITTEST_RESULT_CALLBACKS: &[&str] = &[
+    "addError",
+    "addExpectedFailure",
+    "addFailure",
+    "addSkip",
+    "addSubTest",
+    "addSuccess",
+    "addUnexpectedSuccess",
+    "startTest",
+    "startTestRun",
+    "stopTest",
+    "stopTestRun",
+];
+
 /// Standard-library base classes whose own machinery calls the methods a
 /// subclass writes, each with the callbacks that machinery reaches.
 ///
@@ -6273,6 +6374,11 @@ const XML_SAX_CONTENT_HANDLER_CALLBACKS: &[&str] = &[
 /// standard-library subclass that is a base in its own right —
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
+///
+/// Rows stay sorted by module then base, which is what makes a module's rows
+/// sit together and a missing one visible next to its neighbours. Batches add
+/// rows to this table concurrently, so `the_callback_base_table_is_sorted`
+/// guards the order rather than leaving it to each author.
 const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
     (
         "argparse",
@@ -6300,6 +6406,13 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
         "RawTextHelpFormatter",
         ARGPARSE_FORMATTER_CALLBACKS,
     ),
+    ("doctest", "DebugRunner", DOCTEST_RUNNER_CALLBACKS),
+    ("doctest", "DocTestRunner", DOCTEST_RUNNER_CALLBACKS),
+    (
+        "doctest",
+        "OutputChecker",
+        &["check_output", "output_difference"],
+    ),
     ("email._policybase", "Compat32", EMAIL_POLICY_CALLBACKS),
     ("email._policybase", "Policy", EMAIL_POLICY_CALLBACKS),
     ("email.policy", "Compat32", EMAIL_POLICY_CALLBACKS),
@@ -6311,6 +6424,23 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
     ("enum", "IntFlag", ENUM_CALLBACKS),
     ("enum", "ReprEnum", ENUM_CALLBACKS),
     ("enum", "StrEnum", ENUM_CALLBACKS),
+    (
+        "html.parser",
+        "HTMLParser",
+        &[
+            "handle_charref",
+            "handle_comment",
+            "handle_data",
+            "handle_decl",
+            "handle_endtag",
+            "handle_entityref",
+            "handle_pi",
+            "handle_startendtag",
+            "handle_starttag",
+            "reset",
+            "unknown_decl",
+        ],
+    ),
     (
         "importlib.abc",
         "ExecutionLoader",
@@ -6388,6 +6518,8 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
     ("importlib.util", "LazyLoader", IMPORTLIB_IMPORT_CALLBACKS),
     ("io", "FileIO", IO_RAW_CALLBACKS),
     ("io", "RawIOBase", IO_RAW_CALLBACKS),
+    ("json", "JSONEncoder", JSON_ENCODER_CALLBACKS),
+    ("json.encoder", "JSONEncoder", JSON_ENCODER_CALLBACKS),
     (
         "logging",
         "BufferingFormatter",
@@ -6474,6 +6606,42 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
         "logging.handlers",
         "WatchedFileHandler",
         LOGGING_HANDLER_CALLBACKS,
+    ),
+    ("pprint", "PrettyPrinter", &["format"]),
+    (
+        "string",
+        "Formatter",
+        &[
+            "check_unused_args",
+            "convert_field",
+            "format_field",
+            "get_field",
+            "get_value",
+            "parse",
+            "vformat",
+        ],
+    ),
+    ("unittest", "FunctionTestCase", UNITTEST_CASE_CALLBACKS),
+    (
+        "unittest",
+        "IsolatedAsyncioTestCase",
+        UNITTEST_ASYNC_CASE_CALLBACKS,
+    ),
+    ("unittest", "TestCase", UNITTEST_CASE_CALLBACKS),
+    ("unittest", "TestResult", UNITTEST_RESULT_CALLBACKS),
+    ("unittest", "TextTestResult", UNITTEST_RESULT_CALLBACKS),
+    (
+        "unittest.async_case",
+        "IsolatedAsyncioTestCase",
+        UNITTEST_ASYNC_CASE_CALLBACKS,
+    ),
+    ("unittest.case", "FunctionTestCase", UNITTEST_CASE_CALLBACKS),
+    ("unittest.case", "TestCase", UNITTEST_CASE_CALLBACKS),
+    ("unittest.result", "TestResult", UNITTEST_RESULT_CALLBACKS),
+    (
+        "unittest.runner",
+        "TextTestResult",
+        UNITTEST_RESULT_CALLBACKS,
     ),
     // `xml.sax` re-exports `ContentHandler` from `xml.sax.handler`, so both
     // spellings name the same base and both have to be rows.
@@ -6619,6 +6787,8 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     aliases: &self.aliases,
                     module_bindings: &self.module_bindings,
                 };
+                self.class_opaque_rebindings
+                    .push(class_opaque_rebindings(&class.body, context));
                 let collected = class_method_aliases(class, context);
                 self.class_rewraps.push(collected.rewraps);
                 self.method_aliases.push(collected.aliases);
@@ -9466,6 +9636,117 @@ fn common_all_state(outcomes: &[Option<BTreeSet<String>>]) -> Option<BTreeSet<St
 /// A nested `def` or `class` is a scope of its own, and the rewriter pushes one
 /// for it on the way in, so what it binds is left to it. Only its own name is
 /// taken, because that is what the body being collected binds.
+/// Every method a class body names in an assignment whose value this file
+/// cannot describe.
+///
+/// A value the alias machinery recognises — a bare name, a `Class.method`, or a
+/// descriptor wrapper around one of those — records an alias, and a call through
+/// the assigned name is rewritten against it. Anything else records nothing at
+/// all, which left the assigned name unknown to the fixer: the call through it
+/// was neither rewritten nor reported, while the default behind the method it
+/// mentions was removed. Naming the methods such a value mentions is what lets
+/// those defaults be held back instead.
+///
+/// The names are read from the whole value, so `_identity(target)`,
+/// `[target][0]` and `(target if flag else other)` are all caught. A name the
+/// class defines no method under matches nothing and costs nothing.
+fn class_opaque_rebindings(body: &[Stmt], context: AliasContext<'_>) -> BTreeSet<String> {
+    /// Every name an expression reads, however deeply it is written into it.
+    fn collect_read_names(expression: &Expr, found: &mut BTreeSet<String>) {
+        struct Reader<'a>(&'a mut BTreeSet<String>);
+
+        impl<'a> Visitor<'a> for Reader<'_> {
+            fn visit_expr(&mut self, expression: &'a Expr) {
+                if let Expr::Name(name) = expression {
+                    self.0.insert(name.id.to_string());
+                }
+                walk_expr(self, expression);
+            }
+        }
+
+        Reader(found).visit_expr(expression);
+    }
+
+    struct Collector<'a> {
+        found: BTreeSet<String>,
+        context: AliasContext<'a>,
+    }
+
+    impl Collector<'_> {
+        /// Record what an assignment of `value` to `target` puts out of reach.
+        ///
+        /// The pairing of matched tuples and lists is walked element by
+        /// element, exactly as the alias collector walks it, so
+        /// `first, second = one, two` is read as the two assignments it is
+        /// rather than as one opaque value.
+        fn record(&mut self, target: &Expr, value: &Expr) {
+            // A tuple and a list of the same length unpack the same way, so
+            // which brackets each side is written with says nothing about the
+            // pairing, exactly as the alias collector reads it.
+            if let (
+                Expr::Tuple(ast::ExprTuple { elts: targets, .. })
+                | Expr::List(ast::ExprList { elts: targets, .. }),
+                Expr::Tuple(ast::ExprTuple { elts: values, .. })
+                | Expr::List(ast::ExprList { elts: values, .. }),
+            ) = (target, value)
+            {
+                if targets.len() == values.len() {
+                    for (target, value) in targets.iter().zip(values) {
+                        self.record(target, value);
+                    }
+                    return;
+                }
+            }
+            // A value the alias machinery describes records an alias of its
+            // own, and the call through the assigned name is rewritten against
+            // it.
+            if method_alias_origin(value, self.context, &BTreeMap::new()).is_some() {
+                return;
+            }
+            collect_read_names(value, &mut self.found);
+        }
+    }
+
+    impl<'a> Visitor<'a> for Collector<'_> {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            match statement {
+                Stmt::Assign(assign) => {
+                    for target in &assign.targets {
+                        self.record(target, &assign.value);
+                    }
+                }
+                Stmt::AnnAssign(assign) => {
+                    if let Some(value) = &assign.value {
+                        self.record(&assign.target, value);
+                    }
+                }
+                // A walrus written straight in the body binds the class
+                // namespace exactly as an assignment does, which is why
+                // `record_assigned_aliases` reads this form too. Leaving it out
+                // here let `(alias := wrap(target))` take the default off
+                // `target` with the call through `alias` still as written.
+                Stmt::Expr(expression) => {
+                    if let Expr::Named(named) = expression.value.as_ref() {
+                        self.record(&named.target, &named.value);
+                    }
+                }
+                // A method written in a body of its own is a definition rather
+                // than a rebinding, and a nested class keeps its own body to
+                // itself.
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                _ => walk_stmt(self, statement),
+            }
+        }
+    }
+
+    let mut collector = Collector {
+        found: BTreeSet::new(),
+        context,
+    };
+    collector.visit_body(body);
+    collector.found
+}
+
 fn class_assignments(body: &[Stmt]) -> BTreeMap<String, Vec<TextSize>> {
     #[derive(Default)]
     struct Collector(BTreeMap<String, Vec<TextSize>>);
@@ -10608,9 +10889,8 @@ impl Rewriter<'_> {
     /// Definitions are indexed under the lexical path they were written at,
     /// so the search runs outwards from the call site the way
     /// [`Self::nested_signature`] does, stopping at the nearest scope that
-    /// binds the name. A scope that also assigns the name, or a scope inside
-    /// that declares it `nonlocal`, says nothing about what stands behind it
-    /// when the call runs, so neither resolves.
+    /// binds the name. A scope that binds the name a second time says nothing
+    /// about what stands behind it when the call runs, so it does not resolve.
     fn nested_class(&self, name: &str) -> Option<(PathBuf, String)> {
         // A class body is not a closure scope, so a class written beside a
         // lambda or a comprehension there is out of that scope's reach.
@@ -24204,6 +24484,500 @@ def b(x=1): pass  # type: ignore  # noqa
             "import xml.sax.handler\n\n\nclass Base(xml.sax.handler.ContentHandler):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    def characters(self, content, extra): return extra\n"
         );
         Ok(())
+    }
+
+    #[test]
+    fn html_parser_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `HTMLParser` reaches each of these from `goahead`, which is what
+        // `feed` and `close` run, and `reset` from `HTMLParser.__init__`.
+        // Nothing here writes those calls, so removing a default leaves a
+        // parser the module can no longer drive.
+        let source = "import html.parser\n\n\nclass P(html.parser.HTMLParser):\n    def handle_starttag(self, tag, attrs, extra=1): pass\n\n    def handle_endtag(self, tag, extra=2): pass\n\n    def handle_startendtag(self, tag, attrs, extra=3): pass\n\n    def handle_data(self, data, extra=4): pass\n\n    def handle_entityref(self, name, extra=5): pass\n\n    def handle_charref(self, name, extra=6): pass\n\n    def handle_comment(self, data, extra=7): pass\n\n    def handle_decl(self, decl, extra=8): pass\n\n    def handle_pi(self, data, extra=9): pass\n\n    def unknown_decl(self, data, extra=10): pass\n\n    def reset(self, extra=11): super().reset()\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn string_formatter_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `Formatter.format` reaches `vformat`, which reaches `check_unused_args`
+        // and, through `_vformat`, `parse`, `get_field`, `convert_field` and
+        // `format_field`; `get_field` reaches `get_value`. Only the outermost
+        // call is ever written down.
+        let source = "import string\n\n\nclass F(string.Formatter):\n    def vformat(self, format_string, args, kwargs, extra=1): return \"\"\n\n    def parse(self, format_string, extra=2): return []\n\n    def get_field(self, field_name, args, kwargs, extra=3): return None, None\n\n    def get_value(self, key, args, kwargs, extra=4): return \"\"\n\n    def check_unused_args(self, used_args, args, kwargs, extra=5): pass\n\n    def format_field(self, value, format_spec, extra=6): return \"\"\n\n    def convert_field(self, value, conversion, extra=7): return value\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn json_encoder_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `json.dumps(..., cls=E)` calls `encode` on an encoder it builds
+        // itself, `json.dump` calls `iterencode`, and `default` is reached from
+        // the C serialiser for every object it cannot render.
+        let source = "import json\n\n\nclass E(json.JSONEncoder):\n    def default(self, obj, extra=1): return str(obj)\n\n    def encode(self, o, extra=2): return \"\"\n\n    def iterencode(self, o, _one_shot=False, extra=3): return iter(())\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn pprint_pretty_printer_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `pformat` and `pprint` reach `format` through `_repr`, once per
+        // object rendered.
+        let source = "import pprint\n\n\nclass P(pprint.PrettyPrinter):\n    def format(self, obj, context, maxlevels, level, extra=1): return repr(obj), True, False\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_imported_html_parser_base_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "from html.parser import HTMLParser\n\n\nclass P(HTMLParser):\n    def handle_data(self, data, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_package_from_import_reaches_the_html_parser_base() -> Result<(), String> {
+        // `from html import parser` binds the submodule under the package, so
+        // the base is one attribute away from a name that is not the module's
+        // own.
+        let source = "from html import parser\n\n\nclass P(parser.HTMLParser):\n    def handle_data(self, data, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_html_parser_subclass_keeps_its_callback_defaults() -> Result<(), String>
+    {
+        let source = "from html.parser import HTMLParser\n\n\nclass Base(HTMLParser):\n    pass\n\n\nclass Child(Base):\n    def handle_data(self, data, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_json_encoder_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "from json import JSONEncoder\n\n\nclass Base(JSONEncoder):\n    pass\n\n\nclass Child(Base):\n    def default(self, obj, extra=1): return str(obj)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn the_defining_module_of_the_json_encoder_keeps_its_callback_defaults() -> Result<(), String> {
+        // `json` re-exports `JSONEncoder` from `json.encoder`, so both dotted
+        // spellings name the class `json.dumps` calls `default` on, and the
+        // submodule needs a row of its own to be recognised.
+        let source = "import json.encoder\n\n\nclass E(json.encoder.JSONEncoder):\n    def default(self, obj, extra=1): return str(obj)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        let imported = "from json.encoder import JSONEncoder\n\n\nclass E(JSONEncoder):\n    def default(self, obj, extra=1): return str(obj)\n";
+        assert_eq!(fixed_with_retained_defaults(imported)?, imported);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_pprint_module_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import pprint as pp\n\n\nclass P(pp.PrettyPrinter):\n    def format(self, obj, context, maxlevels, level, extra=1): return repr(obj), True, False\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_string_formatter_import_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "from string import Formatter as Base\n\n\nclass F(Base):\n    def convert_field(self, value, conversion, extra=1): return value\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_these_parsing_hierarchies_are_still_fixed() -> Result<(), String> {
+        // `default`, `format`, `parse` and `handle_data` are ordinary method
+        // names. Nothing reaches these classes but the calls written below, so
+        // the defaults go and those calls carry the values they held.
+        let source = "class Encoder:\n    def default(self, obj, extra=1): return extra\n\n    def encode(self, o, extra=2): return extra\n\n\nclass Printer:\n    def format(self, obj, context, maxlevels, level, extra=3): return extra\n\n\nclass Formatter:\n    def parse(self, format_string, extra=4): return extra\n\n    def get_value(self, key, args, kwargs, extra=5): return extra\n\n\nclass Parser:\n    def handle_data(self, data, extra=6): return extra\n\n    def reset(self, extra=7): return extra\n\n\ne = Encoder()\nassert Encoder.default(e, None) == 1\nassert Encoder.encode(e, None) == 2\nassert Printer.format(Printer(), None, None, None, None) == 3\nf = Formatter()\nassert Formatter.parse(f, \"\") == 4\nassert Formatter.get_value(f, 0, (), {}) == 5\nq = Parser()\nassert Parser.handle_data(q, \"\") == 6\nassert Parser.reset(q) == 7\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Encoder:\n    def default(self, obj, extra): return extra\n\n    def encode(self, o, extra): return extra\n\n\nclass Printer:\n    def format(self, obj, context, maxlevels, level, extra): return extra\n\n\nclass Formatter:\n    def parse(self, format_string, extra): return extra\n\n    def get_value(self, key, args, kwargs, extra): return extra\n\n\nclass Parser:\n    def handle_data(self, data, extra): return extra\n\n    def reset(self, extra): return extra\n\n\ne = Encoder()\nassert Encoder.default(e, None, extra=1) == 1\nassert Encoder.encode(e, None, extra=2) == 2\nassert Printer.format(Printer(), None, None, None, None, extra=3) == 3\nf = Formatter()\nassert Formatter.parse(f, \"\", extra=4) == 4\nassert Formatter.get_value(f, 0, (), {}, extra=5) == 5\nq = Parser()\nassert Parser.handle_data(q, \"\", extra=6) == 6\nassert Parser.reset(q, extra=7) == 7\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unrecognised_wrapper_around_a_class_body_alias_holds_the_default_back(
+    ) -> Result<(), String> {
+        // `_identity` may return anything at all, so no signature can be
+        // recorded for `alias` and the call written through it is never
+        // rewritten. It is not even reported, because `alias` is not a name
+        // any fixed callable goes by, so removing the default here was the one
+        // pairing that turns a working file into a `TypeError`.
+        let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = _identity(target)\n\n\nassert C().alias(2) == (2, 1)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_subscript_of_a_method_holds_the_default_back() -> Result<(), String> {
+        // The same silence for any value this file cannot describe that still
+        // mentions the method.
+        let source = "class C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = [target][0]\n\n\nassert C().alias(2) == (2, 1)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_conditional_expression_holds_the_default_back() -> Result<(), String> {
+        // Which of the two the name ends up holding is a runtime fact, so the
+        // call through it cannot be rewritten against either.
+        let source = "import os\n\n\ndef other(self, x):\n    return x\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = target if os.environ.get(\"ND_TYPING\") else other\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_tuple_unpacking_holds_the_default_back() -> Result<(), String> {
+        // The shape `fractions.Fraction` is written in: a helper defined in the
+        // class body is called there and its results unpacked. Removing the
+        // default leaves the call beside it short of an argument, and the
+        // module raises before anything can import it.
+        let source = "import operator\n\n\nclass C:\n    def _fallbacks(forward, reverse, handle_complex=True):\n        return forward, reverse\n\n    def _add(self, other):\n        return other\n\n    __add__, __radd__ = _fallbacks(_add, operator.add)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_recognised_wrapper_around_a_class_body_alias_is_still_fixed() -> Result<(), String> {
+        // The counterpart guard. A descriptor wrapper leaves the function's own
+        // parameters behind the name, so the alias carries a signature and the
+        // call through it takes the value the removed default held.
+        let source = "class C:\n    def target(x, y=1):\n        return (x, y)\n\n    alias = staticmethod(target)\n\n\nassert C.alias(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("y=1):", "y):")
+                .replace("C.alias(2)", "C.alias(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_value_naming_no_method_is_still_fixed() -> Result<(), String> {
+        // Holding back every method of a class that writes anything opaque in
+        // its body would retain a default for most classes. Only a value that
+        // names the method counts.
+        let source = "class C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    table = {\"a\": 1}\n    label = \"x\".upper()\n\n\nassert C().target(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("y=1):", "y):")
+                .replace("C().target(2)", "C().target(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_module_level_opaque_binding_still_fixes_the_function() -> Result<(), String> {
+        // A module namespace is not a class body: a name bound there is one the
+        // fixer already tracks, and the call through it is reported by the
+        // paths that own module bindings.
+        let source = "def _identity(function):\n    return function\n\n\ndef target(x, y=1):\n    return (x, y)\n\n\nassert target(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("y=1):", "y):")
+                .replace("assert target(2)", "assert target(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_opaque_value_naming_a_class_body_alias_holds_the_default_back() -> Result<(), String> {
+        // `alias` is `target` under another spelling, so a value this file
+        // cannot describe naming `alias` puts `target` out of reach just as
+        // surely. Reading only the written spelling let the default go and
+        // left `C().wrapped(2)` unrewritten and unreported.
+        let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = target\n    wrapped = _identity(alias)\n\n\nassert C().wrapped(2) == (2, 1)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_opaque_value_naming_a_copy_of_another_class_is_still_fixed() -> Result<(), String> {
+        // `copied` holds `Other.target`, which is recorded under the name it
+        // goes by there — the same name `C` writes a method under. It is not
+        // `C.target` under another spelling, so naming it in a value this file
+        // cannot describe says nothing about `C.target` and holding that
+        // default back was a false retention.
+        let source = "def _identity(function):\n    return function\n\n\nclass Other:\n    def target(self, a):\n        return a\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    copied = Other.target\n    wrapped = _identity(copied)\n\n\nassert C().target(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("x, y=1):", "x, y):")
+                .replace("C().target(2)", "C().target(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_opaque_value_naming_an_unrelated_alias_is_still_fixed() -> Result<(), String> {
+        // The counterpart guard: `other` is an alias of a different method, so
+        // naming it says nothing about `target` and `target` is still fixed.
+        let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    def spare(self):\n        return 0\n\n    other = spare\n    wrapped = _identity(other)\n\n\nassert C().target(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("y=1):", "y):")
+                .replace("C().target(2)", "C().target(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_opaque_class_body_walrus_holds_the_default_back() -> Result<(), String> {
+        // A walrus written straight in the body binds the class namespace
+        // exactly as an assignment does, so an unrecognised wrapper behind one
+        // puts the method just as far out of reach. Reading only `Assign` and
+        // `AnnAssign` let this one strip the default with the call through
+        // `alias` still as written.
+        let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    (alias := _identity(target))\n\n\nassert C().alias(2) == (2, 1)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_class_body_walrus_is_still_fixed() -> Result<(), String> {
+        // The counterpart guard: the value is a bare name, so the alias is
+        // recorded, the call through it carries the value the removed default
+        // held, and nothing is held back.
+        let source = "class C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    (alias := target)\n\n\nassert C().alias(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("x, y=1):", "x, y):")
+                .replace("C().alias(2)", "C().alias(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctest_runner_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `DocTestRunner.__run` calls all four of these as it walks the
+        // examples of a test, and `run` is the only thing this file calls, so a
+        // removed default has no call site to be carried to.
+        let source = "import doctest\n\n\nclass R(doctest.DocTestRunner):\n    def report_start(self, out, test, example, extra=1): pass\n\n    def report_success(self, out, test, example, got, extra=2): pass\n\n    def report_failure(self, out, test, example, got, extra=3): pass\n\n    def report_unexpected_exception(self, out, test, example, exc_info, extra=4): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn doctest_output_checker_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A runner compares every example through the checker it was given, and
+        // reports a mismatch through the same object, so both hooks are reached
+        // from inside `doctest` alone.
+        let source = "import doctest\n\n\nclass C(doctest.OutputChecker):\n    def check_output(self, want, got, optionflags, extra=1): return True\n\n    def output_difference(self, example, got, optionflags, extra=2): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_doctest_debug_runner_keeps_its_callback_defaults() -> Result<(), String> {
+        // `DebugRunner` derives from `DocTestRunner` and inherits the loop that
+        // reaches the report hooks, so a subclass of it is called the same way.
+        let source = "from doctest import DebugRunner\n\n\nclass R(DebugRunner):\n    def report_start(self, out, test, example, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn unittest_test_case_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `unittest` drives a case itself: `setUp` and `tearDown` from
+        // `TestCase.run`, `setUpClass` and `tearDownClass` from `TestSuite.run`,
+        // `defaultTestResult` from `TestCase.run` when no result was passed, and
+        // `shortDescription` from the runner's own reporting.
+        let source = "import unittest\n\n\nclass C(unittest.TestCase):\n    def setUp(self, extra=1): pass\n\n    def tearDown(self, extra=2): pass\n\n    @classmethod\n    def setUpClass(cls, extra=3): pass\n\n    @classmethod\n    def tearDownClass(cls, extra=4): pass\n\n    def defaultTestResult(self, extra=5): return None\n\n    def shortDescription(self, extra=6): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_test_case_hook_keeps_its_default_without_the_classmethod_decorator() -> Result<(), String>
+    {
+        // `classmethod` is a descriptor whose effect on the signature is known,
+        // so it is not what holds the default. The row is keyed on the name, and
+        // the hook keeps its default written either way.
+        let source = "import unittest\n\n\nclass C(unittest.TestCase):\n    def setUpClass(cls, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn unittest_async_test_case_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `IsolatedAsyncioTestCase` derives from `TestCase`, so it is reached by
+        // the synchronous lifecycle as well, and `_callSetUp` and `_callTearDown`
+        // await the two coroutine hooks on top of that.
+        let source = "import unittest\n\n\nclass C(unittest.IsolatedAsyncioTestCase):\n    async def asyncSetUp(self, extra=1): pass\n\n    async def asyncTearDown(self, extra=2): pass\n\n    def setUp(self, extra=3): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_async_hook_on_a_plain_test_case_is_still_fixed() -> Result<(), String> {
+        // Only the asynchronous case awaits `asyncSetUp`. A plain `TestCase`
+        // never reaches it, so the default is removed there like any other.
+        let source = "import unittest\n\n\nclass C(unittest.TestCase):\n    async def asyncSetUp(self, extra=1): return extra\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, "import unittest\n\n\nclass C(unittest.TestCase):\n    async def asyncSetUp(self, extra): return extra\n");
+        Ok(())
+    }
+
+    #[test]
+    fn unittest_test_result_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A runner reports into the result object it built, and every one of
+        // these is called from inside `unittest` — the run boundaries from
+        // `TextTestRunner.run`, the per-test boundaries and the outcomes from
+        // `TestCase.run`, and `addSubTest` from `TestCase.subTest`.
+        let source = "import unittest\n\n\nclass R(unittest.TestResult):\n    def startTestRun(self, extra=1): pass\n\n    def stopTestRun(self, extra=2): pass\n\n    def startTest(self, test, extra=3): pass\n\n    def stopTest(self, test, extra=4): pass\n\n    def addSuccess(self, test, extra=5): pass\n\n    def addError(self, test, err, extra=6): pass\n\n    def addFailure(self, test, err, extra=7): pass\n\n    def addSkip(self, test, reason, extra=8): pass\n\n    def addExpectedFailure(self, test, err, extra=9): pass\n\n    def addUnexpectedSuccess(self, test, extra=10): pass\n\n    def addSubTest(self, test, subtest, err, extra=11): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_test_result_keeps_its_callback_defaults() -> Result<(), String> {
+        // `TextTestResult` is what `TextTestRunner` builds by default, and it
+        // derives from `TestResult`, so a subclass of it is reported into the
+        // same way.
+        let source = "import unittest\n\n\nclass R(unittest.TextTestResult):\n    def addSuccess(self, test, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_function_test_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // `FunctionTestCase` derives from `TestCase`, so a subclass of it is run
+        // through the same lifecycle.
+        let source = "import unittest\n\n\nclass C(unittest.FunctionTestCase):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_test_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being run by `unittest` is inherited, so a case written on a case
+        // defined here is set up the same way. This is the shape almost every
+        // test suite takes.
+        let source = "import unittest\n\n\nclass Base(unittest.TestCase):\n    pass\n\n\nclass Child(Base):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_imported_test_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // The base is the same class whether it is spelled through the module or
+        // bound under a name of the reader's choosing.
+        let source = "from unittest import TestCase as Base\n\n\nclass C(Base):\n    def tearDown(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_unittest_module_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import unittest as ut\n\n\nclass C(ut.TestCase):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_unittest_hierarchy_are_still_fixed() -> Result<(), String> {
+        // `setUp` and `tearDown` are among the commonest method names there are.
+        // Nothing but the calls written below reaches this class, so the defaults
+        // go and those calls carry the values they held.
+        let source = "class Fixture:\n    def setUp(self, extra=1): return extra\n\n    def tearDown(self, extra=2): return extra\n\n    def setUpClass(cls, extra=3): return extra\n\n    def tearDownClass(cls, extra=4): return extra\n\n    def defaultTestResult(self, extra=5): return extra\n\n    def shortDescription(self, extra=6): return extra\n\n\nf = Fixture()\nassert Fixture.setUp(f) == 1\nassert Fixture.tearDown(f) == 2\nassert Fixture.setUpClass(f) == 3\nassert Fixture.tearDownClass(f) == 4\nassert Fixture.defaultTestResult(f) == 5\nassert Fixture.shortDescription(f) == 6\n";
+        assert_eq!(fixed(source)?, "class Fixture:\n    def setUp(self, extra): return extra\n\n    def tearDown(self, extra): return extra\n\n    def setUpClass(cls, extra): return extra\n\n    def tearDownClass(cls, extra): return extra\n\n    def defaultTestResult(self, extra): return extra\n\n    def shortDescription(self, extra): return extra\n\n\nf = Fixture()\nassert Fixture.setUp(f, extra=1) == 1\nassert Fixture.tearDown(f, extra=2) == 2\nassert Fixture.setUpClass(f, extra=3) == 3\nassert Fixture.tearDownClass(f, extra=4) == 4\nassert Fixture.defaultTestResult(f, extra=5) == 5\nassert Fixture.shortDescription(f, extra=6) == 6\n");
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_result_and_doctest_hierarchies_are_still_fixed(
+    ) -> Result<(), String> {
+        // The same holds for the result and comparison hooks: nothing reaches
+        // this class but the calls written below.
+        let source = "class Sink:\n    def addSuccess(self, test, extra=1): return extra\n\n    def startTest(self, test, extra=2): return extra\n\n    def addSubTest(self, test, subtest, err, extra=3): return extra\n\n    def check_output(self, want, got, optionflags, extra=4): return extra\n\n    def report_start(self, out, test, example, extra=5): return extra\n\n\ns = Sink()\nassert Sink.addSuccess(s, None) == 1\nassert Sink.startTest(s, None) == 2\nassert Sink.addSubTest(s, None, None, None) == 3\nassert Sink.check_output(s, \"\", \"\", 0) == 4\nassert Sink.report_start(s, None, None, None) == 5\n";
+        assert_eq!(fixed(source)?, "class Sink:\n    def addSuccess(self, test, extra): return extra\n\n    def startTest(self, test, extra): return extra\n\n    def addSubTest(self, test, subtest, err, extra): return extra\n\n    def check_output(self, want, got, optionflags, extra): return extra\n\n    def report_start(self, out, test, example, extra): return extra\n\n\ns = Sink()\nassert Sink.addSuccess(s, None, extra=1) == 1\nassert Sink.startTest(s, None, extra=2) == 2\nassert Sink.addSubTest(s, None, None, None, extra=3) == 3\nassert Sink.check_output(s, \"\", \"\", 0, extra=4) == 4\nassert Sink.report_start(s, None, None, None, extra=5) == 5\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_class_in_a_test_case_body_is_no_test_case() -> Result<(), String> {
+        // Deriving is what the retention is gated on, not being written next to
+        // something that does, so the nested class is fixed while the case's own
+        // hook is left alone.
+        let source = "import unittest\n\n\nclass C(unittest.TestCase):\n    class Inner:\n        def setUp(self, extra=1): return extra\n\n    def setUp(self, extra=2): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, "import unittest\n\n\nclass C(unittest.TestCase):\n    class Inner:\n        def setUp(self, extra): return extra\n\n    def setUp(self, extra=2): pass\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_unittest_submodule_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // `unittest` re-exports `TestCase` from `unittest.case`, so both
+        // spellings name the same class and both have to be rows. The subsystem
+        // runs the case either way.
+        let source = "from unittest.case import TestCase\n\n\nclass C(TestCase):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_dotted_unittest_submodule_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // `import unittest.case` binds `unittest` alone, so the base is read
+        // through two attributes rather than one.
+        let source = "import unittest.case\n\n\nclass C(unittest.case.TestCase):\n    def tearDown(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_unittest_submodule_function_test_case_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "from unittest.case import FunctionTestCase\n\n\nclass C(FunctionTestCase):\n    def setUp(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_unittest_submodule_async_case_keeps_its_callback_defaults() -> Result<(), String> {
+        // `IsolatedAsyncioTestCase` lives in `unittest.async_case`, a different
+        // submodule from the synchronous case, and carries the same superset.
+        let source = "from unittest.async_case import IsolatedAsyncioTestCase\n\n\nclass C(IsolatedAsyncioTestCase):\n    async def asyncSetUp(self, extra=1): pass\n\n    def setUp(self, extra=2): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn unittest_submodule_results_keep_their_callback_defaults() -> Result<(), String> {
+        // The two result classes come from two different submodules,
+        // `unittest.result` and `unittest.runner`, though `unittest` re-exports
+        // both.
+        let source = "from unittest.result import TestResult\nfrom unittest.runner import TextTestResult\n\n\nclass R(TestResult):\n    def addSuccess(self, test, extra=1): pass\n\n\nclass T(TextTestResult):\n    def startTest(self, test, extra=2): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_case_namespace_is_no_unittest_submodule() -> Result<(), String> {
+        // The row is the standard library's `unittest.case`, not any two names
+        // that happen to read that way, so a class written under a local
+        // namespace of the same spelling is fixed as usual.
+        let source = "class case:\n    class TestCase:\n        pass\n\n\nclass C(case.TestCase):\n    def setUp(self, extra=1): return extra\n\n\nassert C.setUp(C()) == 1\n";
+        assert_eq!(fixed(source)?, "class case:\n    class TestCase:\n        pass\n\n\nclass C(case.TestCase):\n    def setUp(self, extra): return extra\n\n\nassert C.setUp(C(), extra=1) == 1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn the_callback_base_table_is_sorted() {
+        // The order is what lets a reader, or an author adding a row, find a
+        // module's rows together and see that one is missing. A row landing out
+        // of position also drags the next insertion out with it, since a search
+        // for the first row that sorts after the new one stops at the stray.
+        let keys: Vec<_> = IMPLICIT_CALLBACK_BASES
+            .iter()
+            .map(|(module, base, _)| (*module, *base))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted);
     }
 
     #[test]

@@ -7358,6 +7358,155 @@ fn callback_names_off_the_xml_sax_hierarchy_are_still_fixed(
 }
 
 #[test]
+fn parser_and_encoder_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Each of these is reached by the module that owns the base — `goahead`
+    // drives the parser hooks, `_vformat` drives the formatter hooks, the
+    // encoder is built by `json.dumps` itself, and `pformat` reaches `format`
+    // through `_repr`. None of those calls is written here. `json` re-exports
+    // its encoder, so the last class names the same base through the module
+    // that defines it.
+    let source = "import json\nimport json.encoder\nimport pprint\nimport string\nfrom html.parser import HTMLParser\n\n\nclass P(HTMLParser):\n    def handle_data(self, data, extra=1): pass\n\n\nclass Child(P):\n    def handle_starttag(self, tag, attrs, extra=2): pass\n\n\nclass F(string.Formatter):\n    def get_value(self, key, args, kwargs, extra=3): return ''\n\n    def check_unused_args(self, used_args, args, kwargs, extra=4): pass\n\n\nclass E(json.JSONEncoder):\n    def default(self, obj, extra=5): return str(obj)\n\n\nclass Pretty(pprint.PrettyPrinter):\n    def format(self, obj, context, maxlevels, level, extra=6): return repr(obj), True, False\n\n\nclass Defining(json.encoder.JSONEncoder):\n    def default(self, obj, extra=7): return str(obj)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The defaults are still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn callback_names_off_the_parser_hierarchies_are_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // `default`, `format` and `parse` are ordinary method names, and these
+    // classes derive from nothing that would call them, so the defaults go and
+    // the calls written below carry the values they held.
+    let case = directory.path().join("case.py");
+    let source = "class Encoder:\n    def default(self, obj, extra=1): return extra\n\n\nclass Printer:\n    def format(self, obj, context, maxlevels, level, extra=2): return extra\n\n\nclass Formatter:\n    def parse(self, format_string, extra=3): return extra\n\n\nassert Encoder.default(Encoder(), None) == 1\nassert Printer.format(Printer(), None, None, None, None) == 2\nassert Formatter.parse(Formatter(), '') == 3\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Encoder:\n    def default(self, obj, extra): return extra\n\n\nclass Printer:\n    def format(self, obj, context, maxlevels, level, extra): return extra\n\n\nclass Formatter:\n    def parse(self, format_string, extra): return extra\n\n\nassert Encoder.default(Encoder(), None, extra=1) == 1\nassert Printer.format(Printer(), None, None, None, None, extra=2) == 2\nassert Formatter.parse(Formatter(), '', extra=3) == 3\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn an_opaque_class_body_rebinding_holds_the_default_back() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("main.py");
+    // `_identity` may return anything at all, so nothing here can say how
+    // `C().alias(2)` is spelled once the default is gone. The file has to come
+    // back untouched.
+    let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = _identity(target)\n\n\nassert C().alias(2) == (2, 1)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The default is still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_class_body_helper_unpacked_into_two_names_holds_its_default_back(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("main.py");
+    // The shape `fractions.Fraction` is written in. Removing the default left
+    // the call written beside it short of an argument, so the module raised
+    // before anything could import it.
+    let source = "import operator\n\n\nclass C:\n    def _fallbacks(forward, reverse, handle_complex=True):\n        return forward, reverse\n\n    def _add(self, other):\n        return other\n\n    __add__, __radd__ = _fallbacks(_add, operator.add)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_descriptor_wrapper_around_a_class_body_alias_is_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("main.py");
+    // The counterpart: a descriptor wrapper leaves the function's own
+    // parameters behind the name, so the alias carries a signature and the
+    // call through it takes the value the removed default held.
+    let source = "class C:\n    def target(x, y=1):\n        return (x, y)\n\n    alias = staticmethod(target)\n\n\nassert C.alias(2) == (2, 1)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class C:\n    def target(x, y):\n        return (x, y)\n\n    alias = staticmethod(target)\n\n\nassert C.alias(2, y=1) == (2, 1)\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn doctest_and_unittest_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Every one of these is called by `doctest` or `unittest` itself — from
+    // `DocTestRunner.__run`, from `TestCase.run`, from `TestSuite.run`, from
+    // `IsolatedAsyncioTestCase._callSetUp`, from `TextTestRunner.run` — so
+    // there is no call site here to carry the value once the default is gone.
+    // The case written on a case defined in this file inherits that reach.
+    let source = "import doctest\nimport unittest\nfrom unittest import TestCase\nfrom unittest.result import TestResult\n\n\nclass R(doctest.DocTestRunner):\n    def report_start(self, out, test, example, extra=1): pass\n\n\nclass Checker(doctest.OutputChecker):\n    def check_output(self, want, got, optionflags, extra=2): return True\n\n\nclass Base(TestCase):\n    def setUp(self, extra=3): pass\n\n\nclass Child(Base):\n    def tearDown(self, extra=4): pass\n\n    @classmethod\n    def setUpClass(cls, extra=5): pass\n\n\nclass Async(unittest.IsolatedAsyncioTestCase):\n    async def asyncSetUp(self, extra=6): pass\n\n\nclass Result(unittest.TextTestResult):\n    def addSuccess(self, test, extra=7): pass\n\n    def addSubTest(self, test, subtest, err, extra=8): pass\n\n\nclass Plain(TestResult):\n    def stopTestRun(self, extra=9): pass\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The defaults are still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn callback_names_off_the_unittest_hierarchy_are_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `setUp` and `tearDown` are among the commonest method names in any
+    // Python codebase. Nothing but the calls written below reaches this class,
+    // so the defaults go and those calls carry the values they held.
+    let source = "class Fixture:\n    def setUp(self, extra=1): return extra\n\n    def tearDown(self, extra=2): return extra\n\n    def addSuccess(self, test, extra=3): return extra\n\n    def check_output(self, want, got, optionflags, extra=4): return extra\n\n\nf = Fixture()\nassert Fixture.setUp(f) == 1\nassert Fixture.tearDown(f) == 2\nassert Fixture.addSuccess(f, None) == 3\nassert Fixture.check_output(f, '', '', 0) == 4\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Fixture:\n    def setUp(self, extra): return extra\n\n    def tearDown(self, extra): return extra\n\n    def addSuccess(self, test, extra): return extra\n\n    def check_output(self, want, got, optionflags, extra): return extra\n\n\nf = Fixture()\nassert Fixture.setUp(f, extra=1) == 1\nassert Fixture.tearDown(f, extra=2) == 2\nassert Fixture.addSuccess(f, None, extra=3) == 3\nassert Fixture.check_output(f, '', '', 0, extra=4) == 4\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn an_import_hook_that_finds_and_loads_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

@@ -5626,7 +5626,14 @@ impl Checker<'_> {
                 names.contains(name)
                     || self.method_aliases.last().is_some_and(|aliases| {
                         aliases.get(name).is_some_and(|aliases| {
-                            aliases.iter().any(|alias| names.contains(&alias.name))
+                            aliases.iter().any(|alias| {
+                                // A copy of another class's function is keyed
+                                // under the name it goes by there, which may
+                                // be the name of a method here too. It is not
+                                // this method under another spelling, so a
+                                // value naming it says nothing about this one.
+                                alias.original_class.is_none() && names.contains(&alias.name)
+                            })
                         })
                     })
             })
@@ -23694,6 +23701,23 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed_with_retained_defaults(source)?,
             source
                 .replace("y=1):", "y):")
+                .replace("C().target(2)", "C().target(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_opaque_value_naming_a_copy_of_another_class_is_still_fixed() -> Result<(), String> {
+        // `copied` holds `Other.target`, which is recorded under the name it
+        // goes by there — the same name `C` writes a method under. It is not
+        // `C.target` under another spelling, so naming it in a value this file
+        // cannot describe says nothing about `C.target` and holding that
+        // default back was a false retention.
+        let source = "def _identity(function):\n    return function\n\n\nclass Other:\n    def target(self, a):\n        return a\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    copied = Other.target\n    wrapped = _identity(copied)\n\n\nassert C().target(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("x, y=1):", "x, y):")
                 .replace("C().target(2)", "C().target(2, y=1)")
         );
         Ok(())

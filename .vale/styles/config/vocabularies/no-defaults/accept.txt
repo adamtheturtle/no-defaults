@@ -36,6 +36,7 @@ Clippy
 CPython
 maturin
 mypy
+ty
 pydantic('s)?
 pyproject
 Ruff

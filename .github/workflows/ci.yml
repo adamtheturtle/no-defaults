@@ -26,3 +26,24 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --release
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      VALE_VERSION: 3.19.0
+      VALE_SHA256: c8f9d6c8055442bc7e9c121b2498e6f0e3fb670f4665e6ee577f1897f7665cf6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Vale
+        run: |
+          curl --fail --location --silent --show-error \
+            --output "${RUNNER_TEMP}/vale.tar.gz" \
+            "https://github.com/vale-cli/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Linux_64-bit.tar.gz"
+          echo "${VALE_SHA256}  ${RUNNER_TEMP}/vale.tar.gz" | sha256sum --check
+          tar --extract --file "${RUNNER_TEMP}/vale.tar.gz" --directory "${RUNNER_TEMP}" vale
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+      - name: Download the pinned styles
+        run: vale sync
+      - run: vale .

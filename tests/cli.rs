@@ -8031,3 +8031,124 @@ fn an_init_is_no_construction_hook() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn an_ancestry_this_run_cannot_walk_stands_construction_down(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // Two suites give `Mid` different bases, so nothing says which ancestry
+    // `Child` ends up with. The part of it that can be walked holds no
+    // `__new__`, but the part that cannot is exactly where one may be, so the
+    // construction is stood down rather than read against the prefix.
+    let file0 = directory.path().join("case.py");
+    let source0 = "import sys\n\n\nclass Other:\n    def own(self, extra=9):\n        return extra\n\n\nclass Hooked:\n    def __new__(cls):\n        return object.__new__(Other)\n\n\nclass Plain:\n    pass\n\n\nif sys.argv[1:]:\n    class Mid(Hooked):\n        pass\nelse:\n    class Mid(Plain):\n        pass\n\n\nclass Child(Mid):\n    def own(self, extra=7):\n        return extra\n\n\nassert Child().own() == 9, Child().own()\n";
+    std::fs::write(&file0, source0)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&file0)?, source0);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_ancestry_this_run_can_walk_leaves_construction_alone(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // The other direction: one `Mid`, so the whole order is known, nothing in
+    // it writes `__new__`, and the call carries the deleted default.
+    let file0 = directory.path().join("case.py");
+    let source0 = "class Plain:\n    pass\n\n\nclass Mid(Plain):\n    pass\n\n\nclass Child(Mid):\n    def own(self, extra=7):\n        return extra\n\n\nassert Child().own() == 7, Child().own()\n";
+    std::fs::write(&file0, source0)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&file0)?, "class Plain:\n    pass\n\n\nclass Mid(Plain):\n    pass\n\n\nclass Child(Mid):\n    def own(self, extra):\n        return extra\n\n\nassert Child().own(extra=7) == 7, Child().own(extra=7)\n");
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_metaclass_reached_through_a_re_export_is_still_a_hook(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // A metaclass named through a package that re-exports it is recorded
+    // against the initializer, which writes no `__call__`. Following it to the
+    // file that defines it is what finds the hook, exactly as a base named
+    // that way is followed.
+    let file0 = directory.path().join("main.py");
+    let source0 = "from pkg import Meta\n\n\nclass Child(metaclass=Meta):\n    def own(self, extra=7):\n        return extra\n\n\nassert Child().own() == 9, Child().own()\n";
+    std::fs::write(&file0, source0)?;
+    std::fs::create_dir_all(directory.path().join("pkg"))?;
+    let file1 = directory.path().join("pkg/__init__.py");
+    let source1 = "from pkg.core import Meta\n";
+    std::fs::write(&file1, source1)?;
+    std::fs::create_dir_all(directory.path().join("pkg"))?;
+    let file2 = directory.path().join("pkg/core.py");
+    let source2 = "class Other:\n    def own(self):\n        return 9\n\n\nclass Meta(type):\n    def __call__(cls, *arguments, **options):\n        return Other()\n";
+    std::fs::write(&file2, source2)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&file0)?, source0);
+    assert_eq!(std::fs::read_to_string(&file1)?, source1);
+    assert_eq!(std::fs::read_to_string(&file2)?, source2);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_re_exported_metaclass_that_writes_no_call_leaves_construction_alone(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // The other direction: followed to the same file, a metaclass that writes
+    // no `__call__` still leaves `type` to build the instance.
+    let file0 = directory.path().join("main.py");
+    let source0 = "from pkg import Meta\n\n\nclass Child(metaclass=Meta):\n    def own(self, extra=7):\n        return extra\n\n\nassert Child().own() == 7, Child().own()\n";
+    std::fs::write(&file0, source0)?;
+    std::fs::create_dir_all(directory.path().join("pkg"))?;
+    let file1 = directory.path().join("pkg/__init__.py");
+    let source1 = "from pkg.core import Meta\n";
+    std::fs::write(&file1, source1)?;
+    std::fs::create_dir_all(directory.path().join("pkg"))?;
+    let file2 = directory.path().join("pkg/core.py");
+    let source2 = "class Meta(type):\n    def register(cls):\n        return cls\n";
+    std::fs::write(&file2, source2)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&file0)?, "from pkg import Meta\n\n\nclass Child(metaclass=Meta):\n    def own(self, extra):\n        return extra\n\n\nassert Child().own(extra=7) == 7, Child().own(extra=7)\n");
+    assert_eq!(
+        std::fs::read_to_string(&file1)?,
+        "from pkg.core import Meta\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file2)?,
+        "class Meta(type):\n    def register(cls):\n        return cls\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn either_metaclass_two_suites_name_stands_construction_down(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // Two suites name different metaclasses for one class and only one of them
+    // runs, so both are kept and the hooked one is enough. Keeping the last
+    // would drop it whenever the harmless suite is written second.
+    let file0 = directory.path().join("case.py");
+    let source0 = "import sys\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\nclass Hooked(type):\n    def __call__(cls, *arguments, **options):\n        return Other()\n\n\nclass Harmless(type):\n    pass\n\n\nif sys.argv[1:]:\n    class Child(metaclass=Hooked):\n        def own(self, extra=7):\n            return extra\nelse:\n    class Child(metaclass=Harmless):\n        def own(self, extra=7):\n            return extra\n\n\nassert Child().own() == 9, Child().own()\n";
+    std::fs::write(&file0, source0)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&file0)?, source0);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

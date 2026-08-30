@@ -426,11 +426,13 @@ struct Definitions {
     /// Classes whose decorator writes their constructor, so the `__init__`
     /// they inherit is not what a construction of them reaches.
     own_constructors: BTreeSet<(PathBuf, String)>,
-    /// The metaclass each class names in its header, under the identity this
-    /// index knows that metaclass by. A class inherits its metaclass, so the
-    /// entry is read along the resolution order rather than off the class
-    /// alone.
-    metaclasses: BTreeMap<(PathBuf, String), (PathBuf, String)>,
+    /// The metaclasses each class names in its header, under the identities
+    /// this index knows them by. A class inherits its metaclass, so the entry
+    /// is read along the resolution order rather than off the class alone.
+    /// Two suites of one statement may name different ones and only one of
+    /// them runs, so both are kept and either is enough to stand construction
+    /// down.
+    metaclasses: BTreeMap<(PathBuf, String), BTreeSet<(PathBuf, String)>>,
 }
 
 impl Definitions {
@@ -530,19 +532,23 @@ impl Definitions {
     /// what it returns is what the attribute lookup then reads. Where one is
     /// written, nothing here says which class the call reaches.
     fn construction_is_hooked(&self, class: &(PathBuf, String)) -> bool {
-        if self.declares_in_mro(&class.0, &class.1, "__new__") {
+        // An ancestry this index cannot walk answers yes through
+        // `declares_in_mro`: nothing there rules a hook out.
+        if self.declares_in_mro(class, "__new__") {
             return true;
         }
         // A metaclass `__call__` stands in front of construction entirely:
         // `C()` is `type(C).__call__(C)`, and one written by hand answers
         // with whatever it likes. The metaclass is inherited, so every class
-        // in the order is asked which one it names.
+        // in the order is asked which ones it names.
         let mro = self
             .linearized_mro(class, &mut BTreeSet::new())
-            .unwrap_or_else(|| self.settled_ancestry(class));
+            .unwrap_or_default();
         mro.iter().any(|identity| {
-            self.metaclasses.get(identity).is_some_and(|metaclass| {
-                self.declares_in_mro(&metaclass.0, &metaclass.1, "__call__")
+            self.metaclasses.get(identity).is_some_and(|metaclasses| {
+                metaclasses
+                    .iter()
+                    .any(|metaclass| self.declares_in_mro(metaclass, "__call__"))
             })
         })
     }
@@ -555,11 +561,15 @@ impl Definitions {
     /// method was written at all answers yes. Construction hooks are asked
     /// about this way: what matters is that the class took the decision
     /// over, not what the fixer found to change in it.
-    fn declares_in_mro(&self, file: &Path, class: &str, name: &str) -> bool {
-        let identity = (file.to_path_buf(), class.to_owned());
-        let mro = self
-            .linearized_mro(&identity, &mut BTreeSet::new())
-            .unwrap_or_else(|| self.settled_ancestry(&identity));
+    fn declares_in_mro(&self, class: &(PathBuf, String), name: &str) -> bool {
+        // Where no whole order can be walked, the classes past the unknown
+        // point are exactly the ones that might write the method, so the
+        // question is answered yes rather than against the prefix that can
+        // be walked. Reading the prefix would say a construction is safe on
+        // the strength of the part of the ancestry that is known.
+        let Some(mro) = self.linearized_mro(class, &mut BTreeSet::new()) else {
+            return true;
+        };
         mro.iter().any(|identity| {
             self.methods
                 .get(identity)
@@ -686,6 +696,26 @@ impl Definitions {
             .collect();
         for (class, bases) in followed {
             self.bases.insert(class, bases);
+        }
+        // A metaclass is named the same way a base is and is re-exported the
+        // same way, so it is followed to the file that defines it for the
+        // same reason.
+        let followed: Vec<(ClassIdentity, BTreeSet<ClassIdentity>)> = self
+            .metaclasses
+            .iter()
+            .filter_map(|(class, metaclasses)| {
+                let resolved: BTreeSet<ClassIdentity> = metaclasses
+                    .iter()
+                    .map(|(file, name)| {
+                        self.class_identity(file, name)
+                            .unwrap_or_else(|| (file.clone(), name.clone()))
+                    })
+                    .collect();
+                (resolved != *metaclasses).then(|| (class.clone(), resolved))
+            })
+            .collect();
+        for (class, metaclasses) in followed {
+            self.metaclasses.insert(class, metaclasses);
         }
     }
 
@@ -1968,7 +1998,9 @@ fn record_class_bases_and_attributes(
     if let Some(metaclass) = metaclass {
         definitions
             .metaclasses
-            .insert((importer.to_path_buf(), identity.to_owned()), metaclass);
+            .entry((importer.to_path_buf(), identity.to_owned()))
+            .or_default()
+            .insert(metaclass);
     }
     definitions.record_bases(
         (importer.to_path_buf(), identity.to_owned()),

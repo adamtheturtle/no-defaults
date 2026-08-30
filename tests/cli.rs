@@ -7462,6 +7462,50 @@ fn a_descriptor_wrapper_around_a_class_body_alias_is_still_fixed(
 }
 
 #[test]
+fn doctest_and_unittest_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Every one of these is called by `doctest` or `unittest` itself — from
+    // `DocTestRunner.__run`, from `TestCase.run`, from `TestSuite.run`, from
+    // `IsolatedAsyncioTestCase._callSetUp`, from `TextTestRunner.run` — so
+    // there is no call site here to carry the value once the default is gone.
+    // The case written on a case defined in this file inherits that reach.
+    let source = "import doctest\nimport unittest\nfrom unittest import TestCase\nfrom unittest.result import TestResult\n\n\nclass R(doctest.DocTestRunner):\n    def report_start(self, out, test, example, extra=1): pass\n\n\nclass Checker(doctest.OutputChecker):\n    def check_output(self, want, got, optionflags, extra=2): return True\n\n\nclass Base(TestCase):\n    def setUp(self, extra=3): pass\n\n\nclass Child(Base):\n    def tearDown(self, extra=4): pass\n\n    @classmethod\n    def setUpClass(cls, extra=5): pass\n\n\nclass Async(unittest.IsolatedAsyncioTestCase):\n    async def asyncSetUp(self, extra=6): pass\n\n\nclass Result(unittest.TextTestResult):\n    def addSuccess(self, test, extra=7): pass\n\n    def addSubTest(self, test, subtest, err, extra=8): pass\n\n\nclass Plain(TestResult):\n    def stopTestRun(self, extra=9): pass\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The defaults are still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn callback_names_off_the_unittest_hierarchy_are_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `setUp` and `tearDown` are among the commonest method names in any
+    // Python codebase. Nothing but the calls written below reaches this class,
+    // so the defaults go and those calls carry the values they held.
+    let source = "class Fixture:\n    def setUp(self, extra=1): return extra\n\n    def tearDown(self, extra=2): return extra\n\n    def addSuccess(self, test, extra=3): return extra\n\n    def check_output(self, want, got, optionflags, extra=4): return extra\n\n\nf = Fixture()\nassert Fixture.setUp(f) == 1\nassert Fixture.tearDown(f) == 2\nassert Fixture.addSuccess(f, None) == 3\nassert Fixture.check_output(f, '', '', 0) == 4\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Fixture:\n    def setUp(self, extra): return extra\n\n    def tearDown(self, extra): return extra\n\n    def addSuccess(self, test, extra): return extra\n\n    def check_output(self, want, got, optionflags, extra): return extra\n\n\nf = Fixture()\nassert Fixture.setUp(f, extra=1) == 1\nassert Fixture.tearDown(f, extra=2) == 2\nassert Fixture.addSuccess(f, None, extra=3) == 3\nassert Fixture.check_output(f, '', '', 0, extra=4) == 4\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn a_copy_of_a_first_bound_contested_name_keeps_the_inherited_default(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The suites bind `Alias` for the first time, so nothing stands behind it

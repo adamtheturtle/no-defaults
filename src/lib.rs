@@ -4859,10 +4859,22 @@ impl Checker<'_> {
         }
     }
 
+    /// Forget what a `for` target, a `with` target or a walrus rebinds.
+    ///
+    /// Each of these is reached at the depth of the statement it belongs to
+    /// rather than inside it — a clause's test runs whenever the clause is
+    /// reached, and a loop's target is read before the body is entered — so
+    /// the depth here answers the right question. One written in a suite that
+    /// may not run takes the name's import records off nothing: where the
+    /// suite is skipped the import is still what the name stands for, exactly
+    /// as it is behind a class statement or an assignment written there.
     fn invalidate_target_aliases(&mut self, target: &Expr) {
         let mut bound = BoundNames::default();
         bound.bind(target);
-        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
+        self.rebind_names(
+            bound.names.iter().map(String::as_str),
+            self.conditional_depth == 0,
+        );
     }
 
     /// Forget what a walrus in a `def` or `class` header rebinds.
@@ -4961,7 +4973,7 @@ impl Checker<'_> {
         self.conditional_depth -= 1;
     }
 
-    fn visit_while<'a>(&mut self, loop_: &'a ast::StmtWhile, statement: &'a Stmt)
+    fn visit_while<'a>(&mut self, loop_: &'a ast::StmtWhile)
     where
         Self: Visitor<'a>,
     {
@@ -4969,7 +4981,18 @@ impl Checker<'_> {
             Truthiness::False | Truthiness::Falsey | Truthiness::None => {
                 self.visit_body(&loop_.orelse);
             }
-            _ => self.visit_uncertain(statement),
+            _ => {
+                // The test runs whenever the loop is reached, exactly as a
+                // clause's test does, so a walrus in it binds where the `while`
+                // is written rather than in a suite that may not run. Only the
+                // bodies are uncertain, and reading the test inside their depth
+                // held back an import the name really had lost.
+                self.visit_expr(&loop_.test);
+                self.conditional_depth += 1;
+                self.visit_body(&loop_.body);
+                self.visit_body(&loop_.orelse);
+                self.conditional_depth -= 1;
+            }
         }
     }
 
@@ -6205,6 +6228,65 @@ const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
     "release",
 ];
 
+/// The methods `argparse` reaches on the formatter a parser builds, whichever
+/// formatter base the subclass was written on.
+///
+/// A parser makes the formatter itself, from the `formatter_class` it was given,
+/// and drives it through `format_help`, `format_usage` and `print_help`; none of
+/// those calls is written in the file that supplies the subclass.
+const ARGPARSE_FORMATTER_CALLBACKS: &[&str] = &[
+    "add_argument",
+    "add_arguments",
+    "add_text",
+    "add_usage",
+    "end_section",
+    "format_help",
+    "start_section",
+];
+
+/// The methods the `email` package reaches on the policy a message or parser was
+/// handed, whichever policy base the subclass was written on.
+///
+/// `email.policy` re-exports `Policy` and `Compat32` from `email._policybase`,
+/// so both spellings name the same classes and both get rows. The callbacks
+/// themselves are split across the hierarchy — `register_defect` and
+/// `handle_defect` are `Policy`'s, the rest `EmailPolicy` overrides — but a
+/// subclass inherits whichever it does not write, and the package calls it
+/// either way.
+const EMAIL_POLICY_CALLBACKS: &[&str] = &[
+    "fold",
+    "fold_binary",
+    "handle_defect",
+    "header_fetch_parse",
+    "header_max_count",
+    "header_source_parse",
+    "header_store_parse",
+    "register_defect",
+];
+
+/// The methods the `xml.sax` reader drives on the content handler a parser was
+/// given, whichever content-handler base the subclass was written on.
+///
+/// The four namespace callbacks are here because they are the same protocol,
+/// reached by the same driver once `feature_namespaces` is on; a handler that
+/// writes them is a content handler either way. `ignorableWhitespace` and
+/// `skippedEntity` are the two `ContentHandler` methods left out: the expat
+/// reader is the only one the standard library ships, and neither could be
+/// reached through it, so neither is claimed.
+const XML_SAX_CONTENT_HANDLER_CALLBACKS: &[&str] = &[
+    "characters",
+    "endDocument",
+    "endElement",
+    "endElementNS",
+    "endPrefixMapping",
+    "processingInstruction",
+    "setDocumentLocator",
+    "startDocument",
+    "startElement",
+    "startElementNS",
+    "startPrefixMapping",
+];
+
 /// Standard-library base classes whose own machinery calls the methods a
 /// subclass writes, each with the callbacks that machinery reaches.
 ///
@@ -6220,6 +6302,37 @@ const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
 const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
+    (
+        "argparse",
+        "ArgumentDefaultsHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    (
+        "argparse",
+        "ArgumentParser",
+        &["convert_arg_line_to_args", "error", "exit"],
+    ),
+    ("argparse", "HelpFormatter", ARGPARSE_FORMATTER_CALLBACKS),
+    (
+        "argparse",
+        "MetavarTypeHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    (
+        "argparse",
+        "RawDescriptionHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    (
+        "argparse",
+        "RawTextHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    ("email._policybase", "Compat32", EMAIL_POLICY_CALLBACKS),
+    ("email._policybase", "Policy", EMAIL_POLICY_CALLBACKS),
+    ("email.policy", "Compat32", EMAIL_POLICY_CALLBACKS),
+    ("email.policy", "EmailPolicy", EMAIL_POLICY_CALLBACKS),
+    ("email.policy", "Policy", EMAIL_POLICY_CALLBACKS),
     ("enum", "Enum", ENUM_CALLBACKS),
     ("enum", "Flag", ENUM_CALLBACKS),
     ("enum", "IntEnum", ENUM_CALLBACKS),
@@ -6325,6 +6438,31 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
         "WatchedFileHandler",
         LOGGING_HANDLER_CALLBACKS,
     ),
+    // `xml.sax` re-exports `ContentHandler` from `xml.sax.handler`, so both
+    // spellings name the same base and both have to be rows.
+    (
+        "xml.sax",
+        "ContentHandler",
+        XML_SAX_CONTENT_HANDLER_CALLBACKS,
+    ),
+    (
+        "xml.sax.handler",
+        "ContentHandler",
+        XML_SAX_CONTENT_HANDLER_CALLBACKS,
+    ),
+    // A filter is installed as the content handler of the parser beneath it, so
+    // the reader calls these on it even though it derives from `XMLReader`
+    // rather than from `ContentHandler`.
+    (
+        "xml.sax.saxutils",
+        "XMLFilterBase",
+        XML_SAX_CONTENT_HANDLER_CALLBACKS,
+    ),
+    (
+        "xml.sax.saxutils",
+        "XMLGenerator",
+        XML_SAX_CONTENT_HANDLER_CALLBACKS,
+    ),
 ];
 
 /// The callbacks the standard library reaches on a subclass of `base` written in
@@ -6381,7 +6519,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::Try(_) => self.visit_uncertain(statement),
             Stmt::Match(block) => self.visit_match(block),
             Stmt::For(loop_) => self.visit_loop(loop_),
-            Stmt::While(loop_) => self.visit_while(loop_, statement),
+            Stmt::While(loop_) => self.visit_while(loop_),
             Stmt::With(block) => self.visit_with(block),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
@@ -23700,6 +23838,338 @@ def b(x=1): pass  # type: ignore  # noqa
             source
                 .replace("value=1):", "value):")
                 .replace("Child().method()", "Child().method(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_an_untaken_branch_leaves_an_import_standing() -> Result<(), String> {
+        // A walrus binds the name where it is written, so one written in a
+        // suite that may not run is the same shape as an assignment there.
+        // #1115 covered the assignment and left this reached through
+        // `invalidate_target_aliases`, which still took the import off the
+        // name and stripped a default the enumeration needs.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    holder = (Enum := object)\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_with_target_in_an_untaken_branch_leaves_an_import_standing() -> Result<(), String> {
+        // The `with` target is bound when its statement runs, and its
+        // statement is in the same suite, so it stands or falls with it.
+        let source = "import contextlib\nimport os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    with contextlib.nullcontext(object) as Enum:\n        pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_target_in_an_untaken_branch_leaves_an_import_standing() -> Result<(), String> {
+        // So does the loop target, which is read at the depth of the `for`
+        // statement rather than inside its body.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    for Enum in [object]:\n        pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_a_clause_test_still_takes_an_import_back() -> Result<(), String> {
+        // The counterpart guard. A clause's test runs whenever the clause is
+        // reached, and the traversal reads it before entering the suite, so
+        // the depth there is the depth of the `if` itself and the walrus
+        // really does take the name over.
+        let source = "from enum import Enum\n\nif (Enum := object):\n    pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_target_written_where_it_runs_still_takes_an_import_back() -> Result<(), String> {
+        // And the loop counterpart: nothing guards this loop, so `Enum` is
+        // whatever the iterable last yielded by the time `C` is written.
+        let source = "from enum import Enum\n\nfor Enum in [object]:\n    pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_a_while_test_still_takes_an_import_back() -> Result<(), String> {
+        // A `while` test runs whenever the loop is reached, exactly as a
+        // clause's test does, so the walrus in it really does take the name
+        // over. Reading the test inside the bodies' conditional depth held
+        // back an import the name had genuinely lost.
+        let source = "from enum import Enum\n\nwhile (Enum := object):\n    break\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_a_while_body_leaves_an_import_standing() -> Result<(), String> {
+        // The body is a suite that may not run, though — a `while` over a
+        // false test never enters it — so a walrus written there still leaves
+        // the import standing.
+        let source = "import os\nfrom enum import Enum\n\nwhile os.environ.get(\"ND_TYPING\") == \"1\":\n    holder = (Enum := object)\n    break\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn argparse_parser_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `argparse` calls each of these from inside a parse: `error` from
+        // `parse_args` on a bad argument, `exit` from `error`, and
+        // `convert_arg_line_to_args` for every line of an `@file`. None of
+        // those calls is written here.
+        let source = "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def convert_arg_line_to_args(self, arg_line, extra=1): return arg_line.split()\n\n    def error(self, message, extra=2): raise RuntimeError(message)\n\n    def exit(self, status=0, message=None, extra=3): raise SystemExit(status)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn argparse_formatter_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A parser builds the formatter itself from the `formatter_class` it was
+        // given and drives all seven of these from `format_help`, so the file
+        // that supplies the subclass holds no call to carry the values.
+        let source = "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n    def add_arguments(self, actions, extra=2): pass\n\n    def add_text(self, text, extra=3): pass\n\n    def add_usage(self, usage, actions, groups, prefix=None, extra=4): pass\n\n    def end_section(self, extra=5): pass\n\n    def format_help(self, extra=6): return \"\"\n\n    def start_section(self, heading, extra=7): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_argument_defaults_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        // The four formatters `argparse` ships are bases in their own right, and
+        // a parser drives whichever of them it was handed the same way.
+        let source = "import argparse\n\n\nclass F(argparse.ArgumentDefaultsHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_metavar_type_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import argparse\n\n\nclass F(argparse.MetavarTypeHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_raw_description_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import argparse\n\n\nclass F(argparse.RawDescriptionHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_raw_text_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import argparse\n\n\nclass F(argparse.RawTextHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn email_policy_callbacks_keep_their_defaults() -> Result<(), String> {
+        // The `email` package reaches these on whatever policy a message or
+        // parser was handed: `header_source_parse` and `register_defect` from
+        // the feed parser, `header_store_parse` and `header_max_count` from
+        // header assignment, `header_fetch_parse` from header access, and
+        // `fold` and `fold_binary` from the generator that serialises it.
+        // `EmailPolicy` overrides most of them and inherits the two defect
+        // hooks, so a subclass of it is reached through both halves.
+        let source = "import email.policy\n\n\nclass P(email.policy.EmailPolicy):\n    def fold(self, name, value, extra=1): return \"\"\n\n    def fold_binary(self, name, value, extra=2): return b\"\"\n\n    def handle_defect(self, obj, defect, extra=3): pass\n\n    def header_fetch_parse(self, name, value, extra=4): return value\n\n    def header_max_count(self, name, extra=5): return None\n\n    def header_source_parse(self, sourcelines, extra=6): return \"\", \"\"\n\n    def header_store_parse(self, name, value, extra=7): return name, value\n\n    def register_defect(self, obj, defect, extra=8): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_email_policy_compat32_keeps_its_callback_defaults() -> Result<(), String> {
+        // `email.policy` re-exports `Compat32`, and the package calls a subclass
+        // of it exactly as it calls an `EmailPolicy` one.
+        let source = "from email.policy import Compat32\n\n\nclass C(Compat32):\n    def fold(self, name, value, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_email_policy_policy_keeps_its_callback_defaults() -> Result<(), String> {
+        // `Policy` is the abstract base the whole hierarchy is written on, and
+        // the defect hooks are its own.
+        let source = "from email.policy import Policy\n\n\nclass P(Policy):\n    def register_defect(self, obj, defect, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_policybase_compat32_keeps_its_callback_defaults() -> Result<(), String> {
+        // `email.policy` re-exports `Compat32` from `email._policybase`, which
+        // is where it is written, so the private spelling names the same class
+        // and has to be recognised as well.
+        let source = "from email._policybase import Compat32\n\n\nclass C(Compat32):\n    def header_fetch_parse(self, name, value, extra=1): return value\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_policybase_policy_keeps_its_callback_defaults() -> Result<(), String> {
+        // The same for `Policy`, whose defect hooks a subclass inherits whether
+        // it is reached through the public module or the private one.
+        let source = "from email._policybase import Policy\n\n\nclass P(Policy):\n    def handle_defect(self, obj, defect, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_argparse_parser_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being reached by the subsystem is inherited, so a parser written on a
+        // parser defined here fails the same way.
+        let source = "import argparse\n\n\nclass Base(argparse.ArgumentParser):\n    pass\n\n\nclass Child(Base):\n    def error(self, message, extra=1): raise RuntimeError(message)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_email_policy_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import email.policy\n\n\nclass Base(email.policy.EmailPolicy):\n    pass\n\n\nclass Child(Base):\n    def fold(self, name, value, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_argparse_and_email_are_still_fixed() -> Result<(), String> {
+        // `error`, `exit`, `add_argument` and `format_help` are among the most
+        // ordinary method names there are. Nothing reaches this class but the
+        // calls written below, so the defaults go and those calls carry them.
+        let source = "class Recorder:\n    def add_argument(self, action, extra=1): return extra\n\n    def error(self, message, extra=2): return extra\n\n    def exit(self, status=3): return status\n\n    def fold(self, name, value, extra=4): return extra\n\n    def format_help(self, extra=5): return extra\n\n    def register_defect(self, obj, defect, extra=6): return extra\n\n\nr = Recorder()\nassert Recorder.add_argument(r, \"a\") == 1\nassert Recorder.error(r, \"m\") == 2\nassert Recorder.exit(r) == 3\nassert Recorder.fold(r, \"n\", \"v\") == 4\nassert Recorder.format_help(r) == 5\nassert Recorder.register_defect(r, \"o\", \"d\") == 6\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "class Recorder:\n    def add_argument(self, action, extra): return extra\n\n    def error(self, message, extra): return extra\n\n    def exit(self, status): return status\n\n    def fold(self, name, value, extra): return extra\n\n    def format_help(self, extra): return extra\n\n    def register_defect(self, obj, defect, extra): return extra\n\n\nr = Recorder()\nassert Recorder.add_argument(r, \"a\", extra=1) == 1\nassert Recorder.error(r, \"m\", extra=2) == 2\nassert Recorder.exit(r, status=3) == 3\nassert Recorder.fold(r, \"n\", \"v\", extra=4) == 4\nassert Recorder.format_help(r, extra=5) == 5\nassert Recorder.register_defect(r, \"o\", \"d\", extra=6) == 6\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_add_argument_call_off_the_formatter_hierarchy_is_still_rewritten() -> Result<(), String> {
+        // `add_argument` is a formatter callback and the method every argparse
+        // user calls by hand. Only the formatter's keeps its default; the
+        // ordinary class of the same name is fixed and its call rewritten.
+        let source = "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n\nclass Recorder:\n    def add_argument(self, action, extra=2): return extra\n\n\nassert Recorder.add_argument(Recorder(), \"a\") == 2\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n\nclass Recorder:\n    def add_argument(self, action, extra): return extra\n\n\nassert Recorder.add_argument(Recorder(), \"a\", extra=2) == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_callback_of_the_other_argparse_base_is_still_fixed() -> Result<(), String> {
+        // The two `argparse` rows name different callbacks, and nothing calls a
+        // formatter's hooks on a parser or a parser's on a formatter.
+        let source = "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def start_section(self, heading, extra=1): return extra\n\n\nclass F(argparse.HelpFormatter):\n    def error(self, message, extra=2): return extra\n\n\nassert P.start_section(P(add_help=False), \"h\") == 1\nassert F.error(F(\"p\"), \"m\") == 2\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def start_section(self, heading, extra): return extra\n\n\nclass F(argparse.HelpFormatter):\n    def error(self, message, extra): return extra\n\n\nassert P.start_section(P(add_help=False), \"h\", extra=1) == 1\nassert F.error(F(\"p\"), \"m\", extra=2) == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn xml_sax_content_handler_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A parser drives every one of these on the handler it was given:
+        // `setDocumentLocator` before the document, `startDocument` and
+        // `endDocument` around it, `startElement`, `endElement`, `characters`
+        // and `processingInstruction` from the expat callbacks, and the four
+        // namespace hooks once `feature_namespaces` is on. None of those calls
+        // is written here, so removing a default leaves a handler the reader
+        // can no longer call.
+        let source = "import xml.sax.handler\n\n\nclass H(xml.sax.handler.ContentHandler):\n    def setDocumentLocator(self, locator, extra=1): pass\n\n    def startDocument(self, extra=2): pass\n\n    def endDocument(self, extra=3): pass\n\n    def startElement(self, name, attrs, extra=4): pass\n\n    def endElement(self, name, extra=5): pass\n\n    def characters(self, content, extra=6): pass\n\n    def processingInstruction(self, target, data, extra=7): pass\n\n    def startPrefixMapping(self, prefix, uri, extra=8): pass\n\n    def endPrefixMapping(self, prefix, extra=9): pass\n\n    def startElementNS(self, name, qname, attrs, extra=10): pass\n\n    def endElementNS(self, name, qname, extra=11): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn the_xml_sax_re_export_of_a_content_handler_keeps_its_callback_defaults() -> Result<(), String>
+    {
+        // `xml.sax` re-exports the class `xml.sax.handler` defines, so the
+        // shorter spelling names the same base the reader calls.
+        let source = "from xml.sax import ContentHandler\n\n\nclass H(ContentHandler):\n    def characters(self, content, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_sax_handler_module_keeps_its_callback_defaults() -> Result<(), String> {
+        // A renaming import binds the submodule itself, so one attribute is all
+        // that stands between the name and the base.
+        let source = "import xml.sax.handler as sh\n\n\nclass H(sh.ContentHandler):\n    def startDocument(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sax_package_from_import_keeps_its_callback_defaults() -> Result<(), String> {
+        // `from xml import sax` binds the package, so the base is read through
+        // two attributes rather than one.
+        let source = "from xml import sax\n\n\nclass H(sax.handler.ContentHandler):\n    def endDocument(self, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sax_generator_keeps_its_callback_defaults() -> Result<(), String> {
+        // A generator is a content handler in its own right, and users write
+        // one to filter what a parse writes out, so the reader reaches the same
+        // callbacks on it.
+        let source = "import xml.sax.saxutils\n\n\nclass G(xml.sax.saxutils.XMLGenerator):\n    def characters(self, content, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sax_filter_keeps_its_callback_defaults() -> Result<(), String> {
+        // A filter derives from `XMLReader` rather than from `ContentHandler`,
+        // but it is installed as the content handler of the parser beneath it,
+        // so the reader calls these on it all the same.
+        let source = "from xml.sax.saxutils import XMLFilterBase\n\n\nclass F(XMLFilterBase):\n    def startElement(self, name, attrs, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_sax_handler_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being reached by the reader is inherited, so a subclass written on a
+        // handler defined here is parsed through in the same way.
+        let source = "import xml.sax.handler\n\n\nclass Base(xml.sax.handler.ContentHandler):\n    pass\n\n\nclass Child(Base):\n    def characters(self, content, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_the_xml_sax_hierarchy_are_still_fixed() -> Result<(), String> {
+        // `characters`, `startElement` and `endElement` are ordinary method
+        // names. Nothing calls them here but the calls written below, so the
+        // defaults go and those calls carry the values they held.
+        let source = "class Handler:\n    def characters(self, content, extra=1): return extra\n\n    def startElement(self, name, attrs, extra=2): return extra\n\n    def endElement(self, name, extra=3): return extra\n\n    def startDocument(self, extra=4): return extra\n\n    def endDocument(self, extra=5): return extra\n\n    def setDocumentLocator(self, locator, extra=6): return extra\n\n    def processingInstruction(self, target, data, extra=7): return extra\n\n    def startPrefixMapping(self, prefix, uri, extra=8): return extra\n\n    def endPrefixMapping(self, prefix, extra=9): return extra\n\n    def startElementNS(self, name, qname, attrs, extra=10): return extra\n\n    def endElementNS(self, name, qname, extra=11): return extra\n\n\nh = Handler()\nassert Handler.characters(h, \"c\") == 1\nassert Handler.startElement(h, \"n\", \"a\") == 2\nassert Handler.endElement(h, \"n\") == 3\nassert Handler.startDocument(h) == 4\nassert Handler.endDocument(h) == 5\nassert Handler.setDocumentLocator(h, \"l\") == 6\nassert Handler.processingInstruction(h, \"t\", \"d\") == 7\nassert Handler.startPrefixMapping(h, \"p\", \"u\") == 8\nassert Handler.endPrefixMapping(h, \"p\") == 9\nassert Handler.startElementNS(h, \"n\", \"q\", \"a\") == 10\nassert Handler.endElementNS(h, \"n\", \"q\") == 11\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Handler:\n    def characters(self, content, extra): return extra\n\n    def startElement(self, name, attrs, extra): return extra\n\n    def endElement(self, name, extra): return extra\n\n    def startDocument(self, extra): return extra\n\n    def endDocument(self, extra): return extra\n\n    def setDocumentLocator(self, locator, extra): return extra\n\n    def processingInstruction(self, target, data, extra): return extra\n\n    def startPrefixMapping(self, prefix, uri, extra): return extra\n\n    def endPrefixMapping(self, prefix, extra): return extra\n\n    def startElementNS(self, name, qname, attrs, extra): return extra\n\n    def endElementNS(self, name, qname, extra): return extra\n\n\nh = Handler()\nassert Handler.characters(h, \"c\", extra=1) == 1\nassert Handler.startElement(h, \"n\", \"a\", extra=2) == 2\nassert Handler.endElement(h, \"n\", extra=3) == 3\nassert Handler.startDocument(h, extra=4) == 4\nassert Handler.endDocument(h, extra=5) == 5\nassert Handler.setDocumentLocator(h, \"l\", extra=6) == 6\nassert Handler.processingInstruction(h, \"t\", \"d\", extra=7) == 7\nassert Handler.startPrefixMapping(h, \"p\", \"u\", extra=8) == 8\nassert Handler.endPrefixMapping(h, \"p\", extra=9) == 9\nassert Handler.startElementNS(h, \"n\", \"q\", \"a\", extra=10) == 10\nassert Handler.endElementNS(h, \"n\", \"q\", extra=11) == 11\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_redefined_without_a_sax_base_gives_up_its_callbacks() -> Result<(), String> {
+        // The second `Base` is what `Child` is built on, and no reader reaches
+        // it, so the default is removed.
+        let source = "import xml.sax.handler\n\n\nclass Base(xml.sax.handler.ContentHandler):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    def characters(self, content, extra=1): return extra\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import xml.sax.handler\n\n\nclass Base(xml.sax.handler.ContentHandler):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    def characters(self, content, extra): return extra\n"
         );
         Ok(())
     }

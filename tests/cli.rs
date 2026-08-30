@@ -7401,6 +7401,67 @@ fn callback_names_off_the_parser_hierarchies_are_still_fixed(
 }
 
 #[test]
+fn an_opaque_class_body_rebinding_holds_the_default_back() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("main.py");
+    // `_identity` may return anything at all, so nothing here can say how
+    // `C().alias(2)` is spelled once the default is gone. The file has to come
+    // back untouched.
+    let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    alias = _identity(target)\n\n\nassert C().alias(2) == (2, 1)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The default is still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_class_body_helper_unpacked_into_two_names_holds_its_default_back(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("main.py");
+    // The shape `fractions.Fraction` is written in. Removing the default left
+    // the call written beside it short of an argument, so the module raised
+    // before anything could import it.
+    let source = "import operator\n\n\nclass C:\n    def _fallbacks(forward, reverse, handle_complex=True):\n        return forward, reverse\n\n    def _add(self, other):\n        return other\n\n    __add__, __radd__ = _fallbacks(_add, operator.add)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_descriptor_wrapper_around_a_class_body_alias_is_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("main.py");
+    // The counterpart: a descriptor wrapper leaves the function's own
+    // parameters behind the name, so the alias carries a signature and the
+    // call through it takes the value the removed default held.
+    let source = "class C:\n    def target(x, y=1):\n        return (x, y)\n\n    alias = staticmethod(target)\n\n\nassert C.alias(2) == (2, 1)\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class C:\n    def target(x, y):\n        return (x, y)\n\n    alias = staticmethod(target)\n\n\nassert C.alias(2, y=1) == (2, 1)\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn a_copy_of_a_first_bound_contested_name_keeps_the_inherited_default(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The suites bind `Alias` for the first time, so nothing stands behind it

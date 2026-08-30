@@ -11,6 +11,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - `--diff` lists the diagnostics it cannot fix, and `--fix` prints the ones that remain after writing, so neither mode implies everything was handled.
 - A `# noqa` may carry an explanation after a blanket directive and after a file-level one, and Flake8's whitespace forms are accepted.
 - `--fix` resolves a call whose receiver is a parameterized generic, so `Box[int]()` and `Box[int].make()` are rewritten like their unsubscripted spellings.
+- `--fix` resolves a call whose receiver is a local that a function body binds exactly once, so `made = Child()` followed by `made.own()` is rewritten rather than left to raise. A name a second binding reaches, one an attribute is written through, and one a `global` or `nonlocal` declaration hands to another scope all carry nothing.
 
 ### Changed
 

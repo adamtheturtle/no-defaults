@@ -98,7 +98,7 @@ impl TyResolver {
         source: &str,
         offset: usize,
     ) -> Result<Vec<DefinitionLocation>, String> {
-        self.ensure_open(path, source)?;
+        self.open(path, source)?;
         let (line, character) = lsp_position(source, offset);
         let id = self.request(
             "textDocument/definition",
@@ -111,7 +111,7 @@ impl TyResolver {
         Ok(locations_from_value(&result))
     }
 
-    fn ensure_open(&mut self, path: &Path, source: &str) -> Result<(), String> {
+    pub fn open(&mut self, path: &Path, source: &str) -> Result<(), String> {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         if self.opened.insert(path.clone()) {
             self.notify(

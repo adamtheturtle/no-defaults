@@ -7235,6 +7235,9 @@ fn resolve_pending_external_calls(
         .map(|(module, (_, _, path, _))| (comparable_external_path(path), module.as_str()))
         .collect();
     let mut ty = ty_resolver::TyResolver::start(project_root)?;
+    for (_, _, path, source) in parsed_modules.values() {
+        ty.open(path, source)?;
+    }
     let mut direct: BTreeMap<(String, String), CallbackMethods> = BTreeMap::new();
     for call in pending_calls {
         let Some((_, _, path, source)) = parsed_modules.get(&call.module) else {

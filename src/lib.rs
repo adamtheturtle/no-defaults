@@ -6031,21 +6031,11 @@ fn implicitly_called_method(name: &str) -> bool {
             | "__prepare__"
             | "__init_subclass__"
             | "__annotate__"
-            | "find_spec"
-            | "create_module"
-            | "exec_module"
             | "persistent_id"
             | "reducer_override"
             | "persistent_load"
             | "find_class"
-            | "invalidate_caches"
-            | "load_module"
-            | "get_code"
-            | "get_source"
             | "__conform__"
-            | "is_package"
-            | "get_filename"
-            | "source_to_code"
             | "__call__"
             | "__enter__"
             | "__exit__"
@@ -6155,11 +6145,36 @@ const IO_RAW_CALLBACKS: &[&str] = &[
     "close", "readable", "readinto", "seek", "seekable", "tell", "writable", "write",
 ];
 
-/// The methods the import machinery reaches on a source loader while it turns a
-/// module name into code, whichever source-loader base the subclass was written
-/// on.
-const IMPORTLIB_SOURCE_LOADER_CALLBACKS: &[&str] =
-    &["get_data", "path_mtime", "path_stats", "set_data"];
+/// The methods the import machinery reaches on a finder or a loader while it
+/// turns a module name into a module, whichever `importlib` base the subclass
+/// was written on.
+///
+/// The two halves are one list because they are written on one class as a
+/// matter of course: the documented way to add an importer is a single class
+/// registered on `sys.meta_path` whose `find_spec` returns a spec naming
+/// itself as the loader, so the same object answers `find_spec` and
+/// `exec_module` alike. Splitting the list by which base owns each name would
+/// take the default off `exec_module` in a class written on `MetaPathFinder`
+/// alone, and the machinery calls it there with no call site in the file to
+/// carry the value to. The other direction — a source loader keeping a default
+/// on a `find_spec` nothing reaches — costs a default left in place, so that
+/// is the side to be wrong on.
+const IMPORTLIB_IMPORT_CALLBACKS: &[&str] = &[
+    "create_module",
+    "exec_module",
+    "find_spec",
+    "get_code",
+    "get_data",
+    "get_filename",
+    "get_source",
+    "invalidate_caches",
+    "is_package",
+    "load_module",
+    "path_mtime",
+    "path_stats",
+    "set_data",
+    "source_to_code",
+];
 
 /// The methods the enumeration machinery reaches on an enumeration, whichever
 /// of the module's bases the subclass was written on.
@@ -6298,14 +6313,79 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
     ("enum", "StrEnum", ENUM_CALLBACKS),
     (
         "importlib.abc",
-        "SourceLoader",
-        IMPORTLIB_SOURCE_LOADER_CALLBACKS,
+        "ExecutionLoader",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    ("importlib.abc", "FileLoader", IMPORTLIB_IMPORT_CALLBACKS),
+    ("importlib.abc", "InspectLoader", IMPORTLIB_IMPORT_CALLBACKS),
+    ("importlib.abc", "Loader", IMPORTLIB_IMPORT_CALLBACKS),
+    (
+        "importlib.abc",
+        "MetaPathFinder",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    (
+        "importlib.abc",
+        "PathEntryFinder",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    (
+        "importlib.abc",
+        "ResourceLoader",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    ("importlib.abc", "SourceLoader", IMPORTLIB_IMPORT_CALLBACKS),
+    (
+        "importlib.machinery",
+        "AppleFrameworkLoader",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "BuiltinImporter",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "ExtensionFileLoader",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "FileFinder",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "FrozenImporter",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "NamespaceLoader",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "PathFinder",
+        IMPORTLIB_IMPORT_CALLBACKS,
     ),
     (
         "importlib.machinery",
         "SourceFileLoader",
-        IMPORTLIB_SOURCE_LOADER_CALLBACKS,
+        IMPORTLIB_IMPORT_CALLBACKS,
     ),
+    (
+        "importlib.machinery",
+        "SourcelessFileLoader",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    (
+        "importlib.machinery",
+        "WindowsRegistryFinder",
+        IMPORTLIB_IMPORT_CALLBACKS,
+    ),
+    ("importlib.util", "LazyLoader", IMPORTLIB_IMPORT_CALLBACKS),
     ("io", "FileIO", IO_RAW_CALLBACKS),
     ("io", "RawIOBase", IO_RAW_CALLBACKS),
     (
@@ -9452,6 +9532,32 @@ fn tests_type_checking(test: &Expr) -> bool {
     }
 }
 
+/// Every name a body, and the scopes written inside it, declare `nonlocal`.
+///
+/// An assignment under such a declaration binds a name in a scope outside the
+/// one holding the statement, so that scope holds nothing saying its name was
+/// taken. Gathering the declarations is what lets it know.
+#[derive(Default)]
+struct NonlocalNames {
+    names: BTreeSet<String>,
+}
+
+impl<'a> Visitor<'a> for NonlocalNames {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        if let Stmt::Nonlocal(nonlocal) = statement {
+            self.names
+                .extend(nonlocal.names.iter().map(ToString::to_string));
+        }
+        walk_stmt(self, statement);
+    }
+}
+
+fn nonlocal_names(body: &[Stmt]) -> BTreeSet<String> {
+    let mut collector = NonlocalNames::default();
+    collector.visit_body(body);
+    collector.names
+}
+
 #[derive(Default)]
 struct BoundNames {
     names: BTreeSet<String>,
@@ -9465,6 +9571,11 @@ struct BoundNames {
     nonlocals: BTreeSet<String>,
     functions: BTreeSet<String>,
     classes: BTreeSet<String>,
+    /// Names something other than a `def` or a `class` statement binds. A
+    /// class written in a scope that also assigns its name is not what the
+    /// name reaches everywhere in that scope, so nothing may be resolved
+    /// through it.
+    rebound: BTreeSet<String>,
     /// Whether to collect only the names still bound once the body has run.
     /// An `except ... as` target is deleted when its handler ends, and a
     /// `TYPE_CHECKING` block is read by type checkers and never run at all,
@@ -9481,6 +9592,7 @@ impl BoundNames {
         match target {
             Expr::Name(name) => {
                 self.names.insert(name.id.to_string());
+                self.rebound.insert(name.id.to_string());
             }
             Expr::Tuple(tuple) => tuple.elts.iter().for_each(|element| self.bind(element)),
             Expr::List(list) => list.elts.iter().for_each(|element| self.bind(element)),
@@ -9504,12 +9616,14 @@ impl BoundNames {
             .chain(&parameters.kwonlyargs)
         {
             self.names.insert(parameter.parameter.name.to_string());
+            self.rebound.insert(parameter.parameter.name.to_string());
         }
         for parameter in [&parameters.vararg, &parameters.kwarg]
             .into_iter()
             .flatten()
         {
             self.names.insert(parameter.name.to_string());
+            self.rebound.insert(parameter.name.to_string());
         }
     }
 
@@ -9645,15 +9759,20 @@ impl<'a> Visitor<'a> for BoundNames {
                 }
             }
             // A nested scope binds its own name here and everything else
-            // inside itself, so it is not descended into.
+            // inside itself, so it is not descended into — except for the
+            // `nonlocal` declarations written in it, since an assignment under
+            // one of those rebinds a name out here with nothing in this body
+            // saying so.
             Stmt::FunctionDef(function) => {
                 self.names.insert(function.name.to_string());
                 self.functions.insert(function.name.to_string());
+                self.rebound.extend(nonlocal_names(&function.body));
                 return;
             }
             Stmt::ClassDef(class) => {
                 self.names.insert(class.name.to_string());
                 self.classes.insert(class.name.to_string());
+                self.rebound.extend(nonlocal_names(&class.body));
                 return;
             }
             Stmt::Import(import) => {
@@ -9669,7 +9788,8 @@ impl<'a> Visitor<'a> for BoundNames {
                         },
                         ToString::to_string,
                     );
-                    self.names.insert(bound);
+                    self.names.insert(bound.clone());
+                    self.rebound.insert(bound);
                 }
             }
             Stmt::ImportFrom(import) => {
@@ -9678,7 +9798,8 @@ impl<'a> Visitor<'a> for BoundNames {
                         .asname
                         .as_ref()
                         .map_or_else(|| alias.name.to_string(), ToString::to_string);
-                    self.names.insert(bound);
+                    self.names.insert(bound.clone());
+                    self.rebound.insert(bound);
                 }
             }
             Stmt::Try(block) if !self.surviving_only => {
@@ -9686,6 +9807,7 @@ impl<'a> Visitor<'a> for BoundNames {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
                     if let Some(name) = &handler.name {
                         self.names.insert(name.to_string());
+                        self.rebound.insert(name.to_string());
                     }
                 }
             }
@@ -9754,16 +9876,19 @@ impl<'a> Visitor<'a> for BoundNames {
             Pattern::MatchMapping(mapping) => {
                 if let Some(name) = &mapping.rest {
                     self.names.insert(name.to_string());
+                    self.rebound.insert(name.to_string());
                 }
             }
             Pattern::MatchStar(star) => {
                 if let Some(name) = &star.name {
                     self.names.insert(name.to_string());
+                    self.rebound.insert(name.to_string());
                 }
             }
             Pattern::MatchAs(as_pattern) => {
                 if let Some(name) = &as_pattern.name {
                     self.names.insert(name.to_string());
+                    self.rebound.insert(name.to_string());
                 }
             }
             _ => {}
@@ -10285,6 +10410,9 @@ impl Rewriter<'_> {
                     false,
                 ));
             }
+            if let Some((file, class)) = self.nested_class(name.id.as_str()) {
+                return Some((file, class, false, false));
+            }
             if self
                 .scopes
                 .iter()
@@ -10465,6 +10593,49 @@ impl Rewriter<'_> {
                     .get(depth - 1)
                     .is_some_and(|scope| scope.names.contains(name))
             {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// The class a bare name stands for when a function scope around the call
+    /// site writes one under it.
+    ///
+    /// A class written in a function body is reached by its bare name for the
+    /// rest of that body, so the definition beside the call is the one the
+    /// call goes to and a method on it can be rewritten like any other.
+    /// Definitions are indexed under the lexical path they were written at,
+    /// so the search runs outwards from the call site the way
+    /// [`Self::nested_signature`] does, stopping at the nearest scope that
+    /// binds the name. A scope that also assigns the name, or a scope inside
+    /// that declares it `nonlocal`, says nothing about what stands behind it
+    /// when the call runs, so neither resolves.
+    fn nested_class(&self, name: &str) -> Option<(PathBuf, String)> {
+        // A class body is not a closure scope, so a class written beside a
+        // lambda or a comprehension there is out of that scope's reach.
+        if self
+            .scopes
+            .iter()
+            .skip(self.lexical_scope.len())
+            .any(|scope| scope.names.contains(name))
+        {
+            return None;
+        }
+        for depth in (1..=self.lexical_scope.len()).rev() {
+            if self.lexical_is_class.get(depth - 1) == Some(&true) {
+                continue;
+            }
+            let scope = self.scopes.get(depth - 1);
+            if scope
+                .is_some_and(|scope| scope.classes.contains(name) && !scope.rebound.contains(name))
+            {
+                let qualified = qualified_lexical_name(&self.lexical_scope[..depth], name);
+                if let Some(class) = self.definitions.class_identity(self.physical, &qualified) {
+                    return Some(class);
+                }
+            }
+            if scope.is_some_and(|scope| scope.names.contains(name)) {
                 return None;
             }
         }
@@ -21210,7 +21381,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // parameter beside those is only ever filled by its default. Removing
         // it leaves the next import raising `TypeError` from inside
         // `importlib`, where there is no written call the fixer could update.
-        let source = "class Finder:\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n";
+        let source = "import importlib.abc\n\n\nclass Finder(importlib.abc.MetaPathFinder):\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21227,10 +21398,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_finder_method_beside_find_spec_stays_fixable() {
-        // Retention covers the callback the import system reaches for, not
-        // every method a finder happens to carry, so an ordinary helper on the
-        // same class is still the fixer's to rewrite.
-        let source = "class Finder:\n    def find_spec(self, fullname, path, target, extra=1):\n        return self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass Finder(importlib.abc.MetaPathFinder):\n    def find_spec(self, fullname, path, target, extra=1):\n        return self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21248,7 +21419,7 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn import_loader_create_module_defaults_are_retained() {
         let source =
-            "class Loader:\n    def create_module(self, spec, extra=1):\n        return None\n";
+            "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def create_module(self, spec, extra=1):\n        return None\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21265,9 +21436,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_loader_method_beside_create_module_stays_fixable() {
-        // Retention is keyed to the hook `importlib` reaches for, so an
-        // ordinary helper sharing the loader keeps its ordinary treatment.
-        let source = "class Loader:\n    def create_module(self, spec, extra=1):\n        return self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def create_module(self, spec, extra=1):\n        return self.helper(extra)\n    def helper(self, value=2):\n        return value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21288,7 +21460,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // `_bootstrap._load`, handing it the module and nothing more, so a
         // parameter beside it survives only through its default.
         let source =
-            "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
+            "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21305,9 +21477,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_loader_method_beside_exec_module_stays_fixable() {
-        // Retention is keyed to the hook name, so a sibling sharing the
-        // loader and the signature shape keeps its ordinary treatment.
-        let source = "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(module)\n    def helper(self, module, value=2):\n        return value\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(module)\n    def helper(self, module, value=2):\n        return value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21548,7 +21721,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // missing 1 required positional argument` with nothing for the fixer
         // to update.
         let source =
-            "class Finder:\n    def invalidate_caches(self, extra=1):\n        self.stamp = extra\n";
+            "import importlib.abc\n\n\nclass Finder(importlib.abc.MetaPathFinder):\n    def invalidate_caches(self, extra=1):\n        self.stamp = extra\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21565,9 +21738,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_finder_method_beside_invalidate_caches_stays_fixable() {
-        // Retention is keyed to the hook name, so a sibling sharing the finder
-        // and the signature shape keeps its ordinary treatment.
-        let source = "class Finder:\n    def invalidate_caches(self, extra=1):\n        self.stamp = self.helper()\n    def helper(self, value=2):\n        return value\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass Finder(importlib.abc.MetaPathFinder):\n    def invalidate_caches(self, extra=1):\n        self.stamp = self.helper()\n    def helper(self, value=2):\n        return value\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21610,7 +21784,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // import raising `TypeError: Loader.load_module() missing 1 required
         // positional argument` with nothing for the fixer to update.
         let source =
-            "class Loader:\n    def load_module(self, fullname, extra=1):\n        return fullname\n";
+            "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def load_module(self, fullname, extra=1):\n        return fullname\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21627,10 +21801,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_loader_method_beside_load_module_stays_fixable() {
-        // Retention is keyed to the hook name rather than to the shape of the
-        // parameter list, so a sibling declared the very same way keeps its
-        // ordinary treatment.
-        let source = "class Loader:\n    def load_module(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, extra=1):\n        return fullname\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def load_module(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, extra=1):\n        return fullname\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21672,7 +21846,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // any written line, so dropping the default leaves the next import
         // raising `TypeError: L.get_code() missing 1 required positional
         // argument` with nothing for the fixer to update.
-        let source = "class L:\n    def get_code(self, fullname, extra=1):\n        return None\n";
+        let source = "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def get_code(self, fullname, extra=1):\n        return None\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21689,9 +21863,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_loader_method_beside_get_code_stays_fixable() {
-        // Retention is keyed to the hook name, so a sibling sharing the loader
-        // and the signature shape keeps its ordinary treatment.
-        let source = "class L:\n    def get_code(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def get_code(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21735,7 +21910,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // Loader.get_source() missing 1 required positional argument` from
         // inside `importlib.abc` with nothing for the fixer to update.
         let source =
-            "class Loader:\n    def get_source(self, fullname, extra=1):\n        return 'answer = 1'\n";
+            "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def get_source(self, fullname, extra=1):\n        return 'answer = 1'\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21752,9 +21927,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_loader_method_beside_get_source_stays_fixable() {
-        // Retention is keyed to the hook name, so a sibling sharing the loader
-        // and the signature shape keeps its ordinary treatment.
-        let source = "class Loader:\n    def get_source(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def get_source(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21931,7 +22107,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // positional argument` from inside the import machinery, where there
         // is no written line for the fixer to keep in step.
         let source =
-            "class Loader:\n    def is_package(self, fullname, extra=1):\n        return False\n";
+            "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def is_package(self, fullname, extra=1):\n        return False\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -21948,10 +22124,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_loader_method_beside_is_package_stays_fixable() {
-        // Retention is keyed to the hook name rather than to the shape of the
-        // parameter list, so a sibling declared the very same way keeps its
-        // ordinary treatment.
-        let source = "class Loader:\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, extra=1):\n        return False\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, extra=1):\n        return False\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -22014,7 +22190,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // `TypeError: L.get_filename() missing 1 required positional
         // argument` with nothing for the fixer to update.
         let source =
-            "class L:\n    def get_filename(self, fullname, extra=1):\n        return '/virtual/probe.py'\n";
+            "import importlib.abc\n\n\nclass L(importlib.abc.ExecutionLoader):\n    def get_filename(self, fullname, extra=1):\n        return '/virtual/probe.py'\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -22031,9 +22207,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_loader_method_beside_get_filename_stays_fixable() {
-        // Retention is keyed to the hook name, so a sibling sharing the loader
-        // and the signature shape keeps its ordinary treatment.
-        let source = "class L:\n    def get_filename(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass L(importlib.abc.ExecutionLoader):\n    def get_filename(self, fullname, extra=1):\n        return self.helper(fullname)\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -22095,7 +22272,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // import raising `TypeError: L.source_to_code() missing 1 required
         // positional argument` with nothing for the fixer to update.
         let source =
-            "class L:\n    def source_to_code(self, data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+            "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def source_to_code(self, data, path, extra=1):\n        return compile(data, path, 'exec')\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -22112,9 +22289,10 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_loader_method_beside_source_to_code_stays_fixable() {
-        // Retention is keyed to the hook name, so a sibling sharing the loader
-        // and the signature shape keeps its ordinary treatment.
-        let source = "class L:\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path)\n    def helper(self, data, path, value=2):\n        return (data, path, value)\n";
+        // Retention is keyed to the base whose machinery makes the call and
+        // the callbacks it reaches, not to every method the class carries, so
+        // an ordinary helper beside the hook is rewritten as usual.
+        let source = "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path)\n    def helper(self, data, path, value=2):\n        return (data, path, value)\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -22154,7 +22332,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // machinery reaches it through the instance either way, so the
         // decorated form is retained on the same grounds.
         let source =
-            "class L:\n    @staticmethod\n    def source_to_code(data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+            "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    @staticmethod\n    def source_to_code(data, path, extra=1):\n        return compile(data, path, 'exec')\n";
         let checked = check_source(
             Path::new("fixture.py"),
             source,
@@ -24025,6 +24203,217 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed_with_retained_defaults(source)?,
             "import xml.sax.handler\n\n\nclass Base(xml.sax.handler.ContentHandler):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    def characters(self, content, extra): return extra\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_find_spec_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // The import system asks every finder on `sys.meta_path` for a spec,
+        // and only a class the machinery was handed is reached that way: a
+        // subclass of `importlib.abc.MetaPathFinder`. `Registry` is none, so
+        // the call written below is all that reaches the method, and the
+        // default goes into it.
+        let source = "class Registry:\n    def find_spec(self, fullname, path, target, extra=1): return extra\n\n\no = Registry()\nassert Registry.find_spec(o, \"n\", None, None) == 1\n";
+        assert_eq!(fixed(source)?, "class Registry:\n    def find_spec(self, fullname, path, target, extra): return extra\n\n\no = Registry()\nassert Registry.find_spec(o, \"n\", None, None, extra=1) == 1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_create_module_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // `module_from_spec` asks the spec's loader to build the module, and
+        // only a class the machinery was handed is reached that way: a
+        // subclass of `importlib.abc.Loader`. `Factory` is none, so the call
+        // written below is all that reaches the method, and the default goes
+        // into it.
+        let source = "class Factory:\n    def create_module(self, spec, extra=2): return extra\n\n\no = Factory()\nassert Factory.create_module(o, \"s\") == 2\n";
+        assert_eq!(fixed(source)?, "class Factory:\n    def create_module(self, spec, extra): return extra\n\n\no = Factory()\nassert Factory.create_module(o, \"s\", extra=2) == 2\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_exec_module_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // `_bootstrap._load` runs a module body through the loader its spec
+        // names, and only a class the machinery was handed is reached that
+        // way: a subclass of `importlib.abc.Loader`. `Runner` is none, so the
+        // call written below is all that reaches the method, and the default
+        // goes into it.
+        let source = "class Runner:\n    def exec_module(self, module, extra=3): return extra\n\n\no = Runner()\nassert Runner.exec_module(o, \"m\") == 3\n";
+        assert_eq!(fixed(source)?, "class Runner:\n    def exec_module(self, module, extra): return extra\n\n\no = Runner()\nassert Runner.exec_module(o, \"m\", extra=3) == 3\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_module_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // The backward-compatible path in `_bootstrap` drives a loader that
+        // offers no `exec_module`, and only a class the machinery was handed
+        // is reached that way: a subclass of `importlib.abc.Loader`. `Plugins`
+        // is none, so the call written below is all that reaches the method,
+        // and the default goes into it.
+        let source = "class Plugins:\n    def load_module(self, fullname, extra=4): return extra\n\n\no = Plugins()\nassert Plugins.load_module(o, \"n\") == 4\n";
+        assert_eq!(fixed(source)?, "class Plugins:\n    def load_module(self, fullname, extra): return extra\n\n\no = Plugins()\nassert Plugins.load_module(o, \"n\", extra=4) == 4\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_get_code_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // `InspectLoader.exec_module` and `runpy` ask a loader for a module's
+        // code, and only a class the machinery was handed is reached that way:
+        // a subclass of `importlib.abc.InspectLoader`. `Coupons` is none, so
+        // the call written below is all that reaches the method, and the
+        // default goes into it.
+        let source = "class Coupons:\n    def get_code(self, name, extra=5): return extra\n\n\no = Coupons()\nassert Coupons.get_code(o, \"n\") == 5\n";
+        assert_eq!(fixed(source)?, "class Coupons:\n    def get_code(self, name, extra): return extra\n\n\no = Coupons()\nassert Coupons.get_code(o, \"n\", extra=5) == 5\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_get_source_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // `InspectLoader.get_code` and `linecache` ask a loader for a module's
+        // source, and only a class the machinery was handed is reached that
+        // way: a subclass of `importlib.abc.InspectLoader`. `Templates` is
+        // none, so the call written below is all that reaches the method, and
+        // the default goes into it.
+        let source = "class Templates:\n    def get_source(self, name, extra=6): return extra\n\n\no = Templates()\nassert Templates.get_source(o, \"n\") == 6\n";
+        assert_eq!(fixed(source)?, "class Templates:\n    def get_source(self, name, extra): return extra\n\n\no = Templates()\nassert Templates.get_source(o, \"n\", extra=6) == 6\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_is_package_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // `spec_from_loader` asks a loader whether the name it was given is a
+        // package, and only a class the machinery was handed is reached that
+        // way: a subclass of `importlib.abc.InspectLoader`. `Manifest` is
+        // none, so the call written below is all that reaches the method, and
+        // the default goes into it.
+        let source = "class Manifest:\n    def is_package(self, name, extra=7): return extra\n\n\no = Manifest()\nassert Manifest.is_package(o, \"n\") == 7\n";
+        assert_eq!(fixed(source)?, "class Manifest:\n    def is_package(self, name, extra): return extra\n\n\no = Manifest()\nassert Manifest.is_package(o, \"n\", extra=7) == 7\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_get_filename_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // `spec_from_loader` and `ExecutionLoader.get_code` ask a loader for a
+        // module's file, and only a class the machinery was handed is reached
+        // that way: a subclass of `importlib.abc.ExecutionLoader`. `Uploads`
+        // is none, so the call written below is all that reaches the method,
+        // and the default goes into it.
+        let source = "class Uploads:\n    def get_filename(self, name, extra=8): return extra\n\n\no = Uploads()\nassert Uploads.get_filename(o, \"n\") == 8\n";
+        assert_eq!(fixed(source)?, "class Uploads:\n    def get_filename(self, name, extra): return extra\n\n\no = Uploads()\nassert Uploads.get_filename(o, \"n\", extra=8) == 8\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_to_code_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // `InspectLoader.get_code` compiles through the loader's own hook, and
+        // only a class the machinery was handed is reached that way: a
+        // subclass of `importlib.abc.InspectLoader`. `Snippets` is none, so
+        // the call written below is all that reaches the method, and the
+        // default goes into it.
+        let source = "class Snippets:\n    def source_to_code(self, data, path, extra=9): return extra\n\n\no = Snippets()\nassert Snippets.source_to_code(o, \"d\", \"p\") == 9\n";
+        assert_eq!(fixed(source)?, "class Snippets:\n    def source_to_code(self, data, path, extra): return extra\n\n\no = Snippets()\nassert Snippets.source_to_code(o, \"d\", \"p\", extra=9) == 9\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_invalidate_caches_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
+        // `importlib.invalidate_caches` walks `sys.meta_path` and rings every
+        // finder, and only a class the machinery was handed is reached that
+        // way: a subclass of `importlib.abc.MetaPathFinder`. `Sessions` is
+        // none, so the call written below is all that reaches the method, and
+        // the default goes into it.
+        let source = "class Sessions:\n    def invalidate_caches(self, extra=10): return extra\n\n\no = Sessions()\nassert Sessions.invalidate_caches(o) == 10\n";
+        assert_eq!(fixed(source)?, "class Sessions:\n    def invalidate_caches(self, extra): return extra\n\n\no = Sessions()\nassert Sessions.invalidate_caches(o, extra=10) == 10\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_import_hook_that_finds_and_loads_keeps_every_callback() -> Result<(), String> {
+        // One class registered on `sys.meta_path` answering both halves is the
+        // documented way to add an importer: `find_spec` returns a spec naming
+        // the finder itself as the loader, and the machinery then calls
+        // `create_module` and `exec_module` on that same object. The loader
+        // callbacks are reached here even though the only base written is a
+        // finder, which is why one list covers both.
+        let source = "import importlib.abc\n\n\nclass Hook(importlib.abc.MetaPathFinder):\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n\n    def create_module(self, spec, extra=2):\n        return None\n\n    def exec_module(self, module, extra=3):\n        module.answer = extra\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_importlib_machinery_finder_keeps_its_callback_defaults() -> Result<(), String> {
+        // `importlib.machinery` ships the concrete finders, and `PathFinder`
+        // is the one on `sys.meta_path` by default, so a subclass of it is
+        // reached by exactly the same walk.
+        let source = "import importlib.machinery\n\n\nclass Finder(importlib.machinery.PathFinder):\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_import_base_bound_by_name_keeps_its_callback_defaults() -> Result<(), String> {
+        // The base is the same class whether it is spelled through the module
+        // or bound by a `from` import.
+        let source = "from importlib.abc import MetaPathFinder\n\n\nclass Finder(MetaPathFinder):\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_import_hook_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being driven by the import machinery is inherited, so a loader
+        // written on one defined here is reached in the same way.
+        let source = "import importlib.abc\n\n\nclass Base(importlib.abc.Loader):\n    pass\n\n\nclass Child(Base):\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_of_a_function_body_answers_the_call_beside_it() -> Result<(), String> {
+        // A class written in a function body is reached by its bare name for
+        // the rest of that body, so the call sitting beside it goes to the
+        // definition beside it and carries the deleted default. Leaving the
+        // call alone wrote a file that raised `TypeError` on the next run.
+        let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    return Child().own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    return Child().own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn namesake_classes_of_two_function_bodies_answer_their_own_calls() -> Result<(), String> {
+        // Each class is recorded under the lexical path it was written at, so
+        // the two `Child` classes are told apart and each call carries the
+        // default its own definition held.
+        let source = "def one():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    return Child().own()\n\n\ndef two():\n    class Child:\n        def own(self, extra=9):\n            return extra\n\n    return Child().own()\n\n\nassert (one(), two()) == (7, 9), (one(), two())\n";
+        assert_eq!(fixed(source)?, "def one():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    return Child().own(extra=7)\n\n\ndef two():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    return Child().own(extra=9)\n\n\nassert (one(), two()) == (7, 9), (one(), two())\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebinding_takes_the_name_off_a_class_of_a_function_body() -> Result<(), String> {
+        // The body assigns `Child` again, so the name no longer stands for
+        // the class written under it by the time the call runs. Nothing is
+        // written into the call, which is what keeps it running.
+        let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    class Other:\n        def own(self):\n            return 7\n\n    Child = Other\n    return Child().own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    class Other:\n        def own(self):\n            return 7\n\n    Child = Other\n    return Child().own()\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_nonlocal_takes_the_name_off_a_class_of_a_function_body() -> Result<(), String> {
+        // The assignment reaching out through `nonlocal` rebinds `Child` here
+        // with no statement in this body saying so, so the class written under
+        // the name answers for nothing and the call is left alone.
+        let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    class Other:\n        def own(self):\n            return 7\n\n    def swap():\n        nonlocal Child\n\n        Child = Other\n\n    swap()\n    return Child().own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    class Other:\n        def own(self):\n            return 7\n\n    def swap():\n        nonlocal Child\n\n        Child = Other\n\n    swap()\n    return Child().own()\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_beside_a_function_still_answers_the_call_inside_it() -> Result<(), String> {
+        // The same file with the class lifted out of the body: only the
+        // nesting differs, and the call is rewritten either way.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    return Child().own(extra=7)\n\n\nassert outer() == 7, outer()\n");
         Ok(())
     }
 }

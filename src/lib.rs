@@ -11091,15 +11091,29 @@ impl Rewriter<'_> {
         {
             return None;
         }
+        let innermost_class_applies = self.in_class_scope();
         for depth in (1..=self.lexical_scope.len()).rev() {
-            if self.lexical_is_class.get(depth - 1) == Some(&true) {
+            // A class body is passed over for the same reason: a function
+            // written in one does not see the names it binds. The body the
+            // call is written straight in is the exception, since that is the
+            // namespace the name is read from, and what it binds hides
+            // whatever the scopes around it call by the same name.
+            let class_frame = self.lexical_is_class.get(depth - 1) == Some(&true);
+            if class_frame && !(depth == self.lexical_scope.len() && innermost_class_applies) {
                 continue;
             }
             let scope = self.scopes.get(depth - 1);
             if scope
                 .is_some_and(|scope| scope.classes.contains(name) && !scope.rebound.contains(name))
             {
-                let qualified = qualified_lexical_name(&self.lexical_scope[..depth], name);
+                // A class written straight in a class body is recorded under
+                // that class rather than under a lexical path, which is the
+                // one place the two spellings differ.
+                let qualified = if class_frame {
+                    qualified_name(self.classes.last().map(String::as_str), name)
+                } else {
+                    qualified_lexical_name(&self.lexical_scope[..depth], name)
+                };
                 if let Some(class) = self.definitions.class_identity(self.physical, &qualified) {
                     return Some(class);
                 }
@@ -25558,6 +25572,46 @@ def b(x=1): pass  # type: ignore  # noqa
         // runs, and nothing is written into the call.
         let source = "def outer():\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n    class Other:\n        class Child:\n            def own(self):\n                return 7\n\n    Holder = Other\n    return Holder.Child().own()\n\n\nassert outer() == 7, outer()\n";
         assert_eq!(fixed(source)?, "def outer():\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n    class Other:\n        class Child:\n            def own(self):\n                return 7\n\n    Holder = Other\n    return Holder.Child().own()\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_reads_the_namesake_it_holds_itself() -> Result<(), String> {
+        // A statement written straight in a class body reads the body's own
+        // namespace first, so the `Child` beside it is the one the call
+        // reaches, not the `Child` of the function scope around it.
+        let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    class Holder:\n        class Child:\n            def own(self, extra=9):\n                return extra\n\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        value = Child().own(extra=9)\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_rebinding_takes_the_name_off_the_class_outside_it() -> Result<(), String> {
+        // The body binds `Child` to another class before the call, so nothing
+        // the function scope around it holds under that name is what the call
+        // reaches, and nothing is written into it.
+        let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        Child = Other\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        Child = Other\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_body_reaches_a_class_of_the_function_around_it() -> Result<(), String> {
+        // Nothing in the body binds `Child`, so the class of the function
+        // scope around it is what the call reaches, and it carries the
+        // deleted default.
+        let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    class Holder:\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    class Holder:\n        value = Child().own(extra=7)\n\n    return Holder.value\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_method_body_does_not_read_the_class_namespace_around_it() -> Result<(), String> {
+        // A class body is no closure scope, so the `Child` the class binds is
+        // out of reach from the method written in it and the call reaches the
+        // function scope's class instead — which is what Python does too.
+        let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        Child = Other\n\n        def go(self):\n            return Child().own()\n\n    return Holder().go()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        Child = Other\n\n        def go(self):\n            return Child().own(extra=7)\n\n    return Holder().go()\n\n\nassert outer() == 7, outer()\n");
         Ok(())
     }
 }

@@ -7232,3 +7232,24 @@ fn a_base_bound_above_a_nested_scope_is_still_rewritten() -> Result<(), Box<dyn 
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_walrus_in_an_untaken_branch_leaves_an_import_standing_end_to_end(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `ND_TYPING` is unset, so the walrus never runs, `Enum` is the import and
+    // `C` is an enumeration whose members the class statement builds by
+    // calling the initializer. Nothing written here could carry the value once
+    // the default were gone.
+    let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    holder = (Enum := object)\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n\n\nassert C.A.label == 'x'\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The default is still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

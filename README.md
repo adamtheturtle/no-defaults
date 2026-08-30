@@ -118,15 +118,6 @@ repos:
 
 pre-commit passes only the changed files, so a call in a file that did not change is not updated. Run `no-defaults --fix .` by hand when you are removing a default that is called from elsewhere.
 
-## Performance
-
-A `--release` build of `2.1.0` checked a pinned Typeshed checkout of 5,360 Python and stub files (12.5 MiB) on an Apple Silicon Mac, producing 50,923 diagnostics. Medians of five warm runs, at 49 MiB maximum RSS either way:
-
-| output format | wall clock | files per second |
-| --- | --- | --- |
-| `concise` | 0.35 s | ~15,000 |
-| `full` (the default) | 0.58 s | ~9,000 |
-
 ## License
 
 MIT

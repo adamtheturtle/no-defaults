@@ -208,7 +208,7 @@ A base is matched by the last segment of its name, as a decorator is, so `pydant
 field_base_classes = [ "pydantic.BaseModel", "msgspec.Struct" ]
 ```
 
-Within such a class, `Field(default=…)` and `Field(default_factory=…)` are reported and `--fix` removes only those arguments, keeping the rest of the metadata, exactly as it does for `field(...)`. Pydantic's `Field(...)` and `Field(default=...)` declare a field with no default, so neither is reported.
+Within such a class, `Field(default=…)` and `Field(default_factory=…)` are reported and `--fix` removes only those arguments, keeping the rest of the metadata, exactly as it does for `field(...)`. pydantic's `Field(...)` and `Field(default=...)` declare a field with no default, so neither is reported.
 
 A class is recognised only where it names a listed base itself. `class Job(BaseModel)` is checked; `class SubJob(Job)` is not, because knowing that `Job` is a model means resolving imports across files. Where a model has a base beyond the listed one, its fields are still reported, but `--fix` leaves its call sites alone and says so, because that base may declare fields of its own.
 

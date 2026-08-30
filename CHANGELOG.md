@@ -58,7 +58,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - A decorator that is not `dataclass` keeps the defaults of what it decorates, because it may replace the callable or the constructor that the rewritten call sites would target. This applies to a decorator on a function and on a class, and in every form it is written in: a bare name, a factory such as `@replace()`, and an attribute such as `@mod.replace`.
 - Whether a class carries fields is decided by what its names are bound to rather than by how they are spelled. A locally defined `dataclass`, `field` or `Field`, a `BaseModel` declared in the file, an aliased `ClassVar`, and a `KW_ONLY` marker reached through a `dataclasses` import are each resolved to the definition in force at that point, and a name rebound later stops standing for what it did before.
 - A class whose field list is not one reliable shape is left alone. Fields declared inside a conditional, a loop, a `try`, a `match` case, or an `if TYPE_CHECKING:` block do not describe the constructor the class ends up with, and a field that a later statement deletes or overwrites is not treated as settled. Imports in those blocks still bind the names the rest of the file is written against.
-- A name beginning with two underscores, other than a dunder, counts as private, and a Pydantic private attribute or an underscore-prefixed model attribute is not a field.
+- A name beginning with two underscores, other than a dunder, counts as private, and a pydantic private attribute or an underscore-prefixed model attribute is not a field.
 
 ### Fixed
 
@@ -88,15 +88,15 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - Transitive class-body method aliases resolve to the original method signature, so calls through every alias receive removed defaults.
 - Staticmethod and classmethod aliases imported inside `match` cases are available to call rewriting.
 - Staticmethod and classmethod aliases imported inside a `while` body or its `else` suite are available to call rewriting.
-- A match-pattern capture invalidates any imported dataclass identity it may replace before its guard and case body are analyzed.
+- A match-pattern capture invalidates any imported dataclass identity it may replace before its guard and case body are analysed.
 - A named-expression target invalidates any imported dataclass identity it replaces after its value has been evaluated.
 - A `with ... as` target invalidates any imported dataclass identity it replaces, both inside and after the suite.
 - A `for` target invalidates any imported dataclass identity it may replace, while a statically empty loop leaves the identity unchanged.
-- A user-defined helper named `PrivateAttr` is treated as an ordinary configured-model field default; only a resolved Pydantic helper suppresses field handling.
-- Assigning over an imported `TYPE_CHECKING` alias invalidates its type-only identity, so a statically live guarded branch is analyzed and fixed normally.
+- A user-defined helper named `PrivateAttr` is treated as an ordinary configured-model field default; only a resolved pydantic helper suppresses field handling.
+- Assigning over an imported `TYPE_CHECKING` alias invalidates its type-only identity, so a statically live guarded branch is analysed and fixed normally.
 - Assigning over an imported `abc` module alias invalidates its module identity, so a dataclass reached through the replacement namespace contributes its inherited fields.
 - Assigning over an imported `typing.Generic` or `Protocol` alias invalidates its structural-base identity, so a dataclass rebound under that name contributes its inherited fields.
-- Assigning over an imported Pydantic `Field` helper invalidates that imported identity and retains the replacement call, so its arguments are not edited as though it were still the standard helper.
+- Assigning over an imported pydantic `Field` helper invalidates that imported identity and retains the replacement call, so its arguments are not edited as though it were still the standard helper.
 - Assigning over an imported `dataclasses.field` helper invalidates that imported identity and retains the replacement call, so its arguments are not edited as though it were still the standard helper.
 - Assigning over an imported `dataclass` decorator invalidates that imported identity, so later ordinary classes are not rewritten as dataclasses.
 
@@ -193,6 +193,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 - `README.md` is an overview again: what the tool is, how to install and run it, what `--fix` does and cannot do, the configuration keys, and pre-commit. The behaviour it used to spell out in full moved to `docs/reference.md`, which it links to, with nothing dropped.
 - The `.pyi` note said only `= ...` was reported without being fixed. Every default in a stub has been reported and retained since that change, so the note now says so.
+- `README.md` drops its `## Performance` section. The measurements it quoted, along with the maximum RSS it left out and the note on where the time goes, are in the [reference](docs/reference.md#performance), which the README already points at for everything else it summarises.
+- Prose in the README, the reference, and the other documents is linted with Vale, which CI runs on every pull request. The style is the built-in `Vale` rules plus `proselint`, with this project's terms in `.vale/styles/config/vocabularies/no-defaults/accept.txt`; `CONTRIBUTING.md` says how to run it.
+- The library `pydantic` is spelled the way it spells itself throughout, rather than capitalised in five places. `analysed` and `behaviour` are likewise spelled the way the rest of the documents spell them, in the five places that had drifted to the American forms.
 
 ## 2.1.0 - 2026-08-07
 
@@ -220,7 +223,7 @@ This release changes what the linter reports, what `--fix` writes, and which con
 ### Added
 
 - Defaults on pydantic models are reported. A class is now checked for fields when it names a base class from `field_base_classes`, which defaults to `[ "pydantic.BaseModel" ]`, as well as when it carries `@dataclass`. Its violations are named `class field` where a dataclass's are named `dataclass field`. Codebases built on `BaseModel` will see violations that earlier versions passed over in silence; `field_base_classes = []` restores the old behaviour, and the same setting extends the rule to `msgspec.Struct`, `sqlmodel.SQLModel`, or anything else that carries fields through a base class.
-- `Field(default=…)` and `Field(default_factory=…)` are fixed the way `field(...)` is, removing only those arguments and keeping the rest of the metadata. Pydantic writes a field with no default as `Field(...)` or `Field(default=...)`, and neither is reported. A model's call sites gain the removed default as a keyword argument like any other.
+- `Field(default=…)` and `Field(default_factory=…)` are fixed the way `field(...)` is, removing only those arguments and keeping the rest of the metadata. pydantic writes a field with no default as `Field(...)` or `Field(default=...)`, and neither is reported. A model's call sites gain the removed default as a keyword argument like any other.
 - `--show-settings` reports `field-base-classes`.
 - `--fix` now updates call sites. Every call in the checked files that relied on a removed default gains it as an explicit argument, so `connect("h")` becomes `connect("h", timeout=30)` and `Job("j")` becomes `Job("j", retries=3)`. A `default_factory` becomes the value it produces. Arguments are appended as keywords except for positional-only parameters. `--diff` previews these edits too. This supersedes the 1.1.0 warning that call sites were left alone.
 - Calls are resolved through the calling file's own imports rather than by matching the bare name, so a project with its own `connect` does not have `socket.connect` rewritten, and two modules that each define `helper` are told apart. A method is rewritten when reached through `self`, `cls`, or a class the file can name, whether local, imported, or reached through an imported module, and what it already receives is accounted for, so `instance.fetch(url)`, `Client.fetch(instance, url)`, and a `staticmethod` reached through either are each filled in correctly.

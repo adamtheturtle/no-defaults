@@ -2,3 +2,7 @@
 /dist
 /.venv
 *.pyc
+# `vale sync` downloads the packages named in `.vale.ini` into the styles path.
+# Only this project's own vocabulary is kept in the repository.
+/.vale/styles/*
+!/.vale/styles/config

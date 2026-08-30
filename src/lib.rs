@@ -6486,26 +6486,12 @@ const UNITTEST_RESULT_CALLBACKS: &[&str] = &[
 /// standard-library subclass that is a base in its own right —
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
+///
+/// Rows stay sorted by module then base, which is what makes a module's rows
+/// sit together and a missing one visible next to its neighbours. Batches add
+/// rows to this table concurrently, so `the_callback_base_table_is_sorted`
+/// guards the order rather than leaving it to each author.
 const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
-    (
-        "html.parser",
-        "HTMLParser",
-        &[
-            "handle_charref",
-            "handle_comment",
-            "handle_data",
-            "handle_decl",
-            "handle_endtag",
-            "handle_entityref",
-            "handle_pi",
-            "handle_startendtag",
-            "handle_starttag",
-            "reset",
-            "unknown_decl",
-        ],
-    ),
-    ("json", "JSONEncoder", JSON_ENCODER_CALLBACKS),
-    ("json.encoder", "JSONEncoder", JSON_ENCODER_CALLBACKS),
     (
         "argparse",
         "ArgumentDefaultsHelpFormatter",
@@ -6551,6 +6537,23 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
     ("enum", "ReprEnum", ENUM_CALLBACKS),
     ("enum", "StrEnum", ENUM_CALLBACKS),
     (
+        "html.parser",
+        "HTMLParser",
+        &[
+            "handle_charref",
+            "handle_comment",
+            "handle_data",
+            "handle_decl",
+            "handle_endtag",
+            "handle_entityref",
+            "handle_pi",
+            "handle_startendtag",
+            "handle_starttag",
+            "reset",
+            "unknown_decl",
+        ],
+    ),
+    (
         "importlib.abc",
         "SourceLoader",
         IMPORTLIB_SOURCE_LOADER_CALLBACKS,
@@ -6562,6 +6565,8 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
     ),
     ("io", "FileIO", IO_RAW_CALLBACKS),
     ("io", "RawIOBase", IO_RAW_CALLBACKS),
+    ("json", "JSONEncoder", JSON_ENCODER_CALLBACKS),
+    ("json.encoder", "JSONEncoder", JSON_ENCODER_CALLBACKS),
     (
         "logging",
         "BufferingFormatter",
@@ -24947,6 +24952,21 @@ def b(x=1): pass  # type: ignore  # noqa
         let source = "class case:\n    class TestCase:\n        pass\n\n\nclass C(case.TestCase):\n    def setUp(self, extra=1): return extra\n\n\nassert C.setUp(C()) == 1\n";
         assert_eq!(fixed(source)?, "class case:\n    class TestCase:\n        pass\n\n\nclass C(case.TestCase):\n    def setUp(self, extra): return extra\n\n\nassert C.setUp(C(), extra=1) == 1\n");
         Ok(())
+    }
+
+    #[test]
+    fn the_callback_base_table_is_sorted() {
+        // The order is what lets a reader, or an author adding a row, find a
+        // module's rows together and see that one is missing. A row landing out
+        // of position also drags the next insertion out with it, since a search
+        // for the first row that sorts after the new one stops at the stray.
+        let keys: Vec<_> = IMPLICIT_CALLBACK_BASES
+            .iter()
+            .map(|(module, base, _)| (*module, *base))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted);
     }
 
     #[test]

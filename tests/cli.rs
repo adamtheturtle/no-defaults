@@ -7141,3 +7141,45 @@ fn an_assignment_in_an_untaken_branch_leaves_an_import_standing_end_to_end(
     assert_eq!(output.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn parser_and_encoder_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // Each of these is reached by the module that owns the base — `goahead`
+    // drives the parser hooks, `_vformat` drives the formatter hooks, the
+    // encoder is built by `json.dumps` itself, and `pformat` reaches `format`
+    // through `_repr`. None of those calls is written here.
+    let source = "import json\nimport pprint\nimport string\nfrom html.parser import HTMLParser\n\n\nclass P(HTMLParser):\n    def handle_data(self, data, extra=1): pass\n\n\nclass Child(P):\n    def handle_starttag(self, tag, attrs, extra=2): pass\n\n\nclass F(string.Formatter):\n    def get_value(self, key, args, kwargs, extra=3): return ''\n\n    def check_unused_args(self, used_args, args, kwargs, extra=4): pass\n\n\nclass E(json.JSONEncoder):\n    def default(self, obj, extra=5): return str(obj)\n\n\nclass Pretty(pprint.PrettyPrinter):\n    def format(self, obj, context, maxlevels, level, extra=6): return repr(obj), True, False\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The defaults are still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn callback_names_off_the_parser_hierarchies_are_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    // `default`, `format` and `parse` are ordinary method names, and these
+    // classes derive from nothing that would call them, so the defaults go and
+    // the calls written below carry the values they held.
+    let case = directory.path().join("case.py");
+    let source = "class Encoder:\n    def default(self, obj, extra=1): return extra\n\n\nclass Printer:\n    def format(self, obj, context, maxlevels, level, extra=2): return extra\n\n\nclass Formatter:\n    def parse(self, format_string, extra=3): return extra\n\n\nassert Encoder.default(Encoder(), None) == 1\nassert Printer.format(Printer(), None, None, None, None) == 2\nassert Formatter.parse(Formatter(), '') == 3\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Encoder:\n    def default(self, obj, extra): return extra\n\n\nclass Printer:\n    def format(self, obj, context, maxlevels, level, extra): return extra\n\n\nclass Formatter:\n    def parse(self, format_string, extra): return extra\n\n\nassert Encoder.default(Encoder(), None, extra=1) == 1\nassert Printer.format(Printer(), None, None, None, None, extra=2) == 2\nassert Formatter.parse(Formatter(), '', extra=3) == 3\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

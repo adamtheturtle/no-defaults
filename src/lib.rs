@@ -1238,6 +1238,12 @@ struct ClassNamespace<'a> {
     /// this scope writes no class of reads one of these rather than a class of
     /// its own written further down, which had bound nothing yet.
     enclosing: &'a BTreeMap<String, String>,
+    /// The spellings a scope around these statements binds to a class written
+    /// below them. Which class such a name reaches by the time these
+    /// statements run is not something the written order settles, so the
+    /// spelling reaches none of them here and a base written with it leaves
+    /// the class's ancestry unsettled rather than silently baseless.
+    withheld: &'a BTreeSet<String>,
     /// Whether the statements sit in one of several suites of a control-flow
     /// statement of which only one runs, so a class written here stands beside
     /// whatever a sibling suite writes under the same name.
@@ -1249,10 +1255,12 @@ impl ClassNamespace<'_> {
         // Nothing encloses a module, so a base written directly in one reads
         // only what the module itself binds.
         static NOTHING: BTreeMap<String, String> = BTreeMap::new();
+        static NONE_WITHHELD: BTreeSet<String> = BTreeSet::new();
         Self {
             parent: None,
             lexical_scope: &[],
             enclosing: &NOTHING,
+            withheld: &NONE_WITHHELD,
             alternative: false,
         }
     }
@@ -1562,19 +1570,31 @@ impl<'a> BaseScope<'a> {
     /// statement stands below the nested scope, what the name reaches by the
     /// time that scope runs is not something the written order settles, so the
     /// spelling is taken away rather than answered with the outer class.
-    fn visible_classes(&self, defined_at: TextSize) -> BTreeMap<String, String> {
+    /// Which spellings were taken away is returned beside the ones that
+    /// remain, because a base written with one of them is not a base this file
+    /// has no record of — it names a class the file can see and simply cannot
+    /// choose between. Dropping it and saying nothing left the subclass looking
+    /// as though it had no base at all, so the calls it inherits were reported
+    /// while the defaults behind them were removed.
+    fn visible_classes(
+        &self,
+        defined_at: TextSize,
+    ) -> (BTreeMap<String, String>, BTreeSet<String>) {
         let mut visible = self.namespace.enclosing.clone();
+        let mut withheld = self.namespace.withheld.clone();
         if self.namespace.parent.is_some() {
-            return visible;
+            return (visible, withheld);
         }
         for (spelling, class) in self.classes {
             if class.holds_at(defined_at) {
                 visible.insert(spelling.clone(), class.identity.clone());
+                withheld.remove(spelling);
             } else {
                 visible.remove(spelling);
+                withheld.insert(spelling.clone());
             }
         }
-        visible
+        (visible, withheld)
     }
 }
 
@@ -1593,7 +1613,7 @@ fn index_class_body_method_bases(
 ) {
     let mut inner = scope.namespace.lexical_scope.to_vec();
     inner.push(class.name.to_string());
-    let visible = scope.visible_classes(class.start());
+    let (visible, withheld) = scope.visible_classes(class.start());
     index_method_bases(
         &class.body,
         importer,
@@ -1603,6 +1623,7 @@ fn index_class_body_method_bases(
             parent: Some(identity),
             lexical_scope: &inner,
             enclosing: &visible,
+            withheld: &withheld,
             alternative: scope.namespace.alternative,
         },
         scope.lexical_classes,
@@ -1624,7 +1645,7 @@ fn index_function_body_method_bases(
 ) {
     let mut inner = scope.namespace.lexical_scope.to_vec();
     inner.push(function.name.to_string());
-    let visible = scope.visible_classes(function.start());
+    let (visible, withheld) = scope.visible_classes(function.start());
     index_method_bases(
         &function.body,
         importer,
@@ -1640,6 +1661,7 @@ fn index_function_body_method_bases(
             parent: None,
             lexical_scope: &inner,
             enclosing: &visible,
+            withheld: &withheld,
             alternative: scope.namespace.alternative,
         },
         scope.lexical_classes.entering_function(),
@@ -1782,12 +1804,18 @@ fn record_class_bases_and_attributes(
     if !scope.lexical_classes.holds(identity) {
         return;
     }
+    // A base whose spelling an enclosing scope took away names a class this
+    // file can see and cannot choose between, which is not the same as a base
+    // it has no record of at all. Dropping it silently left the subclass
+    // looking baseless, so the calls it inherits resolved to nothing and were
+    // reported while the defaults behind them went.
+    let mut withholds_a_base = false;
     let bases = class
         .arguments
         .iter()
         .flat_map(|arguments| arguments.args.iter())
         .filter_map(|base| {
-            method_base_identity(
+            let identity = method_base_identity(
                 base,
                 importer,
                 bindings,
@@ -1795,7 +1823,13 @@ fn record_class_bases_and_attributes(
                 class.start(),
                 &scope.aliases,
                 &definitions.methods,
-            )
+            );
+            if identity.is_none()
+                && base_root_name(base).is_some_and(|name| scope.namespace.withheld.contains(name))
+            {
+                withholds_a_base = true;
+            }
+            identity
         })
         .collect();
     let methods = definitions
@@ -1823,9 +1857,10 @@ fn record_class_bases_and_attributes(
     // settles none of them, exactly as it settles none for a class those
     // suites give different bases. The name is read at the root of the base,
     // so a parameterized `Alias[int]` and a member of one are caught with it.
-    if class_bases(class)
-        .filter_map(base_root_name)
-        .any(|name| scope.contested.contains(name))
+    if withholds_a_base
+        || class_bases(class)
+            .filter_map(base_root_name)
+            .any(|name| scope.contested.contains(name))
     {
         definitions
             .uncertain_bases
@@ -18882,10 +18917,19 @@ def b(x=1): pass  # type: ignore  # noqa
             &default_bases(),
             true,
         );
-        let mut edits =
-            call_site_edits(&files, checked.signatures, checked.own_constructors)?.edits;
+        let call_sites = call_site_edits(&files, checked.signatures, checked.own_constructors)?;
+        let mut edits = call_sites.edits;
         for diagnostic in &checked.diagnostics {
             if let Some(range) = diagnostic.fix {
+                // A deletion the call-site pass held back is one `--fix` never
+                // applies, so applying it here would read back a file the tool
+                // does not write.
+                if call_sites
+                    .retained
+                    .contains(&fix_key(&diagnostic.path, range))
+                {
+                    continue;
+                }
                 edits
                     .entry(diagnostic.path.clone())
                     .or_default()
@@ -22228,8 +22272,16 @@ def b(x=1): pass  # type: ignore  # noqa
         // class statement as easily as after — so the base is left unresolved
         // and the call it heads is left alone, rather than answered with the
         // module-level class the subclass may never be built on.
+        //
+        // Leaving the call alone is only half of it. The default behind it has
+        // to stay too, and this test used to read the file back through
+        // `fixed`, which applies every deletion whether or not it was held
+        // back, and so asserted an output the real `--fix` never writes and
+        // which raises `TypeError` when run. Byte identity keeps the guard the
+        // old assertion carried — the call is still not answered with the
+        // module-level 111 — and adds the retention it was missing.
         let source = "class Helper:\n    def method(self, value=111):\n        return value\n\n\ndef outer():\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    class Helper:\n        def method(self, value=333):\n            return value\n\n    return inner()\n\n\nassert outer() == 333, outer()\n";
-        assert_eq!(fixed(source)?, "class Helper:\n    def method(self, value):\n        return value\n\n\ndef outer():\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    class Helper:\n        def method(self, value):\n            return value\n\n    return inner()\n\n\nassert outer() == 333, outer()\n");
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
         Ok(())
     }
 
@@ -23467,6 +23519,64 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(control)?,
             "class IntEnum:\n    pass\n\nclass E(IntEnum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback): return cls.A\n\nE._missing_(1, fallback='x')\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_written_below_a_function_holds_its_defaults_back() -> Result<(), String> {
+        // The module binds `Helper` below `outer`, so which class the base
+        // reaches when `outer` runs is a runtime fact. The call it heads is
+        // rightly left alone, and the default behind it has to stay where it
+        // is or the file that is written raises.
+        let source = "def outer():\n    class Child(Helper):\n        def run(self):\n            return self.method()\n\n    return Child().run()\n\n\nclass Helper:\n    def method(self, value=111):\n        return value\n\n\nassert outer() == 111, outer()\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_written_above_a_nested_scope_still_resolves() -> Result<(), String> {
+        // The counterpart guard. `Helper` is bound before `inner` is written,
+        // so the spelling is not withheld, the base resolves, and the call
+        // carries the value the removed default held. Marking every class
+        // whose base cannot be resolved would have retained this one too.
+        let source = "def outer():\n    class Helper:\n        def method(self, value=111):\n            return value\n\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    return inner()\n\n\nassert outer() == 111, outer()\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("value=111):", "value):")
+                .replace("self.method()", "self.method(value=111)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_scope_that_binds_the_spelling_itself_still_resolves() -> Result<(), String> {
+        // `inner` writes its own `Helper` above the subclass, so the base
+        // reaches that class whatever the scopes around it hold and the
+        // withheld spelling never comes into it.
+        let source = "class Helper:\n    def method(self, value=111):\n        return value\n\n\ndef outer():\n    def inner():\n        class Helper:\n            def method(self, value=222):\n                return value\n\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    class Helper:\n        def method(self, value=333):\n            return value\n\n    return inner()\n\n\nassert outer() == 222, outer()\n";
+        let updated = fixed_with_retained_defaults(source)?;
+        assert!(updated.contains("self.method(value=222)"), "{updated}");
+        assert!(
+            updated.contains("def method(self, value):\n                return value"),
+            "{updated}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_an_unfollowable_import_is_still_fixed() -> Result<(), String> {
+        // A base this file has no record of is not a withheld spelling: the
+        // file never saw the class, so nothing here is being chosen between.
+        // Holding these back would retain a default for every subclass of an
+        // imported base.
+        let source = "from unchecked import Base\n\n\nclass Child(Base):\n    def method(self, value=1):\n        return value\n\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("value=1):", "value):")
+                .replace("Child().method()", "Child().method(value=1)")
         );
         Ok(())
     }

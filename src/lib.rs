@@ -6587,6 +6587,16 @@ impl<'a> Visitor<'a> for Checker<'a> {
                     .cloned()
                     .collect();
                 self.metaclass_classes = outer_metaclass_classes;
+                // A namesake body this run is certain to reach replaces what
+                // the spelling stood for, so the marks an earlier body of the
+                // same name left under this path go with it rather than
+                // outliving the class that earned them. One in a branch that
+                // may not run takes nothing back, for the reason
+                // `record_metaclass_construction` gives for the bare name.
+                if self.conditional_depth == 0 {
+                    self.metaclass_classes
+                        .retain(|spelling| !spelling.starts_with(&nested));
+                }
                 self.metaclass_classes.extend(carried);
                 self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
@@ -23617,6 +23627,19 @@ def b(x=1): pass  # type: ignore  # noqa
         // here can see the fields, or the metaclass, the import carries.
         let source = "from dataclasses import dataclass, field\nfrom other import Base\n\nclass holder:\n    class Middle(Base):\n        pass\n\n@dataclass\nclass Child(holder.Middle):\n    keyword: int = field(default=3, kw_only=True)\n";
         assert_eq!(fixed_keeping_unreachable_defaults(source)?, source);
+        // A later `holder` this run is certain to reach replaces the first,
+        // so the mark its nested `Middle` earned goes with it and the live
+        // plain class holds nothing back — exactly as the flat spelling
+        // already behaves. A namesake in a branch that may not run takes
+        // nothing back, since where the branch is skipped the first `holder`
+        // is still what the name stands for.
+        let namesake = "from dataclasses import dataclass, field\nfrom other import Base\n\nclass holder:\n    class Middle(Base):\n        pass\n\nclass holder:\n    class Middle:\n        pass\n\n@dataclass\nclass Child(holder.Middle):\n    keyword: int = field(default=3, kw_only=True)\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(namesake)?,
+            namesake.replace("field(default=3, kw_only=True)", "field(kw_only=True)")
+        );
+        let guarded = "import os\nfrom dataclasses import dataclass, field\nfrom other import Base\n\nclass holder:\n    class Middle(Base):\n        pass\n\nif os.environ.get('PICK'):\n    class holder:\n        class Middle:\n            pass\n\n@dataclass\nclass Child(holder.Middle):\n    keyword: int = field(default=3, kw_only=True)\n";
+        assert_eq!(fixed_keeping_unreachable_defaults(guarded)?, guarded);
         // The nesting is not what holds the default: the same shape with a
         // base that carries no unseen import is still fixed.
         let control = "from dataclasses import dataclass, field\n\nclass holder:\n    class Middle:\n        pass\n\n@dataclass\nclass Child(holder.Middle):\n    keyword: int = field(default=3, kw_only=True)\n";

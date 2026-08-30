@@ -22,6 +22,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - run: uv tool install ty==0.0.64
+      - run: ty version
       - run: cargo test --locked
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings

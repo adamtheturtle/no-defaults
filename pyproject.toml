@@ -25,6 +25,7 @@ classifiers = [
   "Topic :: Software Development :: Quality Assurance",
 ]
 keywords = ["lint", "defaults", "dataclasses", "pre-commit"]
+dependencies = ["ty>=0.0.52"]
 
 [project.urls]
 Source = "https://github.com/adamtheturtle/no-defaults"

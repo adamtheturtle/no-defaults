@@ -7504,3 +7504,100 @@ fn callback_names_off_the_unittest_hierarchy_are_still_fixed(
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_copy_of_a_first_bound_contested_name_keeps_the_inherited_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The suites bind `Alias` for the first time, so nothing stands behind it
+    // for `Other` to resolve to. Giving up there dropped the doubt too, and
+    // `Child` was recorded with no bases: both defaults went and the
+    // inherited call was left as written, which raises `TypeError` whichever
+    // suite ran.
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "import os\n\n\nclass First:\n    def target(self, value=1):\n        return value\n\n\nclass Second:\n    def target(self, other=2):\n        return other\n\n\nif os.environ.get(\"PICK\"):\n    Alias = Second\nelse:\n    Alias = First\n\nOther = Alias\n\n\nclass Child(Other):\n    def run(self):\n        return self.target()\n\n\nprint(Child().run())\n";
+    std::fs::write(&case, source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_nested_unseen_imported_ancestor_keeps_its_subclass_field_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // `other` is not in the run, so nothing here sees the fields or the
+    // metaclass `Base` may carry. Nesting the class that stands between the
+    // import and the dataclass changes none of that, and the base spelling
+    // `holder.Middle` is the only way to reach it.
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    let source = "from dataclasses import dataclass, field\nfrom other import Base\n\n\nclass holder:\n    class Middle(Base):\n        pass\n\n\n@dataclass\nclass Child(holder.Middle):\n    keyword: int = field(default=3, kw_only=True)\n";
+    std::fs::write(&case, source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_rebound_field_base_spelling_keeps_the_field_default() -> Result<(), Box<dyn std::error::Error>>
+{
+    // `BaseModel` names an ordinary class where `C` is written, so `x` is an
+    // ordinary class attribute and the construction the field was rewritten
+    // into raises `TypeError: C() takes no arguments`. The conditional import
+    // is the same blindness one suite further out: where the suite is skipped
+    // the parameter's value is what `C` is built on.
+    for source in [
+        "from pydantic import BaseModel\n\n\nclass Other:\n    x = 5\n\n\nBaseModel = Other\n\n\nclass C(BaseModel):\n    x: int = 7\n\n\nprint(\"VALUE\", C().x)\n",
+        "import os\n\n\nclass Plain:\n    x = 3\n\n\ndef outer(BaseModel):\n    if os.environ.get(\"NDV\") == \"real\":\n        from pydantic import BaseModel\n\n    class C(BaseModel):\n        x: int = 7\n\n    return C()\n\n\nprint(\"VALUE\", outer(Plain).x)\n",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let case = directory.path().join("case.py");
+        std::fs::write(&case, source)?;
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(std::fs::read_to_string(&case)?, source);
+        // Neither class is a model here, so nothing is reported either.
+        assert_eq!(output.status.code(), Some(0));
+    }
+    Ok(())
+}
+
+#[test]
+fn two_bodies_under_one_class_spelling_keep_their_defaults(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The scope writes `Base`, imports the name, and writes it again, so the
+    // subclass is built on the second local class and CPython gives the call
+    // 4. Both bodies define `target` under the one identity the spelling
+    // carries, so nothing here says which of them a lookup reaches: the
+    // defaults stay and the call is reported rather than rewritten, and in
+    // particular the import's `9` is not handed over in their place.
+    let directory = tempfile::tempdir()?;
+    let api = directory.path().join("api.py");
+    let case = directory.path().join("case.py");
+    std::fs::write(
+        &api,
+        "class Base:\n    def target(self, value=9):\n        return value\n",
+    )?;
+    let source = "class Base:\n    def target(self, value=1):\n        return value\n\n\nfrom api import Base\n\n\nclass Base:\n    def target(self, value=4):\n        return value\n\n\nclass Child(Base):\n    def run(self):\n        return self.target()\n\n\nprint(\"run\", Child().run())\n";
+    std::fs::write(&case, source)?;
+
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}

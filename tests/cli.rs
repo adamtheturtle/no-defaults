@@ -7172,6 +7172,89 @@ fn enumeration_bases_beyond_enum_keep_their_hook_defaults() -> Result<(), Box<dy
 }
 
 #[test]
+fn an_enclosing_rebinding_holds_the_inherited_default_back(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("l.py");
+    // `class Helper` inside `outer` binds that spelling for the whole of
+    // `outer`, so `inner` closes over `outer`'s cell and the program returns
+    // 333. Which class the base reaches is a runtime fact, so the call is
+    // rightly left alone — and the default behind it has to stay, or the file
+    // that is written raises `TypeError`.
+    let source = "class Helper:\n    def method(self, value=111):\n        return value\n\n\ndef outer():\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    class Helper:\n        def method(self, value=333):\n            return value\n\n    return inner()\n\n\nassert outer() == 333, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // Both defaults are still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_base_bound_below_a_function_holds_the_inherited_default_back(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("l.py");
+    // The same shape one scope out: the module binds `Helper` below `outer`,
+    // so the spelling the base uses reaches nothing the written order settles.
+    let source = "def outer():\n    class Child(Helper):\n        def run(self):\n            return self.method()\n\n    return Child().run()\n\n\nclass Helper:\n    def method(self, value=111):\n        return value\n\n\nassert outer() == 111, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_base_bound_above_a_nested_scope_is_still_rewritten() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("l.py");
+    // The counterpart: `Helper` is bound before `inner` is written, so nothing
+    // is being chosen between, the base resolves and the call carries the
+    // value the removed default held.
+    let source = "def outer():\n    class Helper:\n        def method(self, value=111):\n            return value\n\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    return inner()\n\n\nassert outer() == 111, outer()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "def outer():\n    class Helper:\n        def method(self, value):\n            return value\n\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method(value=111)\n\n        return Child().run()\n\n    return inner()\n\n\nassert outer() == 111, outer()\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn a_walrus_in_an_untaken_branch_leaves_an_import_standing_end_to_end(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `ND_TYPING` is unset, so the walrus never runs, `Enum` is the import and
+    // `C` is an enumeration whose members the class statement builds by
+    // calling the initializer. Nothing written here could carry the value once
+    // the default were gone.
+    let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    holder = (Enum := object)\n\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n\n\nassert C.A.label == 'x'\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The default is still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
 fn parser_and_encoder_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");

@@ -7313,6 +7313,50 @@ fn callback_names_off_the_argparse_hierarchy_are_still_fixed(
 }
 
 #[test]
+fn xml_sax_callback_defaults_survive_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // A parser drives each of these itself — `startDocument` and `endDocument`
+    // around the document, `characters` and `startElement` from the expat
+    // callbacks, `startElementNS` once namespace processing is on — so there is
+    // no call site here to carry the value once the default is gone. A
+    // generator and a filter are reached the same way, and the subclass of a
+    // handler written in this file inherits that reach.
+    let source = "import xml.sax.handler\nimport xml.sax.saxutils\nfrom xml.sax import ContentHandler\n\n\nclass H(xml.sax.handler.ContentHandler):\n    def startDocument(self, extra=1): pass\n\n    def characters(self, content, extra=2): pass\n\n\nclass Child(H):\n    def endDocument(self, extra=3): pass\n\n\nclass N(ContentHandler):\n    def startElementNS(self, name, qname, attrs, extra=4): pass\n\n\nclass G(xml.sax.saxutils.XMLGenerator):\n    def startElement(self, name, attrs, extra=5): pass\n\n\nclass F(xml.sax.saxutils.XMLFilterBase):\n    def endElement(self, name, extra=6): pass\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    // The defaults are still reported, only without a fix to apply.
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn callback_names_off_the_xml_sax_hierarchy_are_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `characters`, `startElement` and `endElement` are ordinary method names.
+    // Nothing but the calls written below reaches this class, so the defaults
+    // go and those calls carry the values they held.
+    let source = "class Handler:\n    def characters(self, content, extra=1): return extra\n\n    def startElement(self, name, attrs, extra=2): return extra\n\n    def endElement(self, name, extra=3): return extra\n\n\nh = Handler()\nassert Handler.characters(h, 'c') == 1\nassert Handler.startElement(h, 'n', 'a') == 2\nassert Handler.endElement(h, 'n') == 3\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Handler:\n    def characters(self, content, extra): return extra\n\n    def startElement(self, name, attrs, extra): return extra\n\n    def endElement(self, name, extra): return extra\n\n\nh = Handler()\nassert Handler.characters(h, 'c', extra=1) == 1\nassert Handler.startElement(h, 'n', 'a', extra=2) == 2\nassert Handler.endElement(h, 'n', extra=3) == 3\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
 fn a_copy_of_a_first_bound_contested_name_keeps_the_inherited_default(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The suites bind `Alias` for the first time, so nothing stands behind it

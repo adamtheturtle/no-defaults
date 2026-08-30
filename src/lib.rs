@@ -6599,7 +6599,7 @@ const UNITTEST_RESULT_CALLBACKS: &[&str] = &[
     "stopTestRun",
 ];
 
-/// Standard-library base classes whose own machinery calls the methods a
+/// Library base classes whose own machinery calls the methods a
 /// subclass writes, each with the callbacks that machinery reaches.
 ///
 /// These names are ordinary ones — `close`, `emit`, `format`, `filter` — so the
@@ -6610,7 +6610,7 @@ const UNITTEST_RESULT_CALLBACKS: &[&str] = &[
 ///
 /// Covering another module means adding rows: the module the base is imported
 /// from, the base's own name, and the callbacks its machinery reaches. A
-/// standard-library subclass that is a base in its own right —
+/// library subclass that is a base in its own right —
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
 ///
@@ -6645,6 +6645,8 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
         "RawTextHelpFormatter",
         ARGPARSE_FORMATTER_CALLBACKS,
     ),
+    ("bs4.builder", "HTMLTreeBuilder", &["prepare_markup"]),
+    ("bs4.builder", "TreeBuilder", &["prepare_markup"]),
     ("doctest", "DebugRunner", DOCTEST_RUNNER_CALLBACKS),
     ("doctest", "DocTestRunner", DOCTEST_RUNNER_CALLBACKS),
     (
@@ -25546,6 +25548,20 @@ def b(x=1): pass  # type: ignore  # noqa
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn beautiful_soup_tree_builders_keep_prepare_markup_defaults() -> Result<(), String> {
+        let imported = "from bs4.builder import TreeBuilder\n\n\nclass Builder(TreeBuilder):\n    def prepare_markup(self, markup, user_specified_encoding=None, document_declared_encoding=None, exclude_encodings=None):\n        yield markup, None, None, False\n";
+        assert_eq!(fixed_with_retained_defaults(imported)?, imported);
+
+        let qualified = "import bs4.builder\n\n\nclass Builder(bs4.builder.TreeBuilder):\n    def prepare_markup(self, markup, user_specified_encoding=None, document_declared_encoding=None, exclude_encodings=None):\n        yield markup, None, None, False\n";
+        assert_eq!(fixed_with_retained_defaults(qualified)?, qualified);
+
+        let intermediate = "from bs4.builder import HTMLTreeBuilder\n\n\nclass Builder(HTMLTreeBuilder):\n    def prepare_markup(self, markup, user_specified_encoding=None, document_declared_encoding=None, exclude_encodings=None):\n        yield markup, None, None, False\n";
+        assert_eq!(fixed_with_retained_defaults(intermediate)?, intermediate);
+
+        Ok(())
     }
 
     #[test]

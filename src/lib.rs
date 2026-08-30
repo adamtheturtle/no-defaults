@@ -11500,11 +11500,7 @@ impl Rewriter<'_> {
             // working file into a `TypeError`. A signature nothing was taken
             // from leaves the call untouched either way, and saying so would
             // warn about a call this run never threatened.
-            let held: Vec<FixKey> = signature
-                .removed
-                .iter()
-                .map(|removed| fix_key(&signature.path, removed.fix))
-                .collect();
+            let held = held_fixes(signature);
             if held.is_empty() {
                 return;
             }
@@ -11521,7 +11517,15 @@ impl Rewriter<'_> {
         }
         let arguments = match missing_arguments(&call.arguments, signature, bound) {
             Ok(arguments) => arguments,
+            // The call was tied to the definition, but what was taken out of
+            // it cannot be written back here. Deleting the default and
+            // leaving the call as it stands is the pairing that turns a
+            // working file into a `TypeError`, so the deletion is held back
+            // and reported instead, exactly as it is where the signature
+            // itself is unknown.
             Err(reason) => {
+                let held = held_fixes(signature);
+                self.retained.extend(held);
                 self.skip(call.start(), name, reason);
                 return;
             }
@@ -11639,7 +11643,11 @@ impl Rewriter<'_> {
         }
         let arguments = match missing_arguments_for(signature, bound, 1, &[]) {
             Ok(arguments) => arguments,
+            // A decorator applied bare is a call like any other, and the
+            // deletion behind it has to stay for the same reason.
             Err(reason) => {
+                let held = held_fixes(signature);
+                self.retained.extend(held);
                 self.skip(expression.start(), name, reason);
                 return;
             }
@@ -11669,6 +11677,16 @@ impl Rewriter<'_> {
 
 /// The arguments a call must gain to keep meaning what it meant before the
 /// defaults were removed, or the reason the call has to be left alone.
+/// Every deletion a signature carries, keyed the way the fixer holds them
+/// back by.
+fn held_fixes(signature: &Signature) -> Vec<FixKey> {
+    signature
+        .removed
+        .iter()
+        .map(|removed| fix_key(&signature.path, removed.fix))
+        .collect()
+}
+
 fn missing_arguments(
     call: &ast::Arguments,
     signature: &Signature,

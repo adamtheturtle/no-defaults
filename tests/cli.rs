@@ -7143,6 +7143,35 @@ fn an_assignment_in_an_untaken_branch_leaves_an_import_standing_end_to_end(
 }
 
 #[test]
+fn enumeration_bases_beyond_enum_keep_their_hook_defaults() -> Result<(), Box<dyn std::error::Error>>
+{
+    // Every base the `enum` module ships creates its members the same way, so
+    // the initializer and `_missing_` are reached through machinery no call
+    // site here stands for. Removing the default made the class statement
+    // itself raise `TypeError` under CPython.
+    for source in [
+        "from enum import IntEnum\n\n\nclass E(IntEnum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n",
+        "from enum import StrEnum\n\n\nclass E(StrEnum):\n    A = 'a'\n\n    def __init__(self, value, label='x'):\n        self.label = label\n",
+        "from enum import Flag\n\n\nclass E(Flag):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n",
+        "import enum\n\n\nclass E(enum.IntFlag):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n",
+        "from enum import IntEnum as IE\n\n\nclass E(IE):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n",
+        "from enum import IntEnum\n\n\nclass Base(IntEnum):\n    pass\n\n\nclass E(Base):\n    A = 1\n\n    @classmethod\n    def _missing_(cls, value, fallback='x'):\n        return cls.A\n",
+    ] {
+        let directory = tempfile::tempdir()?;
+        let case = directory.path().join("case.py");
+        std::fs::write(&case, source)?;
+        let output = Command::new(binary())
+            .arg("--fix")
+            .arg(directory.path())
+            .output()?;
+        assert_eq!(std::fs::read_to_string(&case)?, source);
+        // The defaults are still reported, only without a fix to apply.
+        assert_eq!(output.status.code(), Some(1));
+    }
+    Ok(())
+}
+
+#[test]
 fn an_enclosing_rebinding_holds_the_inherited_default_back(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

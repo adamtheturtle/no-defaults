@@ -6171,6 +6171,13 @@ const IMPORTLIB_SOURCE_LOADER_CALLBACKS: &[&str] =
 /// the file to carry a deleted default to.
 const ENUM_CALLBACKS: &[&str] = &["__init__", "_generate_next_value_", "_missing_"];
 
+/// The methods `json` reaches on an encoder it owns, whichever spelling of the
+/// base the subclass was written on.
+///
+/// `json` re-exports `JSONEncoder` from `json.encoder`, so the class has two
+/// equally ordinary spellings and each needs its own row.
+const JSON_ENCODER_CALLBACKS: &[&str] = &["default", "encode", "iterencode"];
+
 /// The methods `logging` reaches on a handler it owns, whichever handler base
 /// the subclass was written on.
 const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
@@ -6259,6 +6266,25 @@ const XML_SAX_CONTENT_HANDLER_CALLBACKS: &[&str] = &[
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
 const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
+    (
+        "html.parser",
+        "HTMLParser",
+        &[
+            "handle_charref",
+            "handle_comment",
+            "handle_data",
+            "handle_decl",
+            "handle_endtag",
+            "handle_entityref",
+            "handle_pi",
+            "handle_startendtag",
+            "handle_starttag",
+            "reset",
+            "unknown_decl",
+        ],
+    ),
+    ("json", "JSONEncoder", JSON_ENCODER_CALLBACKS),
+    ("json.encoder", "JSONEncoder", JSON_ENCODER_CALLBACKS),
     (
         "argparse",
         "ArgumentDefaultsHelpFormatter",
@@ -6394,6 +6420,20 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
         "logging.handlers",
         "WatchedFileHandler",
         LOGGING_HANDLER_CALLBACKS,
+    ),
+    ("pprint", "PrettyPrinter", &["format"]),
+    (
+        "string",
+        "Formatter",
+        &[
+            "check_unused_args",
+            "convert_field",
+            "format_field",
+            "get_field",
+            "get_value",
+            "parse",
+            "vformat",
+        ],
     ),
     // `xml.sax` re-exports `ContentHandler` from `xml.sax.handler`, so both
     // spellings name the same base and both have to be rows.
@@ -24024,6 +24064,118 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed_with_retained_defaults(source)?,
             "import xml.sax.handler\n\n\nclass Base(xml.sax.handler.ContentHandler):\n    pass\n\n\nclass Base:\n    pass\n\n\nclass Child(Base):\n    def characters(self, content, extra): return extra\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn html_parser_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `HTMLParser` reaches each of these from `goahead`, which is what
+        // `feed` and `close` run, and `reset` from `HTMLParser.__init__`.
+        // Nothing here writes those calls, so removing a default leaves a
+        // parser the module can no longer drive.
+        let source = "import html.parser\n\n\nclass P(html.parser.HTMLParser):\n    def handle_starttag(self, tag, attrs, extra=1): pass\n\n    def handle_endtag(self, tag, extra=2): pass\n\n    def handle_startendtag(self, tag, attrs, extra=3): pass\n\n    def handle_data(self, data, extra=4): pass\n\n    def handle_entityref(self, name, extra=5): pass\n\n    def handle_charref(self, name, extra=6): pass\n\n    def handle_comment(self, data, extra=7): pass\n\n    def handle_decl(self, decl, extra=8): pass\n\n    def handle_pi(self, data, extra=9): pass\n\n    def unknown_decl(self, data, extra=10): pass\n\n    def reset(self, extra=11): super().reset()\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn string_formatter_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `Formatter.format` reaches `vformat`, which reaches `check_unused_args`
+        // and, through `_vformat`, `parse`, `get_field`, `convert_field` and
+        // `format_field`; `get_field` reaches `get_value`. Only the outermost
+        // call is ever written down.
+        let source = "import string\n\n\nclass F(string.Formatter):\n    def vformat(self, format_string, args, kwargs, extra=1): return \"\"\n\n    def parse(self, format_string, extra=2): return []\n\n    def get_field(self, field_name, args, kwargs, extra=3): return None, None\n\n    def get_value(self, key, args, kwargs, extra=4): return \"\"\n\n    def check_unused_args(self, used_args, args, kwargs, extra=5): pass\n\n    def format_field(self, value, format_spec, extra=6): return \"\"\n\n    def convert_field(self, value, conversion, extra=7): return value\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn json_encoder_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `json.dumps(..., cls=E)` calls `encode` on an encoder it builds
+        // itself, `json.dump` calls `iterencode`, and `default` is reached from
+        // the C serialiser for every object it cannot render.
+        let source = "import json\n\n\nclass E(json.JSONEncoder):\n    def default(self, obj, extra=1): return str(obj)\n\n    def encode(self, o, extra=2): return \"\"\n\n    def iterencode(self, o, _one_shot=False, extra=3): return iter(())\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn pprint_pretty_printer_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `pformat` and `pprint` reach `format` through `_repr`, once per
+        // object rendered.
+        let source = "import pprint\n\n\nclass P(pprint.PrettyPrinter):\n    def format(self, obj, context, maxlevels, level, extra=1): return repr(obj), True, False\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_imported_html_parser_base_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "from html.parser import HTMLParser\n\n\nclass P(HTMLParser):\n    def handle_data(self, data, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_package_from_import_reaches_the_html_parser_base() -> Result<(), String> {
+        // `from html import parser` binds the submodule under the package, so
+        // the base is one attribute away from a name that is not the module's
+        // own.
+        let source = "from html import parser\n\n\nclass P(parser.HTMLParser):\n    def handle_data(self, data, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_html_parser_subclass_keeps_its_callback_defaults() -> Result<(), String>
+    {
+        let source = "from html.parser import HTMLParser\n\n\nclass Base(HTMLParser):\n    pass\n\n\nclass Child(Base):\n    def handle_data(self, data, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_json_encoder_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "from json import JSONEncoder\n\n\nclass Base(JSONEncoder):\n    pass\n\n\nclass Child(Base):\n    def default(self, obj, extra=1): return str(obj)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn the_defining_module_of_the_json_encoder_keeps_its_callback_defaults() -> Result<(), String> {
+        // `json` re-exports `JSONEncoder` from `json.encoder`, so both dotted
+        // spellings name the class `json.dumps` calls `default` on, and the
+        // submodule needs a row of its own to be recognised.
+        let source = "import json.encoder\n\n\nclass E(json.encoder.JSONEncoder):\n    def default(self, obj, extra=1): return str(obj)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        let imported = "from json.encoder import JSONEncoder\n\n\nclass E(JSONEncoder):\n    def default(self, obj, extra=1): return str(obj)\n";
+        assert_eq!(fixed_with_retained_defaults(imported)?, imported);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_pprint_module_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import pprint as pp\n\n\nclass P(pp.PrettyPrinter):\n    def format(self, obj, context, maxlevels, level, extra=1): return repr(obj), True, False\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_string_formatter_import_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "from string import Formatter as Base\n\n\nclass F(Base):\n    def convert_field(self, value, conversion, extra=1): return value\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_these_parsing_hierarchies_are_still_fixed() -> Result<(), String> {
+        // `default`, `format`, `parse` and `handle_data` are ordinary method
+        // names. Nothing reaches these classes but the calls written below, so
+        // the defaults go and those calls carry the values they held.
+        let source = "class Encoder:\n    def default(self, obj, extra=1): return extra\n\n    def encode(self, o, extra=2): return extra\n\n\nclass Printer:\n    def format(self, obj, context, maxlevels, level, extra=3): return extra\n\n\nclass Formatter:\n    def parse(self, format_string, extra=4): return extra\n\n    def get_value(self, key, args, kwargs, extra=5): return extra\n\n\nclass Parser:\n    def handle_data(self, data, extra=6): return extra\n\n    def reset(self, extra=7): return extra\n\n\ne = Encoder()\nassert Encoder.default(e, None) == 1\nassert Encoder.encode(e, None) == 2\nassert Printer.format(Printer(), None, None, None, None) == 3\nf = Formatter()\nassert Formatter.parse(f, \"\") == 4\nassert Formatter.get_value(f, 0, (), {}) == 5\nq = Parser()\nassert Parser.handle_data(q, \"\") == 6\nassert Parser.reset(q) == 7\n";
+        assert_eq!(
+            fixed(source)?,
+            "class Encoder:\n    def default(self, obj, extra): return extra\n\n    def encode(self, o, extra): return extra\n\n\nclass Printer:\n    def format(self, obj, context, maxlevels, level, extra): return extra\n\n\nclass Formatter:\n    def parse(self, format_string, extra): return extra\n\n    def get_value(self, key, args, kwargs, extra): return extra\n\n\nclass Parser:\n    def handle_data(self, data, extra): return extra\n\n    def reset(self, extra): return extra\n\n\ne = Encoder()\nassert Encoder.default(e, None, extra=1) == 1\nassert Encoder.encode(e, None, extra=2) == 2\nassert Printer.format(Printer(), None, None, None, None, extra=3) == 3\nf = Formatter()\nassert Formatter.parse(f, \"\", extra=4) == 4\nassert Formatter.get_value(f, 0, (), {}, extra=5) == 5\nq = Parser()\nassert Parser.handle_data(q, \"\", extra=6) == 6\nassert Parser.reset(q, extra=7) == 7\n"
         );
         Ok(())
     }

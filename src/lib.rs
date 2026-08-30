@@ -10474,10 +10474,16 @@ impl Rewriter<'_> {
     /// statement has run: a class body binds in statement order.
     fn bind_statement_in_class(&mut self, statement: &Stmt) {
         let bound = BoundNames::of_body(std::slice::from_ref(statement));
-        let rebound: Vec<String> = bound
+        // `finish` folds a bare annotation into the names a body binds, since
+        // `Child: object` does make the name the scope's own. It puts nothing
+        // behind it, though, so the class already written under the name is
+        // still what stands there and is not cleared.
+        let mut assigned = BoundNames::default();
+        assigned.visit_stmt(statement);
+        let rebound: Vec<String> = assigned
             .names
             .iter()
-            .filter(|name| !bound.functions.contains(*name) && !bound.classes.contains(*name))
+            .filter(|name| !assigned.functions.contains(*name) && !assigned.classes.contains(*name))
             .cloned()
             .collect();
         self.rebind_in_class(rebound);
@@ -11802,6 +11808,24 @@ impl<'a> Rewriter<'a> {
                     .cloned()
             })
             .collect();
+        // A capture also takes the name off a `def` or a `class` the body
+        // wrote above it, and the case after this one runs where this pattern
+        // did not match, so that definition still stands there. What the
+        // capture displaced goes back with the rest of it.
+        let held: Vec<(String, bool, bool)> = self
+            .scopes
+            .last()
+            .into_iter()
+            .flat_map(|scope| {
+                captures.names.iter().map(|name| {
+                    (
+                        name.clone(),
+                        scope.functions.contains(name),
+                        scope.classes.contains(name),
+                    )
+                })
+            })
+            .collect();
         self.invalidate_class_bindings(captures.names.iter().cloned());
         self.rebind_in_class(captures.names.iter().cloned());
         if let Some(guard) = &case.guard {
@@ -11819,6 +11843,14 @@ impl<'a> Rewriter<'a> {
         if let Some(scope) = self.scopes.last_mut() {
             for name in shadowed {
                 scope.names.remove(&name);
+            }
+            for (name, was_function, was_class) in held {
+                if was_function {
+                    scope.functions.insert(name.clone());
+                }
+                if was_class {
+                    scope.classes.insert(name);
+                }
             }
         }
         captures.names
@@ -25672,6 +25704,45 @@ def b(x=1): pass  # type: ignore  # noqa
         // deleted default is carried into it.
         let source = "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        value = Child().own()\n        Child = Other\n\n    return Holder.value\n\n\nassert outer() == 7, outer()\n";
         assert_eq!(fixed(source)?, "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        value = Child().own(extra=7)\n        Child = Other\n\n    return Holder.value\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_annotation_leaves_a_class_body_class_standing() -> Result<(), String> {
+        // `Child: object` makes the name the class body's own without
+        // putting anything behind it, so the class written above still stands
+        // there and the call below carries its deleted default.
+        let source = "def outer():\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        Child: object\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        Child: object\n        value = Child().own(extra=7)\n\n    return Holder.value\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotated_assignment_takes_the_name_off_a_class_body_class() -> Result<(), String> {
+        // An annotation with a value does bind, so the class written above
+        // answers for nothing and the call is left alone.
+        let source = "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        Child: object = Other\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        Child: object = Other\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_match_capture_that_may_not_run_leaves_the_class_standing() -> Result<(), String> {
+        // A case runs only where the ones above it did not match, so the
+        // capture of the first case is undone before the second is walked and
+        // the class the body wrote is still what the call there reaches.
+        let source = "def outer(flag):\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        match flag:\n            case [Child]:\n                first = Child\n            case _:\n                value = Child().own()\n\n    return Holder.value\n\n\nassert outer(0) == 7, outer(0)\n";
+        assert_eq!(fixed(source)?, "def outer(flag):\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        match flag:\n            case [Child]:\n                first = Child\n            case _:\n                value = Child().own(extra=7)\n\n    return Holder.value\n\n\nassert outer(0) == 7, outer(0)\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_match_capture_takes_the_name_off_the_class_inside_its_own_case() -> Result<(), String> {
+        // Inside the case that captured it the name stands for whatever the
+        // pattern bound, not for the class written above, so the call there is
+        // left alone.
+        let source = "class Other:\n    def own(self):\n        return 9\n\n\ndef outer(flag):\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        value = 0\n        match flag:\n            case [Child]:\n                value = Child.own()\n            case _:\n                pass\n\n    return Holder.value\n\n\nassert outer([Other()]) == 9, outer([Other()])\n";
+        assert_eq!(fixed(source)?, "class Other:\n    def own(self):\n        return 9\n\n\ndef outer(flag):\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        value = 0\n        match flag:\n            case [Child]:\n                value = Child.own()\n            case _:\n                pass\n\n    return Holder.value\n\n\nassert outer([Other()]) == 9, outer([Other()])\n");
         Ok(())
     }
 }

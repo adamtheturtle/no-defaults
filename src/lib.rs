@@ -1242,6 +1242,12 @@ struct ClassNamespace<'a> {
     /// this scope writes no class of reads one of these rather than a class of
     /// its own written further down, which had bound nothing yet.
     enclosing: &'a BTreeMap<String, String>,
+    /// The spellings a scope around these statements binds to a class written
+    /// below them. Which class such a name reaches by the time these
+    /// statements run is not something the written order settles, so the
+    /// spelling reaches none of them here and a base written with it leaves
+    /// the class's ancestry unsettled rather than silently baseless.
+    withheld: &'a BTreeSet<String>,
     /// Whether the statements sit in one of several suites of a control-flow
     /// statement of which only one runs, so a class written here stands beside
     /// whatever a sibling suite writes under the same name.
@@ -1253,10 +1259,12 @@ impl ClassNamespace<'_> {
         // Nothing encloses a module, so a base written directly in one reads
         // only what the module itself binds.
         static NOTHING: BTreeMap<String, String> = BTreeMap::new();
+        static NONE_WITHHELD: BTreeSet<String> = BTreeSet::new();
         Self {
             parent: None,
             lexical_scope: &[],
             enclosing: &NOTHING,
+            withheld: &NONE_WITHHELD,
             alternative: false,
         }
     }
@@ -1579,19 +1587,31 @@ impl<'a> BaseScope<'a> {
     /// statement stands below the nested scope, what the name reaches by the
     /// time that scope runs is not something the written order settles, so the
     /// spelling is taken away rather than answered with the outer class.
-    fn visible_classes(&self, defined_at: TextSize) -> BTreeMap<String, String> {
+    /// Which spellings were taken away is returned beside the ones that
+    /// remain, because a base written with one of them is not a base this file
+    /// has no record of — it names a class the file can see and simply cannot
+    /// choose between. Dropping it and saying nothing left the subclass looking
+    /// as though it had no base at all, so the calls it inherits were reported
+    /// while the defaults behind them were removed.
+    fn visible_classes(
+        &self,
+        defined_at: TextSize,
+    ) -> (BTreeMap<String, String>, BTreeSet<String>) {
         let mut visible = self.namespace.enclosing.clone();
+        let mut withheld = self.namespace.withheld.clone();
         if self.namespace.parent.is_some() {
-            return visible;
+            return (visible, withheld);
         }
         for (spelling, class) in self.classes {
             if class.holds_at(defined_at) {
                 visible.insert(spelling.clone(), class.identity.clone());
+                withheld.remove(spelling);
             } else {
                 visible.remove(spelling);
+                withheld.insert(spelling.clone());
             }
         }
-        visible
+        (visible, withheld)
     }
 }
 
@@ -1610,7 +1630,7 @@ fn index_class_body_method_bases(
 ) {
     let mut inner = scope.namespace.lexical_scope.to_vec();
     inner.push(class.name.to_string());
-    let visible = scope.visible_classes(class.start());
+    let (visible, withheld) = scope.visible_classes(class.start());
     index_method_bases(
         &class.body,
         importer,
@@ -1620,6 +1640,7 @@ fn index_class_body_method_bases(
             parent: Some(identity),
             lexical_scope: &inner,
             enclosing: &visible,
+            withheld: &withheld,
             alternative: scope.namespace.alternative,
         },
         scope.lexical_classes,
@@ -1641,7 +1662,7 @@ fn index_function_body_method_bases(
 ) {
     let mut inner = scope.namespace.lexical_scope.to_vec();
     inner.push(function.name.to_string());
-    let visible = scope.visible_classes(function.start());
+    let (visible, withheld) = scope.visible_classes(function.start());
     index_method_bases(
         &function.body,
         importer,
@@ -1657,6 +1678,7 @@ fn index_function_body_method_bases(
             parent: None,
             lexical_scope: &inner,
             enclosing: &visible,
+            withheld: &withheld,
             alternative: scope.namespace.alternative,
         },
         scope.lexical_classes.entering_function(),
@@ -1825,12 +1847,18 @@ fn record_class_bases_and_attributes(
     if !scope.lexical_classes.holds(identity) {
         return;
     }
+    // A base whose spelling an enclosing scope took away names a class this
+    // file can see and cannot choose between, which is not the same as a base
+    // it has no record of at all. Dropping it silently left the subclass
+    // looking baseless, so the calls it inherits resolved to nothing and were
+    // reported while the defaults behind them went.
+    let mut withholds_a_base = false;
     let bases = class
         .arguments
         .iter()
         .flat_map(|arguments| arguments.args.iter())
         .filter_map(|base| {
-            method_base_identity(
+            let identity = method_base_identity(
                 base,
                 importer,
                 bindings,
@@ -1838,7 +1866,13 @@ fn record_class_bases_and_attributes(
                 class.start(),
                 &scope.aliases,
                 &definitions.methods,
-            )
+            );
+            if identity.is_none()
+                && base_root_name(base).is_some_and(|name| scope.namespace.withheld.contains(name))
+            {
+                withholds_a_base = true;
+            }
+            identity
         })
         .collect();
     let methods = definitions
@@ -1866,9 +1900,10 @@ fn record_class_bases_and_attributes(
     // settles none of them, exactly as it settles none for a class those
     // suites give different bases. The name is read at the root of the base,
     // so a parameterized `Alias[int]` and a member of one are caught with it.
-    if class_bases(class)
-        .filter_map(base_root_name)
-        .any(|name| scope.contested.contains(name))
+    if withholds_a_base
+        || class_bases(class)
+            .filter_map(base_root_name)
+            .any(|name| scope.contested.contains(name))
     {
         definitions
             .uncertain_bases
@@ -4920,10 +4955,22 @@ impl Checker<'_> {
         }
     }
 
+    /// Forget what a `for` target, a `with` target or a walrus rebinds.
+    ///
+    /// Each of these is reached at the depth of the statement it belongs to
+    /// rather than inside it — a clause's test runs whenever the clause is
+    /// reached, and a loop's target is read before the body is entered — so
+    /// the depth here answers the right question. One written in a suite that
+    /// may not run takes the name's import records off nothing: where the
+    /// suite is skipped the import is still what the name stands for, exactly
+    /// as it is behind a class statement or an assignment written there.
     fn invalidate_target_aliases(&mut self, target: &Expr) {
         let mut bound = BoundNames::default();
         bound.bind(target);
-        self.invalidate_bound_names(bound.names.iter().map(String::as_str));
+        self.rebind_names(
+            bound.names.iter().map(String::as_str),
+            self.conditional_depth == 0,
+        );
     }
 
     /// Forget what a walrus in a `def` or `class` header rebinds.
@@ -5022,7 +5069,7 @@ impl Checker<'_> {
         self.conditional_depth -= 1;
     }
 
-    fn visit_while<'a>(&mut self, loop_: &'a ast::StmtWhile, statement: &'a Stmt)
+    fn visit_while<'a>(&mut self, loop_: &'a ast::StmtWhile)
     where
         Self: Visitor<'a>,
     {
@@ -5030,7 +5077,18 @@ impl Checker<'_> {
             Truthiness::False | Truthiness::Falsey | Truthiness::None => {
                 self.visit_body(&loop_.orelse);
             }
-            _ => self.visit_uncertain(statement),
+            _ => {
+                // The test runs whenever the loop is reached, exactly as a
+                // clause's test does, so a walrus in it binds where the `while`
+                // is written rather than in a suite that may not run. Only the
+                // bodies are uncertain, and reading the test inside their depth
+                // held back an import the name really had lost.
+                self.visit_expr(&loop_.test);
+                self.conditional_depth += 1;
+                self.visit_body(&loop_.body);
+                self.visit_body(&loop_.orelse);
+                self.conditional_depth -= 1;
+            }
         }
     }
 
@@ -6240,6 +6298,42 @@ const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
     "release",
 ];
 
+/// The methods `argparse` reaches on the formatter a parser builds, whichever
+/// formatter base the subclass was written on.
+///
+/// A parser makes the formatter itself, from the `formatter_class` it was given,
+/// and drives it through `format_help`, `format_usage` and `print_help`; none of
+/// those calls is written in the file that supplies the subclass.
+const ARGPARSE_FORMATTER_CALLBACKS: &[&str] = &[
+    "add_argument",
+    "add_arguments",
+    "add_text",
+    "add_usage",
+    "end_section",
+    "format_help",
+    "start_section",
+];
+
+/// The methods the `email` package reaches on the policy a message or parser was
+/// handed, whichever policy base the subclass was written on.
+///
+/// `email.policy` re-exports `Policy` and `Compat32` from `email._policybase`,
+/// so both spellings name the same classes and both get rows. The callbacks
+/// themselves are split across the hierarchy — `register_defect` and
+/// `handle_defect` are `Policy`'s, the rest `EmailPolicy` overrides — but a
+/// subclass inherits whichever it does not write, and the package calls it
+/// either way.
+const EMAIL_POLICY_CALLBACKS: &[&str] = &[
+    "fold",
+    "fold_binary",
+    "handle_defect",
+    "header_fetch_parse",
+    "header_max_count",
+    "header_source_parse",
+    "header_store_parse",
+    "register_defect",
+];
+
 /// Standard-library base classes whose own machinery calls the methods a
 /// subclass writes, each with the callbacks that machinery reaches.
 ///
@@ -6255,6 +6349,37 @@ const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
 /// `logging.StreamHandler` under `logging.Handler` — gets a row naming the same
 /// list.
 const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
+    (
+        "argparse",
+        "ArgumentDefaultsHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    (
+        "argparse",
+        "ArgumentParser",
+        &["convert_arg_line_to_args", "error", "exit"],
+    ),
+    ("argparse", "HelpFormatter", ARGPARSE_FORMATTER_CALLBACKS),
+    (
+        "argparse",
+        "MetavarTypeHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    (
+        "argparse",
+        "RawDescriptionHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    (
+        "argparse",
+        "RawTextHelpFormatter",
+        ARGPARSE_FORMATTER_CALLBACKS,
+    ),
+    ("email._policybase", "Compat32", EMAIL_POLICY_CALLBACKS),
+    ("email._policybase", "Policy", EMAIL_POLICY_CALLBACKS),
+    ("email.policy", "Compat32", EMAIL_POLICY_CALLBACKS),
+    ("email.policy", "EmailPolicy", EMAIL_POLICY_CALLBACKS),
+    ("email.policy", "Policy", EMAIL_POLICY_CALLBACKS),
     ("enum", "Enum", ENUM_CALLBACKS),
     ("enum", "Flag", ENUM_CALLBACKS),
     ("enum", "IntEnum", ENUM_CALLBACKS),
@@ -6416,7 +6541,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::Try(_) => self.visit_uncertain(statement),
             Stmt::Match(block) => self.visit_match(block),
             Stmt::For(loop_) => self.visit_loop(loop_),
-            Stmt::While(loop_) => self.visit_while(loop_, statement),
+            Stmt::While(loop_) => self.visit_while(loop_),
             Stmt::With(block) => self.visit_with(block),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
@@ -19008,10 +19133,19 @@ def b(x=1): pass  # type: ignore  # noqa
             &default_bases(),
             true,
         );
-        let mut edits =
-            call_site_edits(&files, checked.signatures, checked.own_constructors)?.edits;
+        let call_sites = call_site_edits(&files, checked.signatures, checked.own_constructors)?;
+        let mut edits = call_sites.edits;
         for diagnostic in &checked.diagnostics {
             if let Some(range) = diagnostic.fix {
+                // A deletion the call-site pass held back is one `--fix` never
+                // applies, so applying it here would read back a file the tool
+                // does not write.
+                if call_sites
+                    .retained
+                    .contains(&fix_key(&diagnostic.path, range))
+                {
+                    continue;
+                }
                 edits
                     .entry(diagnostic.path.clone())
                     .or_default()
@@ -22354,8 +22488,16 @@ def b(x=1): pass  # type: ignore  # noqa
         // class statement as easily as after — so the base is left unresolved
         // and the call it heads is left alone, rather than answered with the
         // module-level class the subclass may never be built on.
+        //
+        // Leaving the call alone is only half of it. The default behind it has
+        // to stay too, and this test used to read the file back through
+        // `fixed`, which applies every deletion whether or not it was held
+        // back, and so asserted an output the real `--fix` never writes and
+        // which raises `TypeError` when run. Byte identity keeps the guard the
+        // old assertion carried — the call is still not answered with the
+        // module-level 111 — and adds the retention it was missing.
         let source = "class Helper:\n    def method(self, value=111):\n        return value\n\n\ndef outer():\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    class Helper:\n        def method(self, value=333):\n            return value\n\n    return inner()\n\n\nassert outer() == 333, outer()\n";
-        assert_eq!(fixed(source)?, "class Helper:\n    def method(self, value):\n        return value\n\n\ndef outer():\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    class Helper:\n        def method(self, value):\n            return value\n\n    return inner()\n\n\nassert outer() == 333, outer()\n");
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
         Ok(())
     }
 
@@ -23593,6 +23735,300 @@ def b(x=1): pass  # type: ignore  # noqa
         assert_eq!(
             fixed(control)?,
             "class IntEnum:\n    pass\n\nclass E(IntEnum):\n    A = 1\n    @classmethod\n    def _missing_(cls, value, fallback): return cls.A\n\nE._missing_(1, fallback='x')\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_written_below_a_function_holds_its_defaults_back() -> Result<(), String> {
+        // The module binds `Helper` below `outer`, so which class the base
+        // reaches when `outer` runs is a runtime fact. The call it heads is
+        // rightly left alone, and the default behind it has to stay where it
+        // is or the file that is written raises.
+        let source = "def outer():\n    class Child(Helper):\n        def run(self):\n            return self.method()\n\n    return Child().run()\n\n\nclass Helper:\n    def method(self, value=111):\n        return value\n\n\nassert outer() == 111, outer()\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_base_written_above_a_nested_scope_still_resolves() -> Result<(), String> {
+        // The counterpart guard. `Helper` is bound before `inner` is written,
+        // so the spelling is not withheld, the base resolves, and the call
+        // carries the value the removed default held. Marking every class
+        // whose base cannot be resolved would have retained this one too.
+        let source = "def outer():\n    class Helper:\n        def method(self, value=111):\n            return value\n\n    def inner():\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    return inner()\n\n\nassert outer() == 111, outer()\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("value=111):", "value):")
+                .replace("self.method()", "self.method(value=111)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_scope_that_binds_the_spelling_itself_still_resolves() -> Result<(), String> {
+        // `inner` writes its own `Helper` above the subclass, so the base
+        // reaches that class whatever the scopes around it hold and the
+        // withheld spelling never comes into it.
+        let source = "class Helper:\n    def method(self, value=111):\n        return value\n\n\ndef outer():\n    def inner():\n        class Helper:\n            def method(self, value=222):\n                return value\n\n        class Child(Helper):\n            def run(self):\n                return self.method()\n\n        return Child().run()\n\n    class Helper:\n        def method(self, value=333):\n            return value\n\n    return inner()\n\n\nassert outer() == 222, outer()\n";
+        let updated = fixed_with_retained_defaults(source)?;
+        assert!(updated.contains("self.method(value=222)"), "{updated}");
+        assert!(
+            updated.contains("def method(self, value):\n                return value"),
+            "{updated}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_an_unfollowable_import_is_still_fixed() -> Result<(), String> {
+        // A base this file has no record of is not a withheld spelling: the
+        // file never saw the class, so nothing here is being chosen between.
+        // Holding these back would retain a default for every subclass of an
+        // imported base.
+        let source = "from unchecked import Base\n\n\nclass Child(Base):\n    def method(self, value=1):\n        return value\n\n\nassert Child().method() == 1\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("value=1):", "value):")
+                .replace("Child().method()", "Child().method(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_an_untaken_branch_leaves_an_import_standing() -> Result<(), String> {
+        // A walrus binds the name where it is written, so one written in a
+        // suite that may not run is the same shape as an assignment there.
+        // #1115 covered the assignment and left this reached through
+        // `invalidate_target_aliases`, which still took the import off the
+        // name and stripped a default the enumeration needs.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    holder = (Enum := object)\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_with_target_in_an_untaken_branch_leaves_an_import_standing() -> Result<(), String> {
+        // The `with` target is bound when its statement runs, and its
+        // statement is in the same suite, so it stands or falls with it.
+        let source = "import contextlib\nimport os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    with contextlib.nullcontext(object) as Enum:\n        pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_target_in_an_untaken_branch_leaves_an_import_standing() -> Result<(), String> {
+        // So does the loop target, which is read at the depth of the `for`
+        // statement rather than inside its body.
+        let source = "import os\nfrom enum import Enum\n\n\nif os.environ.get(\"ND_TYPING\") == \"1\":\n    for Enum in [object]:\n        pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_a_clause_test_still_takes_an_import_back() -> Result<(), String> {
+        // The counterpart guard. A clause's test runs whenever the clause is
+        // reached, and the traversal reads it before entering the suite, so
+        // the depth there is the depth of the `if` itself and the walrus
+        // really does take the name over.
+        let source = "from enum import Enum\n\nif (Enum := object):\n    pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_target_written_where_it_runs_still_takes_an_import_back() -> Result<(), String> {
+        // And the loop counterpart: nothing guards this loop, so `Enum` is
+        // whatever the iterable last yielded by the time `C` is written.
+        let source = "from enum import Enum\n\nfor Enum in [object]:\n    pass\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_a_while_test_still_takes_an_import_back() -> Result<(), String> {
+        // A `while` test runs whenever the loop is reached, exactly as a
+        // clause's test does, so the walrus in it really does take the name
+        // over. Reading the test inside the bodies' conditional depth held
+        // back an import the name had genuinely lost.
+        let source = "from enum import Enum\n\nwhile (Enum := object):\n    break\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_a_while_body_leaves_an_import_standing() -> Result<(), String> {
+        // The body is a suite that may not run, though — a `while` over a
+        // false test never enters it — so a walrus written there still leaves
+        // the import standing.
+        let source = "import os\nfrom enum import Enum\n\nwhile os.environ.get(\"ND_TYPING\") == \"1\":\n    holder = (Enum := object)\n    break\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn argparse_parser_callbacks_keep_their_defaults() -> Result<(), String> {
+        // `argparse` calls each of these from inside a parse: `error` from
+        // `parse_args` on a bad argument, `exit` from `error`, and
+        // `convert_arg_line_to_args` for every line of an `@file`. None of
+        // those calls is written here.
+        let source = "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def convert_arg_line_to_args(self, arg_line, extra=1): return arg_line.split()\n\n    def error(self, message, extra=2): raise RuntimeError(message)\n\n    def exit(self, status=0, message=None, extra=3): raise SystemExit(status)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn argparse_formatter_callbacks_keep_their_defaults() -> Result<(), String> {
+        // A parser builds the formatter itself from the `formatter_class` it was
+        // given and drives all seven of these from `format_help`, so the file
+        // that supplies the subclass holds no call to carry the values.
+        let source = "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n    def add_arguments(self, actions, extra=2): pass\n\n    def add_text(self, text, extra=3): pass\n\n    def add_usage(self, usage, actions, groups, prefix=None, extra=4): pass\n\n    def end_section(self, extra=5): pass\n\n    def format_help(self, extra=6): return \"\"\n\n    def start_section(self, heading, extra=7): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_argument_defaults_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        // The four formatters `argparse` ships are bases in their own right, and
+        // a parser drives whichever of them it was handed the same way.
+        let source = "import argparse\n\n\nclass F(argparse.ArgumentDefaultsHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_metavar_type_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import argparse\n\n\nclass F(argparse.MetavarTypeHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_raw_description_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import argparse\n\n\nclass F(argparse.RawDescriptionHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_raw_text_formatter_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import argparse\n\n\nclass F(argparse.RawTextHelpFormatter):\n    def format_help(self, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn email_policy_callbacks_keep_their_defaults() -> Result<(), String> {
+        // The `email` package reaches these on whatever policy a message or
+        // parser was handed: `header_source_parse` and `register_defect` from
+        // the feed parser, `header_store_parse` and `header_max_count` from
+        // header assignment, `header_fetch_parse` from header access, and
+        // `fold` and `fold_binary` from the generator that serialises it.
+        // `EmailPolicy` overrides most of them and inherits the two defect
+        // hooks, so a subclass of it is reached through both halves.
+        let source = "import email.policy\n\n\nclass P(email.policy.EmailPolicy):\n    def fold(self, name, value, extra=1): return \"\"\n\n    def fold_binary(self, name, value, extra=2): return b\"\"\n\n    def handle_defect(self, obj, defect, extra=3): pass\n\n    def header_fetch_parse(self, name, value, extra=4): return value\n\n    def header_max_count(self, name, extra=5): return None\n\n    def header_source_parse(self, sourcelines, extra=6): return \"\", \"\"\n\n    def header_store_parse(self, name, value, extra=7): return name, value\n\n    def register_defect(self, obj, defect, extra=8): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_email_policy_compat32_keeps_its_callback_defaults() -> Result<(), String> {
+        // `email.policy` re-exports `Compat32`, and the package calls a subclass
+        // of it exactly as it calls an `EmailPolicy` one.
+        let source = "from email.policy import Compat32\n\n\nclass C(Compat32):\n    def fold(self, name, value, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn an_email_policy_policy_keeps_its_callback_defaults() -> Result<(), String> {
+        // `Policy` is the abstract base the whole hierarchy is written on, and
+        // the defect hooks are its own.
+        let source = "from email.policy import Policy\n\n\nclass P(Policy):\n    def register_defect(self, obj, defect, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_policybase_compat32_keeps_its_callback_defaults() -> Result<(), String> {
+        // `email.policy` re-exports `Compat32` from `email._policybase`, which
+        // is where it is written, so the private spelling names the same class
+        // and has to be recognised as well.
+        let source = "from email._policybase import Compat32\n\n\nclass C(Compat32):\n    def header_fetch_parse(self, name, value, extra=1): return value\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_policybase_policy_keeps_its_callback_defaults() -> Result<(), String> {
+        // The same for `Policy`, whose defect hooks a subclass inherits whether
+        // it is reached through the public module or the private one.
+        let source = "from email._policybase import Policy\n\n\nclass P(Policy):\n    def handle_defect(self, obj, defect, extra=1): pass\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_argparse_parser_keeps_its_callback_defaults() -> Result<(), String> {
+        // Being reached by the subsystem is inherited, so a parser written on a
+        // parser defined here fails the same way.
+        let source = "import argparse\n\n\nclass Base(argparse.ArgumentParser):\n    pass\n\n\nclass Child(Base):\n    def error(self, message, extra=1): raise RuntimeError(message)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subclass_of_a_local_email_policy_keeps_its_callback_defaults() -> Result<(), String> {
+        let source = "import email.policy\n\n\nclass Base(email.policy.EmailPolicy):\n    pass\n\n\nclass Child(Base):\n    def fold(self, name, value, extra=1): return \"\"\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_names_outside_argparse_and_email_are_still_fixed() -> Result<(), String> {
+        // `error`, `exit`, `add_argument` and `format_help` are among the most
+        // ordinary method names there are. Nothing reaches this class but the
+        // calls written below, so the defaults go and those calls carry them.
+        let source = "class Recorder:\n    def add_argument(self, action, extra=1): return extra\n\n    def error(self, message, extra=2): return extra\n\n    def exit(self, status=3): return status\n\n    def fold(self, name, value, extra=4): return extra\n\n    def format_help(self, extra=5): return extra\n\n    def register_defect(self, obj, defect, extra=6): return extra\n\n\nr = Recorder()\nassert Recorder.add_argument(r, \"a\") == 1\nassert Recorder.error(r, \"m\") == 2\nassert Recorder.exit(r) == 3\nassert Recorder.fold(r, \"n\", \"v\") == 4\nassert Recorder.format_help(r) == 5\nassert Recorder.register_defect(r, \"o\", \"d\") == 6\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "class Recorder:\n    def add_argument(self, action, extra): return extra\n\n    def error(self, message, extra): return extra\n\n    def exit(self, status): return status\n\n    def fold(self, name, value, extra): return extra\n\n    def format_help(self, extra): return extra\n\n    def register_defect(self, obj, defect, extra): return extra\n\n\nr = Recorder()\nassert Recorder.add_argument(r, \"a\", extra=1) == 1\nassert Recorder.error(r, \"m\", extra=2) == 2\nassert Recorder.exit(r, status=3) == 3\nassert Recorder.fold(r, \"n\", \"v\", extra=4) == 4\nassert Recorder.format_help(r, extra=5) == 5\nassert Recorder.register_defect(r, \"o\", \"d\", extra=6) == 6\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_add_argument_call_off_the_formatter_hierarchy_is_still_rewritten() -> Result<(), String> {
+        // `add_argument` is a formatter callback and the method every argparse
+        // user calls by hand. Only the formatter's keeps its default; the
+        // ordinary class of the same name is fixed and its call rewritten.
+        let source = "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n\nclass Recorder:\n    def add_argument(self, action, extra=2): return extra\n\n\nassert Recorder.add_argument(Recorder(), \"a\") == 2\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import argparse\n\n\nclass F(argparse.HelpFormatter):\n    def add_argument(self, action, extra=1): pass\n\n\nclass Recorder:\n    def add_argument(self, action, extra): return extra\n\n\nassert Recorder.add_argument(Recorder(), \"a\", extra=2) == 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_callback_of_the_other_argparse_base_is_still_fixed() -> Result<(), String> {
+        // The two `argparse` rows name different callbacks, and nothing calls a
+        // formatter's hooks on a parser or a parser's on a formatter.
+        let source = "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def start_section(self, heading, extra=1): return extra\n\n\nclass F(argparse.HelpFormatter):\n    def error(self, message, extra=2): return extra\n\n\nassert P.start_section(P(add_help=False), \"h\") == 1\nassert F.error(F(\"p\"), \"m\") == 2\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            "import argparse\n\n\nclass P(argparse.ArgumentParser):\n    def start_section(self, heading, extra): return extra\n\n\nclass F(argparse.HelpFormatter):\n    def error(self, message, extra): return extra\n\n\nassert P.start_section(P(add_help=False), \"h\", extra=1) == 1\nassert F.error(F(\"p\"), \"m\", extra=2) == 2\n"
         );
         Ok(())
     }

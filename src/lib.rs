@@ -6967,46 +6967,59 @@ fn external_annotation_reference(
     module: &str,
     bindings: &BTreeMap<String, ExternalBinding>,
 ) -> Option<(String, String)> {
-    match expression {
-        Expr::Subscript(subscript) => {
-            let wrapper = match subscript.value.as_ref() {
-                Expr::Name(name) => Some(name.id.as_str()),
-                Expr::Attribute(attribute) => Some(attribute.attr.as_str()),
-                _ => None,
-            };
-            if matches!(wrapper, Some("Optional" | "ClassVar" | "Annotated")) {
-                let inner = match subscript.slice.as_ref() {
-                    Expr::Tuple(tuple) => tuple.elts.first()?,
-                    inner => inner,
+    fn collect(
+        expression: &Expr,
+        module: &str,
+        bindings: &BTreeMap<String, ExternalBinding>,
+        found: &mut BTreeSet<(String, String)>,
+    ) {
+        match expression {
+            Expr::Subscript(subscript) => {
+                let wrapper = match subscript.value.as_ref() {
+                    Expr::Name(name) => Some(name.id.as_str()),
+                    Expr::Attribute(attribute) => Some(attribute.attr.as_str()),
+                    _ => None,
                 };
-                return external_annotation_reference(inner, module, bindings);
+                if matches!(wrapper, Some("Optional" | "ClassVar" | "Annotated")) {
+                    let inner = match subscript.slice.as_ref() {
+                        Expr::Tuple(tuple) => tuple.elts.first(),
+                        inner => Some(inner),
+                    };
+                    if let Some(inner) = inner {
+                        collect(inner, module, bindings, found);
+                    }
+                } else if wrapper == Some("Union") {
+                    match subscript.slice.as_ref() {
+                        Expr::Tuple(tuple) => {
+                            for item in &tuple.elts {
+                                collect(item, module, bindings, found);
+                            }
+                        }
+                        inner => collect(inner, module, bindings, found),
+                    }
+                } else if let Some(reference) =
+                    resolve_external_reference(expression, module, bindings)
+                {
+                    found.insert(reference);
+                }
             }
-            if wrapper == Some("Union") {
-                let Expr::Tuple(tuple) = subscript.slice.as_ref() else {
-                    return external_annotation_reference(&subscript.slice, module, bindings);
-                };
-                let found: BTreeSet<_> = tuple
-                    .elts
-                    .iter()
-                    .filter_map(|item| external_annotation_reference(item, module, bindings))
-                    .collect();
-                return (found.len() == 1)
-                    .then(|| found.into_iter().next())
-                    .flatten();
+            Expr::BinOp(binary) if binary.op == ast::Operator::BitOr => {
+                collect(&binary.left, module, bindings, found);
+                collect(&binary.right, module, bindings, found);
             }
-            resolve_external_reference(expression, module, bindings)
+            _ => {
+                if let Some(reference) = resolve_external_reference(expression, module, bindings) {
+                    found.insert(reference);
+                }
+            }
         }
-        Expr::BinOp(binary) if binary.op == ast::Operator::BitOr => {
-            let found: BTreeSet<_> = [&binary.left, &binary.right]
-                .into_iter()
-                .filter_map(|item| external_annotation_reference(item, module, bindings))
-                .collect();
-            (found.len() == 1)
-                .then(|| found.into_iter().next())
-                .flatten()
-        }
-        _ => resolve_external_reference(expression, module, bindings),
     }
+
+    let mut found = BTreeSet::new();
+    collect(expression, module, bindings, &mut found);
+    (found.len() == 1)
+        .then(|| found.into_iter().next())
+        .flatten()
 }
 
 fn external_call_shape(call: &ast::ExprCall) -> CallbackCall {
@@ -26241,6 +26254,17 @@ def b(x=1): pass  # type: ignore  # noqa
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn a_nested_union_does_not_collapse_to_its_last_callback_target() -> Result<(), String> {
+        let parsed =
+            parse_expression("(First | Second) | Hook").map_err(|error| error.to_string())?;
+        assert_eq!(
+            external_annotation_reference(parsed.expr(), "dependency", &BTreeMap::new()),
+            None
+        );
+        Ok(())
     }
 
     #[test]

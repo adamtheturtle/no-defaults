@@ -6751,7 +6751,7 @@ struct ExternalModule {
 }
 
 fn python_dependency_roots() -> Vec<PathBuf> {
-    let mut roots: BTreeSet<PathBuf> = std::env::var_os("PYTHONPATH")
+    let mut roots: Vec<PathBuf> = std::env::var_os("PYTHONPATH")
         .map(|value| std::env::split_paths(&value).collect())
         .unwrap_or_default();
     let configured_interpreter = std::env::var_os("VIRTUAL_ENV").map(|environment| {
@@ -6790,9 +6790,12 @@ fn python_dependency_roots() -> Vec<PathBuf> {
             }
         }
     }
+    let mut seen = BTreeSet::new();
     roots
         .into_iter()
-        .filter_map(|path| path.is_dir().then(|| path.canonicalize().unwrap_or(path)))
+        .filter(|path| path.is_dir())
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .filter(|path| seen.insert(path.clone()))
         .collect()
 }
 
@@ -6956,6 +6959,53 @@ fn resolve_external_reference(
             resolve_external_reference(&subscript.value, module, bindings)
         }
         _ => None,
+    }
+}
+
+fn external_annotation_reference(
+    expression: &Expr,
+    module: &str,
+    bindings: &BTreeMap<String, ExternalBinding>,
+) -> Option<(String, String)> {
+    match expression {
+        Expr::Subscript(subscript) => {
+            let wrapper = match subscript.value.as_ref() {
+                Expr::Name(name) => Some(name.id.as_str()),
+                Expr::Attribute(attribute) => Some(attribute.attr.as_str()),
+                _ => None,
+            };
+            if matches!(wrapper, Some("Optional" | "ClassVar" | "Annotated")) {
+                let inner = match subscript.slice.as_ref() {
+                    Expr::Tuple(tuple) => tuple.elts.first()?,
+                    inner => inner,
+                };
+                return external_annotation_reference(inner, module, bindings);
+            }
+            if wrapper == Some("Union") {
+                let Expr::Tuple(tuple) = subscript.slice.as_ref() else {
+                    return external_annotation_reference(&subscript.slice, module, bindings);
+                };
+                let found: BTreeSet<_> = tuple
+                    .elts
+                    .iter()
+                    .filter_map(|item| external_annotation_reference(item, module, bindings))
+                    .collect();
+                return (found.len() == 1)
+                    .then(|| found.into_iter().next())
+                    .flatten();
+            }
+            resolve_external_reference(expression, module, bindings)
+        }
+        Expr::BinOp(binary) if binary.op == ast::Operator::BitOr => {
+            let found: BTreeSet<_> = [&binary.left, &binary.right]
+                .into_iter()
+                .filter_map(|item| external_annotation_reference(item, module, bindings))
+                .collect();
+            (found.len() == 1)
+                .then(|| found.into_iter().next())
+                .flatten()
+        }
+        _ => resolve_external_reference(expression, module, bindings),
     }
 }
 
@@ -7156,7 +7206,7 @@ fn discover_external_callbacks(files: &[PathBuf]) -> ExternalCallbacks {
                 if let Stmt::AnnAssign(assign) = body {
                     if let Expr::Name(name) = assign.target.as_ref() {
                         if let Some(identity) =
-                            resolve_external_reference(&assign.annotation, module_name, bindings)
+                            external_annotation_reference(&assign.annotation, module_name, bindings)
                         {
                             attributes.insert(name.id.to_string(), identity);
                         }

@@ -8169,8 +8169,23 @@ fn dependency_callbacks_are_analyzed_through_reexports_without_editing_dependenc
     let dependency_source = "class HookBase:\n    def callback(self, supplied, omitted=2):\n        return supplied + omitted\n";
     std::fs::write(&hooks, dependency_source)?;
     let engine = package.join("engine.py");
-    let engine_source = "from .hooks import HookBase\n\n\nclass Engine:\n    hook: HookBase\n\n    def run(self):\n        return self.hook.callback(10)\n";
+    let engine_source = "from __future__ import annotations\n\nfrom .hooks import HookBase\n\n\nclass Engine:\n    hook: HookBase | None\n\n    def run(self):\n        return self.hook.callback(10)\n";
     std::fs::write(&engine, engine_source)?;
+    let shadow_root = directory.path().join("aaa-shadow");
+    let shadow_package = shadow_root.join("dependency");
+    std::fs::create_dir_all(&shadow_package)?;
+    std::fs::write(
+        shadow_package.join("__init__.py"),
+        "from .engine import Engine\nfrom .hooks import HookBase\n",
+    )?;
+    std::fs::write(
+        shadow_package.join("hooks.py"),
+        "class HookBase:\n    def callback(self, supplied, omitted):\n        return supplied + omitted\n",
+    )?;
+    std::fs::write(
+        shadow_package.join("engine.py"),
+        "from .hooks import HookBase\n\n\nclass Engine:\n    hook: HookBase\n\n    def run(self):\n        return self.hook.callback(10, 20)\n",
+    )?;
 
     let application = directory.path().join("application.py");
     std::fs::write(
@@ -8178,10 +8193,11 @@ fn dependency_callbacks_are_analyzed_through_reexports_without_editing_dependenc
         "from dependency import Engine, HookBase\n\n\nclass Hook(HookBase):\n    def callback(self, supplied=1, omitted=2):\n        return supplied + omitted\n\n\nclass Unrelated:\n    def callback(self, value=3):\n        return value\n\n\nengine = Engine()\nengine.hook = Hook()\nassert engine.run() == 12\nassert Unrelated().callback() == 3\n",
     )?;
 
+    let pythonpath = std::env::join_paths([dependencies.as_path(), shadow_root.as_path()])?;
     let output = Command::new(binary())
         .arg("--fix")
         .arg(&application)
-        .env("PYTHONPATH", &dependencies)
+        .env("PYTHONPATH", &pythonpath)
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
@@ -8196,7 +8212,7 @@ fn dependency_callbacks_are_analyzed_through_reexports_without_editing_dependenc
     );
     let status = Command::new("python3")
         .arg(&application)
-        .env("PYTHONPATH", &dependencies)
+        .env("PYTHONPATH", &pythonpath)
         .status()?;
     assert!(status.success());
     Ok(())

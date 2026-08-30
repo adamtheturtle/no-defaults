@@ -5685,7 +5685,7 @@ fn an_import_finder_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     // default. Nothing in the file calls `find_spec`, so removing the default
     // leaves the next import raising `TypeError` from inside `importlib` with
     // no written call site for the fixer to keep in step.
-    let source = "class Finder:\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n";
+    let source = "import importlib.abc\n\n\nclass Finder(importlib.abc.MetaPathFinder):\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -5706,7 +5706,7 @@ fn an_import_loader_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     // removing the default leaves the next import raising `TypeError` with no
     // written call site to carry the argument.
     let source =
-        "class Loader:\n    def create_module(self, spec, extra=1):\n        return None\n";
+        "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def create_module(self, spec, extra=1):\n        return None\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -5721,9 +5721,10 @@ fn an_import_loader_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
 fn a_loader_helper_beside_create_module_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The retention follows the hook name, not the class holding it, so a
-    // plain helper on the same loader is rewritten as usual.
-    let source = "class Loader:\n    def create_module(self, spec, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value=2):\n        return value\n";
+    // Retention is keyed to the base whose machinery makes the call and
+    // the callbacks it reaches, not to every method the class carries, so
+    // an ordinary helper beside the hook is rewritten as usual.
+    let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def create_module(self, spec, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value=2):\n        return value\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -5731,7 +5732,7 @@ fn a_loader_helper_beside_create_module_is_still_fixed() -> Result<(), Box<dyn s
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class Loader:\n    def create_module(self, spec, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value):\n        return value\n",
+        "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def create_module(self, spec, extra=1):\n        return self.helper(extra)\n\n    def helper(self, value):\n        return value\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
@@ -5747,7 +5748,7 @@ fn a_loader_execution_hook_survives_a_fix() -> Result<(), Box<dyn std::error::Er
     // see, so dropping the default leaves the next import raising
     // `TypeError: Loader.exec_module() missing 1 required positional
     // argument` with no written call site to carry the value.
-    let source = "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
+    let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def exec_module(self, module, extra=1):\n        module.answer = extra\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -5762,10 +5763,10 @@ fn a_loader_execution_hook_survives_a_fix() -> Result<(), Box<dyn std::error::Er
 fn a_loader_helper_beside_exec_module_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The retention follows the hook name, not the class holding it, so a
-    // sibling with the same signature shape is rewritten as usual, carrying
-    // its own default to the call.
-    let source = "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(module)\n\n    def helper(self, module, value=2):\n        return value\n";
+    // Retention is keyed to the base whose machinery makes the call and
+    // the callbacks it reaches, not to every method the class carries, so
+    // an ordinary helper beside the hook is rewritten as usual.
+    let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(module)\n\n    def helper(self, module, value=2):\n        return value\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -5773,7 +5774,7 @@ fn a_loader_helper_beside_exec_module_is_still_fixed() -> Result<(), Box<dyn std
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class Loader:\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(module, value=2)\n\n    def helper(self, module, value):\n        return value\n",
+        "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def exec_module(self, module, extra=1):\n        module.answer = self.helper(module, value=2)\n\n    def helper(self, module, value):\n        return value\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
@@ -6008,7 +6009,7 @@ fn an_import_finder_invalidate_caches_survives_a_fix() -> Result<(), Box<dyn std
     // `TypeError: Finder.invalidate_caches() missing 1 required positional
     // argument: 'extra'` with no written call site to carry the value.
     let source =
-        "class Finder:\n    def invalidate_caches(self, extra=1):\n        self.stamp = extra\n";
+        "import importlib.abc\n\n\nclass Finder(importlib.abc.MetaPathFinder):\n    def invalidate_caches(self, extra=1):\n        self.stamp = extra\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6024,10 +6025,10 @@ fn a_finder_helper_beside_invalidate_caches_is_still_fixed(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The retention follows the hook name, not the class holding it, so a
-    // sibling with the same signature shape is rewritten as usual, carrying
-    // its own default to the call.
-    let source = "class Finder:\n    def invalidate_caches(self, extra=1):\n        self.stamp = self.helper()\n\n    def helper(self, value=2):\n        return value\n";
+    // Retention is keyed to the base whose machinery makes the call and
+    // the callbacks it reaches, not to every method the class carries, so
+    // an ordinary helper beside the hook is rewritten as usual.
+    let source = "import importlib.abc\n\n\nclass Finder(importlib.abc.MetaPathFinder):\n    def invalidate_caches(self, extra=1):\n        self.stamp = self.helper()\n\n    def helper(self, value=2):\n        return value\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6035,7 +6036,7 @@ fn a_finder_helper_beside_invalidate_caches_is_still_fixed(
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class Finder:\n    def invalidate_caches(self, extra=1):\n        self.stamp = self.helper(value=2)\n\n    def helper(self, value):\n        return value\n",
+        "import importlib.abc\n\n\nclass Finder(importlib.abc.MetaPathFinder):\n    def invalidate_caches(self, extra=1):\n        self.stamp = self.helper(value=2)\n\n    def helper(self, value):\n        return value\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
@@ -6076,7 +6077,7 @@ fn a_legacy_loader_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
     // `TypeError: Loader.load_module() missing 1 required positional argument`
     // with no written call site to carry the value.
     let source =
-        "class Loader:\n    def load_module(self, fullname, extra=1):\n        return fullname\n";
+        "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def load_module(self, fullname, extra=1):\n        return fullname\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6091,10 +6092,10 @@ fn a_legacy_loader_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
 fn a_loader_helper_beside_load_module_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The retention follows the hook name, not the shape of the parameter
-    // list, so a sibling declared with the very same signature is stripped and
-    // its call site given the default that used to reach it.
-    let source = "class Loader:\n    def load_module(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, extra=1):\n        return fullname\n";
+    // Retention is keyed to the base whose machinery makes the call and
+    // the callbacks it reaches, not to every method the class carries, so
+    // an ordinary helper beside the hook is rewritten as usual.
+    let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def load_module(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, extra=1):\n        return fullname\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6102,7 +6103,7 @@ fn a_loader_helper_beside_load_module_is_still_fixed() -> Result<(), Box<dyn std
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class Loader:\n    def load_module(self, fullname, extra=1):\n        return self.helper(fullname, extra=1)\n\n    def helper(self, fullname, extra):\n        return fullname\n",
+        "import importlib.abc\n\n\nclass Loader(importlib.abc.Loader):\n    def load_module(self, fullname, extra=1):\n        return self.helper(fullname, extra=1)\n\n    def helper(self, fullname, extra):\n        return fullname\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
@@ -6141,7 +6142,7 @@ fn an_inspect_loader_get_code_survives_a_fix() -> Result<(), Box<dyn std::error:
     // file, so dropping the default leaves the next import raising
     // `TypeError: L.get_code() missing 1 required positional argument:
     // 'extra'` with no written call site to carry the value.
-    let source = "class L:\n    def get_code(self, fullname, extra=1):\n        return None\n";
+    let source = "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def get_code(self, fullname, extra=1):\n        return None\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6156,10 +6157,10 @@ fn an_inspect_loader_get_code_survives_a_fix() -> Result<(), Box<dyn std::error:
 fn a_loader_helper_beside_get_code_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The retention follows the hook name, not the class holding it, so a
-    // sibling with the same signature shape is rewritten as usual, carrying
-    // its own default to the call.
-    let source = "class L:\n    def get_code(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+    // Retention is keyed to the base whose machinery makes the call and
+    // the callbacks it reaches, not to every method the class carries, so
+    // an ordinary helper beside the hook is rewritten as usual.
+    let source = "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def get_code(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6167,7 +6168,7 @@ fn a_loader_helper_beside_get_code_is_still_fixed() -> Result<(), Box<dyn std::e
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class L:\n    def get_code(self, fullname, extra=1):\n        return self.helper(fullname, value=2)\n\n    def helper(self, fullname, value):\n        return (fullname, value)\n",
+        "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def get_code(self, fullname, extra=1):\n        return self.helper(fullname, value=2)\n\n    def helper(self, fullname, value):\n        return (fullname, value)\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
@@ -6208,7 +6209,7 @@ fn an_inspect_loader_get_source_survives_a_fix() -> Result<(), Box<dyn std::erro
     // positional argument: 'extra'` with no written call site to carry the
     // value.
     let source =
-        "class Loader:\n    def get_source(self, fullname, extra=1):\n        return 'answer = 1'\n";
+        "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def get_source(self, fullname, extra=1):\n        return 'answer = 1'\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6223,10 +6224,10 @@ fn an_inspect_loader_get_source_survives_a_fix() -> Result<(), Box<dyn std::erro
 fn a_loader_helper_beside_get_source_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The retention follows the hook name, not the class holding it, so a
-    // sibling with the same signature shape is rewritten as usual, carrying
-    // its own default to the call.
-    let source = "class Loader:\n    def get_source(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+    // Retention is keyed to the base whose machinery makes the call and
+    // the callbacks it reaches, not to every method the class carries, so
+    // an ordinary helper beside the hook is rewritten as usual.
+    let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def get_source(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6234,7 +6235,7 @@ fn a_loader_helper_beside_get_source_is_still_fixed() -> Result<(), Box<dyn std:
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class Loader:\n    def get_source(self, fullname, extra=1):\n        return self.helper(fullname, value=2)\n\n    def helper(self, fullname, value):\n        return (fullname, value)\n",
+        "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def get_source(self, fullname, extra=1):\n        return self.helper(fullname, value=2)\n\n    def helper(self, fullname, value):\n        return (fullname, value)\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
@@ -6341,7 +6342,7 @@ fn an_import_loader_is_package_survives_a_fix() -> Result<(), Box<dyn std::error
     // `TypeError: Loader.is_package() missing 1 required positional argument`
     // with no written call site to carry the value.
     let source =
-        "class Loader:\n    def is_package(self, fullname, extra=1):\n        return False\n";
+        "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def is_package(self, fullname, extra=1):\n        return False\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6356,10 +6357,10 @@ fn an_import_loader_is_package_survives_a_fix() -> Result<(), Box<dyn std::error
 fn a_loader_helper_beside_is_package_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The retention follows the hook name, not the shape of the parameter
-    // list, so a sibling declared with the very same signature is stripped and
-    // its call site given the default that used to reach it.
-    let source = "class Loader:\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, extra=1):\n        return False\n";
+    // Retention is keyed to the base whose machinery makes the call and
+    // the callbacks it reaches, not to every method the class carries, so
+    // an ordinary helper beside the hook is rewritten as usual.
+    let source = "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, extra=1):\n        return False\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6367,7 +6368,7 @@ fn a_loader_helper_beside_is_package_is_still_fixed() -> Result<(), Box<dyn std:
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class Loader:\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname, extra=1)\n\n    def helper(self, fullname, extra):\n        return False\n",
+        "import importlib.abc\n\n\nclass Loader(importlib.abc.InspectLoader):\n    def is_package(self, fullname, extra=1):\n        return self.helper(fullname, extra=1)\n\n    def helper(self, fullname, extra):\n        return False\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
@@ -6430,7 +6431,7 @@ fn an_execution_loader_get_filename_survives_a_fix() -> Result<(), Box<dyn std::
     // positional argument: 'extra'` with no written call site to carry the
     // value.
     let source =
-        "class L:\n    def get_filename(self, fullname, extra=1):\n        return '/virtual/probe.py'\n";
+        "import importlib.abc\n\n\nclass L(importlib.abc.ExecutionLoader):\n    def get_filename(self, fullname, extra=1):\n        return '/virtual/probe.py'\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6445,10 +6446,10 @@ fn an_execution_loader_get_filename_survives_a_fix() -> Result<(), Box<dyn std::
 fn a_loader_helper_beside_get_filename_is_still_fixed() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The retention follows the hook name, not the class holding it, so a
-    // sibling with the same signature shape is rewritten as usual, carrying
-    // its own default to the call.
-    let source = "class L:\n    def get_filename(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
+    // Retention is keyed to the base whose machinery makes the call and
+    // the callbacks it reaches, not to every method the class carries, so
+    // an ordinary helper beside the hook is rewritten as usual.
+    let source = "import importlib.abc\n\n\nclass L(importlib.abc.ExecutionLoader):\n    def get_filename(self, fullname, extra=1):\n        return self.helper(fullname)\n\n    def helper(self, fullname, value=2):\n        return (fullname, value)\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6456,7 +6457,7 @@ fn a_loader_helper_beside_get_filename_is_still_fixed() -> Result<(), Box<dyn st
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class L:\n    def get_filename(self, fullname, extra=1):\n        return self.helper(fullname, value=2)\n\n    def helper(self, fullname, value):\n        return (fullname, value)\n",
+        "import importlib.abc\n\n\nclass L(importlib.abc.ExecutionLoader):\n    def get_filename(self, fullname, extra=1):\n        return self.helper(fullname, value=2)\n\n    def helper(self, fullname, value):\n        return (fullname, value)\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
@@ -6519,7 +6520,7 @@ fn a_source_loader_source_to_code_survives_a_fix() -> Result<(), Box<dyn std::er
     // `TypeError: L.source_to_code() missing 1 required positional argument:
     // 'extra'` with no written call site to carry the value.
     let source =
-        "class L:\n    def source_to_code(self, data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+        "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def source_to_code(self, data, path, extra=1):\n        return compile(data, path, 'exec')\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6537,7 +6538,7 @@ fn a_static_source_to_code_survives_a_fix() -> Result<(), Box<dyn std::error::Er
     // `importlib.abc.InspectLoader` spells the hook as a `staticmethod`, so a
     // loader written against the documented shape is retained the same way.
     let source =
-        "class L:\n    @staticmethod\n    def source_to_code(data, path, extra=1):\n        return compile(data, path, 'exec')\n";
+        "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    @staticmethod\n    def source_to_code(data, path, extra=1):\n        return compile(data, path, 'exec')\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6553,10 +6554,10 @@ fn a_loader_helper_beside_source_to_code_is_still_fixed() -> Result<(), Box<dyn 
 {
     let directory = tempfile::tempdir()?;
     let case = directory.path().join("case.py");
-    // The retention follows the hook name, not the class holding it, so a
-    // sibling with the same signature shape is rewritten as usual, carrying
-    // its own default to the call.
-    let source = "class L:\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path)\n\n    def helper(self, data, path, value=2):\n        return (data, path, value)\n";
+    // Retention is keyed to the base whose machinery makes the call and
+    // the callbacks it reaches, not to every method the class carries, so
+    // an ordinary helper beside the hook is rewritten as usual.
+    let source = "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path)\n\n    def helper(self, data, path, value=2):\n        return (data, path, value)\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")
@@ -6564,7 +6565,7 @@ fn a_loader_helper_beside_source_to_code_is_still_fixed() -> Result<(), Box<dyn 
         .output()?;
     assert_eq!(
         std::fs::read_to_string(&case)?,
-        "class L:\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path, value=2)\n\n    def helper(self, data, path, value):\n        return (data, path, value)\n",
+        "import importlib.abc\n\n\nclass L(importlib.abc.InspectLoader):\n    def source_to_code(self, data, path, extra=1):\n        return self.helper(data, path, value=2)\n\n    def helper(self, data, path, value):\n        return (data, path, value)\n",
     );
     assert_eq!(output.status.code(), Some(1));
     Ok(())
@@ -7599,5 +7600,49 @@ fn two_bodies_under_one_class_spelling_keep_their_defaults(
         .output()?;
     assert_eq!(std::fs::read_to_string(&case)?, source);
     assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn an_import_hook_that_finds_and_loads_survives_a_fix() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The documented way to add an importer is one class on `sys.meta_path`
+    // whose `find_spec` names the finder itself as the loader, so the
+    // machinery goes on to call `create_module` and `exec_module` on that same
+    // object. None of those three calls is written in the file, so all three
+    // defaults have to stay where they are even though the only base spelled
+    // is a finder.
+    let source = "import importlib.abc\n\n\nclass Hook(importlib.abc.MetaPathFinder):\n    def find_spec(self, fullname, path, target, extra=1):\n        return None\n\n    def create_module(self, spec, extra=2):\n        return None\n\n    def exec_module(self, module, extra=3):\n        module.answer = extra\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn import_callback_names_off_the_hierarchy_are_still_fixed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `find_spec` and `exec_module` are reached by the import machinery only
+    // on a class it was handed. A registry of its own ancestry is never handed
+    // to it, so nothing but the calls written below reaches these methods and
+    // the defaults go into them.
+    let source = "class Registry:\n    def find_spec(self, fullname, path, target, extra=1):\n        return extra\n\n    def exec_module(self, module, extra=2):\n        return extra\n\n\nr = Registry()\nassert Registry.find_spec(r, \"n\", None, None) == 1\nassert Registry.exec_module(r, None) == 2\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Registry:\n    def find_spec(self, fullname, path, target, extra):\n        return extra\n\n    def exec_module(self, module, extra):\n        return extra\n\n\nr = Registry()\nassert Registry.find_spec(r, \"n\", None, None, extra=1) == 1\nassert Registry.exec_module(r, None, extra=2) == 2\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
     Ok(())
 }

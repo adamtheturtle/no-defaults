@@ -7226,6 +7226,7 @@ fn resolve_pending_external_calls(
     modules: &BTreeMap<String, ExternalModule>,
     pending_calls: Vec<PendingExternalCall>,
     project_root: &Path,
+    dependency_roots: &[PathBuf],
 ) -> Result<ExternalCallbacks, String> {
     if pending_calls.is_empty() {
         return Ok(propagated_external_callbacks(modules, &BTreeMap::new()));
@@ -7234,7 +7235,7 @@ fn resolve_pending_external_calls(
         .iter()
         .map(|(module, (_, _, path, _))| (comparable_external_path(path), module.as_str()))
         .collect();
-    let mut ty = ty_resolver::TyResolver::start(project_root)?;
+    let mut ty = ty_resolver::TyResolver::start(project_root, dependency_roots)?;
     for (_, _, path, source) in parsed_modules.values() {
         ty.open(path, source)?;
     }
@@ -7379,7 +7380,13 @@ fn discover_external_callbacks(
             },
         );
     }
-    resolve_pending_external_calls(&parsed_modules, &modules, pending_calls, project_root)
+    resolve_pending_external_calls(
+        &parsed_modules,
+        &modules,
+        pending_calls,
+        project_root,
+        &roots,
+    )
 }
 
 /// Library base classes whose own machinery calls the methods a

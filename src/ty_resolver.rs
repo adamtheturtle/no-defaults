@@ -52,7 +52,7 @@ pub fn require_ty() -> Result<(), String> {
 }
 
 impl TyResolver {
-    pub fn start(project_root: &Path) -> Result<Self, String> {
+    pub fn start(project_root: &Path, extra_paths: &[PathBuf]) -> Result<Self, String> {
         let mut child = ty_command()
             .arg("server")
             .current_dir(project_root)
@@ -85,6 +85,11 @@ impl TyResolver {
                 "processId": std::process::id(),
                 "rootUri": absolute_uri(project_root),
                 "capabilities": { "textDocument": { "diagnostic": {} } },
+                "initializationOptions": {
+                    "configuration": {
+                        "environment": { "extra-paths": extra_paths },
+                    },
+                },
             }),
         )?;
         resolver.collect(id, INITIALIZE_TIMEOUT)?;

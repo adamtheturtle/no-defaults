@@ -4933,7 +4933,7 @@ impl Checker<'_> {
         self.conditional_depth -= 1;
     }
 
-    fn visit_while<'a>(&mut self, loop_: &'a ast::StmtWhile, statement: &'a Stmt)
+    fn visit_while<'a>(&mut self, loop_: &'a ast::StmtWhile)
     where
         Self: Visitor<'a>,
     {
@@ -4941,7 +4941,18 @@ impl Checker<'_> {
             Truthiness::False | Truthiness::Falsey | Truthiness::None => {
                 self.visit_body(&loop_.orelse);
             }
-            _ => self.visit_uncertain(statement),
+            _ => {
+                // The test runs whenever the loop is reached, exactly as a
+                // clause's test does, so a walrus in it binds where the `while`
+                // is written rather than in a suite that may not run. Only the
+                // bodies are uncertain, and reading the test inside their depth
+                // held back an import the name really had lost.
+                self.visit_expr(&loop_.test);
+                self.conditional_depth += 1;
+                self.visit_body(&loop_.body);
+                self.visit_body(&loop_.orelse);
+                self.conditional_depth -= 1;
+            }
         }
     }
 
@@ -6315,7 +6326,7 @@ impl<'a> Visitor<'a> for Checker<'a> {
             Stmt::Try(_) => self.visit_uncertain(statement),
             Stmt::Match(block) => self.visit_match(block),
             Stmt::For(loop_) => self.visit_loop(loop_),
-            Stmt::While(loop_) => self.visit_while(loop_, statement),
+            Stmt::While(loop_) => self.visit_while(loop_),
             Stmt::With(block) => self.visit_with(block),
             Stmt::Import(_) | Stmt::ImportFrom(_) => self.visit_import_statement(statement),
             Stmt::FunctionDef(function) => self.visit_function_statement(function, statement),
@@ -23513,6 +23524,30 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed_with_retained_defaults(source)?,
             source.replace("label='x'", "label")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_a_while_test_still_takes_an_import_back() -> Result<(), String> {
+        // A `while` test runs whenever the loop is reached, exactly as a
+        // clause's test does, so the walrus in it really does take the name
+        // over. Reading the test inside the bodies' conditional depth held
+        // back an import the name had genuinely lost.
+        let source = "from enum import Enum\n\nwhile (Enum := object):\n    break\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source.replace("label='x'", "label")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_in_a_while_body_leaves_an_import_standing() -> Result<(), String> {
+        // The body is a suite that may not run, though — a `while` over a
+        // false test never enters it — so a walrus written there still leaves
+        // the import standing.
+        let source = "import os\nfrom enum import Enum\n\nwhile os.environ.get(\"ND_TYPING\") == \"1\":\n    holder = (Enum := object)\n    break\n\nclass C(Enum):\n    A = 1\n\n    def __init__(self, value, label='x'):\n        self.label = label\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
         Ok(())
     }
 }

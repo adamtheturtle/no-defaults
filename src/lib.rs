@@ -7245,15 +7245,6 @@ fn resolve_pending_external_calls(
             continue;
         };
         let locations = ty.definitions(path, source, call.offset)?;
-        if std::env::var_os("NO_DEFAULTS_DEBUG_TY").is_some() {
-            eprintln!(
-                "ty definition: module={} method={} source={} locations={locations:?} known={:?}",
-                call.module,
-                call.method,
-                path.display(),
-                modules_by_path.keys().collect::<Vec<_>>()
-            );
-        }
         let mut targets = BTreeSet::new();
         for location in locations {
             let path = comparable_external_path(&location.path);

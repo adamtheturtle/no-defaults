@@ -272,6 +272,7 @@ fn locations_from_value(result: &Value) -> Vec<DefinitionLocation> {
 fn absolute_uri(path: &Path) -> String {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let path = absolute.to_string_lossy().replace('\\', "/");
+    let path = uri_path(&path);
     let encoded = path
         .replace('%', "%25")
         .replace(' ', "%20")
@@ -281,6 +282,10 @@ fn absolute_uri(path: &Path) -> String {
     } else {
         format!("file:///{encoded}")
     }
+}
+
+fn uri_path(path: &str) -> &str {
+    path.strip_prefix("//?/").unwrap_or(path)
 }
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -315,7 +320,7 @@ fn percent_decode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{lsp_position, percent_decode};
+    use super::{lsp_position, percent_decode, uri_path};
 
     #[test]
     fn lsp_columns_count_utf16_code_units() {
@@ -325,5 +330,10 @@ mod tests {
     #[test]
     fn percent_encoded_paths_are_decoded() {
         assert_eq!(percent_decode("/tmp/a%20b%23c.py"), "/tmp/a b#c.py");
+    }
+
+    #[test]
+    fn windows_verbatim_paths_become_regular_lsp_paths() {
+        assert_eq!(uri_path("//?/C:/work/file.py"), "C:/work/file.py");
     }
 }

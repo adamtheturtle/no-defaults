@@ -8217,7 +8217,6 @@ fn dependency_callbacks_are_analyzed_through_reexports_without_editing_dependenc
         .arg("--fix")
         .arg(&application)
         .env("PYTHONPATH", &pythonpath)
-        .env("NO_DEFAULTS_DEBUG_TY", "1")
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(

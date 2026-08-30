@@ -4,6 +4,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+### Changed
+
+- Cross-package callback analysis now resolves dependency method targets through
+  the supported `ty server` LSP interface. Inferred attributes, inheritance,
+  aliases, re-exports, and wrapped annotations therefore use ty's Python
+  semantics instead of a local approximation. The Python package depends on
+  `ty`; Cargo installations must provide the `ty` executable on `PATH`.
+
 ## 2.2.0 - 2026-08-30
 
 Everything here makes `--fix` safer to run. A default that the interpreter itself supplies the call for is now reported and kept, and a deletion whose call site cannot be written is held back rather than made anyway, so `--fix` no longer writes a file that raises `TypeError` and reports a clean sweep. Where the call site can be written, `--fix` reaches a great many it used to leave alone.

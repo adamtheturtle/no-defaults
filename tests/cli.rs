@@ -91,6 +91,25 @@ fn show_settings_rejects_mutating_modes() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
+fn a_missing_ty_backend_is_an_explicit_operational_error() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("example.py");
+    std::fs::write(&path, "def target(value=1): pass\n")?;
+    let output = Command::new(binary())
+        .arg(&path)
+        .env("PATH", directory.path())
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("`ty` type-inference backend is required"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn later_dataclass_alias_imports_do_not_change_earlier_classes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
@@ -8163,13 +8182,13 @@ fn dependency_callbacks_are_analyzed_through_reexports_without_editing_dependenc
     let initializer = package.join("__init__.py");
     std::fs::write(
         &initializer,
-        "from .engine import Engine\nfrom .hooks import HookBase\n",
+        "from .engine import Engine, InferredEngine\nfrom .hooks import HookBase\n",
     )?;
     let hooks = package.join("hooks.py");
-    let dependency_source = "class HookBase:\n    def callback(self, supplied, omitted=2):\n        return supplied + omitted\n";
+    let dependency_source = "class HookBase:\n    if True:\n        def callback(self, supplied, omitted=2):\n            return supplied + omitted\n\n    def other_callback(self, supplied, omitted=2):\n        return supplied + omitted\n";
     std::fs::write(&hooks, dependency_source)?;
     let engine = package.join("engine.py");
-    let engine_source = "from __future__ import annotations\n\nfrom .hooks import HookBase\n\n\nclass Engine:\n    hook: HookBase | None\n\n    def run(self):\n        return self.hook.callback(10)\n";
+    let engine_source = "from __future__ import annotations\n\nfrom .hooks import HookBase\n\n\nclass Engine:\n    hook: HookBase | None\n\n    def run(self):\n        return self.hook.other_callback(10)\n\n\nclass InferredEngine:\n    def __init__(self):\n        self.hook = HookBase()\n\n    def run(self):\n        return self.hook.callback(10)\n";
     std::fs::write(&engine, engine_source)?;
     let shadow_root = directory.path().join("aaa-shadow");
     let shadow_package = shadow_root.join("dependency");
@@ -8180,17 +8199,17 @@ fn dependency_callbacks_are_analyzed_through_reexports_without_editing_dependenc
     )?;
     std::fs::write(
         shadow_package.join("hooks.py"),
-        "class HookBase:\n    def callback(self, supplied, omitted):\n        return supplied + omitted\n",
+        "class HookBase:\n    def callback(self, supplied, omitted):\n        return supplied + omitted\n\n    def other_callback(self, supplied, omitted):\n        return supplied + omitted\n",
     )?;
     std::fs::write(
         shadow_package.join("engine.py"),
-        "from .hooks import HookBase\n\n\nclass Engine:\n    hook: HookBase\n\n    def run(self):\n        return self.hook.callback(10, 20)\n",
+        "from .hooks import HookBase\n\n\nclass Engine:\n    hook: HookBase\n\n    def run(self):\n        return self.hook.other_callback(10, 20)\n",
     )?;
 
     let application = directory.path().join("application.py");
     std::fs::write(
         &application,
-        "from dependency import Engine, HookBase\n\n\nclass Hook(HookBase):\n    def callback(self, supplied=1, omitted=2):\n        return supplied + omitted\n\n\nclass Unrelated:\n    def callback(self, value=3):\n        return value\n\n\nengine = Engine()\nengine.hook = Hook()\nassert engine.run() == 12\nassert Unrelated().callback() == 3\n",
+        "from dependency import Engine, HookBase, InferredEngine\n\n\nclass Hook(HookBase):\n    def callback(self, supplied=1, omitted=2):\n        return supplied + omitted\n\n\nclass Unrelated:\n    def callback(self, value=3):\n        return value\n\n\nfor engine in (Engine(), InferredEngine()):\n    engine.hook = Hook()\n    assert engine.run() == 12\nassert Unrelated().callback() == 3\n",
     )?;
 
     let pythonpath = std::env::join_paths([dependencies.as_path(), shadow_root.as_path()])?;
@@ -8202,13 +8221,13 @@ fn dependency_callbacks_are_analyzed_through_reexports_without_editing_dependenc
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         std::fs::read_to_string(&initializer)?,
-        "from .engine import Engine\nfrom .hooks import HookBase\n"
+        "from .engine import Engine, InferredEngine\nfrom .hooks import HookBase\n"
     );
     assert_eq!(std::fs::read_to_string(&hooks)?, dependency_source);
     assert_eq!(std::fs::read_to_string(&engine)?, engine_source);
     assert_eq!(
         std::fs::read_to_string(&application)?,
-        "from dependency import Engine, HookBase\n\n\nclass Hook(HookBase):\n    def callback(self, supplied, omitted=2):\n        return supplied + omitted\n\n\nclass Unrelated:\n    def callback(self, value):\n        return value\n\n\nengine = Engine()\nengine.hook = Hook()\nassert engine.run() == 12\nassert Unrelated().callback(value=3) == 3\n"
+        "from dependency import Engine, HookBase, InferredEngine\n\n\nclass Hook(HookBase):\n    def callback(self, supplied, omitted=2):\n        return supplied + omitted\n\n\nclass Unrelated:\n    def callback(self, value):\n        return value\n\n\nfor engine in (Engine(), InferredEngine()):\n    engine.hook = Hook()\n    assert engine.run() == 12\nassert Unrelated().callback(value=3) == 3\n"
     );
     let status = Command::new("python3")
         .arg(&application)

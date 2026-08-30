@@ -14,11 +14,13 @@ use ruff_python_ast::helpers::Truthiness;
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::{walk_except_handler, walk_expr, walk_pattern, walk_stmt, Visitor};
 use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
-use ruff_python_parser::{parse_expression, parse_module};
+use ruff_python_parser::{parse_expression, parse_module, Parsed};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use unicode_width::UnicodeWidthChar as _;
+
+mod ty_resolver;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CallbackCall {
@@ -884,7 +886,11 @@ fn run() -> Result<bool, String> {
         return Ok(false);
     }
     let fixing = cli.fix || cli.diff;
-    let external_callbacks = discover_external_callbacks(&files);
+    ty_resolver::require_ty()?;
+    let project_root = settings
+        .first()
+        .map_or_else(|| Path::new("."), |setting| setting.project_root.as_path());
+    let external_callbacks = discover_external_callbacks(&files, project_root)?;
     let results: Vec<Checked> = files
         .par_iter()
         .zip(settings.par_iter())
@@ -6750,6 +6756,25 @@ struct ExternalModule {
     classes: BTreeMap<String, ExternalClass>,
 }
 
+#[derive(Clone, Debug)]
+struct PendingExternalCall {
+    module: String,
+    offset: usize,
+    method: String,
+    shape: CallbackCall,
+    fallback: Option<(String, String)>,
+}
+
+type ParsedExternalModules = BTreeMap<
+    String,
+    (
+        Parsed<ast::ModModule>,
+        BTreeMap<String, ExternalBinding>,
+        PathBuf,
+        String,
+    ),
+>;
+
 fn python_dependency_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = std::env::var_os("PYTHONPATH")
         .map(|value| std::env::split_paths(&value).collect())
@@ -7050,38 +7075,62 @@ fn external_call_shape(call: &ast::ExprCall) -> CallbackCall {
 }
 
 struct ExternalCallCollector<'a> {
+    module: &'a str,
     class: (String, String),
     receivers: BTreeSet<String>,
     attributes: &'a BTreeMap<String, (String, String)>,
-    calls: &'a mut BTreeMap<(String, String), CallbackMethods>,
+    calls: &'a mut Vec<PendingExternalCall>,
 }
 
 impl Visitor<'_> for ExternalCallCollector<'_> {
     fn visit_expr(&mut self, expression: &Expr) {
         if let Expr::Call(call) = expression {
             if let Expr::Attribute(method) = call.func.as_ref() {
-                let target = match method.value.as_ref() {
+                let (candidate, target) = match method.value.as_ref() {
                     Expr::Name(receiver) if self.receivers.contains(receiver.id.as_str()) => {
-                        Some(self.class.clone())
+                        (true, Some(self.class.clone()))
                     }
                     Expr::Attribute(attribute) if matches!(attribute.value.as_ref(), Expr::Name(receiver) if self.receivers.contains(receiver.id.as_str())) => {
-                        self.attributes.get(attribute.attr.as_str()).cloned()
+                        (true, self.attributes.get(attribute.attr.as_str()).cloned())
                     }
-                    _ => None,
+                    _ => (false, None),
                 };
-                if let Some(target) = target {
-                    self.calls
-                        .entry(target)
-                        .or_default()
-                        .entry(method.attr.to_string())
-                        .or_default()
-                        .calls
-                        .push(external_call_shape(call));
+                if candidate {
+                    self.calls.push(PendingExternalCall {
+                        module: self.module.to_owned(),
+                        offset: method
+                            .end()
+                            .to_usize()
+                            .saturating_sub(method.attr.as_str().len()),
+                        method: method.attr.to_string(),
+                        shape: external_call_shape(call),
+                        fallback: target,
+                    });
                 }
             }
         }
         walk_expr(self, expression);
     }
+}
+
+fn external_class_at_line(suite: &[Stmt], source: &str, line: u32) -> Option<String> {
+    let line = usize::try_from(line).ok()?;
+    suite.iter().find_map(|statement| {
+        let Stmt::ClassDef(class) = statement else {
+            return None;
+        };
+        let start_line = source
+            .get(..class.start().to_usize())?
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let end_line = source
+            .get(..class.end().to_usize())?
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        (line >= start_line && line <= end_line).then(|| class.name.to_string())
+    })
 }
 
 fn resolve_external_class(
@@ -7165,10 +7214,75 @@ fn propagated_external_callbacks(
     ExternalCallbacks(callbacks)
 }
 
-fn discover_external_callbacks(files: &[PathBuf]) -> ExternalCallbacks {
+fn resolve_pending_external_calls(
+    parsed_modules: &ParsedExternalModules,
+    modules: &BTreeMap<String, ExternalModule>,
+    pending_calls: Vec<PendingExternalCall>,
+    project_root: &Path,
+    dependency_roots: &[PathBuf],
+) -> Result<ExternalCallbacks, String> {
+    if pending_calls.is_empty() {
+        return Ok(propagated_external_callbacks(modules, &BTreeMap::new()));
+    }
+    let modules_by_path: BTreeMap<PathBuf, &str> = parsed_modules
+        .iter()
+        .map(|(module, (_, _, path, _))| (comparable_external_path(path), module.as_str()))
+        .collect();
+    let mut ty = ty_resolver::TyResolver::start(project_root, dependency_roots)?;
+    for (_, _, path, source) in parsed_modules.values() {
+        ty.open(path, source)?;
+    }
+    let mut direct: BTreeMap<(String, String), CallbackMethods> = BTreeMap::new();
+    for call in pending_calls {
+        let Some((_, _, path, source)) = parsed_modules.get(&call.module) else {
+            continue;
+        };
+        let locations = ty.definitions(path, source, call.offset)?;
+        let mut targets = BTreeSet::new();
+        for location in locations {
+            let path = comparable_external_path(&location.path);
+            let Some(module) = modules_by_path.get(&path) else {
+                continue;
+            };
+            let Some((parsed, _, _, source)) = parsed_modules.get(*module) else {
+                continue;
+            };
+            if let Some(class) = external_class_at_line(parsed.suite(), source, location.line) {
+                targets.insert(((*module).to_owned(), class));
+            }
+        }
+        if targets.is_empty() {
+            targets.extend(call.fallback);
+        }
+        for target in targets {
+            direct
+                .entry(target)
+                .or_default()
+                .entry(call.method.clone())
+                .or_default()
+                .calls
+                .push(call.shape.clone());
+        }
+    }
+    Ok(propagated_external_callbacks(modules, &direct))
+}
+
+fn comparable_external_path(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if cfg!(windows) {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path
+    }
+}
+
+fn discover_external_callbacks(
+    files: &[PathBuf],
+    project_root: &Path,
+) -> Result<ExternalCallbacks, String> {
     let roots = python_dependency_roots();
     if roots.is_empty() {
-        return ExternalCallbacks::default();
+        return Ok(ExternalCallbacks::default());
     }
     let mut pending = BTreeSet::new();
     for file in files {
@@ -7199,11 +7313,11 @@ fn discover_external_callbacks(files: &[PathBuf]) -> ExternalCallbacks {
         };
         let (bindings, imports) = external_imports(parsed.suite(), &module, is_package);
         pending.extend(imports);
-        parsed_modules.insert(module, (parsed, bindings));
+        parsed_modules.insert(module, (parsed, bindings, path, source));
     }
     let mut modules = BTreeMap::new();
-    let mut direct: BTreeMap<(String, String), CallbackMethods> = BTreeMap::new();
-    for (module_name, (parsed, bindings)) in &parsed_modules {
+    let mut pending_calls = Vec::new();
+    for (module_name, (parsed, bindings, _, _)) in &parsed_modules {
         let mut classes = BTreeMap::new();
         for statement in parsed.suite() {
             let Stmt::ClassDef(class) = statement else {
@@ -7239,10 +7353,11 @@ fn discover_external_callbacks(files: &[PathBuf]) -> ExternalCallbacks {
                     .map(|parameter| BTreeSet::from([parameter.parameter.name.to_string()]))
                     .unwrap_or_default();
                 let mut collector = ExternalCallCollector {
+                    module: module_name,
                     class: (module_name.clone(), class.name.to_string()),
                     receivers,
                     attributes: &attributes,
-                    calls: &mut direct,
+                    calls: &mut pending_calls,
                 };
                 for statement in &function.body {
                     collector.visit_stmt(statement);
@@ -7258,7 +7373,13 @@ fn discover_external_callbacks(files: &[PathBuf]) -> ExternalCallbacks {
             },
         );
     }
-    propagated_external_callbacks(&modules, &direct)
+    resolve_pending_external_calls(
+        &parsed_modules,
+        &modules,
+        pending_calls,
+        project_root,
+        &roots,
+    )
 }
 
 /// Library base classes whose own machinery calls the methods a

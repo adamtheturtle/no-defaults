@@ -70,7 +70,7 @@ Dataclass and model fields become required at construction the same way, and `fi
 
 Nothing is guessed. A call is left alone, and named in a warning, when it cannot be tied to the definition that changed, when the removed default is not a literal, or in any of the other cases listed in the [reference](docs/reference.md#--fix). Defaults in `.pyi` stubs are reported but never removed, since a stub describes a signature rather than supplying one.
 
-Two things `--fix` cannot reach at all: **callers outside the files you checked**, and **calls made dynamically**. A warning after fixing says so, and **your test suite is what confirms the result**. Run it over the whole project at once, and prefer `private_only` with `respect_reexports`, where the symbols it touches have no callers outside the project.
+Two things `--fix` cannot reach in general: **callers outside the files you checked**, and **calls made dynamically**. It does read imported Python packages from `PYTHONPATH` and the active virtual environment to recognize statically visible framework callbacks: a default omitted by one of those dependency calls is retained, while the dependency is never imported, diagnosed, or edited. A warning after fixing covers callers it still cannot see, and **your test suite is what confirms the result**. Run it over the whole project at once, and prefer `private_only` with `respect_reexports`, where the symbols it touches have no callers outside the project.
 
 ## Suppressing
 

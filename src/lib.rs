@@ -10030,6 +10030,25 @@ struct BoundNames {
     /// wants them anyway, because they are the scope's own while the body is
     /// running; a caller asking what a class ends up carrying does not.
     surviving_only: bool,
+    /// Whether these bindings were read off a whole body, so that a name
+    /// `multiply_bound` leaves out really is bound only once.
+    /// [`BoundNames::finish`] sets it. A scope collected from a signature
+    /// alone — a lambda's parameters, a comprehension's targets — has not
+    /// looked at what is written inside it and makes no such claim, which
+    /// matters because a walrus in a lambda body may rebind a parameter.
+    whole_body: bool,
+    /// Names more than one binding in this body reaches, counting a
+    /// `nonlocal` declaration in a nested scope as a binding of its own: an
+    /// assignment under one of those puts something else behind the name
+    /// with nothing out here saying so.
+    multiply_bound: BTreeSet<String>,
+    /// Names an assignment writes an attribute through. Whatever it puts
+    /// there stands in front of the method the class holds, so a call
+    /// through the name no longer reaches the definition.
+    attribute_targets: BTreeSet<String>,
+    /// The class each singly bound local was constructed from, recorded by
+    /// the rewriter as it reaches the assignment.
+    instances: BTreeMap<String, (PathBuf, String)>,
 }
 
 impl BoundNames {
@@ -10037,14 +10056,58 @@ impl BoundNames {
     /// target rebinds nothing by its own name.
     fn bind(&mut self, target: &Expr) {
         match target {
-            Expr::Name(name) => {
-                self.names.insert(name.id.to_string());
-                self.rebound.insert(name.id.to_string());
-            }
+            Expr::Name(name) => self.take(name.id.as_str()),
             Expr::Tuple(tuple) => tuple.elts.iter().for_each(|element| self.bind(element)),
             Expr::List(list) => list.elts.iter().for_each(|element| self.bind(element)),
             Expr::Starred(starred) => self.bind(&starred.value),
+            // An attribute target binds nothing by its own name, but it does
+            // put something on the object the name holds, in front of
+            // whatever that object's class carries.
+            Expr::Attribute(attribute) => {
+                if let Expr::Name(name) = attribute.value.as_ref() {
+                    self.attribute_targets.insert(name.id.to_string());
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Make a name this body's own, noting whether something had already
+    /// bound it. A name more than one binding reaches holds nothing a single
+    /// assignment settles, which is what tells the two apart.
+    fn claim(&mut self, name: &str) {
+        if !self.names.insert(name.to_owned()) {
+            self.multiply_bound.insert(name.to_owned());
+        }
+    }
+
+    /// Claim a name and record that something other than a `def` or a
+    /// `class` statement is what put a value behind it.
+    fn take(&mut self, name: &str) {
+        self.claim(name);
+        self.rebound.insert(name.to_owned());
+    }
+
+    /// Whether one binding in this body settles what a name holds for the
+    /// whole scope.
+    ///
+    /// [`BoundNames::finish`] takes the names a `global` or a `nonlocal`
+    /// declaration hands to a scope outside this one back out of `names`,
+    /// and anything at all may bind those between the assignment and the
+    /// call, so asking what this body owns is what leaves them out.
+    fn sole_binding(&self, name: &str) -> bool {
+        self.whole_body && self.names.contains(name) && !self.multiply_bound.contains(name)
+    }
+
+    /// Bind the name a nested `def` or `class` takes out here, along with
+    /// every name a `nonlocal` declaration written inside it reaches back out
+    /// for. The body is otherwise left alone: everything else in it belongs
+    /// to the scope it makes.
+    fn nested_definition(&mut self, name: &str, body: &[Stmt]) {
+        self.claim(name);
+        for declared in nonlocal_names(body) {
+            self.multiply_bound.insert(declared.clone());
+            self.rebound.insert(declared);
         }
     }
 
@@ -10062,15 +10125,13 @@ impl BoundNames {
             .chain(&parameters.args)
             .chain(&parameters.kwonlyargs)
         {
-            self.names.insert(parameter.parameter.name.to_string());
-            self.rebound.insert(parameter.parameter.name.to_string());
+            self.take(parameter.parameter.name.as_str());
         }
         for parameter in [&parameters.vararg, &parameters.kwarg]
             .into_iter()
             .flatten()
         {
-            self.names.insert(parameter.name.to_string());
-            self.rebound.insert(parameter.name.to_string());
+            self.take(parameter.name.as_str());
         }
     }
 
@@ -10095,6 +10156,7 @@ impl BoundNames {
             self.functions.remove(name);
             self.classes.remove(name);
         }
+        self.whole_body = true;
         self
     }
 
@@ -10211,15 +10273,13 @@ impl<'a> Visitor<'a> for BoundNames {
             // one of those rebinds a name out here with nothing in this body
             // saying so.
             Stmt::FunctionDef(function) => {
-                self.names.insert(function.name.to_string());
                 self.functions.insert(function.name.to_string());
-                self.rebound.extend(nonlocal_names(&function.body));
+                self.nested_definition(function.name.as_str(), &function.body);
                 return;
             }
             Stmt::ClassDef(class) => {
-                self.names.insert(class.name.to_string());
                 self.classes.insert(class.name.to_string());
-                self.rebound.extend(nonlocal_names(&class.body));
+                self.nested_definition(class.name.as_str(), &class.body);
                 return;
             }
             Stmt::Import(import) => {
@@ -10235,8 +10295,7 @@ impl<'a> Visitor<'a> for BoundNames {
                         },
                         ToString::to_string,
                     );
-                    self.names.insert(bound.clone());
-                    self.rebound.insert(bound);
+                    self.take(&bound);
                 }
             }
             Stmt::ImportFrom(import) => {
@@ -10245,16 +10304,14 @@ impl<'a> Visitor<'a> for BoundNames {
                         .asname
                         .as_ref()
                         .map_or_else(|| alias.name.to_string(), ToString::to_string);
-                    self.names.insert(bound.clone());
-                    self.rebound.insert(bound);
+                    self.take(&bound);
                 }
             }
             Stmt::Try(block) if !self.surviving_only => {
                 for handler in &block.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
                     if let Some(name) = &handler.name {
-                        self.names.insert(name.to_string());
-                        self.rebound.insert(name.to_string());
+                        self.take(name.as_str());
                     }
                 }
             }
@@ -10322,20 +10379,17 @@ impl<'a> Visitor<'a> for BoundNames {
         match pattern {
             Pattern::MatchMapping(mapping) => {
                 if let Some(name) = &mapping.rest {
-                    self.names.insert(name.to_string());
-                    self.rebound.insert(name.to_string());
+                    self.take(name.as_str());
                 }
             }
             Pattern::MatchStar(star) => {
                 if let Some(name) = &star.name {
-                    self.names.insert(name.to_string());
-                    self.rebound.insert(name.to_string());
+                    self.take(name.as_str());
                 }
             }
             Pattern::MatchAs(as_pattern) => {
                 if let Some(name) = &as_pattern.name {
-                    self.names.insert(name.to_string());
-                    self.rebound.insert(name.to_string());
+                    self.take(name.as_str());
                 }
             }
             _ => {}
@@ -10891,6 +10945,21 @@ impl Rewriter<'_> {
             if let Some((file, class)) = self.nested_class(name.id.as_str()) {
                 return Some((file, class, false, false));
             }
+            // A local the scope binds once holds the instance it was given
+            // for as long as that scope runs, so a call through it reaches
+            // exactly what writing the assigned expression out in its place
+            // would have reached. Only the scope being walked is asked: a
+            // body nested in it reads the same closure cell, but resolving
+            // through one takes back a retention that is holding a default
+            // in place for calls this run cannot write into at all, which
+            // issue #1137 has to settle first.
+            if let Some((file, class)) = self
+                .scopes
+                .last()
+                .and_then(|scope| scope.instances.get(name.id.as_str()))
+            {
+                return Some((file.clone(), class.clone(), true, false));
+            }
             if self
                 .scopes
                 .iter()
@@ -10963,6 +11032,100 @@ impl Rewriter<'_> {
         match self.binding(&dotted)? {
             Binding::Module(file) => Some((file.clone(), attribute.attr.to_string(), false, false)),
             Binding::Symbol(..) | Binding::Unknown => None,
+        }
+    }
+
+    /// Remember that a local names an instance of a class this file can
+    /// name, so that a call written through the local resolves the way the
+    /// expression it was assigned from does in its place.
+    ///
+    /// Only a name the scope binds exactly once carries this. A second
+    /// binding anywhere in the body leaves the name holding something else
+    /// by the time the call runs, and an attribute written through the name
+    /// puts its own value in front of the method the class holds, so neither
+    /// is read as an instance.
+    fn record_constructed_local(&mut self, statement: &Stmt) {
+        // An annotation is not checked when the statement runs, so what the
+        // name ends up holding is the value either spelling assigns, and an
+        // annotated assignment is read like the bare one. A bare annotation
+        // assigns nothing and so says nothing about the name.
+        let (target, value) = match statement {
+            Stmt::Assign(assign) => match &*assign.targets {
+                [Expr::Name(target)] => (target, assign.value.as_ref()),
+                _ => return,
+            },
+            Stmt::AnnAssign(assign) => match (assign.target.as_ref(), assign.value.as_deref()) {
+                (Expr::Name(target), Some(value)) => (target, value),
+                _ => return,
+            },
+            _ => return,
+        };
+        self.record_instance(target, value);
+    }
+
+    /// Remember what a name a single binding settles was given, on the scope
+    /// the rewriter is walking.
+    ///
+    /// Asking that scope whether the binding is its only one is what keeps a
+    /// walrus honest: one written inside a comprehension or a lambda binds
+    /// out in the body around it rather than in the scope being walked, and
+    /// neither of those scopes is collected with the body's own bindings, so
+    /// neither claims the name and nothing is recorded for it.
+    fn record_instance(&mut self, target: &ast::ExprName, value: &Expr) {
+        let settled = self.scopes.last().is_some_and(|scope| {
+            scope.sole_binding(target.id.as_str())
+                && !scope.attribute_targets.contains(target.id.as_str())
+        });
+        if !settled {
+            return;
+        }
+        // Only an instance is carried across: a class assigned to a local is
+        // still a class, and `super()` hands back a proxy that starts its
+        // lookup above the class the assignment was written in, so neither
+        // answers to what the local holds.
+        let Some((file, class, true, false)) = self.receiving_class(value) else {
+            return;
+        };
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.instances.insert(target.id.to_string(), (file, class));
+        }
+    }
+
+    /// Take the name a walrus binds off whatever was there before it, in the
+    /// scope the binding actually reaches: a lambda body written inside a
+    /// function keeps its own, and anywhere else it is the body around it.
+    fn bind_walrus_target(&mut self, named: &ast::ExprNamed) {
+        if let Expr::Name(target) = named.target.as_ref() {
+            self.record_instance(target, &named.value);
+        }
+        let mut rebound = BoundNames::default();
+        rebound.bind(&named.target);
+        let function_depth = self
+            .binding_scope_depths
+            .last()
+            .copied()
+            .filter(|_| self.bindings.len() > 1);
+        let lambda_owner = self
+            .lambda_scope_depths
+            .last()
+            .copied()
+            .filter(|lambda| function_depth.is_none_or(|function| *lambda > function));
+        if let Some(lambda) = lambda_owner {
+            if let Some(scope) = self.scopes.get_mut(lambda) {
+                scope.names.extend(rebound.names);
+            }
+        } else if let Some(bindings) = self
+            .bindings
+            .last_mut()
+            .filter(|_| function_depth.is_some())
+        {
+            for name in rebound.names {
+                bindings.remove(&name);
+            }
+        } else {
+            self.invalidated_bindings
+                .extend(rebound.names.iter().cloned());
+            self.rebound_classes.extend(rebound.names);
         }
     }
 
@@ -12333,6 +12496,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         bindings.remove(&name);
                     }
                 }
+                self.record_constructed_local(statement);
             }
             Stmt::For(loop_statement) if self.scopes.is_empty() => {
                 // The iterable is evaluated before the first target binding.
@@ -12786,35 +12950,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
             Expr::Named(named) => {
                 self.visit_expr(&named.value);
                 self.visit_expr(&named.target);
-                let mut rebound = BoundNames::default();
-                rebound.bind(&named.target);
-                let function_depth = self
-                    .binding_scope_depths
-                    .last()
-                    .copied()
-                    .filter(|_| self.bindings.len() > 1);
-                let lambda_owner = self
-                    .lambda_scope_depths
-                    .last()
-                    .copied()
-                    .filter(|lambda| function_depth.is_none_or(|function| *lambda > function));
-                if let Some(lambda) = lambda_owner {
-                    if let Some(scope) = self.scopes.get_mut(lambda) {
-                        scope.names.extend(rebound.names);
-                    }
-                } else if let Some(bindings) = self
-                    .bindings
-                    .last_mut()
-                    .filter(|_| function_depth.is_some())
-                {
-                    for name in rebound.names {
-                        bindings.remove(&name);
-                    }
-                } else {
-                    self.invalidated_bindings
-                        .extend(rebound.names.iter().cloned());
-                    self.rebound_classes.extend(rebound.names);
-                }
+                self.bind_walrus_target(named);
                 return;
             }
             Expr::Call(call) => {
@@ -25743,6 +25879,262 @@ def b(x=1): pass  # type: ignore  # noqa
         // left alone.
         let source = "class Other:\n    def own(self):\n        return 9\n\n\ndef outer(flag):\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        value = 0\n        match flag:\n            case [Child]:\n                value = Child.own()\n            case _:\n                pass\n\n    return Holder.value\n\n\nassert outer([Other()]) == 9, outer([Other()])\n";
         assert_eq!(fixed(source)?, "class Other:\n    def own(self):\n        return 9\n\n\ndef outer(flag):\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        value = 0\n        match flag:\n            case [Child]:\n                value = Child.own()\n            case _:\n                pass\n\n    return Holder.value\n\n\nassert outer([Other()]) == 9, outer([Other()])\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_built_from_a_class_carries_it_into_the_call() -> Result<(), String> {
+        // A local a function body binds once from a construction holds an
+        // instance of that class for as long as the body runs, so the call
+        // written through it reaches the same method the construction
+        // spelled out in its place would, and the deleted default goes
+        // into it.
+        let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    made = Child()\n    return made.own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    made = Child()\n    return made.own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_bound_from_an_unknown_receiver_carries_nothing() -> Result<(), String> {
+        // The other direction: nothing in the file says what the parameter
+        // holds, so the local it is copied into says nothing either and
+        // the call through it is left alone.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(given):\n    made = given\n    return made.own()\n\n\nassert outer(Other()) == 9, outer(Other())\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(given):\n    made = given\n    return made.own()\n\n\nassert outer(Other()) == 9, outer(Other())\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_bound_from_super_is_no_instance_of_its_own_class() -> Result<(), String> {
+        // `super()` hands back a proxy whose lookup starts above the class
+        // the call is written in, so a local bound from it is not an
+        // instance of that class and a call through it must not be given
+        // that class's deleted default.
+        let source = "class Base:\n    def own(self):\n        return 7\n\n\nclass Child(Base):\n    def own(self, extra=9):\n        made = super()\n        return made.own()\n\n\nassert Child().own() == 7, Child().own()\n";
+        assert_eq!(fixed(source)?, "class Base:\n    def own(self):\n        return 7\n\n\nclass Child(Base):\n    def own(self, extra):\n        made = super()\n        return made.own()\n\n\nassert Child().own(extra=9) == 7, Child().own(extra=9)\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_built_in_a_method_body_carries_the_class() -> Result<(), String> {
+        // The other direction: a construction written in a method body is
+        // read the same way as one written anywhere else.
+        let source = "class Base:\n    def own(self, extra=7):\n        return extra\n\n\nclass Child:\n    def go(self):\n        made = Base()\n        return made.own()\n\n\nassert Child().go() == 7, Child().go()\n";
+        assert_eq!(fixed(source)?, "class Base:\n    def own(self, extra):\n        return extra\n\n\nclass Child:\n    def go(self):\n        made = Base()\n        return made.own(extra=7)\n\n\nassert Child().go() == 7, Child().go()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_a_branch_binds_again_carries_no_class() -> Result<(), String> {
+        // A second assignment leaves the name holding something else by
+        // the time the call runs, so neither of them stands for the whole
+        // body. The construction of the class being fixed is written
+        // second, so a reading that took the last assignment for the answer
+        // would write its default into a call that reaches the other class.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(flag):\n    made = Other()\n    if flag:\n        made = Child()\n    return made.own()\n\n\nassert outer(0) == 9, outer(0)\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(flag):\n    made = Other()\n    if flag:\n        made = Child()\n    return made.own()\n\n\nassert outer(0) == 9, outer(0)\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_bound_once_beside_a_branch_carries_the_class() -> Result<(), String> {
+        // The other direction: a branch that binds nothing leaves the one
+        // assignment standing for the whole body.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer(flag):\n    made = Child()\n    if flag:\n        pass\n    return made.own()\n\n\nassert outer(1) == 7, outer(1)\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer(flag):\n    made = Child()\n    if flag:\n        pass\n    return made.own(extra=7)\n\n\nassert outer(1) == 7, outer(1)\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_binding_the_local_again_carries_no_class() -> Result<(), String> {
+        // A walrus binds in the scope holding it, so it is a second
+        // binding of the name however deeply it is written. The
+        // construction of the class being fixed is the second of the two, so
+        // a reading that took the last binding for the answer would write
+        // its default into a call that reaches the other class.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(flag):\n    made = Other()\n    if flag and (made := Child()):\n        pass\n    return made.own()\n\n\nassert outer(0) == 9, outer(0)\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(flag):\n    made = Other()\n    if flag and (made := Child()):\n        pass\n    return made.own()\n\n\nassert outer(0) == 9, outer(0)\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_binding_another_name_leaves_the_local_standing() -> Result<(), String> {
+        // The other direction: a walrus over a different name takes
+        // nothing from the local beside it.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer(flag):\n    made = Child()\n    if flag and (seen := 1):\n        pass\n    return made.own()\n\n\nassert outer(1) == 7, outer(1)\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer(flag):\n    made = Child()\n    if flag and (seen := 1):\n        pass\n    return made.own(extra=7)\n\n\nassert outer(1) == 7, outer(1)\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameter_the_body_binds_again_carries_no_class() -> Result<(), String> {
+        // A parameter is a binding of its own, so a body that assigns over
+        // it only sometimes leaves the name holding whatever the caller
+        // passed.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(made):\n    if made is None:\n        made = Child()\n    return made.own()\n\n\nassert outer(Other()) == 9, outer(Other())\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(made):\n    if made is None:\n        made = Child()\n    return made.own()\n\n\nassert outer(Other()) == 9, outer(Other())\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_beside_a_parameter_of_another_name_carries_the_class() -> Result<(), String> {
+        // The other direction: a parameter of a different name takes
+        // nothing from the local.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer(flag):\n    made = Child()\n    return made.own()\n\n\nassert outer(1) == 7, outer(1)\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer(flag):\n    made = Child()\n    return made.own(extra=7)\n\n\nassert outer(1) == 7, outer(1)\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_nonlocal_declaration_below_takes_the_class_off_a_local() -> Result<(), String> {
+        // An assignment under a `nonlocal` declaration binds out here with
+        // nothing written out here saying so, so the name is no more
+        // settled than one this body binds twice.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Child()\n\n    def swap():\n        nonlocal made\n        made = Other()\n\n    swap()\n    return made.own()\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Child()\n\n    def swap():\n        nonlocal made\n        made = Other()\n\n    swap()\n    return made.own()\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_binding_of_its_own_leaves_the_local_standing() -> Result<(), String> {
+        // The other direction: without the declaration the nested
+        // assignment binds a name of the nested body's own, and each scope
+        // keeps what its own assignment put there.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Child()\n\n    def swap():\n        made = Other()\n        return made.own()\n\n    swap()\n    return made.own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Child()\n\n    def swap():\n        made = Other()\n        return made.own()\n\n    swap()\n    return made.own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_attribute_written_through_a_local_takes_the_class_off_it() -> Result<(), String> {
+        // An attribute assigned through the name puts a value of its own
+        // in front of what the class holds, so the call no longer reaches
+        // the definition the default was taken from.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    made = Child()\n    made.own = lambda: 9\n    return made.own()\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    made = Child()\n    made.own = lambda: 9\n    return made.own()\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_attribute_written_through_another_local_leaves_this_one_standing() -> Result<(), String> {
+        // The other direction: an attribute written on a different object
+        // leaves the local beside it holding what it was built from.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    made = Child()\n    other = Child()\n    other.own = lambda: 9\n    return made.own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    made = Child()\n    other = Child()\n    other.own = lambda: 9\n    return made.own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_import_taking_the_local_name_takes_the_class_off_it() -> Result<(), String> {
+        // An import binds the name too, and the module it puts there is
+        // what the call below reaches.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    made = Child()\n    import io as made\n\n    return made.own()\n\n\ntry:\n    outer()\nexcept AttributeError:\n    pass\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    made = Child()\n    import io as made\n\n    return made.own()\n\n\ntry:\n    outer()\nexcept AttributeError:\n    pass\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_except_target_taking_the_local_name_takes_the_class_off_it() -> Result<(), String> {
+        // An `except ... as` target binds the name for the length of its
+        // handler, and the call written in there reaches the exception.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other(Exception):\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Child()\n    try:\n        raise Other\n    except Other as made:\n        return made.own()\n    return None\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other(Exception):\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Child()\n    try:\n        raise Other\n    except Other as made:\n        return made.own()\n    return None\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_match_capture_taking_the_local_name_takes_the_class_off_it() -> Result<(), String> {
+        // A capture pattern binds the name as well, so what the assignment
+        // above put there is not what the case body sees.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(value):\n    made = Child()\n    match value:\n        case [made]:\n            return made.own()\n    return None\n\n\nassert outer([Other()]) == 9, outer([Other()])\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(value):\n    made = Child()\n    match value:\n        case [made]:\n            return made.own()\n    return None\n\n\nassert outer([Other()]) == 9, outer([Other()])\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_definition_taking_the_local_name_takes_the_class_off_it() -> Result<(), String> {
+        // A `def` binds its own name here, so the function it makes is
+        // what stands behind the name by the time the call is reached.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    made = Child()\n\n    def made():\n        return 9\n\n    return made.own()\n\n\ntry:\n    outer()\nexcept AttributeError:\n    pass\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    made = Child()\n\n    def made():\n        return 9\n\n    return made.own()\n\n\ntry:\n    outer()\nexcept AttributeError:\n    pass\n");
+        Ok(())
+    }
+
+    #[test]
+    fn statements_binding_other_names_leave_the_local_standing() -> Result<(), String> {
+        // The other direction for all four: an import, an `except ... as`,
+        // a capture pattern and a `def` that take names of their own leave
+        // the local beside them holding what it was built from.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer(value):\n    made = Child()\n    import io as stream\n\n    def helper():\n        return stream\n\n    try:\n        raise ValueError\n    except ValueError as problem:\n        helper()\n    match value:\n        case [seen]:\n            pass\n    return made.own()\n\n\nassert outer([1]) == 7, outer([1])\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer(value):\n    made = Child()\n    import io as stream\n\n    def helper():\n        return stream\n\n    try:\n        raise ValueError\n    except ValueError as problem:\n        helper()\n    match value:\n        case [seen]:\n            pass\n    return made.own(extra=7)\n\n\nassert outer([1]) == 7, outer([1])\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotated_assignment_carries_the_class_like_a_bare_one() -> Result<(), String> {
+        // An annotation is not checked when the statement runs, so what
+        // the name holds is the value the assignment gives it whatever the
+        // annotation says, and `made: Child = Child()` is read like the
+        // bare spelling.
+        let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    made: Child = Child()\n    return made.own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    made: Child = Child()\n    return made.own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_annotation_puts_nothing_behind_the_local() -> Result<(), String> {
+        // The other direction: a bare annotation makes the name the body's
+        // own without assigning to it, so the assignment beside it is
+        // still the one binding, and nothing in the file says what that
+        // one gives.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(given):\n    made: Child\n    made = given\n    return made.own()\n\n\nassert outer(Other()) == 9, outer(Other())\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer(given):\n    made: Child\n    made = given\n    return made.own()\n\n\nassert outer(Other()) == 9, outer(Other())\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_binding_the_local_carries_the_class() -> Result<(), String> {
+        // A walrus binds in the body around it just as an assignment
+        // statement does, so a local it settles carries the instance it
+        // was given to the call below.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    if (made := Child()):\n        return made.own()\n    return None\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    if (made := Child()):\n        return made.own(extra=7)\n    return None\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_written_in_a_generator_carries_nothing() -> Result<(), String> {
+        // The other direction: a walrus written in a generator expression
+        // binds in the body around the generator rather than where it is
+        // written, and it runs only when the generator is first drawn, so
+        // what stands behind the name where the call is written is
+        // whatever bound it last. The scope the rewriter is walking is the
+        // generator's, which claims no such name, so nothing is recorded
+        // and the call is left alone.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Other()\n    drawn = ((made := Child()) for _ in range(1))\n    return made.own()\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Other()\n    drawn = ((made := Child()) for _ in range(1))\n    return made.own()\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_rebinding_a_lambda_parameter_carries_no_class() -> Result<(), String> {
+        // A lambda's scope is collected from its parameters alone, so it
+        // has not seen the walrus in its body and cannot say the name is
+        // bound once. The walrus here runs only where the flag is set, and
+        // the call below it reaches whatever the caller passed everywhere
+        // else, so nothing may be written into it.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\nrun = lambda made, flag: (flag and (made := Child())) or made.own()\n\nassert run(Other(), False) == 9, run(Other(), False)\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\nrun = lambda made, flag: (flag and (made := Child())) or made.own()\n\nassert run(Other(), False) == 9, run(Other(), False)\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_beside_a_parameter_in_a_function_carries_no_class() -> Result<(), String> {
+        // The same shape written as a function is turned down for the
+        // ordinary reason: a body is read whole, so the parameter and the
+        // walrus are two bindings of the one name.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef run(made, flag):\n    return (flag and (made := Child())) or made.own()\n\n\nassert run(Other(), False) == 9, run(Other(), False)\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef run(made, flag):\n    return (flag and (made := Child())) or made.own()\n\n\nassert run(Other(), False) == 9, run(Other(), False)\n");
         Ok(())
     }
 }

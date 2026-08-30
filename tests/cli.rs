@@ -7646,3 +7646,46 @@ fn import_callback_names_off_the_hierarchy_are_still_fixed(
     assert_eq!(output.status.code(), Some(0));
     Ok(())
 }
+
+#[test]
+fn a_global_declaration_keeps_a_constructed_local_from_carrying_its_class(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // `global made` hands the name to the module, where anything at all may
+    // bind it between the assignment and the call — here another function
+    // does exactly that. Nothing is written into the call, so the default it
+    // would have needed is held back and the file is left as it stands.
+    let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\nmade = None\n\n\ndef swap():\n    global made\n    made = Other()\n\n\ndef go():\n    global made\n    made = Child()\n    swap()\n    return made.own()\n\n\nassert go() == 9, go()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(std::fs::read_to_string(&case)?, source);
+    assert_eq!(output.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_local_the_body_owns_carries_its_class_past_a_call_out(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let case = directory.path().join("case.py");
+    // The other direction: without the declaration the name is the body's
+    // own, so what another function does to the module-level name of the
+    // same spelling reaches nothing here and the deleted default is written
+    // into the call.
+    let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\nmade = None\n\n\ndef swap():\n    global made\n    made = Other()\n\n\ndef go():\n    made = Child()\n    swap()\n    return made.own()\n\n\nassert go() == 7, go()\n";
+    std::fs::write(&case, source)?;
+    let output = Command::new(binary())
+        .arg("--fix")
+        .arg(directory.path())
+        .output()?;
+    assert_eq!(
+        std::fs::read_to_string(&case)?,
+        "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\nmade = None\n\n\ndef swap():\n    global made\n    made = Other()\n\n\ndef go():\n    made = Child()\n    swap()\n    return made.own(extra=7)\n\n\nassert go() == 7, go()\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    Ok(())
+}

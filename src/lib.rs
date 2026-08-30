@@ -10473,11 +10473,36 @@ impl Rewriter<'_> {
     /// Bind in the class body what a statement in it binds, once that
     /// statement has run: a class body binds in statement order.
     fn bind_statement_in_class(&mut self, statement: &Stmt) {
+        let bound = BoundNames::of_body(std::slice::from_ref(statement));
+        let rebound: Vec<String> = bound
+            .names
+            .iter()
+            .filter(|name| !bound.functions.contains(*name) && !bound.classes.contains(*name))
+            .cloned()
+            .collect();
+        self.rebind_in_class(rebound);
         if let Some(scope) = self.scopes.last_mut() {
-            let bound = BoundNames::of_body(std::slice::from_ref(statement));
             scope.names.extend(bound.names);
             scope.functions.extend(bound.functions);
             scope.classes.extend(bound.classes);
+        }
+    }
+
+    /// Take a name the class body being walked binds off whatever definition
+    /// an earlier statement in that body put behind it.
+    ///
+    /// A class body is filled statement by statement rather than read whole,
+    /// so unlike a function scope it cannot say up front which of its names a
+    /// rebinding touches. Clearing the name as the rebinding is walked is what
+    /// keeps a call below it from resolving against a class the name no longer
+    /// stands for.
+    fn rebind_in_class(&mut self, names: impl IntoIterator<Item = String>) {
+        if let Some(scope) = self.scopes.last_mut() {
+            for name in names {
+                scope.functions.remove(&name);
+                scope.classes.remove(&name);
+                scope.names.insert(name);
+            }
         }
     }
 
@@ -11778,9 +11803,7 @@ impl<'a> Rewriter<'a> {
             })
             .collect();
         self.invalidate_class_bindings(captures.names.iter().cloned());
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.names.extend(captures.names.iter().cloned());
-        }
+        self.rebind_in_class(captures.names.iter().cloned());
         if let Some(guard) = &case.guard {
             self.visit_expr(guard);
         }
@@ -12246,9 +12269,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                 let mut target = BoundNames::default();
                 target.bind(&loop_statement.target);
                 self.invalidate_class_bindings(target.names.iter().cloned());
-                if let Some(scope) = self.scopes.last_mut() {
-                    scope.names.extend(target.names);
-                }
+                self.rebind_in_class(target.names);
                 self.visit_body(&loop_statement.body);
                 self.visit_body(&loop_statement.orelse);
             }
@@ -12260,9 +12281,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                         let mut bound = BoundNames::default();
                         bound.bind(target);
                         self.invalidate_class_bindings(bound.names.iter().cloned());
-                        if let Some(scope) = self.scopes.last_mut() {
-                            scope.names.extend(bound.names);
-                        }
+                        self.rebind_in_class(bound.names);
                     }
                 }
                 self.visit_body(&block.body);
@@ -12468,9 +12487,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     let mut captures = BoundNames::default();
                     captures.visit_pattern(&case.pattern);
                     self.invalidate_class_bindings(captures.names.iter().cloned());
-                    if let Some(scope) = self.scopes.last_mut() {
-                        scope.names.extend(captures.names);
-                    }
+                    self.rebind_in_class(captures.names);
                     if let Some(guard) = &case.guard {
                         self.visit_expr(guard);
                         match Truthiness::from_expr(guard, |_| false) {
@@ -12488,9 +12505,7 @@ impl<'a> Visitor<'a> for Rewriter<'a> {
                     break;
                 }
                 self.invalidate_class_bindings(uncertain.iter().cloned());
-                if let Some(scope) = self.scopes.last_mut() {
-                    scope.names.extend(uncertain);
-                }
+                self.rebind_in_class(uncertain);
             }
             Stmt::Match(match_statement) if self.scopes.is_empty() => {
                 self.visit_expr(&match_statement.subject);
@@ -25612,6 +25627,51 @@ def b(x=1): pass  # type: ignore  # noqa
         // function scope's class instead — which is what Python does too.
         let source = "def outer():\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        Child = Other\n\n        def go(self):\n            return Child().own()\n\n    return Holder().go()\n\n\nassert outer() == 7, outer()\n";
         assert_eq!(fixed(source)?, "def outer():\n    class Child:\n        def own(self, extra):\n            return extra\n\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        Child = Other\n\n        def go(self):\n            return Child().own(extra=7)\n\n    return Holder().go()\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_assignment_below_a_class_body_class_takes_the_name_off_it() -> Result<(), String> {
+        // A class body is filled statement by statement, so a name a class
+        // statement bound is taken off it again by an assignment further down
+        // and the call below reaches whatever that put there instead.
+        let source = "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        Child = Other\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        Child = Other\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_loop_target_below_a_class_body_class_takes_the_name_off_it() -> Result<(), String> {
+        // A `for` target binds in the class body the same way, and the class
+        // written above it answers for nothing afterwards.
+        let source = "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        for Child in [Other]:\n            pass\n\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        for Child in [Other]:\n            pass\n\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_below_a_class_body_class_takes_the_name_off_it() -> Result<(), String> {
+        // So does a walrus, which binds in the class body it is written in.
+        let source = "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        flag = (Child := Other)\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        flag = (Child := Other)\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_with_target_below_a_class_body_class_takes_the_name_off_it() -> Result<(), String> {
+        // And so does a `with` target.
+        let source = "import contextlib\n\n\ndef outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        with contextlib.nullcontext(Other) as Child:\n            pass\n\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n";
+        assert_eq!(fixed(source)?, "import contextlib\n\n\ndef outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        with contextlib.nullcontext(Other) as Child:\n            pass\n\n        value = Child().own()\n\n    return Holder.value\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_call_above_a_class_body_rebinding_still_reads_the_class() -> Result<(), String> {
+        // Statement order is what decides: the call is written before the
+        // rebinding, so the class beside it is still what it reaches and the
+        // deleted default is carried into it.
+        let source = "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n        value = Child().own()\n        Child = Other\n\n    return Holder.value\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Other:\n        def own(self):\n            return 9\n\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n        value = Child().own(extra=7)\n        Child = Other\n\n    return Holder.value\n\n\nassert outer() == 7, outer()\n");
         Ok(())
     }
 }

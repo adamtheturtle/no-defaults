@@ -10030,6 +10030,13 @@ struct BoundNames {
     /// wants them anyway, because they are the scope's own while the body is
     /// running; a caller asking what a class ends up carrying does not.
     surviving_only: bool,
+    /// Whether these bindings were read off a whole body, so that a name
+    /// `multiply_bound` leaves out really is bound only once.
+    /// [`BoundNames::finish`] sets it. A scope collected from a signature
+    /// alone — a lambda's parameters, a comprehension's targets — has not
+    /// looked at what is written inside it and makes no such claim, which
+    /// matters because a walrus in a lambda body may rebind a parameter.
+    whole_body: bool,
     /// Names more than one binding in this body reaches, counting a
     /// `nonlocal` declaration in a nested scope as a binding of its own: an
     /// assignment under one of those puts something else behind the name
@@ -10089,7 +10096,7 @@ impl BoundNames {
     /// and anything at all may bind those between the assignment and the
     /// call, so asking what this body owns is what leaves them out.
     fn sole_binding(&self, name: &str) -> bool {
-        self.names.contains(name) && !self.multiply_bound.contains(name)
+        self.whole_body && self.names.contains(name) && !self.multiply_bound.contains(name)
     }
 
     /// Bind the name a nested `def` or `class` takes out here, along with
@@ -10149,6 +10156,7 @@ impl BoundNames {
             self.functions.remove(name);
             self.classes.remove(name);
         }
+        self.whole_body = true;
         self
     }
 
@@ -26105,6 +26113,28 @@ def b(x=1): pass  # type: ignore  # noqa
         // and the call is left alone.
         let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Other()\n    drawn = ((made := Child()) for _ in range(1))\n    return made.own()\n\n\nassert outer() == 9, outer()\n";
         assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef outer():\n    made = Other()\n    drawn = ((made := Child()) for _ in range(1))\n    return made.own()\n\n\nassert outer() == 9, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_rebinding_a_lambda_parameter_carries_no_class() -> Result<(), String> {
+        // A lambda's scope is collected from its parameters alone, so it
+        // has not seen the walrus in its body and cannot say the name is
+        // bound once. The walrus here runs only where the flag is set, and
+        // the call below it reaches whatever the caller passed everywhere
+        // else, so nothing may be written into it.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\nrun = lambda made, flag: (flag and (made := Child())) or made.own()\n\nassert run(Other(), False) == 9, run(Other(), False)\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\nrun = lambda made, flag: (flag and (made := Child())) or made.own()\n\nassert run(Other(), False) == 9, run(Other(), False)\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_walrus_beside_a_parameter_in_a_function_carries_no_class() -> Result<(), String> {
+        // The same shape written as a function is turned down for the
+        // ordinary reason: a body is read whole, so the parameter and the
+        // walrus are two bindings of the one name.
+        let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef run(made, flag):\n    return (flag and (made := Child())) or made.own()\n\n\nassert run(Other(), False) == 9, run(Other(), False)\n";
+        assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\nclass Other:\n    def own(self):\n        return 9\n\n\ndef run(made, flag):\n    return (flag and (made := Child())) or made.own()\n\n\nassert run(Other(), False) == 9, run(Other(), False)\n");
         Ok(())
     }
 }

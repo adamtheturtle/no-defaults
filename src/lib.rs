@@ -154,9 +154,13 @@ impl FieldBases {
             // A configured base is matched by its bare spelling, so a
             // parameter named after one would otherwise keep matching inside
             // the function it is bound in, where the name stands for whatever
-            // the caller passed rather than for the library's class.
+            // the caller passed rather than for the library's class. An
+            // assignment takes the spelling over in exactly the same way: what
+            // it puts there is what a class written below is built on, and the
+            // library's class is no longer reachable under the name.
             Expr::Name(name) => {
                 !aliases.parameter_bindings.contains(name.id.as_str())
+                    && !aliases.assigned_bindings.contains(name.id.as_str())
                     && self.names.contains(aliases.resolve(name.id.as_str()))
             }
             Expr::Attribute(attribute) => self.names.contains(attribute.attr.as_str()),
@@ -1294,6 +1298,12 @@ struct LocalClass {
     /// Code written in one of them runs only where this class statement did
     /// not, so the spelling names whatever stood behind it there instead.
     hidden_from: Vec<TextRange>,
+    /// Whether a second class statement of this spelling, written where the
+    /// first has already run rather than in a clause beside it, binds a name
+    /// the first already bound. Both bodies are indexed under the one identity
+    /// the spelling carries, which keeps a single entry per name, so a lookup
+    /// that finds it may be reaching the other class's method.
+    collapsed: bool,
 }
 
 impl LocalClass {
@@ -1433,7 +1443,13 @@ fn local_class_identities(
     last_class_offsets(statements, &mut last_written);
     spellings
         .into_iter()
-        .map(|(spelling, (defined_at, hidden_from))| {
+        .map(|(spelling, spelled)| {
+            let SpelledClass {
+                defined_at,
+                hidden_from,
+                collapsed,
+                ..
+            } = spelled;
             let identity = namespace.identity(&spelling);
             // A dotted spelling is reclaimed by an import of its root, which
             // is the name the import actually binds: once `package` is the
@@ -1463,6 +1479,7 @@ fn local_class_identities(
                     defined_at,
                     superseded_at,
                     hidden_from,
+                    collapsed,
                 },
             )
         })
@@ -1691,6 +1708,24 @@ fn index_scope_method_bases(
                     definitions,
                     scope,
                 );
+                // The scope writes this spelling more than once and the bodies
+                // bind a name in common, so the one identity they share keeps
+                // a single entry for it and a lookup that finds that entry may
+                // be reaching the other class's method. Nothing here says
+                // which of them a base spelled with the name was built on, so
+                // the ancestry is held unknown: the defaults behind it are
+                // kept and the calls it would have answered are reported
+                // rather than rewritten against a signature the file does not
+                // settle.
+                if scope
+                    .classes
+                    .get(class.name.as_str())
+                    .is_some_and(|local| local.collapsed)
+                {
+                    definitions
+                        .uncertain_bases
+                        .insert((importer.to_path_buf(), identity.clone()));
+                }
                 index_class_body_method_bases(
                     class,
                     &identity,
@@ -1724,7 +1759,17 @@ fn index_scope_method_bases(
                 let Some((value, targets)) = assigned_value_and_targets(statement) else {
                     continue;
                 };
-                let Some(identity) = method_base_identity(
+                // A name that stands for either of two classes hands that
+                // doubt on: what is read here is whichever class the name it
+                // was read from turned out to be, so the target is no more
+                // settled than the source was. The doubt is read before the
+                // value is resolved, because competing suites that bind a name
+                // for the first time write no class behind it for the
+                // resolution to find, and reading the doubt afterwards would
+                // drop it along with the failed resolution.
+                let contested_source =
+                    base_root_name(value).is_some_and(|name| scope.contested.contains(name));
+                let identity = method_base_identity(
                     value,
                     importer,
                     bindings,
@@ -1732,15 +1777,10 @@ fn index_scope_method_bases(
                     defined_at,
                     &scope.aliases,
                     &definitions.methods,
-                ) else {
+                );
+                if identity.is_none() && !contested_source {
                     continue;
-                };
-                // A name that stands for either of two classes hands that
-                // doubt on: what is read here is whichever class the name it
-                // was read from turned out to be, so the target is no more
-                // settled than the source was.
-                let contested_source =
-                    base_root_name(value).is_some_and(|name| scope.contested.contains(name));
+                }
                 for target in targets {
                     if let Expr::Name(alias) = target {
                         // An assignment no alternative suite guards takes the
@@ -1751,6 +1791,9 @@ fn index_scope_method_bases(
                         } else if !scope.namespace.alternative {
                             scope.contested.remove(alias.id.as_str());
                         }
+                        let Some(identity) = identity.as_ref() else {
+                            continue;
+                        };
                         // Binding the name again spends whatever an import
                         // above took it back from: what stands here now is
                         // this class, and the scope around a suite should be
@@ -2090,26 +2133,61 @@ fn scoped_bindings(
 /// is found as readily as a class at the top level. Each is recorded beside
 /// the clauses it is missing from, which `hidden` carries down as the walk
 /// enters a suite whose siblings never run with it.
+/// What every class statement a scope writes under one spelling leaves behind.
+#[derive(Default)]
+struct SpelledClass {
+    /// Where the first of them is written.
+    defined_at: TextSize,
+    /// The clauses the spelling is missing from, as [`LocalClass::hidden_from`]
+    /// describes them.
+    hidden_from: Vec<TextRange>,
+    /// The names the bodies read so far bind.
+    attributes: BTreeSet<String>,
+    /// Whether one of them binds a name an earlier one already bound, without
+    /// standing in a clause beside it.
+    collapsed: bool,
+}
+
 fn collect_local_class_offsets(
     statements: &[Stmt],
     prefix: Option<&str>,
     hidden: &[TextRange],
-    found: &mut BTreeMap<String, (TextSize, Vec<TextRange>)>,
+    found: &mut BTreeMap<String, SpelledClass>,
 ) {
     for statement in statements {
         if let Stmt::ClassDef(class) = statement {
             let qualified = qualified_name(prefix, class.name.as_str());
+            let attributes = BoundNames::of_class_attributes(&class.body);
             match found.entry(qualified.clone()) {
                 Entry::Vacant(slot) => {
-                    slot.insert((statement.start(), hidden.to_vec()));
+                    slot.insert(SpelledClass {
+                        defined_at: statement.start(),
+                        hidden_from: hidden.to_vec(),
+                        attributes,
+                        collapsed: false,
+                    });
                 }
                 // A spelling written in a clause is no longer missing from it,
                 // whichever clause the first definition sat in, so the clause
                 // stops hiding the name from the code inside it.
-                Entry::Occupied(mut held) => held
-                    .get_mut()
-                    .1
-                    .retain(|clause| !clause.contains(statement.start())),
+                //
+                // Two classes in clauses beside each other are alternatives:
+                // only one of them is ever written, so the spelling stands for
+                // one body and nothing of theirs collapses. One written where
+                // the other has already run is a second body the same name
+                // goes on to hold, and a name they both bind has a single
+                // entry to be indexed under.
+                Entry::Occupied(mut held) => {
+                    let held = held.get_mut();
+                    let beside = held
+                        .hidden_from
+                        .iter()
+                        .any(|clause| clause.contains(statement.start()));
+                    held.collapsed |= !beside && !held.attributes.is_disjoint(&attributes);
+                    held.attributes.extend(attributes);
+                    held.hidden_from
+                        .retain(|clause| !clause.contains(statement.start()));
+                }
             }
             collect_local_class_offsets(&class.body, Some(&qualified), hidden, found);
             continue;
@@ -4523,7 +4601,23 @@ impl Checker<'_> {
     where
         Self: Visitor<'a>,
     {
+        // An import written in a suite the interpreter may skip does not take
+        // a name back from whatever shadows it: where the suite is skipped the
+        // shadowing binding is still what a base spelled with the name is
+        // built on. Treating the reclaim as certain commits the file to the
+        // run where the import happened and breaks the other, so the shadow
+        // stands and the defaults behind it are kept.
+        let shadowed = (self.conditional_depth > 0).then(|| {
+            (
+                self.aliases.parameter_bindings.clone(),
+                self.aliases.assigned_bindings.clone(),
+            )
+        });
         self.aliases.collect(std::slice::from_ref(statement));
+        if let Some((parameters, assigned)) = shadowed {
+            self.aliases.parameter_bindings.extend(parameters);
+            self.aliases.assigned_bindings.extend(assigned);
+        }
         walk_stmt(self, statement);
     }
 
@@ -4789,6 +4883,13 @@ impl Checker<'_> {
                 self.aliases.invalidate(name);
                 self.local_implicit_callback_classes.remove(name);
             }
+            // Whatever the binding puts behind the name is what a class
+            // written below is built on, so a configured field base is no
+            // longer reachable under it. One in a suite that may not run
+            // leaves the spelling standing for either thing, and declining the
+            // base there keeps the field's default under both readings, which
+            // is the safe half of the choice `supersedes` makes above.
+            self.aliases.assigned_bindings.insert(name.to_owned());
             if rebinds_module_name {
                 self.known_truthiness.remove(name);
             }
@@ -5098,19 +5199,45 @@ impl Checker<'_> {
     /// the new class is not treated as metaclass-built — but only where the
     /// redefinition is certain to run, since a namesake in a branch the
     /// interpreter skips leaves the metaclass-built class standing.
+    ///
+    /// A class nested in another is reached from outside by the path it is
+    /// written under, so it is recorded under that path as well as under its
+    /// own name: a base spelled `holder.Middle` never matches a bare `Middle`,
+    /// and the mark would stop at the class that carries it. Every path a
+    /// scope around it can spell it by is recorded, because the spelling a
+    /// base uses is the one from the scope it is written in: `Middle` inside
+    /// the class itself, `holder.Middle` in the body holding `holder`, and
+    /// `Outer.holder.Middle` outside that again.
     fn record_metaclass_construction(
         &mut self,
         class: &ast::StmtClassDef,
         unseen_import_base: bool,
     ) {
+        let spellings = self.nested_spellings(class.name.as_str());
         if declares_metaclass(class)
             || inherits_metaclass(class, &self.metaclass_classes)
             || unseen_import_base
         {
-            self.metaclass_classes.insert(class.name.to_string());
+            self.metaclass_classes.extend(spellings);
         } else if self.conditional_depth == 0 {
-            self.metaclass_classes.remove(class.name.as_str());
+            for spelling in spellings {
+                self.metaclass_classes.remove(&spelling);
+            }
         }
+    }
+
+    /// Every spelling a scope around this one can name `name` by: the name
+    /// itself, and the name under each stretch of the path it is nested in,
+    /// longest last. A base is written with the spelling its own scope reaches
+    /// the class by, and which of these that is depends on how far out the
+    /// base is written.
+    fn nested_spellings(&self, name: &str) -> Vec<String> {
+        std::iter::once(name.to_owned())
+            .chain(
+                (0..self.lexical_scope.len())
+                    .map(|start| qualified_class_name(&self.lexical_scope[start..], name)),
+            )
+            .collect()
     }
 
     fn visit_conditional<'a>(&mut self, branch: &'a ast::StmtIf)
@@ -6878,7 +7005,39 @@ impl<'a> Visitor<'a> for Checker<'a> {
                 if let Some(bindings) = self.lexical_bindings.last_mut() {
                     bindings.insert(class.name.to_string());
                 }
+                // A class this body wrote is reached from outside by the path
+                // it is written under, and only by that path: the bare names
+                // the body bound go back to whatever they stood for around the
+                // class, but `holder.Middle` names the nested class alone and
+                // is the spelling a base written beneath the class has to use.
+                // Dropping those marks with the rest of the body would leave a
+                // subclass of a nested class unprotected by whatever its own
+                // bases carry.
+                let nested: Vec<String> = self
+                    .nested_spellings(class.name.as_str())
+                    .into_iter()
+                    .map(|spelling| format!("{spelling}."))
+                    .collect();
+                let under_this_class =
+                    |spelling: &String| nested.iter().any(|path| spelling.starts_with(path));
+                let carried: Vec<String> = self
+                    .metaclass_classes
+                    .iter()
+                    .filter(|spelling| under_this_class(spelling))
+                    .cloned()
+                    .collect();
                 self.metaclass_classes = outer_metaclass_classes;
+                // A namesake body this run is certain to reach replaces what
+                // the spelling stood for, so the marks an earlier body of the
+                // same name left under this path go with it rather than
+                // outliving the class that earned them. One in a branch that
+                // may not run takes nothing back, for the reason
+                // `record_metaclass_construction` gives for the bare name.
+                if self.conditional_depth == 0 {
+                    self.metaclass_classes
+                        .retain(|spelling| !under_this_class(spelling));
+                }
+                self.metaclass_classes.extend(carried);
                 self.record_metaclass_construction(class, unseen_import_base);
                 self.metaclass_definitions = outer_metaclass_definitions;
                 let implicit_callbacks = std::mem::replace(
@@ -7249,6 +7408,9 @@ struct Aliases {
     type_checking: BTreeSet<String>,
     kw_only_markers: BTreeSet<String>,
     parameter_bindings: BTreeSet<String>,
+    /// Names an assignment bound over whatever they stood for, which is not a
+    /// name a configured field base can still be spelled with.
+    assigned_bindings: BTreeSet<String>,
 }
 
 impl Aliases {
@@ -7280,6 +7442,7 @@ impl Aliases {
         self.type_checking.remove(name);
         self.kw_only_markers.remove(name);
         self.parameter_bindings.remove(name);
+        self.assigned_bindings.remove(name);
     }
 
     /// Give `name` back every record it held in `before`, undoing an
@@ -7343,6 +7506,7 @@ impl Aliases {
             (&mut self.structural_bases, &before.structural_bases),
             (&mut self.type_checking, &before.type_checking),
             (&mut self.kw_only_markers, &before.kw_only_markers),
+            (&mut self.assigned_bindings, &before.assigned_bindings),
         ] {
             copy(current, before, name);
         }
@@ -7538,21 +7702,23 @@ impl Aliases {
         }
     }
 
-    /// A parameter holds its name for the whole call, but an import written
-    /// under it rebinds that name for everything below, so a base spelled with
+    /// A parameter holds its name for the whole call, and an assignment holds
+    /// its target for the rest of the scope, but an import written under
+    /// either rebinds that name for everything below, so a base spelled with
     /// that name after the import is the imported class again.
-    fn reclaim_parameter_imports(&mut self, import: &ast::StmtImportFrom) {
+    fn reclaim_shadowed_imports(&mut self, import: &ast::StmtImportFrom) {
         for alias in &import.names {
             if alias.name.as_str() != "*" {
-                self.parameter_bindings
-                    .remove(alias.asname.as_ref().unwrap_or(&alias.name).as_str());
+                let bound = alias.asname.as_ref().unwrap_or(&alias.name).as_str();
+                self.parameter_bindings.remove(bound);
+                self.assigned_bindings.remove(bound);
             }
         }
     }
 
     /// Record everything one `from <module> import ...` statement binds.
     fn collect_from_import(&mut self, import: &ast::StmtImportFrom) {
-        self.reclaim_parameter_imports(import);
+        self.reclaim_shadowed_imports(import);
         self.import_bindings.extend(
             import
                 .names
@@ -10728,6 +10894,12 @@ impl Rewriter<'_> {
         if let Some(class) = self.self_class_receiver(receiver) {
             return Some(class);
         }
+        self.attribute_receiving_class(receiver)
+    }
+
+    /// The class an attribute receiver names: one a module this file imported
+    /// holds, or one written inside another class.
+    fn attribute_receiving_class(&self, receiver: &Expr) -> Option<(PathBuf, String, bool, bool)> {
         let Expr::Attribute(attribute) = receiver else {
             return None;
         };
@@ -10738,6 +10910,23 @@ impl Rewriter<'_> {
             .is_some_and(|name| matches!(self.binding(&name), Some(Binding::Module(_))))
         {
             return None;
+        }
+        // A class written in another class is recorded under that class's own
+        // identity, so a receiver naming the outer one names the inner one
+        // too. Reading the outer one the way any other receiver is read is
+        // what lets `Holder.Child()` resolve wherever `Holder` was written:
+        // beside the call, in a function body around it, or in another file.
+        // An instance is no namespace of classes, and a `super()` lookup
+        // starts above the class it is written in, so neither carries one.
+        if let Some((file, outer, through_instance, through_super)) =
+            self.receiving_class(&attribute.value)
+        {
+            if !through_instance && !through_super {
+                let nested = format!("{outer}.{}", attribute.attr);
+                if let Some((file, class)) = self.definitions.class_identity(&file, &nested) {
+                    return Some((file, class, false, false));
+                }
+            }
         }
         let dotted = dotted_name(&attribute.value)?;
         match self.binding(&dotted)? {
@@ -24981,6 +25170,157 @@ def b(x=1): pass  # type: ignore  # noqa
     }
 
     #[test]
+    fn a_copy_of_a_first_bound_contested_name_keeps_its_ancestry_open() -> Result<(), String> {
+        // The suites bind `Alias` for the first time, so no class stands
+        // behind it for the copy to resolve to. Giving up on the copy for
+        // that reason dropped the doubt with it, and `Child` was recorded
+        // with no bases at all: both defaults went and the inherited call was
+        // left as written, which CPython answers with a `TypeError`.
+        let source = "import os\n\nclass First:\n    def target(self, value=1): return value\n\nclass Second:\n    def target(self, other=2): return other\n\nif os.environ.get('PICK'):\n    Alias = Second\nelse:\n    Alias = First\n\nOther = Alias\n\nclass Child(Other):\n    def run(self): return self.target()\n";
+        assert_eq!(fixed_keeping_unreachable_defaults(source)?, source);
+        // With nothing in doubt the copy still resolves, so the same shape is
+        // fixed and the call carries the value the module built.
+        let control = "class First:\n    def target(self, value=1): return value\n\nAlias = First\n\nOther = Alias\n\nclass Child(Other):\n    def run(self): return self.target()\n\nassert Child().run() == 1\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(control)?,
+            control
+                .replace("def target(self, value=1)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_nested_unseen_imported_ancestor_protects_its_subclass() -> Result<(), String> {
+        // The mark an unseen import leaves on the class between it and the
+        // dataclass is reached from outside that class body only under the
+        // path the class is written at, so a base spelled `holder.Middle`
+        // found nothing and the field's default was removed although nothing
+        // here can see the fields, or the metaclass, the import carries.
+        let source = "from dataclasses import dataclass, field\nfrom other import Base\n\nclass holder:\n    class Middle(Base):\n        pass\n\n@dataclass\nclass Child(holder.Middle):\n    keyword: int = field(default=3, kw_only=True)\n";
+        assert_eq!(fixed_keeping_unreachable_defaults(source)?, source);
+        // A later `holder` this run is certain to reach replaces the first,
+        // so the mark its nested `Middle` earned goes with it and the live
+        // plain class holds nothing back — exactly as the flat spelling
+        // already behaves. A namesake in a branch that may not run takes
+        // nothing back, since where the branch is skipped the first `holder`
+        // is still what the name stands for.
+        let namesake = "from dataclasses import dataclass, field\nfrom other import Base\n\nclass holder:\n    class Middle(Base):\n        pass\n\nclass holder:\n    class Middle:\n        pass\n\n@dataclass\nclass Child(holder.Middle):\n    keyword: int = field(default=3, kw_only=True)\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(namesake)?,
+            namesake.replace("field(default=3, kw_only=True)", "field(kw_only=True)")
+        );
+        let guarded = "import os\nfrom dataclasses import dataclass, field\nfrom other import Base\n\nclass holder:\n    class Middle(Base):\n        pass\n\nif os.environ.get('PICK'):\n    class holder:\n        class Middle:\n            pass\n\n@dataclass\nclass Child(holder.Middle):\n    keyword: int = field(default=3, kw_only=True)\n";
+        assert_eq!(fixed_keeping_unreachable_defaults(guarded)?, guarded);
+        // The path a base spells the class by is the one its own scope
+        // reaches it under, so the mark is recorded under every path a scope
+        // around the class can name it by. A `holder.Middle` written inside a
+        // function or another class body is the same protection one stretch
+        // further in.
+        for enclosing in [
+            "def outer():\n    class holder:\n        class Middle(Base):\n            pass\n\n    @dataclass\n    class Child(holder.Middle):\n        keyword: int = field(default=3, kw_only=True)\n\n    return Child\n",
+            "class Outer:\n    class holder:\n        class Middle(Base):\n            pass\n\n    @dataclass\n    class Child(holder.Middle):\n        keyword: int = field(default=3, kw_only=True)\n",
+        ] {
+            let source =
+                format!("from dataclasses import dataclass, field\nfrom other import Base\n\n{enclosing}");
+            assert_eq!(
+                fixed_keeping_unreachable_defaults(&source)?,
+                source,
+                "{enclosing}"
+            );
+        }
+        // The nesting is not what holds the default: the same shape with a
+        // base that carries no unseen import is still fixed.
+        let control = "from dataclasses import dataclass, field\n\nclass holder:\n    class Middle:\n        pass\n\n@dataclass\nclass Child(holder.Middle):\n    keyword: int = field(default=3, kw_only=True)\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(control)?,
+            control.replace("field(default=3, kw_only=True)", "field(kw_only=True)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_assignment_takes_a_configured_field_base_spelling_away() -> Result<(), String> {
+        // `BaseModel` names an ordinary class where `C` is written, so `C` is
+        // an ordinary class too and `x` an ordinary class attribute. Matching
+        // the configured base by its bare spelling regardless made the field
+        // a model's, and the construction it was rewritten into raises
+        // `TypeError: C() takes no arguments`.
+        let source = "from pydantic import BaseModel\n\nclass Other:\n    x = 5\n\nBaseModel = Other\n\nclass C(BaseModel):\n    x: int = 7\n\nprint(C().x)\n";
+        assert_eq!(fixed_keeping_unreachable_defaults(source)?, source);
+        // A binding in a suite that may not run leaves the spelling standing
+        // for either thing, and CPython reads `C().x` as 7 either way, so the
+        // default is kept under both readings rather than rewritten into a
+        // construction one of them cannot make.
+        let conditional = "import os\nfrom pydantic import BaseModel\n\nclass Other:\n    x = 5\n\nif os.environ.get('PICK'):\n    BaseModel = Other\n\nclass C(BaseModel):\n    x: int = 7\n\nprint(C().x)\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(conditional)?,
+            conditional
+        );
+        // An import below the assignment binds the name afresh, so a model
+        // written under it is a model again.
+        let reclaimed = "from pydantic import BaseModel\n\nclass Other:\n    x = 5\n\nBaseModel = Other\n\nfrom pydantic import BaseModel\n\nclass C(BaseModel):\n    x: int = 7\n\nprint(C().x)\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(reclaimed)?,
+            reclaimed
+                .replace("    x: int = 7", "    x: int")
+                .replace("C().x", "C(x=7).x")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_import_in_a_suite_that_may_not_run_reclaims_no_field_base() -> Result<(), String> {
+        // Where the suite is skipped the parameter's value is still what `C`
+        // is built on, so committing to the run where the import happened
+        // rewrites a construction the other run cannot make. Both readings
+        // keep the default instead.
+        for guard in ["if os.environ.get('NDV') == 'real':", "if TYPE_CHECKING:"] {
+            let source = format!(
+                "import os\nfrom typing import TYPE_CHECKING\n\nclass Plain:\n    x = 3\n\ndef outer(BaseModel):\n    {guard}\n        from pydantic import BaseModel\n    class C(BaseModel):\n        x: int = 7\n    return C()\n\nprint(outer(Plain).x)\n"
+            );
+            assert_eq!(
+                fixed_keeping_unreachable_defaults(&source)?,
+                source,
+                "{guard}"
+            );
+        }
+        // An import that certainly runs still takes the name back from the
+        // parameter, which is what #1078 settled.
+        let certain = "class Plain:\n    x = 3\n\ndef outer(BaseModel):\n    from pydantic import BaseModel\n    class C(BaseModel):\n        x: int = 7\n    return C()\n\nprint(outer(Plain).x)\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(certain)?,
+            certain
+                .replace("        x: int = 7", "        x: int")
+                .replace("return C()", "return C(x=7)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_bodies_under_one_class_spelling_keep_the_defaults_behind_them() -> Result<(), String> {
+        // The scope writes `Base` twice and both bodies define `target`, so
+        // the one identity the spelling carries keeps a single entry for it
+        // and a lookup through `Child` may be reaching either. Answering with
+        // whichever was recorded last removed both defaults and left the
+        // inherited call as written, which CPython answers with a
+        // `TypeError`; holding the ancestry open reports the call instead.
+        let source = "class Base:\n    def target(self, value=1): return value\n\nclass Base:\n    def target(self, value=4): return value\n\nclass Child(Base):\n    def run(self): return self.target()\n";
+        assert_eq!(fixed_keeping_unreachable_defaults(source)?, source);
+        // Two bodies with nothing in common leave every name a single entry,
+        // so the spelling still answers for them and the call is rewritten.
+        let control = "class Base:\n    def first(self, value=1): return value\n\nclass Base:\n    def target(self, value=4): return value\n\nclass Child(Base):\n    def run(self): return self.target()\n\nassert Child().run() == 4\n";
+        assert_eq!(
+            fixed_keeping_unreachable_defaults(control)?,
+            control
+                .replace("def first(self, value=1)", "def first(self, value)")
+                .replace("def target(self, value=4)", "def target(self, value)")
+                .replace("self.target()", "self.target(value=4)")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_find_spec_off_the_import_hierarchy_is_fixed() -> Result<(), String> {
         // The import system asks every finder on `sys.meta_path` for a spec,
         // and only a class the machinery was handed is reached that way: a
@@ -25188,6 +25528,36 @@ def b(x=1): pass  # type: ignore  # noqa
         // nesting differs, and the call is rewritten either way.
         let source = "class Child:\n    def own(self, extra=7):\n        return extra\n\n\ndef outer():\n    return Child().own()\n\n\nassert outer() == 7, outer()\n";
         assert_eq!(fixed(source)?, "class Child:\n    def own(self, extra):\n        return extra\n\n\ndef outer():\n    return Child().own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_of_a_class_of_a_function_body_answers_the_call_beside_it() -> Result<(), String> {
+        // `Holder` is reached by its bare name for the rest of the body, and
+        // `Child` is recorded under `Holder`'s own identity, so the receiver
+        // names the inner class and the call carries the deleted default.
+        let source = "def outer():\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n    return Holder.Child().own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n    return Holder.Child().own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_of_a_class_answers_the_call_beside_it() -> Result<(), String> {
+        // The same reading at module level, where the receiver was left
+        // unresolved too: an inner class is reached through whatever names the
+        // class holding it, wherever that class was written.
+        let source = "class Holder:\n    class Child:\n        def own(self, extra=7):\n            return extra\n\n\ndef outer():\n    return Holder.Child().own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "class Holder:\n    class Child:\n        def own(self, extra):\n            return extra\n\n\ndef outer():\n    return Holder.Child().own(extra=7)\n\n\nassert outer() == 7, outer()\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_of_a_rebound_holder_is_left_alone() -> Result<(), String> {
+        // The body assigns `Holder` again, so neither it nor the `Child`
+        // written inside it is what the receiver reaches by the time the call
+        // runs, and nothing is written into the call.
+        let source = "def outer():\n    class Holder:\n        class Child:\n            def own(self, extra=7):\n                return extra\n\n    class Other:\n        class Child:\n            def own(self):\n                return 7\n\n    Holder = Other\n    return Holder.Child().own()\n\n\nassert outer() == 7, outer()\n";
+        assert_eq!(fixed(source)?, "def outer():\n    class Holder:\n        class Child:\n            def own(self, extra):\n                return extra\n\n    class Other:\n        class Child:\n            def own(self):\n                return 7\n\n    Holder = Other\n    return Holder.Child().own()\n\n\nassert outer() == 7, outer()\n");
         Ok(())
     }
 }

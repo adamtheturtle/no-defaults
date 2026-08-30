@@ -9515,6 +9515,16 @@ fn class_opaque_rebindings(body: &[Stmt], context: AliasContext<'_>) -> BTreeSet
                         self.record(&assign.target, value);
                     }
                 }
+                // A walrus written straight in the body binds the class
+                // namespace exactly as an assignment does, which is why
+                // `record_assigned_aliases` reads this form too. Leaving it out
+                // here let `(alias := wrap(target))` take the default off
+                // `target` with the call through `alias` still as written.
+                Stmt::Expr(expression) => {
+                    if let Expr::Named(named) = expression.value.as_ref() {
+                        self.record(&named.target, &named.value);
+                    }
+                }
                 // A method written in a body of its own is a definition rather
                 // than a rebinding, and a nested class keeps its own body to
                 // itself.
@@ -24299,6 +24309,33 @@ def b(x=1): pass  # type: ignore  # noqa
             source
                 .replace("y=1):", "y):")
                 .replace("C().target(2)", "C().target(2, y=1)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_opaque_class_body_walrus_holds_the_default_back() -> Result<(), String> {
+        // A walrus written straight in the body binds the class namespace
+        // exactly as an assignment does, so an unrecognised wrapper behind one
+        // puts the method just as far out of reach. Reading only `Assign` and
+        // `AnnAssign` let this one strip the default with the call through
+        // `alias` still as written.
+        let source = "def _identity(function):\n    return function\n\n\nclass C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    (alias := _identity(target))\n\n\nassert C().alias(2) == (2, 1)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_class_body_walrus_is_still_fixed() -> Result<(), String> {
+        // The counterpart guard: the value is a bare name, so the alias is
+        // recorded, the call through it carries the value the removed default
+        // held, and nothing is held back.
+        let source = "class C:\n    def target(self, x, y=1):\n        return (x, y)\n\n    (alias := target)\n\n\nassert C().alias(2) == (2, 1)\n";
+        assert_eq!(
+            fixed_with_retained_defaults(source)?,
+            source
+                .replace("x, y=1):", "x, y):")
+                .replace("C().alias(2)", "C().alias(2, y=1)")
         );
         Ok(())
     }

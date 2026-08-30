@@ -7261,8 +7261,10 @@ fn parser_and_encoder_callback_defaults_survive_a_fix() -> Result<(), Box<dyn st
     // Each of these is reached by the module that owns the base — `goahead`
     // drives the parser hooks, `_vformat` drives the formatter hooks, the
     // encoder is built by `json.dumps` itself, and `pformat` reaches `format`
-    // through `_repr`. None of those calls is written here.
-    let source = "import json\nimport pprint\nimport string\nfrom html.parser import HTMLParser\n\n\nclass P(HTMLParser):\n    def handle_data(self, data, extra=1): pass\n\n\nclass Child(P):\n    def handle_starttag(self, tag, attrs, extra=2): pass\n\n\nclass F(string.Formatter):\n    def get_value(self, key, args, kwargs, extra=3): return ''\n\n    def check_unused_args(self, used_args, args, kwargs, extra=4): pass\n\n\nclass E(json.JSONEncoder):\n    def default(self, obj, extra=5): return str(obj)\n\n\nclass Pretty(pprint.PrettyPrinter):\n    def format(self, obj, context, maxlevels, level, extra=6): return repr(obj), True, False\n";
+    // through `_repr`. None of those calls is written here. `json` re-exports
+    // its encoder, so the last class names the same base through the module
+    // that defines it.
+    let source = "import json\nimport json.encoder\nimport pprint\nimport string\nfrom html.parser import HTMLParser\n\n\nclass P(HTMLParser):\n    def handle_data(self, data, extra=1): pass\n\n\nclass Child(P):\n    def handle_starttag(self, tag, attrs, extra=2): pass\n\n\nclass F(string.Formatter):\n    def get_value(self, key, args, kwargs, extra=3): return ''\n\n    def check_unused_args(self, used_args, args, kwargs, extra=4): pass\n\n\nclass E(json.JSONEncoder):\n    def default(self, obj, extra=5): return str(obj)\n\n\nclass Pretty(pprint.PrettyPrinter):\n    def format(self, obj, context, maxlevels, level, extra=6): return repr(obj), True, False\n\n\nclass Defining(json.encoder.JSONEncoder):\n    def default(self, obj, extra=7): return str(obj)\n";
     std::fs::write(&case, source)?;
     let output = Command::new(binary())
         .arg("--fix")

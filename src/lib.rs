@@ -6171,6 +6171,13 @@ const IMPORTLIB_SOURCE_LOADER_CALLBACKS: &[&str] =
 /// the file to carry a deleted default to.
 const ENUM_CALLBACKS: &[&str] = &["__init__", "_generate_next_value_", "_missing_"];
 
+/// The methods `json` reaches on an encoder it owns, whichever spelling of the
+/// base the subclass was written on.
+///
+/// `json` re-exports `JSONEncoder` from `json.encoder`, so the class has two
+/// equally ordinary spellings and each needs its own row.
+const JSON_ENCODER_CALLBACKS: &[&str] = &["default", "encode", "iterencode"];
+
 /// The methods `logging` reaches on a handler it owns, whichever handler base
 /// the subclass was written on.
 const LOGGING_HANDLER_CALLBACKS: &[&str] = &[
@@ -6217,7 +6224,8 @@ const IMPLICIT_CALLBACK_BASES: &[(&str, &str, &[&str])] = &[
             "unknown_decl",
         ],
     ),
-    ("json", "JSONEncoder", &["default", "encode", "iterencode"]),
+    ("json", "JSONEncoder", JSON_ENCODER_CALLBACKS),
+    ("json.encoder", "JSONEncoder", JSON_ENCODER_CALLBACKS),
     ("enum", "Enum", ENUM_CALLBACKS),
     ("enum", "Flag", ENUM_CALLBACKS),
     ("enum", "IntEnum", ENUM_CALLBACKS),
@@ -23763,6 +23771,18 @@ def b(x=1): pass  # type: ignore  # noqa
     fn a_subclass_of_a_local_json_encoder_keeps_its_callback_defaults() -> Result<(), String> {
         let source = "from json import JSONEncoder\n\n\nclass Base(JSONEncoder):\n    pass\n\n\nclass Child(Base):\n    def default(self, obj, extra=1): return str(obj)\n";
         assert_eq!(fixed_with_retained_defaults(source)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn the_defining_module_of_the_json_encoder_keeps_its_callback_defaults() -> Result<(), String> {
+        // `json` re-exports `JSONEncoder` from `json.encoder`, so both dotted
+        // spellings name the class `json.dumps` calls `default` on, and the
+        // submodule needs a row of its own to be recognised.
+        let source = "import json.encoder\n\n\nclass E(json.encoder.JSONEncoder):\n    def default(self, obj, extra=1): return str(obj)\n";
+        assert_eq!(fixed_with_retained_defaults(source)?, source);
+        let imported = "from json.encoder import JSONEncoder\n\n\nclass E(JSONEncoder):\n    def default(self, obj, extra=1): return str(obj)\n";
+        assert_eq!(fixed_with_retained_defaults(imported)?, imported);
         Ok(())
     }
 

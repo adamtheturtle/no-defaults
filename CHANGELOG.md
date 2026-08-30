@@ -6,6 +6,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Changed
 
+- Vale now uses the pinned `ai-tells` style package and error threshold shared
+  by the other projects in Coding-Project-TODOs.
 - Cross-package callback analysis now resolves dependency method targets through
   the supported `ty server` LSP interface. Inferred attributes, inheritance,
   aliases, re-exports, and wrapped annotations therefore use ty's Python

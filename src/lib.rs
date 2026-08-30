@@ -7119,24 +7119,17 @@ fn external_class_at_line(suite: &[Stmt], source: &str, line: u32) -> Option<Str
         let Stmt::ClassDef(class) = statement else {
             return None;
         };
-        class.body.iter().find_map(|statement| {
-            let Stmt::FunctionDef(function) = statement else {
-                return None;
-            };
-            let start = function.start().to_usize();
-            let end = function.end().to_usize();
-            let start_line = source
-                .get(..start)?
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count();
-            let end_line = source
-                .get(..end)?
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count();
-            (line >= start_line && line <= end_line).then(|| class.name.to_string())
-        })
+        let start_line = source
+            .get(..class.start().to_usize())?
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let end_line = source
+            .get(..class.end().to_usize())?
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        (line >= start_line && line <= end_line).then(|| class.name.to_string())
     })
 }
 

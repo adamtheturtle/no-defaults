@@ -8185,7 +8185,7 @@ fn dependency_callbacks_are_analyzed_through_reexports_without_editing_dependenc
         "from .engine import Engine, InferredEngine\nfrom .hooks import HookBase\n",
     )?;
     let hooks = package.join("hooks.py");
-    let dependency_source = "class HookBase:\n    def callback(self, supplied, omitted=2):\n        return supplied + omitted\n\n    def other_callback(self, supplied, omitted=2):\n        return supplied + omitted\n";
+    let dependency_source = "class HookBase:\n    if True:\n        def callback(self, supplied, omitted=2):\n            return supplied + omitted\n\n    def other_callback(self, supplied, omitted=2):\n        return supplied + omitted\n";
     std::fs::write(&hooks, dependency_source)?;
     let engine = package.join("engine.py");
     let engine_source = "from __future__ import annotations\n\nfrom .hooks import HookBase\n\n\nclass Engine:\n    hook: HookBase | None\n\n    def run(self):\n        return self.hook.other_callback(10)\n\n\nclass InferredEngine:\n    def __init__(self):\n        self.hook = HookBase()\n\n    def run(self):\n        return self.hook.callback(10)\n";

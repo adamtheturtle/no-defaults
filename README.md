@@ -116,7 +116,7 @@ The [reference](docs/reference.md#configuration) covers what counts as private, 
 ```yaml
 repos:
   - repo: https://github.com/adamtheturtle/no-defaults
-    rev: v2.3.0
+    rev: v2.3.0  # pin to a release tag
     hooks:
       - id: no-defaults
 ```
@@ -127,4 +127,4 @@ pre-commit passes only the changed files, so a call in a file that did not chang
 
 MIT
 
-See [docs/reference.md](docs/reference.md) for the full behaviour, and [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CHANGELOG.md](CHANGELOG.md).
+See [docs/reference.md](docs/reference.md) for the full behaviour, and [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CHANGELOG.rst](CHANGELOG.rst). Semver releases through `2.3.0` are recorded in [CHANGELOG.md](CHANGELOG.md).

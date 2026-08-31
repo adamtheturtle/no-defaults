@@ -4,6 +4,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+## 2.3.0 - 2026-08-31
+
+A minor bump. Cross-package callback analysis now resolves dependency methods
+through ty's LSP interface instead of a local approximation, so inferred
+attributes, inheritance, aliases, re-exports, and wrapped annotations follow
+ty's Python semantics. The Python package depends on `ty`; Cargo installations
+must provide the `ty` executable on `PATH`.
+
 ### Changed
 
 - Vale now uses the pinned `ai-tells` style package and error threshold shared

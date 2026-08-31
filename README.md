@@ -116,7 +116,7 @@ The [reference](docs/reference.md#configuration) covers what counts as private, 
 ```yaml
 repos:
   - repo: https://github.com/adamtheturtle/no-defaults
-    rev: v2.2.0
+    rev: v2.3.0
     hooks:
       - id: no-defaults
 ```

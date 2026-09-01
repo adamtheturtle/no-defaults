@@ -11,7 +11,7 @@ on:
       tag:
         description: Tag to publish (publish_only only)
         type: string
-        default: '2026.5.16'
+        default: 'v2.3.0'
 
 # Deny by default; each job opts into the minimum scopes it needs.
 permissions: {}
@@ -83,11 +83,10 @@ jobs:
         env:
           NEW_TAG: ${{ steps.version.outputs.release }}
         run: |
-          pre_commit_rev="${NEW_TAG/-post./.post}"
           sed -i.bak "s/^version = .*/version = \"${NEW_TAG}\"/" Cargo.toml
           sed -i.bak "s/^version = .*/version = \"${NEW_TAG}\"/" pyproject.toml
-          sed -i.bak -E "s/^([[:space:]]*rev:[[:space:]]*).*(# pin to a release tag)$/\1${pre_commit_rev}  \2/" README.md
-          if ! grep -Fq "    rev: ${pre_commit_rev}  # pin to a release tag" README.md; then
+          sed -i.bak -E "s/^([[:space:]]*rev:[[:space:]]*).*(# pin to a release tag)$/\1${NEW_TAG}  \2/" README.md
+          if ! grep -Fq "    rev: ${NEW_TAG}  # pin to a release tag" README.md; then
             echo "Error: README pre-commit hook revision was not updated"
             exit 1
           fi
@@ -155,11 +154,15 @@ jobs:
           uvx maturin build --release --out dist/
           ls -la dist/
 
+      - name: Build source distribution
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: uvx maturin sdist --out dist/
+
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
-          path: dist/*.whl
+          path: dist/*
           if-no-files-found: error
 
   build-wheels-existing-tag:
@@ -197,11 +200,15 @@ jobs:
           uvx maturin build --release --out dist/
           ls -la dist/
 
+      - name: Build source distribution
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: uvx maturin sdist --out dist/
+
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
-          path: dist/*.whl
+          path: dist/*
           if-no-files-found: error
 
   publish-pypi:

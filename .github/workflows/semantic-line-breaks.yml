@@ -26,4 +26,3 @@ jobs:
           --from
           'git+https://github.com/TurtleTech-ehf/snapper.git@bcd3458e27e4156ce4e0a0b55a227400328fb3b1'
           snapper --max-width 0 --check
-

@@ -32,12 +32,12 @@ Source = "https://github.com/adamtheturtle/no-defaults"
 Issues = "https://github.com/adamtheturtle/no-defaults/issues"
 Changelog = "https://github.com/adamtheturtle/no-defaults/blob/main/CHANGELOG.rst"
 
-[project.optional-dependencies]
+[dependency-groups]
 release = [ "check-wheel-contents==0.6.3", "towncrier==25.8.0" ]
 
 [tool.uv]
 # Release tooling requires Python 3.10+. Resolve the lock for that floor so
-# CI can `uv run --extra release` while the package keeps requires-python >=3.9.
+# CI can `uv run --group release` while the package keeps requires-python >=3.9.
 environments = [ "python_version >= '3.10'" ]
 
 [tool.towncrier]

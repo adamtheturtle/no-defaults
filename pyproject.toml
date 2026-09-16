@@ -33,7 +33,7 @@ Issues = "https://github.com/adamtheturtle/no-defaults/issues"
 Changelog = "https://github.com/adamtheturtle/no-defaults/blob/main/CHANGELOG.rst"
 
 [dependency-groups]
-release = [ "check-wheel-contents==0.6.3", "towncrier==25.8.0" ]
+release = [ "check-wheel-contents==0.6.3", "towncrier==26.9.0" ]
 
 [tool.uv]
 # Release tooling requires Python 3.10+. Resolve the lock for that floor so

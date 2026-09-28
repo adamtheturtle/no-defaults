@@ -6,14 +6,15 @@ build-backend = "maturin"
 name = "no-defaults"
 version = "2026.9.1"
 description = "A fast Python linter that forbids function and dataclass defaults."
-readme = "README.md"
+# Avoid Pyroma treating parameterized Markdown as reStructuredText.
+# https://github.com/regebro/pyroma/issues/135
+readme = { file = "README.md", content-type = "text/markdown" }
 license = "MIT"
 authors = [{ name = "Adam Dangoor", email = "adamdangoor@gmail.com" }]
 requires-python = ">=3.9"
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
@@ -33,6 +34,7 @@ Issues = "https://github.com/adamtheturtle/no-defaults/issues"
 Changelog = "https://github.com/adamtheturtle/no-defaults/blob/main/CHANGELOG.rst"
 
 [dependency-groups]
+dev = [ "pyroma==5.0.1" ]
 release = [ "check-wheel-contents==0.6.3", "towncrier==26.9.0" ]
 
 [tool.uv]

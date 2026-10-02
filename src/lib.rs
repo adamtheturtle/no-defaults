@@ -14586,20 +14586,21 @@ mod tests {
 
     #[test]
     fn pydantic_private_attribute_defaults_are_not_model_fields() {
-        assert!(messages(
+        assert_eq!(messages(
             "from pydantic import BaseModel, PrivateAttr\n\nclass C(BaseModel):\n    _value: int = PrivateAttr(default=1)\n",
             false,
-        )
-        .is_empty());
+        ), [] as [std::string::String; 0]);
     }
 
     #[test]
     fn underscore_model_attributes_are_not_constructor_fields() {
-        assert!(messages(
-            "from pydantic import BaseModel\n\nclass C(BaseModel):\n    _value: int = 1\n",
-            false,
-        )
-        .is_empty());
+        assert_eq!(
+            messages(
+                "from pydantic import BaseModel\n\nclass C(BaseModel):\n    _value: int = 1\n",
+                false,
+            ),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -14638,7 +14639,10 @@ mod tests {
 
     #[test]
     fn a_lambda_default_is_suppressible_and_fixable() -> Result<(), String> {
-        assert!(codes("lam = lambda z=4: z  # noqa: NOD001\n").is_empty());
+        assert_eq!(
+            codes("lam = lambda z=4: z  # noqa: NOD001\n"),
+            [] as [&str; 0]
+        );
         assert_eq!(fixed("lam = lambda z=4: z\n")?, "lam = lambda z: z\n");
         Ok(())
     }
@@ -14809,11 +14813,10 @@ mod tests {
 
     #[test]
     fn a_function_local_dataclass_alias_does_not_escape() {
-        assert!(messages(
+        assert_eq!(messages(
             "def dc(cls): return cls\n\ndef load():\n    from dataclasses import dataclass as dc\n\n@dc\nclass C:\n    value: int = 1\n",
             false,
-        )
-        .is_empty());
+        ), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -15241,7 +15244,10 @@ mod tests {
     #[test]
     fn a_reexported_dataclass_keeps_its_field_defaults() {
         let source = "@dataclass\nclass Job:\n retries: int = 3\n";
-        assert!(private_module_messages(source, &["Job"]).is_empty());
+        assert_eq!(
+            private_module_messages(source, &["Job"]),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(private_module_messages(source, &[]).len(), 1);
     }
 
@@ -15737,7 +15743,7 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn blanket_noqa_accepts_a_following_explanation() -> Result<(), String> {
         let source = "def target(value=1): pass  # noqa  # compatibility\n";
-        assert!(messages(source, false).is_empty());
+        assert_eq!(messages(source, false), [] as [std::string::String; 0]);
         assert_eq!(fixed(source)?, source);
         Ok(())
     }
@@ -15745,7 +15751,7 @@ def b(x=1): pass  # type: ignore  # noqa
     #[test]
     fn file_level_noqa_accepts_a_following_explanation() -> Result<(), String> {
         let source = "# ruff: noqa  # generated file\ndef target(value=1): pass\n";
-        assert!(messages(source, false).is_empty());
+        assert_eq!(messages(source, false), [] as [std::string::String; 0]);
         assert_eq!(fixed(source)?, source);
         Ok(())
     }
@@ -15930,11 +15936,17 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn file_level_noqa_suppresses_rule() {
-        assert!(codes("# ruff: noqa: NOD001\ndef f(x=1): pass\n").is_empty());
+        assert_eq!(
+            codes("# ruff: noqa: NOD001\ndef f(x=1): pass\n"),
+            [] as [&str; 0]
+        );
         assert_eq!(codes("# ruff: noqa: E501\ndef f(x=1): pass\n"), ["NOD001"]);
-        assert!(codes("# ruff: noqa\ndef f(x=1): pass\n").is_empty());
-        assert!(codes("# flake8: noqa\ndef f(x=1): pass\n").is_empty());
-        assert!(codes("# flake8: noqa   \ndef f(x=1): pass\n").is_empty());
+        assert_eq!(codes("# ruff: noqa\ndef f(x=1): pass\n"), [] as [&str; 0]);
+        assert_eq!(codes("# flake8: noqa\ndef f(x=1): pass\n"), [] as [&str; 0]);
+        assert_eq!(
+            codes("# flake8: noqa   \ndef f(x=1): pass\n"),
+            [] as [&str; 0]
+        );
     }
 
     #[test]
@@ -15943,7 +15955,10 @@ def b(x=1): pass  # type: ignore  # noqa
             codes("def a(x=1): pass  # type: ignore[misc]  # noqa: NOD001\n").is_empty(),
             "`# type: ignore` has to come first for some mypy versions"
         );
-        assert!(codes("def a(x=1): pass  # pragma: no cover  # noqa\n").is_empty());
+        assert_eq!(
+            codes("def a(x=1): pass  # pragma: no cover  # noqa\n"),
+            [] as [&str; 0]
+        );
         assert!(
             codes("def a(x=1): pass  # explains why  # NOQA: NOD001\n").is_empty(),
             "the marker is matched case-insensitively wherever it sits"
@@ -16063,11 +16078,17 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn a_file_level_directive_needs_no_space_after_the_colon() {
-        assert!(codes("# ruff:noqa: NOD001\ndef f(x=1): pass\n").is_empty());
-        assert!(codes("# ruff:noqa\ndef f(x=1): pass\n").is_empty());
-        assert!(codes("# flake8:noqa\ndef f(x=1): pass\n").is_empty());
-        assert!(codes("# ruff:\tnoqa\ndef f(x=1): pass\n").is_empty());
-        assert!(codes("# RUFF:NOQA: NOD001\ndef f(x=1): pass\n").is_empty());
+        assert_eq!(
+            codes("# ruff:noqa: NOD001\ndef f(x=1): pass\n"),
+            [] as [&str; 0]
+        );
+        assert_eq!(codes("# ruff:noqa\ndef f(x=1): pass\n"), [] as [&str; 0]);
+        assert_eq!(codes("# flake8:noqa\ndef f(x=1): pass\n"), [] as [&str; 0]);
+        assert_eq!(codes("# ruff:\tnoqa\ndef f(x=1): pass\n"), [] as [&str; 0]);
+        assert_eq!(
+            codes("# RUFF:NOQA: NOD001\ndef f(x=1): pass\n"),
+            [] as [&str; 0]
+        );
         assert_eq!(
             codes("# ruff:noqa: E501\ndef f(x=1): pass\n"),
             ["NOD001"],
@@ -16244,8 +16265,11 @@ def b(x=1): pass  # type: ignore  # noqa
 
     #[test]
     fn directives_survive_carriage_returns() -> Result<(), String> {
-        assert!(codes("def f(x=1): pass  # noqa: NOD001\r\n").is_empty());
-        assert!(codes("def f(x=1): pass  # noqa: NOD001\r").is_empty());
+        assert_eq!(
+            codes("def f(x=1): pass  # noqa: NOD001\r\n"),
+            [] as [&str; 0]
+        );
+        assert_eq!(codes("def f(x=1): pass  # noqa: NOD001\r"), [] as [&str; 0]);
         assert_eq!(
             fixed("def f(x): pass  # noqa: NOD001\r\n")?,
             "def f(x): pass\r\n"
@@ -16407,10 +16431,12 @@ def b(x=1): pass  # type: ignore  # noqa
     fn a_dataclass_named_without_being_called_is_left_quiet() -> Result<(), String> {
         // Class names appear in annotations and `isinstance` checks constantly,
         // and none of those are calls.
-        assert!(skipped_reasons(
-            "@dataclass\nclass C:\n    x: int = 1\n\n\ndef f(c: C) -> C:\n    return c\n"
-        )?
-        .is_empty());
+        assert_eq!(
+            skipped_reasons(
+                "@dataclass\nclass C:\n    x: int = 1\n\n\ndef f(c: C) -> C:\n    return c\n"
+            )?,
+            [] as [std::string::String; 0]
+        );
         Ok(())
     }
 
@@ -18813,7 +18839,7 @@ def b(x=1): pass  # type: ignore  # noqa
              def outer():\n    def inner(connect):\n        return connect\n    \
              connect(\"h\", timeout=30)\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -18825,7 +18851,7 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "def outer():\n    def inner(value):\n        return value\n    return inner(value=1)\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -18952,7 +18978,7 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "def target(value):\n    return lambda function: function\n\n@target(value=1)\ndef decorated():\n    target = 5\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -18963,7 +18989,7 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "def target(value):\n    return int\n\ndef decorated(item: target(value=1)):\n    target = 5\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -18984,7 +19010,7 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "def target(value):\n    return 5\n\nhandler = lambda target=target(value=1): target  # noqa: NOD001\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -19027,7 +19053,7 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "def target(value): return value\n\nresult = [x for target in [target(value=1)] for x in [1]]\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -19038,7 +19064,7 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "def outer():\n    @dataclass\n    class Inner:\n        value: int\n    return Inner(value=1)\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -19120,7 +19146,7 @@ def b(x=1): pass  # type: ignore  # noqa
              @dataclass\nclass Box(Protocol):\n    value: int\n\n\n\
              Box(base_field=0, value=1)\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -19136,7 +19162,7 @@ def b(x=1): pass  # type: ignore  # noqa
              Child(a=1, b=2)\nChild(9, b=2)\nChild(9, 8)\n",
             "the base's fields come first, so `Child(9)` already supplies `a`"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -19236,7 +19262,7 @@ def b(x=1): pass  # type: ignore  # noqa
         let source = "def factory():\n    class Protocol:\n        pass\n    \
                       return Protocol\n\n\n\
                       @dataclass\nclass Box(Protocol):\n    value: int = 1\n\n\nBox()\n";
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -19249,7 +19275,7 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "def f(items):\n    pass\n\n\nf(x for x in range(3))\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -19638,7 +19664,7 @@ def b(x=1): pass  # type: ignore  # noqa
             fixed(source)?,
             "def f(items, timeout):\n    pass\n\n\nf((x for x in range(3)), timeout=30)\n"
         );
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         Ok(())
     }
 
@@ -23709,7 +23735,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // Inside the handler `dataclass` is the caught exception, so the class
         // it decorates is no dataclass and `x = 1` is a plain class attribute.
         let source = "from dataclasses import dataclass\n\nclass DecoratorError(Exception):\n    def __call__(self, cls): return cls\n\ntry:\n    raise DecoratorError()\nexcept DecoratorError as dataclass:\n    @dataclass\n    class C:\n        x: int = 1\n";
-        assert!(messages(source, false).is_empty());
+        assert_eq!(messages(source, false), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -24186,11 +24212,10 @@ def b(x=1): pass  # type: ignore  # noqa
         // plain dataclass so that no underscore rule can answer first. The
         // report above is therefore the parameter binding rather than the
         // call shape going unrecognised.
-        assert!(messages(
+        assert_eq!(messages(
             "from dataclasses import dataclass\nfrom pydantic import PrivateAttr\n\n@dataclass\nclass C:\n    _value: int = PrivateAttr(default=1)\n",
             false,
-        )
-        .is_empty());
+        ), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -24204,7 +24229,7 @@ def b(x=1): pass  # type: ignore  # noqa
             ["dataclass field `x` has a default"]
         );
         let live = shadowed.replace("as field:", "as error:");
-        assert!(messages(&live, false).is_empty());
+        assert_eq!(messages(&live, false), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -24623,7 +24648,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // its calls rewritten exactly as before. Holding the default back
         // there would retain a default no broken call is behind.
         let source = "class Base:\n    def __init__(self, value=1):\n        self.value = value\n\n\nclass Child(Base):\n    pass\n\n\nAlias = Child\n\nassert Child().value == 1\n";
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         let updated = fixed(source)?;
         assert!(
             updated.contains("assert Child(value=1).value == 1"),
@@ -24700,7 +24725,7 @@ def b(x=1): pass  # type: ignore  # noqa
         // it because some other default in the file was removed would name a
         // call that is exactly as it should be.
         let source = "def unrelated(value=1):\n    return value\n\n\nclass Child:\n    def __init__(self):\n        self.value = 2\n\n\nAlias = Child\n\nassert (Alias().value, unrelated()) == (2, 1)\n";
-        assert!(skipped_reasons(source)?.is_empty());
+        assert_eq!(skipped_reasons(source)?, [] as [std::string::String; 0]);
         let updated = fixed(source)?;
         assert!(updated.contains("unrelated(value=1)"), "{updated}");
         Ok(())

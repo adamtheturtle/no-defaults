@@ -79,7 +79,7 @@ fn show_settings_rejects_mutating_modes() -> Result<(), Box<dyn std::error::Erro
             .arg(&path)
             .output()?;
         assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, [] as [u8; 0]);
         let stderr = String::from_utf8(output.stderr)?;
         assert!(stderr.contains("cannot be used with"), "{stderr}");
     }
@@ -125,7 +125,7 @@ fn later_dataclass_alias_imports_do_not_change_earlier_classes(
         .arg(&path)
         .output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     Ok(())
 }
 
@@ -205,7 +205,7 @@ fn diff_rejects_machine_readable_output_formats() -> Result<(), Box<dyn std::err
             .arg(&path)
             .output()?;
         assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, [] as [u8; 0]);
         let stderr = String::from_utf8(output.stderr)?;
         assert!(
             stderr.contains("--diff cannot be combined with a machine-readable --output-format"),
@@ -545,7 +545,7 @@ fn non_utf8_source_does_not_abort_other_files() -> Result<(), Box<dyn std::error
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("latin1.py:1:1: NOD000"), "{stdout}");
     assert!(stdout.contains("utf8.py:1:19: NOD001"), "{stdout}");
-    assert!(String::from_utf8(output.stderr)?.is_empty());
+    assert_eq!(String::from_utf8(output.stderr)?, "");
     Ok(())
 }
 
@@ -983,7 +983,7 @@ fn assignment_aliases_are_public_reexports() -> Result<(), Box<dyn std::error::E
         .arg(directory.path())
         .output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     Ok(())
 }
 
@@ -4301,7 +4301,7 @@ fn custom_dataclass_decorators_do_not_enable_field_diagnostics(
         .arg(&path)
         .output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     Ok(())
 }
 
@@ -4321,7 +4321,7 @@ fn a_local_basemodel_does_not_activate_the_pydantic_default(
         .arg(&path)
         .output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     Ok(())
 }
 
@@ -4340,7 +4340,7 @@ fn rebinding_a_dataclass_alias_invalidates_the_import() -> Result<(), Box<dyn st
         .arg(&path)
         .output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     Ok(())
 }
 
@@ -4394,7 +4394,7 @@ fn assigning_over_a_dataclass_decorator_invalidates_the_import(
 
     let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
@@ -5072,7 +5072,7 @@ fn for_targets_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn std
 
     let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
@@ -5104,7 +5104,7 @@ fn with_targets_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn st
 
     let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
@@ -5119,7 +5119,7 @@ fn walrus_targets_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn 
 
     let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }
@@ -5134,7 +5134,7 @@ fn match_captures_invalidate_imported_dataclass_aliases() -> Result<(), Box<dyn 
 
     let output = Command::new(binary()).arg("--fix").arg(&path).output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     assert_eq!(std::fs::read_to_string(path)?, source);
     Ok(())
 }

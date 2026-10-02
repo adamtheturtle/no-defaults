@@ -446,7 +446,7 @@ Read `### Changed` before upgrading a project that pins an earlier version.
 - A leading UTF-8 byte-order mark is no longer counted as source, so diagnostics on the first line of a BOM-prefixed file report the right column instead of three too far right.
   `--fix` writes the mark back.
 - Diagnostic columns count characters rather than bytes, matching Ruff.
-  Non-ASCII text earlier on a line no longer shifts the reported column in `full`, `concise`, `json`, and `github` output, or pushes the `^` in `full` output past what it points at, so editor and CI annotations land in the right place.
+  Non-ASCII text earlier on a line no longer shifts the reported column in `full`, `concise`, `json`, and `github` output, or pushes the `^` in `full` output past what it points at, so editor and CI annotations point to the correct location.
 - `--fix` writes through a symlink to the file it points at, instead of replacing the link with a regular file and leaving the real source unfixed.
   Directory walks never followed links, so this only affected a link named on the command line — which is exactly what pre-commit and shell globs produce.
 - Files are deduplicated by canonical path, so naming one file twice under different spellings — `d.py` and `./d.py`, a relative and an absolute form, or a symlink and its target — checks and reports it once instead of twice.

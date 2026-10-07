@@ -55,6 +55,22 @@ cargo machete
 
 Review each finding before removing a dependency, including dependencies used by macros or generated code.
 
+## Dependency policy
+
+CI checks Rust dependency advisories, licences, sources, and duplicate versions with [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) 0.20.2.
+The policy in `deny.toml` includes development and platform dependencies.
+Run the check locally:
+
+```console
+cargo install --locked cargo-deny --version 0.20.2
+cargo deny --locked check -D warnings
+```
+
+The policy rejects unknown sources, unapproved licences, wildcard requirements, new duplicate versions, and advisory warnings.
+Existing duplicate versions have exact-version exceptions with reasons in `deny.toml`.
+Review those exceptions when updating dependencies and remove them when the dependency graph permits it.
+
+
 ## Pull requests
 
 - Keep each pull request focused.

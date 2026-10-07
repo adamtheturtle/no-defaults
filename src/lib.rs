@@ -22,6 +22,9 @@ use unicode_width::UnicodeWidthChar as _;
 
 mod ty_resolver;
 
+#[cfg(test)]
+mod source_line_tests;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CallbackCall {
     positional: usize,

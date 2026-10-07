@@ -29,6 +29,8 @@ class Request(BaseModel):
 uv tool install no-defaults
 ```
 
+Building the Rust binary with Cargo requires Rust 1.92 or newer.
+
 The Python package installs [ty](https://docs.astral.sh/ty/) alongside `no-defaults`.
 If you install the Rust binary with Cargo instead, install `ty` separately and make it available on `PATH`; cross-package callback resolution uses the supported `ty server` interface and fails explicitly when it is absent.
 

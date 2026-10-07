@@ -2,6 +2,11 @@
 
 The behaviour the [README](../README.md) summarises, in full.
 
+## Rust compatibility
+
+Building from source requires Rust 1.92 or newer.
+The Python package supports the Python versions declared in its package metadata.
+
 ## What is detected
 
 Defaults on positional-only, positional-or-keyword, and keyword-only parameters, in `def` signatures and in `lambda` ones alike.

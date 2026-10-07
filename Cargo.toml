@@ -2,7 +2,7 @@
 name = "no-defaults"
 version = "2026.9.1"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.92"
 description = "A fast Python linter that forbids function and dataclass defaults"
 license = "MIT"
 readme = "README.md"

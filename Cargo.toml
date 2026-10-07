@@ -41,6 +41,7 @@ xattr = "1.6"
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
 
 [lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(fuzzing)"] }
 warnings = "deny"
 unsafe_code = "forbid"
 

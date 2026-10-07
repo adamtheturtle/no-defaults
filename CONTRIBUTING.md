@@ -63,25 +63,12 @@ Review each finding before removing a dependency, including dependencies used by
 - Do not weaken the zero-warning Clippy gate.
 - Add a `noqa` or declined fix only when the behaviour is intentional and explained.
 
-## Mutation testing
 
-CI uses [cargo-mutants](https://mutants.rs/) to check `previous_line_start`, `next_line_break`, and `line_break_end`.
-The pilot runs the source-line unit tests for each mutation, with a 30-second test timeout and a 180-second build timeout.
-Missed mutations and timeouts fail the job, and CI uploads the results for review.
-The same check also runs weekly and can be started manually.
 
-Install the pinned tool and run the check locally:
+## Property testing
 
-```console
-cargo install --locked cargo-mutants --version 26.2.0
-cargo mutants --in-place --timeout 30 --build-timeout 180
-```
-
-The scope and test command are defined in `.cargo/mutants.toml`.
-Review surviving mutations before broadening the pilot.
-An initial audit also examined `source_line_starts` and prompted more line-ending assertions.
-That function remains outside the CI pilot because mutations to its cursor updates can loop indefinitely.
-The pilot treats every timeout as a failure rather than accepting timeouts as caught mutations.
-
-The tool is pinned to 26.2.0 because 27.1.0 ignores regex filters for struct-field mutations.
-Update the pin after the fix for [cargo-mutants #632](https://github.com/sourcefrog/cargo-mutants/issues/632) is released.
+The Rust unit tests use [proptest](https://github.com/proptest-rs/proptest) to generate inputs and shrink failures.
+Run them with `cargo test --locked --lib property_tests`.
+They also run in the normal CI test suite, with 256 cases per property by default.
+For a longer local run, set `PROPTEST_CASES=4096`.
+Commit generated `proptest-regressions` files when a failure is fixed so the minimal failing input remains covered.

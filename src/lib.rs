@@ -14049,6 +14049,8 @@ fn line_column(source: &str, offset: TextSize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    mod property_tests;
+
     use super::*;
 
     /// The field-carrying base classes a run with no configuration uses.

@@ -27,6 +27,18 @@ A term Vale does not know, such as a Python builtin or a name this project has c
 Use `cargo run -- path/to/project` to exercise a development build.
 Add regression tests for behaviour changes and run `scripts/benchmark-typeshed.sh` when changing parsing, traversal, configuration discovery, or diagnostic generation.
 
+## Minimum Rust version
+
+The supported minimum Rust version is 1.92, matching the parser dependency.
+CI verifies the `Cargo.toml` requirement on Linux, macOS, and Windows with [cargo-msrv](https://github.com/foresterre/cargo-msrv) 0.19.3.
+
+```console
+cargo install --locked cargo-msrv --version 0.19.3
+cargo msrv verify --no-log -- cargo check --locked --all-targets --all-features
+```
+
+When dependencies require a newer compiler, update the declared minimum and verify it with this command.
+
 ## Rust visibility
 
 CI checks Rust visibility with [Cargo Hawk](https://github.com/astral-sh/hawk) 0.1.15 and Rust 1.99.0.
@@ -136,15 +148,3 @@ The generated corpus and failure artifacts are ignored by Git.
 When using a prebuilt cargo-fuzz binary, pass `--target` with the host Rust target if its default differs from your compiler.
 CI explicitly uses `x86_64-unknown-linux-gnu`.
 Update the tool and nightly compiler pins together after validating every target.
-
-## Minimum Rust version
-
-The supported minimum Rust version is 1.92, matching the parser dependency.
-CI verifies the `Cargo.toml` requirement on Linux, macOS, and Windows with [cargo-msrv](https://github.com/foresterre/cargo-msrv) 0.19.3.
-
-```console
-cargo install --locked cargo-msrv --version 0.19.3
-cargo msrv verify --no-log -- cargo check --locked --all-targets --all-features
-```
-
-When dependencies require a newer compiler, update the declared minimum and verify it with this command.

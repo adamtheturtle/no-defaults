@@ -1,0 +1,4 @@
+examine_globs = ["src/lib.rs"]
+examine_re = [' (previous_line_start|next_line_break|line_break_end)\b']
+additional_cargo_args = ["--locked", "--lib"]
+additional_cargo_test_args = ["source_line_tests"]

@@ -3587,6 +3587,10 @@ fn has_multiple_hard_links(_: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "Attribute names must remain quoted and escaped in diagnostics"
+)]
 fn copy_extended_attributes(source: &Path, destination: &std::fs::File) -> Result<(), String> {
     use xattr::FileExt;
 

@@ -136,3 +136,11 @@ The generated corpus and failure artifacts are ignored by Git.
 When using a prebuilt cargo-fuzz binary, pass `--target` with the host Rust target if its default differs from your compiler.
 CI explicitly uses `x86_64-unknown-linux-gnu`.
 Update the tool and nightly compiler pins together after validating every target.
+
+## Property testing
+
+The Rust unit tests use [proptest](https://github.com/proptest-rs/proptest) to generate inputs and shrink failures.
+Run them with `cargo test --locked --lib property_tests`.
+They also run in the normal CI test suite, with 256 cases per property by default.
+For a longer local run, set `PROPTEST_CASES=4096`.
+Commit generated `proptest-regressions` files when a failure is fixed so the minimal failing input remains covered.

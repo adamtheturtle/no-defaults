@@ -39,6 +39,7 @@ xattr = "1.6"
 
 [dev-dependencies]
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "deny", check-cfg = ["cfg(fuzzing)"] }

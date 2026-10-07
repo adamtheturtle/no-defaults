@@ -27190,3 +27190,7 @@ def b(x=1): pass  # type: ignore  # noqa
         Ok(())
     }
 }
+
+/// Assertions for the separate cargo-fuzz targets.
+#[cfg(fuzzing)]
+pub mod fuzzing;

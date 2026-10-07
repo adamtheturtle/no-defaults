@@ -86,6 +86,41 @@ The pilot treats every timeout as a failure rather than accepting timeouts as ca
 The tool is pinned to 26.2.0 because 27.1.0 ignores regex filters for struct-field mutations.
 Update the pin after the fix for [cargo-mutants #632](https://github.com/sourcefrog/cargo-mutants/issues/632) is released.
 
+## Fuzz testing
+
+The [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets exercise our core routines with generated inputs.
+CI runs each target for 60 seconds on pull requests and pushes, and for 10 minutes in the weekly run.
+Each input has a 10-second timeout and the input size is capped at 4096 bytes.
+Crashes and timeouts fail the job, which uploads failure artifacts.
+Fuzz-only entry points are compiled with `cfg(fuzzing)` and do not add APIs to normal builds.
+
+Use Cargo from rustup for the toolchain-qualified commands.
+Install the pinned tool and compiler:
+
+```console
+cargo install --locked cargo-fuzz --version 0.13.2
+rustup toolchain install nightly-2026-09-05 --profile minimal --component rust-src
+```
+
+The targets are `source-analysis`, `source-deletions`.
+Use one target name in place of `TARGET` below:
+
+```console
+mkdir -p fuzz/corpus/TARGET
+cp fuzz/seeds/TARGET/* fuzz/corpus/TARGET/
+cargo +nightly-2026-09-05 fetch --locked --manifest-path fuzz/Cargo.toml
+cargo +nightly-2026-09-05 fuzz run TARGET -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048 -max_len=4096
+```
+
+The fuzz package has its own lockfile and a cargo-deny policy that also audits the fuzzing dependencies.
+The policy permits NCSA because the LLVM fuzzing runtime requires it.
+CI fetches its locked dependencies, builds offline, and checks that the lockfile stays unchanged.
+Keep minimized failures as regression tests, and add useful starting inputs to `fuzz/seeds`.
+The generated corpus and failure artifacts are ignored by Git.
+When using a prebuilt cargo-fuzz binary, pass `--target` with the host Rust target if its default differs from your compiler.
+CI explicitly uses `x86_64-unknown-linux-gnu`.
+Update the tool and nightly compiler pins together after validating every target.
+
 ## Property testing
 
 The Rust unit tests use [proptest](https://github.com/proptest-rs/proptest) to generate inputs and shrink failures.

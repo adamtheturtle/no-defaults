@@ -1,0 +1,4 @@
+def target(value=1):
+    return value
+
+target()

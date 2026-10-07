@@ -4,9 +4,8 @@
 *.pyc
 # Vale styles downloaded by `vale sync`.
 /styles/
-
-
-
+/mutants.out/
+/mutants.out.old/
 /fuzz/target/
 /fuzz/artifacts/
 /fuzz/corpus/

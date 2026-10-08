@@ -5,9 +5,7 @@ edition = "2021"
 rust-version = "1.92"
 description = "A fast Python linter that forbids function and dataclass defaults"
 license = "MIT"
-readme = "README.md"
 repository = "https://github.com/adamtheturtle/no-defaults"
-homepage = "https://github.com/adamtheturtle/no-defaults"
 documentation = "https://github.com/adamtheturtle/no-defaults#readme"
 
 [[bin]]

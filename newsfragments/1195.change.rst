@@ -1,0 +1,1 @@
+Bound writes to ``ty server`` by the operation deadline so a server that stops reading cannot hang the checker or prevent child cleanup.

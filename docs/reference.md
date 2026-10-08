@@ -132,6 +132,9 @@ There is one focused exception: imported Python packages are read from `PYTHONPA
 Defaults those calls omit are retained.
 Package files are parsed without importing the package and are never diagnosed, counted, or edited.
 Re-exports, inferred attributes, wrapped annotations, and inherited intermediate bases are resolved by `ty`; unresolved and dynamically dispatched calls stay conservative.
+Communication with `ty server` has a 15-second initialization deadline and a 20-second deadline for each document open or definition lookup.
+These deadlines cover both sending messages and waiting for responses, including replies to requests from the server.
+An unresponsive server causes an operational error, and cleanup terminates the child without writing to its input pipe.
 A warning after fixing covers callers it still cannot see, and **your test suite is what confirms the result**.
 
 `--fix` is therefore safest under `private_only = true` with `respect_reexports = true`, where the symbols it touches have no callers outside the project, and it sees the most when you run it over the whole project at once.

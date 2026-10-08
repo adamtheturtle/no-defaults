@@ -140,5 +140,5 @@ Run `no-defaults --fix .` by hand when you are removing a default that is called
 
 MIT
 
-See [docs/reference.md](docs/reference.md) for the full behaviour, and [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CHANGELOG.rst](CHANGELOG.rst).
-Semver releases through `2.3.0` are recorded in [CHANGELOG.md](CHANGELOG.md).
+See [docs/reference.md](docs/reference.md) for the full behaviour, and [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CHANGELOG.md](CHANGELOG.md).
+Semver releases through `2.3.0` are recorded in [the SemVer archive](changelog/legacy-semver.md).

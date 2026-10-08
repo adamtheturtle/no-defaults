@@ -13,7 +13,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
 ```
 
-The prose in `README.md`, `CHANGELOG.rst`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, and `docs/` is linted with [Vale](https://vale.sh).
+The prose in `README.md`, `CHANGELOG.md`, `changelog/`, `CONTRIBUTING.md`, `SECURITY.md`, and `docs/` is linted with [Vale](https://vale.sh).
 Install it, then run the same two commands CI runs:
 
 ```console
@@ -86,7 +86,7 @@ Review those exceptions when updating dependencies and remove them when the depe
 ## Pull requests
 
 - Keep each pull request focused.
-- Document user-visible behaviour in a news fragment under `newsfragments/change/` (assembled into `CHANGELOG.rst` at release time) and in `docs/reference.md`.
+- Document user-visible behaviour in a news fragment under `newsfragments/change/` (assembled into `CHANGELOG.md` at release time) and in `docs/reference.md`.
   `README.md` is a short overview: add to it only when the change alters what the tool is for, how it is installed, or how it is invoked.
 - Do not weaken the zero-warning Clippy gate.
 - Add a `noqa` or declined fix only when the behaviour is intentional and explained.
@@ -156,3 +156,9 @@ Run them with `cargo test --locked --lib property_tests`.
 They also run in the normal CI test suite, with 256 cases per property by default.
 For a longer local run, set `PROPTEST_CASES=4096`.
 Commit generated `proptest-regressions` files when a failure is fixed so the minimal failing input remains covered.
+
+# Release notes
+
+Write user-facing changes as Markdown in `newsfragments/<issue>.change.md`.
+Towncrier writes one Markdown file per version, used directly for GitHub release notes.
+Invalid fragment names fail release assembly.

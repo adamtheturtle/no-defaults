@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -20,11 +20,16 @@ pub struct DefinitionLocation {
 
 pub struct TyResolver {
     child: Child,
-    stdin: ChildStdin,
+    outgoing: Option<Sender<OutgoingMessage>>,
     incoming: Receiver<Value>,
     next_id: i64,
     opened: HashSet<PathBuf>,
     pending: HashMap<i64, Value>,
+}
+
+struct OutgoingMessage {
+    body: Vec<u8>,
+    completed: Sender<std::io::Result<()>>,
 }
 
 fn ty_command() -> Command {
@@ -53,7 +58,7 @@ pub fn require_ty() -> Result<(), String> {
 
 impl TyResolver {
     pub fn start(project_root: &Path, extra_paths: &[PathBuf]) -> Result<Self, String> {
-        let mut child = ty_command()
+        let child = ty_command()
             .arg("server")
             .current_dir(project_root)
             .stdin(Stdio::piped())
@@ -61,24 +66,8 @@ impl TyResolver {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|error| format!("could not start `ty server`: {error}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "`ty server` supplied no stdin".to_owned())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "`ty server` supplied no stdout".to_owned())?;
-        let (sender, incoming) = std::sync::mpsc::channel();
-        std::thread::spawn(move || read_messages(stdout, &sender));
-        let mut resolver = Self {
-            child,
-            stdin,
-            incoming,
-            next_id: 1,
-            opened: HashSet::new(),
-            pending: HashMap::new(),
-        };
+        let mut resolver = Self::from_child(child)?;
+        let deadline = Instant::now() + INITIALIZE_TIMEOUT;
         let id = resolver.request(
             "initialize",
             &json!({
@@ -91,10 +80,34 @@ impl TyResolver {
                     },
                 },
             }),
+            deadline,
         )?;
-        resolver.collect(id, INITIALIZE_TIMEOUT)?;
-        resolver.notify("initialized", &json!({}))?;
+        resolver.collect(id, deadline)?;
+        resolver.notify("initialized", &json!({}), deadline)?;
         Ok(resolver)
+    }
+
+    fn from_child(mut child: Child) -> Result<Self, String> {
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "`ty server` supplied no stdin".to_owned())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "`ty server` supplied no stdout".to_owned())?;
+        let (sender, incoming) = std::sync::mpsc::channel();
+        std::thread::spawn(move || read_messages(stdout, &sender));
+        let (outgoing, messages) = std::sync::mpsc::channel();
+        std::thread::spawn(move || write_messages(stdin, messages));
+        Ok(Self {
+            child,
+            outgoing: Some(outgoing),
+            incoming,
+            next_id: 1,
+            opened: HashSet::new(),
+            pending: HashMap::new(),
+        })
     }
 
     pub fn definitions(
@@ -103,7 +116,8 @@ impl TyResolver {
         source: &str,
         offset: usize,
     ) -> Result<Vec<DefinitionLocation>, String> {
-        self.open(path, source)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.open_until(path, source, deadline)?;
         let (line, character) = lsp_position(source, offset);
         let id = self.request(
             "textDocument/definition",
@@ -111,14 +125,19 @@ impl TyResolver {
                 "textDocument": { "uri": absolute_uri(path) },
                 "position": { "line": line, "character": character },
             }),
+            deadline,
         )?;
-        let result = self.collect(id, REQUEST_TIMEOUT)?;
+        let result = self.collect(id, deadline)?;
         Ok(locations_from_value(&result))
     }
 
     pub fn open(&mut self, path: &Path, source: &str) -> Result<(), String> {
+        self.open_until(path, source, Instant::now() + REQUEST_TIMEOUT)
+    }
+
+    fn open_until(&mut self, path: &Path, source: &str, deadline: Instant) -> Result<(), String> {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        if self.opened.insert(path.clone()) {
+        if !self.opened.contains(&path) {
             self.notify(
                 "textDocument/didOpen",
                 &json!({
@@ -129,48 +148,66 @@ impl TyResolver {
                         "text": source,
                     }
                 }),
+                deadline,
             )?;
+            self.opened.insert(path);
         }
         Ok(())
     }
 
-    fn request(&mut self, method: &str, params: &Value) -> Result<i64, String> {
+    fn request(&mut self, method: &str, params: &Value, deadline: Instant) -> Result<i64, String> {
         let id = self.next_id;
         self.next_id += 1;
-        self.send(&json!({
-            "jsonrpc": "2.0", "id": id, "method": method, "params": params,
-        }))?;
+        self.send(
+            &json!({
+                "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+            }),
+            deadline,
+        )?;
         Ok(id)
     }
 
-    fn notify(&mut self, method: &str, params: &Value) -> Result<(), String> {
-        self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+    fn notify(&mut self, method: &str, params: &Value, deadline: Instant) -> Result<(), String> {
+        self.send(
+            &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+            deadline,
+        )
     }
 
-    fn send(&mut self, message: &Value) -> Result<(), String> {
+    fn send(&mut self, message: &Value, deadline: Instant) -> Result<(), String> {
         let body = serde_json::to_vec(message).map_err(|error| error.to_string())?;
-        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())
-            .and_then(|()| self.stdin.write_all(&body))
-            .and_then(|()| self.stdin.flush())
-            .map_err(|error| format!("could not communicate with `ty server`: {error}"))
+        let (completed, written) = std::sync::mpsc::channel();
+        let result = (|| {
+            remaining_time(deadline)?;
+            self.outgoing
+                .as_ref()
+                .ok_or_else(|| "`ty server` disconnected".to_owned())?
+                .send(OutgoingMessage { body, completed })
+                .map_err(|_| "`ty server` disconnected".to_owned())?;
+            written
+                .recv_timeout(remaining_time(deadline)?)
+                .map_err(communication_wait_error)?
+                .map_err(|error| format!("could not communicate with `ty server`: {error}"))
+        })();
+        if result.is_err() {
+            // A timed-out write may have sent only part of a frame. Never reuse
+            // that transport, and unblock the writer by terminating the child.
+            self.outgoing.take();
+            let _ = self.child.kill();
+        }
+        result
     }
 
-    fn collect(&mut self, id: i64, timeout: Duration) -> Result<Value, String> {
+    fn collect(&mut self, id: i64, deadline: Instant) -> Result<Value, String> {
         if let Some(value) = self.pending.remove(&id) {
             return Ok(value);
         }
-        let deadline = Instant::now() + timeout;
         loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| "`ty server` request timed out".to_owned())?;
+            let remaining = remaining_time(deadline)?;
             let message = self
                 .incoming
                 .recv_timeout(remaining)
-                .map_err(|error| match error {
-                    RecvTimeoutError::Timeout => "`ty server` request timed out".to_owned(),
-                    RecvTimeoutError::Disconnected => "`ty server` disconnected".to_owned(),
-                })?;
+                .map_err(communication_wait_error)?;
             if message.get("method").is_none()
                 && message.get("id").and_then(Value::as_i64) == Some(id)
             {
@@ -181,7 +218,10 @@ impl TyResolver {
             }
             if let Some(other_id) = message.get("id").and_then(Value::as_i64) {
                 if message.get("method").is_some() {
-                    self.send(&json!({ "jsonrpc": "2.0", "id": other_id, "result": null }))?;
+                    self.send(
+                        &json!({ "jsonrpc": "2.0", "id": other_id, "result": null }),
+                        deadline,
+                    )?;
                 } else if let Some(error) = message.get("error") {
                     return Err(format!("`ty server` returned an error: {error}"));
                 } else {
@@ -197,11 +237,35 @@ impl TyResolver {
 
 impl Drop for TyResolver {
     fn drop(&mut self) {
-        let _ = self.send(&json!({
-            "jsonrpc": "2.0", "id": -1, "method": "shutdown", "params": null,
-        }));
+        // Cleanup must not write to a pipe that may already be full.
+        self.outgoing.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+fn remaining_time(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| "`ty server` request timed out".to_owned())
+}
+
+fn communication_wait_error(error: RecvTimeoutError) -> String {
+    match error {
+        RecvTimeoutError::Timeout => "`ty server` request timed out".to_owned(),
+        RecvTimeoutError::Disconnected => "`ty server` disconnected".to_owned(),
+    }
+}
+
+fn write_messages(mut stdin: ChildStdin, messages: Receiver<OutgoingMessage>) {
+    for message in messages {
+        let result = write!(stdin, "Content-Length: {}\r\n\r\n", message.body.len())
+            .and_then(|()| stdin.write_all(&message.body))
+            .and_then(|()| stdin.flush());
+        let failed = result.is_err();
+        if message.completed.send(result).is_err() || failed {
+            return;
+        }
     }
 }
 
@@ -320,7 +384,258 @@ fn percent_decode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{lsp_position, percent_decode, uri_path};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{json, Value};
+
+    use super::{
+        lsp_position, percent_decode, read_messages, uri_path, OutgoingMessage, TyResolver,
+    };
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(100);
+    const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
+
+    fn large_params() -> Value {
+        json!({ "text": "x".repeat(8 * 1024 * 1024) })
+    }
+
+    fn transport(mode: &str) -> Result<TyResolver, Box<dyn std::error::Error>> {
+        // Run a Rust test as the peer so real pipe backpressure is covered on
+        // every supported platform, without requiring a shell or Python.
+        let child = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "ty_resolver::tests::transport_peer",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("NO_DEFAULTS_TRANSPORT_PEER", mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let resolver = TyResolver::from_child(child)?;
+        assert_eq!(
+            resolver.incoming.recv_timeout(WATCHDOG_TIMEOUT)?,
+            json!({ "method": "ready" })
+        );
+        Ok(resolver)
+    }
+
+    fn peer_message(message: &Value) -> std::io::Result<()> {
+        let body = serde_json::to_vec(message)?;
+        let mut stdout = std::io::stdout().lock();
+        // The newline separates the first frame from the test harness output.
+        write!(stdout, "\nContent-Length: {}\r\n\r\n", body.len())?;
+        stdout.write_all(&body)?;
+        stdout.flush()
+    }
+
+    #[test]
+    #[ignore = "subprocess peer for transport regression tests"]
+    fn transport_peer() -> Result<(), Box<dyn std::error::Error>> {
+        let mode = std::env::var("NO_DEFAULTS_TRANSPORT_PEER")?;
+        peer_message(&json!({ "method": "ready" }))?;
+        if mode == "server-request" || mode == "echo-server-request" {
+            peer_message(&json!({ "id": 42, "method": "workspace/configuration" }))?;
+        }
+        if mode == "exit" {
+            return Ok(());
+        }
+        if mode == "blocked" || mode == "server-request" {
+            // Finite lifetime also prevents a broken implementation from
+            // leaving the regression test stuck forever.
+            std::thread::sleep(Duration::from_secs(10));
+            return Ok(());
+        }
+        let (sender, incoming) = mpsc::channel();
+        std::thread::spawn(move || read_messages(std::io::stdin().lock(), &sender));
+        for message in incoming {
+            peer_message(&json!({ "id": message["id"], "result": message }))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requests_time_out_when_the_peer_does_not_read() -> Result<(), Box<dyn std::error::Error>> {
+        let mut resolver = transport("blocked")?;
+        let params = large_params();
+        let started = Instant::now();
+        assert_eq!(
+            resolver.request("initialize", &params, started + TEST_TIMEOUT),
+            Err("`ty server` request timed out".to_owned())
+        );
+        assert!(started.elapsed() < WATCHDOG_TIMEOUT);
+        assert!(resolver.outgoing.is_none());
+        // A partially written frame cannot be retried on the same pipe.
+        assert_eq!(
+            resolver.send(&json!({}), Instant::now() + TEST_TIMEOUT),
+            Err("`ty server` disconnected".to_owned())
+        );
+        assert!(!resolver.child.wait()?.success());
+        Ok(())
+    }
+
+    #[test]
+    fn opening_a_document_times_out_without_marking_it_open(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut resolver = transport("blocked")?;
+        let source = "x".repeat(8 * 1024 * 1024);
+        let started = Instant::now();
+        assert_eq!(
+            resolver.open_until(
+                std::path::Path::new("example.py"),
+                &source,
+                started + TEST_TIMEOUT
+            ),
+            Err("`ty server` request timed out".to_owned())
+        );
+        assert!(started.elapsed() < WATCHDOG_TIMEOUT);
+        assert!(resolver.opened.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn server_request_replies_use_the_response_deadline() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut resolver = transport("server-request")?;
+        let (completed, written) = mpsc::channel();
+        resolver
+            .outgoing
+            .as_ref()
+            .ok_or("missing writer")?
+            .send(OutgoingMessage {
+                body: serde_json::to_vec(&large_params())?,
+                completed,
+            })?;
+        assert!(matches!(
+            written.recv_timeout(TEST_TIMEOUT),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        let started = Instant::now();
+        assert_eq!(
+            resolver.collect(1, started + TEST_TIMEOUT),
+            Err("`ty server` request timed out".to_owned())
+        );
+        assert!(started.elapsed() < WATCHDOG_TIMEOUT);
+        assert!(resolver.outgoing.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_terminates_a_child_with_a_blocked_writer() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let resolver = transport("blocked")?;
+        let (completed, written) = mpsc::channel();
+        resolver
+            .outgoing
+            .as_ref()
+            .ok_or("missing writer")?
+            .send(OutgoingMessage {
+                body: serde_json::to_vec(&large_params())?,
+                completed,
+            })?;
+        assert!(matches!(
+            written.recv_timeout(TEST_TIMEOUT),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        let (finished, dropped) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(resolver);
+            let _ = finished.send(());
+        });
+        dropped.recv_timeout(WATCHDOG_TIMEOUT)?;
+        // Killing the child releases the real blocked pipe write too.
+        assert!(written.recv_timeout(WATCHDOG_TIMEOUT)?.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sending_and_receiving_share_one_deadline() -> Result<(), Box<dyn std::error::Error>> {
+        let mut resolver = transport("echo")?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let id = resolver.request("initialize", &json!({}), deadline)?;
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + TEST_TIMEOUT);
+        // Receiving must not start a fresh timeout after sending has used up
+        // the operation's budget, even if a response is already buffered.
+        assert_eq!(
+            resolver.collect(id, deadline),
+            Err("`ty server` request timed out".to_owned())
+        );
+        assert_eq!(
+            resolver.collect(id, Instant::now() + WATCHDOG_TIMEOUT)?,
+            json!({ "jsonrpc": "2.0", "id": id, "method": "initialize", "params": {} })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn messages_remain_framed_and_ordered() -> Result<(), Box<dyn std::error::Error>> {
+        let mut resolver = transport("echo")?;
+        let deadline = Instant::now() + WATCHDOG_TIMEOUT;
+        resolver.notify("initialized", &json!({}), deadline)?;
+        let params = large_params();
+        let first = resolver.request("first", &params, deadline)?;
+        let second = resolver.request("second", &json!({}), deadline)?;
+        // Collect out of order to exercise pending responses as well.
+        assert_eq!(
+            resolver.collect(second, deadline)?,
+            json!({ "jsonrpc": "2.0", "id": second, "method": "second", "params": {} })
+        );
+        assert_eq!(
+            resolver.collect(first, deadline)?,
+            json!({ "jsonrpc": "2.0", "id": first, "method": "first", "params": params })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn server_requests_receive_a_framed_reply() -> Result<(), Box<dyn std::error::Error>> {
+        let mut resolver = transport("echo-server-request")?;
+        let deadline = Instant::now() + WATCHDOG_TIMEOUT;
+        let id = resolver.request("initialize", &json!({}), deadline)?;
+        assert_eq!(
+            resolver.collect(id, deadline)?,
+            json!({ "jsonrpc": "2.0", "id": id, "method": "initialize", "params": {} })
+        );
+        assert_eq!(
+            resolver.collect(42, deadline)?,
+            json!({ "jsonrpc": "2.0", "id": 42, "result": null })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pipe_write_errors_are_reported() -> Result<(), Box<dyn std::error::Error>> {
+        let mut resolver = transport("exit")?;
+        let error = resolver
+            .request(
+                "initialize",
+                &large_params(),
+                Instant::now() + WATCHDOG_TIMEOUT,
+            )
+            .err()
+            .ok_or("expected a pipe write error")?;
+        assert!(
+            error.starts_with("could not communicate with `ty server`: "),
+            "{error}"
+        );
+        assert!(resolver.outgoing.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn closed_response_pipes_report_disconnection() -> Result<(), Box<dyn std::error::Error>> {
+        let mut resolver = transport("exit")?;
+        assert_eq!(
+            resolver.collect(1, Instant::now() + WATCHDOG_TIMEOUT),
+            Err("`ty server` disconnected".to_owned())
+        );
+        Ok(())
+    }
 
     #[test]
     fn lsp_columns_count_utf16_code_units() {

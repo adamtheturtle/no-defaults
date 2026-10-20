@@ -8,6 +8,8 @@ updates:
       default-days: 7
   # Keep Python requirements and ``uv.lock`` updates in one Dependabot commit.
   - package-ecosystem: uv
+    allow:
+      - dependency-type: all
     directory: /
     schedule:
       interval: weekly

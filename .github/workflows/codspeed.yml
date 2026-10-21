@@ -26,7 +26,7 @@ jobs:
       - name: Build benchmarks
         run: cargo codspeed build --locked
       - name: Run benchmarks
-        uses: CodSpeedHQ/action@c4fd08a3a159bd0cc208da1e0edf32b8c47d75e5 # v5
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5
         with:
           mode: simulation
           run: cargo codspeed run

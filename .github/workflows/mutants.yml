@@ -23,7 +23,7 @@ jobs:
           rustup toolchain install 1.99.0 --profile minimal
           rustup override set 1.99.0
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
-      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           # Update after the regex-filter fix is released:
           # https://github.com/sourcefrog/cargo-mutants/issues/632

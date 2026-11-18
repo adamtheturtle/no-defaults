@@ -2,7 +2,8 @@ version = 1
 revision = 5
 requires-python = ">=3.9"
 resolution-markers = [
-    "python_full_version >= '3.10'",
+    "python_full_version >= '3.12'",
+    "python_full_version >= '3.10' and python_full_version < '3.12'",
 ]
 supported-markers = [
     "python_full_version >= '3.10'",
@@ -266,9 +267,52 @@ wheels = [
 ]
 
 [[package]]
+name = "doc8"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docutils", version = "0.21.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "pygments" },
+    { name = "restructuredtext-lint" },
+    { name = "stevedore" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/92/91/88bb55225046a2ee9c2243d47346c78d2ed861c769168f451568625ad670/doc8-2.0.0.tar.gz", hash = "sha256:1267ad32758971fbcf991442417a3935c7bc9e52550e73622e0e56ba55ea1d40", size = 28436, upload-time = "2025-06-13T13:08:53.174Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a2/e9/90b7d243364d3dce38c8c2a1b8c103d7a8d1383c2b24c735fae0eee038dd/doc8-2.0.0-py3-none-any.whl", hash = "sha256:9862710027f793c25f9b1899150660e4bf1d4c9a6738742e71f32011e2e3f590", size = 25861, upload-time = "2025-06-13T13:08:51.839Z" },
+]
+
+[[package]]
+name = "doc8-inline-markup"
+version = "2026.11.18.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "doc8" },
+    { name = "docutils", version = "0.21.2", source = { registry = "https://pypi.org/simple" } },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0f/6b/da198df8d07a7d1bd49809d8d51ca6199aab6b6b2a26a15cd6712aecb3ac/doc8_inline_markup-2026.11.18.3.tar.gz", hash = "sha256:3999b3a2ba032a5540e340ed189dfac3c84ccd7aa18971ff0d4c13faced00b64", size = 9416, upload-time = "2026-11-18T11:48:11.863Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1c/ee/c285898945eeaada351ff774945774938f306ab2194f53161f918c0af10b/doc8_inline_markup-2026.11.18.3-py3-none-any.whl", hash = "sha256:0c4abc2bba198b9303d28fd132d19ab8b6c183a666cdfe3b0fa386385f8c1c3d", size = 5800, upload-time = "2026-11-18T11:48:10.545Z" },
+]
+
+[[package]]
+name = "docutils"
+version = "0.21.2"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.12'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ae/ed/aefcc8cd0ba62a0560c3c18c33925362d46c6075480bfa4df87b28e169a9/docutils-0.21.2.tar.gz", hash = "sha256:3a6b18732edf182daa3cd12775bbb338cf5691468f91eeeb109deff6ebfa986f", size = 2204444, upload-time = "2024-04-23T18:57:18.24Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/d7/9322c609343d929e75e7e5e6255e614fcc67572cfd083959cdef3b7aad79/docutils-0.21.2-py3-none-any.whl", hash = "sha256:dafca5b9e384f0e419294eb4d2ff9fa826435bf15f15b7bd45723e8ad76811b2", size = 587408, upload-time = "2024-04-23T18:57:14.835Z" },
+]
+
+[[package]]
 name = "docutils"
 version = "0.23"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.10' and python_full_version < '3.12'",
+]
 sdist = { url = "https://files.pythonhosted.org/packages/39/a4/5180d9afc57e8fca05601dd652bdff19604c218814037fe90ffc7625a50a/docutils-0.23.tar.gz", hash = "sha256:746f5060322511280a1e50eb76846ed6bf2342984b2ac04dc42caa1a8d78799e", size = 2303823, upload-time = "2026-05-27T17:41:06.934Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/91/30151a39f7570f448ed84529390628a651d7f27c87d73c9b887f8189695e/docutils-0.23-py3-none-any.whl", hash = "sha256:25d013af9bf23bc1c7b2b093dff4208166c53a94786c9e447808335ef1185fea", size = 634701, upload-time = "2026-05-27T17:40:58.442Z" },
@@ -477,6 +521,10 @@ dependencies = [
 dev = [
     { name = "pyroma" },
 ]
+docs-lint = [
+    { name = "doc8", marker = "python_full_version >= '3.12'" },
+    { name = "doc8-inline-markup", marker = "python_full_version >= '3.12'" },
+]
 release = [
     { name = "check-wheel-contents" },
     { name = "towncrier" },
@@ -487,6 +535,10 @@ requires-dist = [{ name = "ty", specifier = ">=0.0.52" }]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pyroma", specifier = "==5.0.1" }]
+docs-lint = [
+    { name = "doc8", marker = "python_full_version >= '3.12'", specifier = "==2.0.0" },
+    { name = "doc8-inline-markup", marker = "python_full_version >= '3.12'", specifier = "==2026.11.18.3" },
+]
 release = [
     { name = "check-wheel-contents", specifier = "==0.6.3" },
     { name = "towncrier", specifier = "==26.9.0" },
@@ -691,7 +743,8 @@ version = "5.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "build" },
-    { name = "docutils" },
+    { name = "docutils", version = "0.21.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "docutils", version = "0.23", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "packaging" },
     { name = "pygments" },
     { name = "requests" },
@@ -719,12 +772,33 @@ wheels = [
 ]
 
 [[package]]
+name = "restructuredtext-lint"
+version = "2.0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docutils", version = "0.21.2", source = { registry = "https://pypi.org/simple" } },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ca/e6/eefcad2228f4124f17e01064428fbcd0ade06a274f3063ce3a126a569d6b/restructuredtext_lint-2.0.2.tar.gz", hash = "sha256:dd25209b9e0b726929d8306339faf723734a3137db382bcf27294fa18a6bc52b", size = 17494, upload-time = "2025-11-23T08:05:18.585Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/63/ac52b32b33ae62f2076ed5c4f6b00e065e3ccbb2063e9a2e813b2bfc95bf/restructuredtext_lint-2.0.2-py3-none-any.whl", hash = "sha256:374c0d3e7e0867b2335146a145343ac619400623716b211b9a010c94426bbed7", size = 14198, upload-time = "2025-11-23T08:05:23.267Z" },
+]
+
+[[package]]
 name = "setuptools"
 version = "84.2.1"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/70/b3/c19426f783614d625699a4b247faf628ea9ab1db228674491767b417f9e1/setuptools-84.2.1.tar.gz", hash = "sha256:3ff8b3b5492a0aa66960f4419365a86b84e013070d4313e4d4a6894f5d64d6bc", size = 1230289, upload-time = "2026-10-20T19:01:37.742Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/setuptools-84.2.1-py3-none-any.whl", hash = "sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2", size = 876263, upload-time = "2026-10-20T19:01:35.678Z" },
+]
+
+[[package]]
+name = "stevedore"
+version = "5.10.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/ec/b628c3b1613fe9340de1c5daba957f5b152159ac350b6ce4ad3d2469f822/stevedore-5.10.0.tar.gz", hash = "sha256:6005f32c09dc3159802a61c04862770e439e32db22f6da78ba56e8a735466882", size = 520466, upload-time = "2026-11-12T11:47:05.38Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/10/78/918aaff2864a8829d061db40acb9da04c89e5c3a01d65932b34432ebd78b/stevedore-5.10.0-py3-none-any.whl", hash = "sha256:47c48dc09e75933106c1bba0a7690eef3b5acecdb807df6d47cc40b2532fa927", size = 56789, upload-time = "2026-11-12T11:47:04.273Z" },
 ]
 
 [[package]]

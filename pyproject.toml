@@ -38,6 +38,11 @@ Changelog = "https://github.com/adamtheturtle/no-defaults/blob/main/CHANGELOG.md
 dev = [ "pyroma==5.0.1" ]
 release = [ "check-wheel-contents==0.6.3", "towncrier==26.9.0" ]
 
+docs-lint = [ "doc8==2.0.0; python_version>='3.12'", "doc8-inline-markup==2026.11.18.3; python_version>='3.12'" ]
+
+[tool.doc8]
+ignore = [ "D001" ]
+
 [tool.uv]
 # Release tooling requires Python 3.10+. Resolve the lock for that floor so
 # CI can `uv run --group release` while the package keeps requires-python >=3.9.

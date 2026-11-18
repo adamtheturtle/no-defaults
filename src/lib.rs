@@ -843,7 +843,6 @@ struct FileCallSites {
     retained: BTreeSet<FixKey>,
 }
 
-#[must_use]
 pub fn main() -> ExitCode {
     match run() {
         Ok(false) => ExitCode::SUCCESS,

@@ -23,3 +23,8 @@ jobs:
           --from
           'snapper-fmt==0.11.7'
           snapper --native --max-width 0 --check
+      - name: Check reStructuredText
+        run: >-
+          git ls-files -z -- '*.rst' ':(exclude)vendored/**'
+          | xargs -0 --no-run-if-empty
+          uv run --locked --python 3.13 --only-group docs-lint -m doc8

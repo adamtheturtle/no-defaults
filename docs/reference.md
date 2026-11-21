@@ -12,14 +12,16 @@ The Python package supports the Python versions declared in its package metadata
 Defaults on positional-only, positional-or-keyword, and keyword-only parameters, in `def` signatures and in `lambda` ones alike.
 
 For classes decorated with `@dataclass` or `@dataclasses.dataclass`, assigned defaults plus `field(default=...)` and `field(default_factory=...)` in the class body.
-A renaming import is followed, so `from dataclasses import dataclass as dc` makes `@dc` count too; the same holds for `field`, pydantic's `Field`, and the `KW_ONLY` marker.
+The checker follows imports with aliases.
+This includes aliases of `dataclass`, `field`, Pydantic's `Field`, and `KW_ONLY`.
 
-A class that carries fields through a base class instead, as a pydantic model does, is detected the same way once that base is in [`field_base_classes`](#classes-that-carry-fields), which lists `pydantic.BaseModel` by default.
+A class that includes fields through a base class instead, as a pydantic model does, is detected the same way once that base is in [`field_base_classes`](#classes-that-carry-fields), which lists `pydantic.BaseModel` by default.
 
 `ClassVar` assignments are ignored because they are not fields, whether the annotation is bare, qualified, or quoted as in `x: "ClassVar[int]" = 1`.
 Annotated assignments inside method bodies are ignored because they are locals.
 
-A default that has to stay keeps the defaults after it, because Python does not allow a parameter without a default to follow one with a default, and `dataclasses` says the same of fields.
+Retaining a default also retains the defaults after it.
+Python does not allow a parameter without a default to follow one with a default, and `dataclasses` says the same of fields.
 Keyword-only parameters and fields are exempt, since order does not constrain them.
 
 Defaults in a `.pyi` stub are reported but never removed.
@@ -47,7 +49,7 @@ Found 2 errors.
 `NOD000` has no fix, so `--fix` counts it as remaining and exits `1` rather than claiming a clean result.
 The file is left out of the fixing pass entirely; the rest of the project is still fixed.
 
-The same holds if a fix would have produced Python that does not parse, which would be a bug in this linter: that file is left exactly as it was, named in a warning, and counted as remaining, and every other file is still fixed.
+If a fix would produce invalid Python, that file is left exactly as it was, named in a warning, and counted as remaining, and every other file is still fixed.
 
 ### Output formats
 
@@ -55,7 +57,8 @@ The default `full` output includes source excerpts and carets.
 `concise` emits one diagnostic per line, `json` emits a machine-readable array, and `github` emits workflow commands for GitHub Actions annotations.
 
 `--output-format` applies when fixing too.
-Under `json` and `github` the diagnostics are all that reaches standard output, so the result stays parseable and CI annotations still appear; the `N fixed` summary and the call-site count go to standard error with the other warnings.
+The `json` and `github` formats print diagnostics to standard output.
+They print the `N fixed` summary, the call-site count, and other warnings to standard error.
 Under `full` and `concise` both stay on standard output as before.
 
 ## `--fix`
@@ -71,7 +74,8 @@ retries: int = field(kw_only=True)
 
 After a successful fix, the command exits with status `0` and prints a Ruff-style summary such as `Found 2 errors (2 fixed, 0 remaining).` followed by `Updated 3 call sites.`
 Writes use an atomic same-directory replacement.
-`--diff` prints a unified diff, writes nothing, and exits with status `1` when changes are available; it shows the call-site edits alongside the signature edits, and reports the same warnings, so you can preview the whole change before writing anything.
+`--diff` previews changes without writing files and exits with status `1` when changes are available.
+The output includes edits to signatures and call sites, plus the same warnings.
 
 ### Call sites
 
@@ -85,7 +89,7 @@ connect("example.com")             # becomes  connect("example.com", timeout=30)
 connect("example.com", 5)          # already supplies it, so it is left alone
 ```
 
-The same applies to dataclass fields, which become required at construction: `Job("j")` becomes `Job("j", retries=3)`.
+Dataclass fields also become required constructor arguments: `Job("j")` becomes `Job("j", retries=3)`.
 A `default_factory` becomes the value it produces, so `field(default_factory=list)` adds `tags=[]` — a fresh list per call, which is what the factory gave you.
 
 Arguments are appended as keywords wherever Python allows it, so the change is stable under later edits to the signature.
@@ -96,12 +100,14 @@ An absolute import is looked up first at the importing file's own directory and 
 A one-component import such as `import utils` is only ever looked up at those ancestors, because one filename matches at any depth and `deep/nested/utils.py` is not what it resolves to.
 A project with its own `connect` does not get `socket.connect` rewritten, and two modules that each define `helper` are told apart.
 A method is rewritten when reached through `self`, `cls`, or a class the file can name — `Client`, `api.Client`, or one imported by name — which is as far as the receiver's type can be known without inference.
-What each method already receives is accounted for, so `instance.fetch(url)` and `Client.fetch(instance, url)` are both filled in correctly, and a `staticmethod` is given nothing extra.
+Rewrites account for how the method receives its receiver.
+This covers `instance.fetch(url)` and `Client.fetch(instance, url)`.
+Static methods have no receiver.
 
 ### What is left alone
 
-Nothing is guessed.
-A call is left alone, with a warning naming the file and line, when
+Rewrites require a statically resolved call.
+A call is left alone, with a warning that identifies the file and line, when
 
 - it cannot be tied to the definition that was fixed: an unrelated callable of the same name, a name an enclosing function or class binds and so shadows the definition with, a method on a receiver whose type is unknown such as `client.fetch(...)`, or a call through an import this run could not resolve;
 - the call unpacks `*args` or `**kwargs`, so what it already supplies is unknown;
@@ -109,14 +115,16 @@ A call is left alone, with a warning naming the file and line, when
 - a positional-only argument cannot be appended without reordering the call;
 - the call's argument is a bare generator expression, which Python allows only when it is the only one, so nothing can follow it;
 - the dataclass inherits fields, whose order in the constructor the defining file cannot see.
-  Bases that declare no fields do not count, so a generic dataclass built on `Generic[T]`, `Protocol`, `ABC`, or `object` is still updated; nor does a single base that is a dataclass in the same file, whose own fields are known and come first;
+  A generic dataclass built on the fieldless base `Generic[T]`, `Protocol`, `ABC`, or `object` is still updated; nor does one base that is a dataclass in the same file, whose own fields are known and come first;
 - the function is named without being called — a bare `@decorator`, or a callback passed as `run(cb)` — because Python calls it somewhere with no argument list to add to.
   Class names are exempt from this check, because they appear in annotations and `isinstance` checks constantly and none of those are calls.
 
 Fields that `__init__` never accepts are never added to a call: `field(..., init=False)`, a `_: KW_ONLY` marker, and a class whose decorator says `init=False`.
 
 Keyword-only fields are accounted for.
-`dataclasses` moves a field declared `field(kw_only=True)`, or any field under `@dataclass(kw_only=True)` or after a `_: KW_ONLY` marker, past the `*` in the generated `__init__`, so it holds no positional slot and the fields written after it keep the positions the source suggests.
+`dataclasses` moves a field declared `field(kw_only=True)`, or any field under `@dataclass(kw_only=True)` or after a `_: KW_ONLY` marker, past the `*` in the generated `__init__`, .
+The keyword-only field can be passed only by name.
+The fields after it retain their positional order.
 
 A lambda is anonymous, so `--fix` cannot resolve its call sites the way it resolves a function's; removing a lambda default is reported as a call it left alone.
 The loop-capture idiom `lambda x=x: ...` relies on its default, so suppress it where you mean it:
@@ -156,9 +164,9 @@ def compatible(timeout=30):  # type: ignore[misc]  # noqa: NOD001
     pass
 ```
 
-Removing such a directive removes only its own `#` segment, leaving the other pragma in place.
+Removing such a directive removes its `#` segment and preserves the other pragma.
 
-A directive on the line holding `def` covers every parameter of that signature, so a multi-line signature needs one directive rather than one per parameter:
+Put the directive on the `def` line to apply it to the entire signature, including a signature that spans multiple lines:
 
 ```python
 def compatible(  # noqa: NOD001
@@ -177,7 +185,9 @@ class Job:  # noqa: NOD001
     tags: list[str] = field(default_factory=list)
 ```
 
-Decorators do not move either line, and the scope stops at the signature or the class body: methods, nested functions, and nested dataclasses keep their own violations and need their own directives.
+Decorators do not move either line.
+The directive applies to the signature or class body.
+Add separate directives for methods, nested functions, and nested dataclasses.
 A directive placed elsewhere in the signature, such as on the closing parenthesis, still applies only to its own line.
 
 Suppress the rule for an entire file with `# ruff: noqa` or `# ruff: noqa: NOD001`.
@@ -193,7 +203,8 @@ src/example.py:1:12: NOD002 unused `noqa` directive for `NOD001`
 ```
 
 Only directives that name the code are checked.
-A blanket `# noqa` may exist for another linter, so it is never reported, and a blanket `# ruff: noqa` or `# flake8: noqa` silences every rule in the file, including this one.
+The checker ignores blanket `# noqa` comments.
+A blanket `# ruff: noqa` or `# flake8: noqa` suppresses the file for this checker too.
 When `--fix` removes the last code from a directive, it removes the whole comment; otherwise it removes just `NOD001` from the list.
 
 ### Alongside Ruff
@@ -210,7 +221,7 @@ lint.external = [ "NOD" ]
 
 ## Configuration
 
-Configuration lives in `pyproject.toml`:
+Configure the tool in `pyproject.toml`:
 
 ```toml
 [tool.no_defaults]
@@ -226,7 +237,7 @@ field_base_classes = [ "pydantic.BaseModel" ]
 Like Ruff, `no-defaults` discovers the closest `pyproject.toml` containing `[tool.no_defaults]` separately for each file.
 This supports monorepos with nested configuration; files without a local table continue searching parent directories.
 
-An unrecognised key in `[tool.no_defaults]` is an error, so a misspelled option fails the run rather than silently leaving the defaults in place:
+An unrecognised key in `[tool.no_defaults]` causes a configuration error:
 
 ```console
 $ no-defaults .
@@ -244,25 +255,27 @@ In private-only mode, the rule applies to private modules and packages, private 
 For example, all defaults in `_module.py` and `_package/module.py` are checked.
 Dunder names such as `__init__.py` are not considered private by themselves.
 
-Privacy is judged from the path below the project root, so a checkout living under a directory such as `_work/` is not treated as a private package and the answer does not change with whether you pass a relative or an absolute path.
+Privacy is judged from the path below the project root, so a checkout under a directory such as `_work/` is not treated as a private package and the answer does not change with whether you pass a relative or an absolute path.
 
-### Classes that carry fields
+### Classes with fields
 
 A `@dataclass` decorator marks a class whose annotated assignments are fields.
 So does a base class, which is how pydantic works, and `field_base_classes` lists the ones to recognise.
 It defaults to `[ "pydantic.BaseModel" ]`, and setting it replaces that list rather than adding to it, so `field_base_classes = []` checks decorated classes only.
 
 A base is matched by the last segment of its name, as a decorator is, so `pydantic.BaseModel` recognises `class Job(BaseModel)` and `class Job(pydantic.BaseModel)` alike.
-Anything else that carries fields this way — `msgspec.Struct`, `sqlmodel.SQLModel`, `typing.NamedTuple` — works once it is listed:
+Anything else that includes fields this way — `msgspec.Struct`, `sqlmodel.SQLModel`, `typing.NamedTuple` — works once it is listed:
 
 ```toml
 [tool.no_defaults]
 field_base_classes = [ "pydantic.BaseModel", "msgspec.Struct" ]
 ```
 
-Within such a class, `Field(default=…)` and `Field(default_factory=…)` are reported and `--fix` removes only those arguments, keeping the rest of the metadata, exactly as it does for `field(...)`. pydantic's `Field(...)` and `Field(default=...)` declare a field with no default, so neither is reported.
+Within such a class, `Field(default=…)` and `Field(default_factory=…)` are reported .
+As with `field(...)`, `--fix` removes those arguments and preserves the remaining metadata. pydantic's `Field(...)` and `Field(default=...)` declare a required field.
+The checker accepts both forms.
 
-A class is recognised only where it names a listed base itself.
+The checker recognises classes that directly name a listed base.
 `class Job(BaseModel)` is checked; `class SubJob(Job)` is not, because knowing that `Job` is a model means resolving imports across files.
 Where a model has a base beyond the listed one, its fields are still reported, but `--fix` leaves its call sites alone and says so, because that base may declare fields of its own.
 
@@ -270,7 +283,7 @@ Where a model has a base beyond the listed one, its fields are still reported, b
 
 By default, privacy is decided from module and symbol names alone.
 A function defined in `_upload.py` counts as private even when the package's `__init__.py` re-exports it, whether through `__all__` or a plain import.
-Under `private_only = true` it is still checked, although its defaults are part of the public API, where removing one is a breaking change for callers.
+The checker still analyzes it with `private_only = true`, even though removing a public default would break callers.
 
 `respect_reexports = true` reads those `__init__.py` files and treats what they export as public:
 
@@ -306,12 +319,12 @@ In each of the files it reads, these make a name public:
 - an entry in `__all__`, when `__all__` is written out as a list or tuple of string literals.
 
 A name treated as public is public wherever it is defined in that package.
-A public class carries its members with it — `class Client` re-exported from `_upload.py` keeps the defaults of `fetch`, but `_retry` is private by its own name and is still checked.
+A public class includes its members with it — `class Client` re-exported from `_upload.py` keeps the defaults of `fetch`, but `_retry` is private by its own name and is still checked.
 A re-exported dataclass keeps its field defaults.
 
 A module or package re-exported under its own name counts too.
 `from . import _upload` makes `package._upload` reachable, so everything in `_upload.py` is treated as being in a public module and only names private in their own right are checked.
-The same applies to `from . import _internal`, which unseals the private package: its `__init__.py` is read after all.
+An import such as `from . Import _internal` also opens access to the private package: its `__init__.py` is read after all.
 
 #### Limitations
 
@@ -365,11 +378,13 @@ def upload(
 
 `per_file_enforcement` accepts Ruff-style glob patterns relative to the directory containing `pyproject.toml`.
 Use `"all"` to reject every default in matching files, `"private"` to reject defaults only in private scopes, or `"none"` to exempt matching files from the rule.
-`"none"` also wins over `--private-only`, so an exempt file stays exempt.
-An exempt file keeps its own defaults, but its call sites are still updated when a callable it uses is fixed elsewhere: exemption decides which definitions are checked, not whether the file keeps working.
+The `"none"` setting takes precedence over `--private-only`.
+The fixer retains defaults in exempt files.
+It still updates calls in those files when the referenced callable changes.
 Patterns without a slash match file names at any depth.
 An initial `!` negates a pattern.
-If multiple patterns match, the most specific pattern wins; equally specific patterns are resolved lexicographically so results never depend on TOML table order.
+If multiple patterns match, the most specific pattern takes precedence.
+The checker uses lexicographic order to break ties.
 
 ## Performance
 

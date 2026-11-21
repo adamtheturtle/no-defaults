@@ -46,7 +46,8 @@ no-defaults --output-format json .                  # also: full, concise, githu
 no-defaults --show-settings src/package/api.py      # the settings that apply to a file
 ```
 
-Exit status is `0` when clean, `1` when violations are found, and `2` for an operational error — including a path named on the command line that is not a `.py` or `.pyi` file, so a mistyped path fails rather than reporting a clean run over nothing.
+Exit status is `0` when clean, `1` when violations are found, and `2` for an operational error — including an explicit path to an unsupported file.
+Use a `.py` or `.pyi` file.
 Directories are walked in parallel for Python files, respecting `.gitignore` and hidden-file filters.
 
 ```text
@@ -74,7 +75,7 @@ connect("example.com", 5)       # already supplies it, so it is left alone
 
 Dataclass and model fields become required at construction the same way, and `field(...)` keeps its other metadata: `field(default=3, kw_only=True)` becomes `field(kw_only=True)`.
 
-Nothing is guessed.
+Rewrites require a statically resolved call.
 A call is left alone, and named in a warning, when it cannot be tied to the definition that changed, when the removed default is not a literal, or in any of the other cases listed in the [reference](docs/reference.md#--fix).
 Defaults in `.pyi` stubs are reported but never removed, since a stub describes a signature rather than supplying one.
 
@@ -86,11 +87,13 @@ Run it over the whole project at once, and prefer `private_only` with `respect_r
 ## Suppressing
 
 `# noqa: NOD001` — or a blanket `# noqa` — on the line holding the default suppresses it.
-On a `def` or `class` line it covers that whole signature or class body, so a multi-line signature needs one directive rather than one per parameter.
+A directive on a `def` line applies to the whole signature, including multi-line signatures.
+A directive on a `class` line applies to the class body.
 `# ruff: noqa: NOD001` on its own line covers a whole file.
 See the [reference](docs/reference.md#suppressing) for the exact scoping rules.
 
-`NOD001` is not a Ruff rule, so Ruff reports every such comment as `RUF102 Invalid rule code` and `ruff check --fix` deletes it, leaving the violation behind.
+Ruff reports `NOD001` as `RUF102 Invalid rule code`.
+The command `ruff check --fix` then deletes the comment, and the original violation remains.
 Register the prefix so Ruff leaves the suppressions alone:
 
 ```toml
@@ -100,9 +103,9 @@ lint.external = [ "NOD" ]
 
 ## Configuration
 
-Configuration lives in `pyproject.toml`.
+Configure the tool in `pyproject.toml`.
 Like Ruff, `no-defaults` finds the closest one containing `[tool.no_defaults]` separately for each file, so nested configuration in a monorepo works.
-An unrecognised key is an error, so a misspelled option fails the run rather than silently leaving the defaults in place.
+An unrecognised key causes a configuration error.
 
 ```toml
 [tool.no_defaults]
